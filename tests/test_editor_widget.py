@@ -1,6 +1,7 @@
-"""Editor widget tests."""
+"""Editor widget tests covering logical behaviors in headless mode."""
 
-from tinkerbell.editor.document_model import DocumentState
+from tinkerbell.chat.message_model import EditDirective
+from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.editor.editor_widget import EditorWidget
 
 
@@ -10,3 +11,46 @@ def test_editor_widget_snapshot_roundtrip():
     widget.load_document(doc)
     snapshot = widget.request_snapshot()
     assert snapshot["text"] == "sample"
+
+
+def test_editor_widget_applies_ai_edit_insert_and_replace():
+    widget = EditorWidget()
+    widget.load_document(DocumentState(text="hello"))
+
+    insert = EditDirective(action="insert", target_range=(5, 5), content=" world")
+    widget.apply_ai_edit(insert)
+    assert widget.to_document().text == "hello world"
+
+    replace = EditDirective(action="replace", target_range=(0, 5), content="hi")
+    widget.apply_ai_edit(replace)
+    assert widget.to_document().text == "hi world"
+
+
+def test_editor_widget_preview_snapshot_contains_html():
+    widget = EditorWidget()
+    widget.load_document(DocumentState(text="# Title"))
+    widget.set_preview_mode(True)
+    snapshot = widget.request_snapshot()
+    assert snapshot["preview_enabled"] is True
+    assert "tb-markdown-preview" in snapshot["preview"]
+    assert "<h1" in snapshot["preview"]
+
+
+def test_editor_widget_undo_redo_roundtrip():
+    widget = EditorWidget()
+    widget.load_document(DocumentState(text="one"))
+    widget.set_text("two")
+    widget.insert_text(" three", position=3)
+    widget.undo()
+    assert widget.to_document().text == "two"
+    widget.redo()
+    assert widget.to_document().text == "two three"
+
+
+def test_editor_widget_selection_updates_document_state():
+    widget = EditorWidget()
+    doc = DocumentState(text="content", selection=SelectionRange(0, 0))
+    widget.load_document(doc)
+    widget.apply_selection(SelectionRange(1, 4))
+    assert widget.to_document().selection.start == 1
+    assert widget.to_document().selection.end == 4

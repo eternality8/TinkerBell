@@ -2,7 +2,54 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Callable, Iterable, Sequence
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ..services.settings import Settings
+
+__all__ = [
+    "DEFAULT_FILE_FILTER",
+    "SettingsDialog",
+    "SettingsDialogResult",
+    "ValidationErrorsDialog",
+    "open_file_dialog",
+    "save_file_dialog",
+    "show_settings_dialog",
+    "show_validation_errors",
+]
+
+DEFAULT_FILE_FILTER = "Markdown / Text (*.md *.markdown *.mdx *.txt *.json *.yaml *.yml);;All Files (*)"
+_MODEL_SUGGESTIONS = ("gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "o4-mini")
+
+
+@dataclass(slots=True)
+class ValidationResult:
+    """Outcome of validating a set of settings."""
+
+    ok: bool
+    message: str = ""
+
+
+SettingsValidator = Callable[[Settings], ValidationResult | tuple[bool, str] | bool]
 
 
 @dataclass(slots=True)
@@ -10,11 +57,275 @@ class SettingsDialogResult:
     """Outcome returned when the settings dialog closes."""
 
     accepted: bool
-    api_key: str
+    settings: Settings
+    validated: bool = False
+    validation_message: str | None = None
 
 
-def show_settings_dialog() -> SettingsDialogResult:
-    """Display the settings dialog (stub)."""
+def open_file_dialog(
+    parent: QWidget | None = None,
+    *,
+    caption: str = "Open Document",
+    start_dir: Path | str | None = None,
+    file_filter: str | None = None,
+) -> Path | None:
+    """Show a native open-file dialog with project-specific defaults."""
 
-    return SettingsDialogResult(accepted=False, api_key="")
+    selected_filter = file_filter or DEFAULT_FILE_FILTER
+    directory = str(start_dir) if start_dir else ""
+    path, _ = QFileDialog.getOpenFileName(parent, caption, directory, selected_filter)
+    return Path(path) if path else None
+
+
+def save_file_dialog(
+    parent: QWidget | None = None,
+    *,
+    caption: str = "Save Document",
+    start_dir: Path | str | None = None,
+    file_filter: str | None = None,
+    default_suffix: str = "md",
+) -> Path | None:
+    """Show a native save-file dialog with sensible defaults."""
+
+    selected_filter = file_filter or DEFAULT_FILE_FILTER
+    directory = str(start_dir) if start_dir else ""
+    path, _ = QFileDialog.getSaveFileName(parent, caption, directory, selected_filter)
+    if not path:
+        return None
+    resolved = Path(path)
+    if not resolved.suffix and default_suffix:
+        resolved = resolved.with_suffix(f".{default_suffix}")
+    return resolved
+
+
+class ValidationErrorsDialog(QDialog):
+    """Dialog presenting a list of validation errors to the user."""
+
+    def __init__(self, errors: Iterable[str], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Validation Errors")
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        header = QLabel("Please resolve the following issues:")
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        self._list = QListWidget()
+        for error in errors:
+            if not error:
+                continue
+            QListWidgetItem(error, self._list)
+        if not self._list.count():
+            QListWidgetItem("No validation errors reported.", self._list)
+        layout.addWidget(self._list)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+
+def show_validation_errors(parent: QWidget | None = None, errors: Iterable[str] = ()) -> None:
+    """Display the validation errors dialog if errors were supplied."""
+
+    errors = list(errors)
+    if not errors:
+        return
+    dialog = ValidationErrorsDialog(errors, parent)
+    dialog.exec()
+
+
+class SettingsDialog(QDialog):
+    """Modal dialog allowing users to configure API connectivity settings."""
+
+    def __init__(
+        self,
+        *,
+        settings: Settings | None = None,
+        parent: QWidget | None = None,
+        available_models: Sequence[str] | None = None,
+        validator: SettingsValidator | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("AI Settings")
+        self.setModal(True)
+
+        self._original = settings or Settings()
+        self._result = self._original
+        self._validator = validator
+        self._last_validation = ValidationResult(ok=False, message="")
+        self._model_choices = tuple(available_models or _MODEL_SUGGESTIONS)
+
+        self._base_url_input = QLineEdit(self._original.base_url)
+        self._base_url_input.setObjectName("base_url_input")
+        self._api_key_input = QLineEdit(self._original.api_key)
+        self._api_key_input.setObjectName("api_key_input")
+        self._api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._model_combo = QComboBox()
+        self._model_combo.setObjectName("model_combo")
+        self._model_combo.setEditable(True)
+        seen = set()
+        for model in self._model_choices:
+            if model in seen:
+                continue
+            seen.add(model)
+            self._model_combo.addItem(model)
+        if self._original.model:
+            index = self._model_combo.findText(self._original.model)
+            if index >= 0:
+                self._model_combo.setCurrentIndex(index)
+            else:
+                self._model_combo.setEditText(self._original.model)
+        self._organization_input = QLineEdit(self._original.organization or "")
+        self._organization_input.setObjectName("organization_input")
+        self._theme_input = QLineEdit(self._original.theme)
+        self._theme_input.setObjectName("theme_input")
+        self._telemetry_checkbox = QCheckBox("Share anonymous telemetry data")
+        self._telemetry_checkbox.setObjectName("telemetry_checkbox")
+        self._telemetry_checkbox.setChecked(self._original.telemetry_opt_in)
+
+        form_layout = QFormLayout()
+        form_layout.addRow("Base URL", self._base_url_input)
+
+        api_container = QWidget()
+        api_layout = QVBoxLayout(api_container)
+        api_layout.setContentsMargins(0, 0, 0, 0)
+        api_layout.addWidget(self._api_key_input)
+        show_checkbox = QCheckBox("Show API key")
+        show_checkbox.setObjectName("show_api_checkbox")
+        show_checkbox.toggled.connect(self._toggle_api_visibility)
+        api_layout.addWidget(show_checkbox)
+        form_layout.addRow("API Key", api_container)
+
+        form_layout.addRow("Model", self._model_combo)
+        form_layout.addRow("Organization", self._organization_input)
+        form_layout.addRow("Theme", self._theme_input)
+        form_layout.addRow("Telemetry", self._telemetry_checkbox)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form_layout)
+
+        validation_row = QHBoxLayout()
+        self._validation_label = QLabel()
+        self._validation_label.setObjectName("validation_label")
+        self._validation_label.setWordWrap(True)
+        self._validation_label.setVisible(False)
+        self._validation_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        validation_row.addWidget(self._validation_label, 1)
+
+        self._validate_button = QPushButton("Validate Key")
+        self._validate_button.setObjectName("validate_button")
+        self._validate_button.clicked.connect(self._run_validation)
+        self._validate_button.setEnabled(self._validator is not None)
+        validation_row.addWidget(self._validate_button, 0)
+        layout.addLayout(validation_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def settings(self) -> Settings:
+        """Return the settings captured by the dialog."""
+
+        return self._result
+
+    @property
+    def validated(self) -> bool:
+        """Indicate whether the last validation run succeeded."""
+
+        return self._last_validation.ok
+
+    @property
+    def last_validation(self) -> ValidationResult:
+        """Return the status of the most recent validation attempt."""
+
+        return self._last_validation
+
+    def gather_settings(self) -> Settings:
+        """Assemble a `Settings` instance from the current form widgets."""
+
+        base_url = self._base_url_input.text().strip() or self._original.base_url
+        api_key = self._api_key_input.text().strip()
+        model = self._model_combo.currentText().strip() or self._original.model
+        organization = self._organization_input.text().strip() or None
+        theme = self._theme_input.text().strip() or self._original.theme
+        telemetry = self._telemetry_checkbox.isChecked()
+        return replace(
+            self._original,
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            organization=organization,
+            theme=theme,
+            telemetry_opt_in=telemetry,
+        )
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+    def _toggle_api_visibility(self, checked: bool) -> None:
+        self._api_key_input.setEchoMode(
+            QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+        )
+
+    def _on_accept(self) -> None:
+        self._result = self.gather_settings()
+        self.accept()
+
+    def _run_validation(self) -> None:
+        if self._validator is None:
+            self._last_validation = ValidationResult(
+                ok=True, message="No validator configured; settings saved locally."
+            )
+        else:
+            candidate = self.gather_settings()
+            raw_result = self._validator(candidate)
+            self._last_validation = _coerce_validation_result(raw_result)
+        self._validation_label.setVisible(True)
+        self._validation_label.setText(self._last_validation.message or "Validation completed.")
+        color = "#22863a" if self._last_validation.ok else "#d73a49"
+        self._validation_label.setStyleSheet(f"color: {color};")
+
+
+def show_settings_dialog(
+    parent: QWidget | None = None,
+    *,
+    settings: Settings | None = None,
+    models: Sequence[str] | None = None,
+    validator: SettingsValidator | None = None,
+) -> SettingsDialogResult:
+    """Display the settings dialog and return the captured values."""
+
+    dialog = SettingsDialog(
+        settings=settings,
+        parent=parent,
+        available_models=models,
+        validator=validator,
+    )
+    accepted = dialog.exec() == int(QDialog.DialogCode.Accepted)
+    last_message = dialog.last_validation.message or None
+    return SettingsDialogResult(
+        accepted=accepted,
+        settings=dialog.settings(),
+        validated=dialog.validated,
+        validation_message=last_message,
+    )
+
+
+def _coerce_validation_result(result: ValidationResult | tuple[bool, str] | bool) -> ValidationResult:
+    if isinstance(result, ValidationResult):
+        return result
+    if isinstance(result, tuple):
+        ok, message = result
+        return ValidationResult(bool(ok), str(message))
+    return ValidationResult(bool(result), "")
 
