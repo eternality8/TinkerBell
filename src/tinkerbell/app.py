@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, cast
 
+from .ai.agents.executor import AIController
+from .ai.client import AIClient, ClientSettings
 from .main_window import MainWindow, WindowContext
 from .services.settings import Settings, SettingsStore
 from .utils import logging as logging_utils
@@ -35,14 +37,14 @@ def configure_logging(debug: bool = False) -> None:
     _install_qt_message_handler()
 
 
-def load_settings(path: Optional[Path] = None) -> Settings:
+def load_settings(path: Optional[Path] = None, *, store: SettingsStore | None = None) -> Settings:
     """Load persisted settings or fall back to defaults."""
 
-    store = SettingsStore(path)
+    active_store = store or SettingsStore(path)
     try:
-        settings = store.load()
+        settings = active_store.load()
     except Exception as exc:  # pragma: no cover - defensive path
-        store_path = getattr(store, "_path", path)
+        store_path = getattr(active_store, "_path", path)
         _LOGGER.warning("Failed to load settings from %s: %s", store_path, exc)
         settings = Settings()
     return settings
@@ -93,12 +95,17 @@ def main() -> None:
 
     settings_path = os.environ.get("TINKERBELL_SETTINGS_PATH")
     resolved_path = Path(settings_path).expanduser() if settings_path else None
-    settings = load_settings(resolved_path)
+    settings_store = SettingsStore(resolved_path)
+    settings = load_settings(resolved_path, store=settings_store)
 
     _warmup_vector_store()
 
+    ai_controller = _build_ai_controller(settings)
+
     runtime = create_qapp(settings)
-    window = MainWindow(WindowContext(settings=settings, ai_controller=None))
+    window = MainWindow(
+        WindowContext(settings=settings, ai_controller=ai_controller, settings_store=settings_store)
+    )
     window.show()
 
     loop = runtime.loop
@@ -158,3 +165,27 @@ def _warmup_vector_store() -> None:
         _LOGGER.debug("FAISS loaded (version=%s).", version)
     except Exception:  # pragma: no cover - extremely defensive
         _LOGGER.debug("FAISS import succeeded.")
+
+
+def _build_ai_controller(settings: Settings) -> AIController | None:
+    """Construct the AI controller using the current settings, if possible."""
+
+    try:
+        client_settings = ClientSettings(
+            base_url=settings.base_url,
+            api_key=settings.api_key,
+            model=settings.model,
+            organization=settings.organization,
+            request_timeout=settings.request_timeout,
+            max_retries=settings.max_retries,
+            retry_min_seconds=settings.retry_min_seconds,
+            retry_max_seconds=settings.retry_max_seconds,
+            default_headers=settings.default_headers,
+            metadata=settings.metadata,
+        )
+        client = AIClient(client_settings)
+    except Exception as exc:  # pragma: no cover - dependency/config errors
+        _LOGGER.warning("AI controller unavailable: %s", exc)
+        return None
+
+    return AIController(client=client)

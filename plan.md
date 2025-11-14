@@ -90,8 +90,7 @@ tinkerbell/
 │  │  │  └─ dialogs.py           # open/save, settings, confirmation
 │  │  └─ utils/
 │  │     ├─ file_io.py
-│  │     ├─ logging.py
-│  │     └─ telemetry.py (optional)
+│  │     └─ logging.py
 │  └─ scripts/
 │     └─ seed_examples.py        # sample docs/conversations
 ├─ tests/
@@ -114,7 +113,7 @@ tinkerbell/
 6. **Agent tools & memory** – each tool module enforces validation (e.g., schema-check edits, token limits). Memory helpers persist conversation buffers + document summaries for retrieval tools.
 7. **Bridge service** – listens for AI commands (replace selection, append at cursor, comment block) and mutates the editor safely (Qt signal/slot) while surfacing diffs back to the agent.
 8. **Settings service** – secure storage, validation, model list caching, UI dialog to update credentials.
-9. **Utilities** – logging wrappers, temporary file helpers, telemetry hooks.
+9. **Utilities** – logging wrappers and temporary file helpers.
 
 ### 8. AI Interaction Flow
 1. User selects text or positions cursor and asks AI for an action.

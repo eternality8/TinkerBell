@@ -6,6 +6,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
+import httpx
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -31,6 +33,7 @@ __all__ = [
     "SettingsDialog",
     "SettingsDialogResult",
     "ValidationErrorsDialog",
+    "test_ai_api_settings",
     "open_file_dialog",
     "save_file_dialog",
     "show_settings_dialog",
@@ -50,6 +53,7 @@ class ValidationResult:
 
 
 SettingsValidator = Callable[[Settings], ValidationResult | tuple[bool, str] | bool]
+SettingsTester = Callable[[Settings], ValidationResult | tuple[bool, str] | bool]
 
 
 @dataclass(slots=True)
@@ -60,6 +64,8 @@ class SettingsDialogResult:
     settings: Settings
     validated: bool = False
     validation_message: str | None = None
+    api_tested: bool = False
+    api_test_message: str | None = None
 
 
 def open_file_dialog(
@@ -146,6 +152,7 @@ class SettingsDialog(QDialog):
         parent: QWidget | None = None,
         available_models: Sequence[str] | None = None,
         validator: SettingsValidator | None = None,
+        api_tester: SettingsTester | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("AI Settings")
@@ -154,7 +161,9 @@ class SettingsDialog(QDialog):
         self._original = settings or Settings()
         self._result = self._original
         self._validator = validator
+        self._api_tester = api_tester
         self._last_validation = ValidationResult(ok=False, message="")
+        self._last_api_test = ValidationResult(ok=False, message="")
         self._model_choices = tuple(available_models or _MODEL_SUGGESTIONS)
 
         self._base_url_input = QLineEdit(self._original.base_url)
@@ -181,9 +190,6 @@ class SettingsDialog(QDialog):
         self._organization_input.setObjectName("organization_input")
         self._theme_input = QLineEdit(self._original.theme)
         self._theme_input.setObjectName("theme_input")
-        self._telemetry_checkbox = QCheckBox("Share anonymous telemetry data")
-        self._telemetry_checkbox.setObjectName("telemetry_checkbox")
-        self._telemetry_checkbox.setChecked(self._original.telemetry_opt_in)
 
         form_layout = QFormLayout()
         form_layout.addRow("Base URL", self._base_url_input)
@@ -201,7 +207,6 @@ class SettingsDialog(QDialog):
         form_layout.addRow("Model", self._model_combo)
         form_layout.addRow("Organization", self._organization_input)
         form_layout.addRow("Theme", self._theme_input)
-        form_layout.addRow("Telemetry", self._telemetry_checkbox)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form_layout)
@@ -221,6 +226,12 @@ class SettingsDialog(QDialog):
         self._validate_button.clicked.connect(self._run_validation)
         self._validate_button.setEnabled(self._validator is not None)
         validation_row.addWidget(self._validate_button, 0)
+
+        self._test_button = QPushButton("Test Connection")
+        self._test_button.setObjectName("test_button")
+        self._test_button.clicked.connect(self._run_api_test)
+        self._test_button.setEnabled(self._api_tester is not None)
+        validation_row.addWidget(self._test_button, 0)
         layout.addLayout(validation_row)
 
         buttons = QDialogButtonBox(
@@ -250,6 +261,18 @@ class SettingsDialog(QDialog):
 
         return self._last_validation
 
+    @property
+    def api_tested(self) -> bool:
+        """Indicate whether the last API test succeeded."""
+
+        return self._last_api_test.ok
+
+    @property
+    def last_api_test(self) -> ValidationResult:
+        """Return the status of the most recent API test."""
+
+        return self._last_api_test
+
     def gather_settings(self) -> Settings:
         """Assemble a `Settings` instance from the current form widgets."""
 
@@ -258,7 +281,6 @@ class SettingsDialog(QDialog):
         model = self._model_combo.currentText().strip() or self._original.model
         organization = self._organization_input.text().strip() or None
         theme = self._theme_input.text().strip() or self._original.theme
-        telemetry = self._telemetry_checkbox.isChecked()
         return replace(
             self._original,
             base_url=base_url,
@@ -266,7 +288,6 @@ class SettingsDialog(QDialog):
             model=model,
             organization=organization,
             theme=theme,
-            telemetry_opt_in=telemetry,
         )
 
     # ------------------------------------------------------------------
@@ -290,9 +311,23 @@ class SettingsDialog(QDialog):
             candidate = self.gather_settings()
             raw_result = self._validator(candidate)
             self._last_validation = _coerce_validation_result(raw_result)
+        self._display_status(self._last_validation, fallback="Validation completed.")
+
+    def _run_api_test(self) -> None:
+        if self._api_tester is None:
+            self._last_api_test = ValidationResult(
+                ok=False, message="No API tester configured; cannot run connection test."
+            )
+        else:
+            candidate = self.gather_settings()
+            raw_result = self._api_tester(candidate)
+            self._last_api_test = _coerce_validation_result(raw_result)
+        self._display_status(self._last_api_test, fallback="API test completed.")
+
+    def _display_status(self, result: ValidationResult, *, fallback: str) -> None:
         self._validation_label.setVisible(True)
-        self._validation_label.setText(self._last_validation.message or "Validation completed.")
-        color = "#22863a" if self._last_validation.ok else "#d73a49"
+        self._validation_label.setText(result.message or fallback)
+        color = "#22863a" if result.ok else "#d73a49"
         self._validation_label.setStyleSheet(f"color: {color};")
 
 
@@ -302,14 +337,17 @@ def show_settings_dialog(
     settings: Settings | None = None,
     models: Sequence[str] | None = None,
     validator: SettingsValidator | None = None,
+    api_tester: SettingsTester | None = None,
 ) -> SettingsDialogResult:
     """Display the settings dialog and return the captured values."""
 
+    tester = api_tester if api_tester is not None else test_ai_api_settings
     dialog = SettingsDialog(
         settings=settings,
         parent=parent,
         available_models=models,
         validator=validator,
+        api_tester=tester,
     )
     accepted = dialog.exec() == int(QDialog.DialogCode.Accepted)
     last_message = dialog.last_validation.message or None
@@ -318,6 +356,8 @@ def show_settings_dialog(
         settings=dialog.settings(),
         validated=dialog.validated,
         validation_message=last_message,
+        api_tested=dialog.api_tested,
+        api_test_message=dialog.last_api_test.message or None,
     )
 
 
@@ -328,4 +368,41 @@ def _coerce_validation_result(result: ValidationResult | tuple[bool, str] | bool
         ok, message = result
         return ValidationResult(bool(ok), str(message))
     return ValidationResult(bool(result), "")
+
+
+def test_ai_api_settings(settings: Settings) -> ValidationResult:
+    """Attempt to reach the AI API using the provided settings."""
+
+    base_url = (settings.base_url or "").strip().rstrip("/")
+    api_key = (settings.api_key or "").strip()
+    if not base_url:
+        return ValidationResult(False, "Base URL is required to test the AI API.")
+    if not api_key:
+        return ValidationResult(False, "API key is required to test the AI API.")
+
+    endpoint = f"{base_url}/models"
+    headers: dict[str, str] = {"Authorization": f"Bearer {api_key}"}
+    if settings.organization:
+        headers["OpenAI-Organization"] = settings.organization
+    if settings.default_headers:
+        headers.update(settings.default_headers)
+
+    timeout = settings.request_timeout or 30.0
+
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers) as client:
+            response = client.get(endpoint)
+    except httpx.TimeoutException:
+        return ValidationResult(False, "Connection to the AI API timed out.")
+    except httpx.HTTPError as exc:
+        return ValidationResult(False, f"Failed to reach AI API: {exc}")
+
+    if response.is_success:
+        return ValidationResult(True, "AI API connection succeeded.")
+
+    snippet = (response.text or "").strip()
+    if len(snippet) > 120:
+        snippet = f"{snippet[:117]}..."
+    reason = snippet or response.reason_phrase or "Unknown error"
+    return ValidationResult(False, f"API responded with {response.status_code}: {reason}")
 

@@ -219,13 +219,6 @@ Below are per-module implementation notes derived from `plan.md`. Each entry lis
   - `qt_message_handler(mode, context, message)` to redirect Qt warnings.
 - **Notes**: consider rotating logs (e.g., `logging.handlers.RotatingFileHandler`).
 
-## `utils/telemetry.py` (optional)
-- **Responsibilities**: capture anonymous usage metrics (feature toggles) respecting opt-in.
-- **Key functions**:
-  - `TelemetryClient`: `track_event(name, props)`, `flush()`.
-  - `is_enabled(settings)` to guard calls.
-- **Notes**: keep stubbed until privacy policy defined.
-
 ## `tests/`
 - **Focus areas**:
   - `test_agent.py`: simulate LangGraph runs w/ mocked tools; ensure directives produced.

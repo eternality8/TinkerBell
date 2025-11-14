@@ -27,7 +27,6 @@ def test_save_and_load_roundtrip(tmp_path: Path) -> None:
         model="gpt-4.1-mini",
         theme="dark",
         organization="acme",
-        telemetry_opt_in=True,
         autosave_interval=45.0,
         default_headers={"X-Test": "1"},
         metadata={"env": "dev"},

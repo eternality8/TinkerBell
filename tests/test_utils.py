@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
 import pytest
 
 from tinkerbell.editor.document_model import DocumentState
-from tinkerbell.utils import file_io, logging as logging_utils, telemetry
+from tinkerbell.utils import file_io, logging as logging_utils
 
 
 def test_read_text_detects_bom_and_normalizes_newlines(tmp_path: Path) -> None:
@@ -100,22 +99,3 @@ def test_setup_logging_creates_rotating_file(tmp_path: Path) -> None:
     assert "Logging smoke test" in contents
 
 
-def test_telemetry_client_flushes_events(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    storage_dir = tmp_path / "telemetry"
-    client = telemetry.TelemetryClient(enabled=True, storage_dir=storage_dir)
-
-    client.track_event("launch", feature="autosave")
-    output_path = client.flush()
-
-    assert output_path is not None
-    body = output_path.read_text(encoding="utf-8").strip().splitlines()
-    assert len(body) == 1
-    event = json.loads(body[0])
-    assert event["name"] == "launch"
-    assert event["properties"]["feature"] == "autosave"
-
-
-def test_telemetry_enabled_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("TINKERBELL_TELEMETRY", "true")
-
-    assert telemetry.telemetry_enabled(settings=None)
