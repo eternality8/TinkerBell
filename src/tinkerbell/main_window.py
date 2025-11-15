@@ -357,6 +357,7 @@ class MainWindow(QMainWindow):
         self._editor.add_text_listener(self._handle_editor_text_changed)
         self._editor.add_selection_listener(self._handle_editor_selection_changed)
         self._chat_panel.add_request_listener(self._handle_chat_request)
+        self._chat_panel.add_session_reset_listener(self._handle_chat_session_reset)
         self._bridge.add_edit_listener(self._handle_edit_applied)
         self._handle_editor_selection_changed(self._editor.to_document().selection)
 
@@ -452,9 +453,7 @@ class MainWindow(QMainWindow):
             return
 
         if self._ai_task and not self._ai_task.done():
-            cancel = getattr(controller, "cancel", None)
-            if callable(cancel):
-                cancel()
+            self._cancel_active_ai_turn()
             self.update_status("Previous AI request canceled")
 
         snapshot = self._bridge.generate_snapshot()
@@ -546,6 +545,28 @@ class MainWindow(QMainWindow):
         task = loop.create_task(coro)
         task.add_done_callback(self._on_ai_task_finished)
         return task
+
+    def _cancel_active_ai_turn(self) -> None:
+        controller = self._context.ai_controller
+        cancel = getattr(controller, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:  # pragma: no cover - defensive logging
+                _LOGGER.debug("AI controller cancel raised", exc_info=True)
+
+        task = self._ai_task
+        if task is not None and not task.done():
+            try:
+                task.cancel()
+            except Exception:  # pragma: no cover - defensive logging
+                _LOGGER.debug("AI task cancellation failed", exc_info=True)
+        self._ai_task = None
+        self._ai_stream_active = False
+
+    def _handle_chat_session_reset(self) -> None:
+        self._cancel_active_ai_turn()
+        self.update_status("Chat reset")
 
     def _on_ai_task_finished(self, task: asyncio.Task[Any]) -> None:
         if task is self._ai_task:

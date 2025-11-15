@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 
+import tinkerbell.chat.chat_panel as chat_panel
 from tinkerbell.chat.chat_panel import ChatPanel, ComposerContext
 from tinkerbell.chat.message_model import ChatMessage, ToolTrace
 
@@ -125,3 +126,65 @@ def test_chat_panel_send_prompt_rejects_empty_text():
     panel = _make_panel()
     with pytest.raises(ValueError):
         panel.send_prompt("")
+
+
+def test_chat_panel_start_new_chat_notifies_listeners():
+    panel = _make_panel()
+    called = []
+
+    def _listener() -> None:
+        called.append(True)
+
+    panel.add_session_reset_listener(_listener)
+    panel.start_new_chat()
+
+    assert called == [True]
+
+
+def test_chat_panel_start_new_chat_resets_state():
+    panel = _make_panel()
+    panel.append_user_message("Hi")
+    panel.append_ai_message(ChatMessage(role="assistant", content="Hello again"))
+    panel.set_composer_text("Draft reply", context=ComposerContext("intro"))
+    panel.start_new_chat()
+
+    assert panel.history() == []
+    assert panel.composer_text == ""
+
+
+def test_copy_text_to_clipboard_records_text_when_qt_missing(monkeypatch):
+    monkeypatch.setattr(chat_panel, "QApplication", None)
+    panel = ChatPanel()
+
+    copied = panel.copy_text_to_clipboard("Example message")
+
+    assert copied is False
+    assert panel.last_copied_text == "Example message"
+
+
+def test_copy_text_to_clipboard_uses_qt_clipboard(monkeypatch):
+    panel = ChatPanel()
+
+    class _Clipboard:
+        def __init__(self) -> None:
+            self.text = ""
+
+        def setText(self, text: str) -> None:
+            self.text = text
+
+    class _QtAppStub:
+        _clipboard = _Clipboard()
+
+        @staticmethod
+        def instance() -> object:
+            return object()
+
+        @staticmethod
+        def clipboard() -> _Clipboard:
+            return _QtAppStub._clipboard
+
+    monkeypatch.setattr(chat_panel, "QApplication", _QtAppStub)
+
+    assert panel.copy_text_to_clipboard("Persist me") is True
+    assert _QtAppStub._clipboard.text == "Persist me"
+    assert panel.last_copied_text == "Persist me"

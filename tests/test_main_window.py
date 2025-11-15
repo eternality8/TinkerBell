@@ -496,6 +496,30 @@ def test_update_status_tracks_message():
     assert window.last_status_message == "Testing status"
 
 
+def test_new_chat_session_cancels_active_ai_request():
+    controller = _StubAIController()
+    window = _make_window(controller)
+
+    class _FakeTask:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    task = _FakeTask()
+    window._ai_task = task  # type: ignore[assignment]
+    window.chat_panel.start_new_chat()
+
+    assert controller.cancelled is True
+    assert task.cancelled is True
+    assert window._ai_task is None
+    assert window.last_status_message == "Chat reset"
+
+
 class _StubAIController:
     def __init__(self) -> None:
         self.prompts: list[str] = []

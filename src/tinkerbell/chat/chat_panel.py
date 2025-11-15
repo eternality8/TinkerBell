@@ -28,22 +28,32 @@ QFrame: Any = None
 QHBoxLayout: Any = None
 QLabel: Any = None
 QListWidget: Any = None
+QListWidgetItem: Any = None
+QMenu: Any = None
 QPushButton: Any = None
 QTextEdit: Any = None
+QToolButton: Any = None
 QVBoxLayout: Any = None
 QWidgetBase: Any = None
+QAbstractItemView: Any = None
+Qt: Any = None
 
 try:  # pragma: no cover - PySide6 optional in CI
+    from PySide6.QtCore import Qt as _Qt
     from PySide6.QtWidgets import (
         QApplication as _QtApplication,
         QFrame as _QtFrame,
         QHBoxLayout as _QtHBoxLayout,
         QLabel as _QtLabel,
-        QListWidget as _QtListWidget,
-        QPushButton as _QtPushButton,
+    QListWidget as _QtListWidget,
+    QListWidgetItem as _QtListWidgetItem,
+    QMenu as _QtMenu,
+    QPushButton as _QtPushButton,
         QTextEdit as _QtTextEdit,
+        QToolButton as _QtToolButton,
         QVBoxLayout as _QtVBoxLayout,
         QWidget as _QtWidget,
+        QAbstractItemView as _QtAbstractItemView,
     )
 
     QApplication = _QtApplication
@@ -51,10 +61,15 @@ try:  # pragma: no cover - PySide6 optional in CI
     QHBoxLayout = _QtHBoxLayout
     QLabel = _QtLabel
     QListWidget = _QtListWidget
+    QListWidgetItem = _QtListWidgetItem
+    QMenu = _QtMenu
     QPushButton = _QtPushButton
     QTextEdit = _QtTextEdit
+    QToolButton = _QtToolButton
     QVBoxLayout = _QtVBoxLayout
     QWidgetBase = _QtWidget
+    QAbstractItemView = _QtAbstractItemView
+    Qt = _Qt
 except Exception:  # pragma: no cover - runtime fallback keeps dependencies optional
 
     class _StubQWidget:  # type: ignore[too-many-ancestors]
@@ -70,6 +85,13 @@ class RequestListener(Protocol):
     """Protocol describing callbacks invoked on prompt submission."""
 
     def __call__(self, prompt: str, metadata: dict[str, Any]) -> None:
+        ...
+
+
+class SessionResetListener(Protocol):
+    """Protocol describing callbacks fired when a new chat session begins."""
+
+    def __call__(self) -> None:
         ...
 
 
@@ -110,15 +132,20 @@ class ChatPanel(QWidgetBase):
         self._composer_text: str = ""
         self._composer_context = ComposerContext()
         self._request_listeners: list[RequestListener] = []
+        self._session_reset_listeners: list[SessionResetListener] = []
         self._tool_activity_visible = bool(show_tool_activity_panel)
 
         # Qt widgets (optional; None when headless)
         self._history_widget: Any = None
         self._composer_widget: Any = None
         self._send_button: Any = None
+        self._new_chat_button: Any = None
         self._suggestion_widget: Any = None
+        self._suggestion_toggle: Any = None
         self._tool_trace_widget: Any = None
         self._tool_trace_label: Any = None
+        self._suggestion_panel_open = False
+        self._last_copied_text: Optional[str] = None
 
         self._build_ui()
 
@@ -135,6 +162,12 @@ class ChatPanel(QWidgetBase):
         """Return whether the tool activity panel is currently visible."""
 
         return self._tool_activity_visible
+
+    @property
+    def last_copied_text(self) -> Optional[str]:
+        """Expose the last message text copied to the clipboard."""
+
+        return self._last_copied_text
 
     def set_tool_activity_visibility(self, visible: bool) -> None:
         """Show or hide the tool activity panel in the Qt layout."""
@@ -183,6 +216,13 @@ class ChatPanel(QWidgetBase):
 
         self.set_composer_text("")
         self._composer_context = ComposerContext()
+
+    def start_new_chat(self) -> None:
+        """Reset the chat conversation and composer for a fresh session."""
+
+        self.clear_history()
+        self.clear_composer()
+        self._emit_session_reset()
 
     def set_selection_summary(
         self,
@@ -299,6 +339,31 @@ class ChatPanel(QWidgetBase):
         self.set_composer_text(text)
         return text
 
+    def copy_text_to_clipboard(self, text: str) -> bool:
+        """Copy ``text`` to the system clipboard when Qt is available."""
+
+        normalized = text if isinstance(text, str) else str(text)
+        self._last_copied_text = normalized
+        if not QApplication:
+            return False
+        try:
+            instance = QApplication.instance()
+        except Exception:  # pragma: no cover - defensive guard
+            return False
+        if instance is None:
+            return False
+        try:
+            clipboard = QApplication.clipboard()
+        except Exception:  # pragma: no cover - clipboard access failed
+            return False
+        if clipboard is None:
+            return False
+        try:
+            clipboard.setText(normalized)
+        except Exception:  # pragma: no cover - clipboard write failure
+            return False
+        return True
+
     # ------------------------------------------------------------------
     # Prompt submission + listeners
     # ------------------------------------------------------------------
@@ -312,6 +377,19 @@ class ChatPanel(QWidgetBase):
 
         try:
             self._request_listeners.remove(listener)
+        except ValueError:  # pragma: no cover - defensive guard
+            pass
+
+    def add_session_reset_listener(self, listener: SessionResetListener) -> None:
+        """Register a callback fired when a new chat session begins."""
+
+        self._session_reset_listeners.append(listener)
+
+    def remove_session_reset_listener(self, listener: SessionResetListener) -> None:
+        """Remove a previously registered session reset listener."""
+
+        try:
+            self._session_reset_listeners.remove(listener)
         except ValueError:  # pragma: no cover - defensive guard
             pass
 
@@ -360,31 +438,126 @@ class ChatPanel(QWidgetBase):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setSpacing(10)
 
         self._history_widget = QListWidget(self)
         self._history_widget.setObjectName("tb-chat-history")
-        layout.addWidget(self._history_widget)
+        self._history_widget.setAlternatingRowColors(False)
+        self._history_widget.setSpacing(4)
+        if QAbstractItemView is not None:
+            try:
+                self._history_widget.setSelectionMode(QAbstractItemView.NoSelection)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+        if Qt is not None:
+            try:
+                self._history_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+        try:
+            self._history_widget.setWordWrap(True)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+        layout.addWidget(self._history_widget, 1)
 
         composer_frame = QFrame(self)
-        composer_layout = QHBoxLayout(composer_frame)
+        composer_frame.setObjectName("tb-chat-composer-frame")
+        composer_layout = QVBoxLayout(composer_frame)
         composer_layout.setContentsMargins(0, 0, 0, 0)
-        self._composer_widget = QTextEdit(composer_frame)
+        composer_layout.setSpacing(4)
+
+        input_row = QHBoxLayout()
+        input_row.setContentsMargins(0, 0, 0, 0)
+        input_row.setSpacing(6)
+
+        button_stack = QVBoxLayout()
+        button_stack.setContentsMargins(0, 4, 6, 4)
+        button_stack.setSpacing(6)
+        input_row.addLayout(button_stack, 0)
+
+        if QToolButton is not None:
+            button_edge = 32
+            self._suggestion_toggle = QToolButton(composer_frame)
+            self._suggestion_toggle.setObjectName("tb-chat-suggestions-toggle")
+            self._suggestion_toggle.setText("+")
+            self._suggestion_toggle.setToolTip("Show suggestions")
+            try:
+                self._suggestion_toggle.setFixedSize(button_edge, button_edge)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+            self._suggestion_toggle.clicked.connect(self._toggle_suggestion_panel)  # type: ignore[attr-defined]
+            button_stack.addWidget(self._suggestion_toggle, 0)
+
+            self._new_chat_button = QToolButton(composer_frame)
+            self._new_chat_button.setObjectName("tb-chat-new")
+            self._new_chat_button.setText("⟳")
+            self._new_chat_button.setToolTip("Start a new chat")
+            try:
+                self._new_chat_button.setFixedSize(button_edge, button_edge)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+            button_stack.addWidget(self._new_chat_button, 0)
+        else:
+            self._suggestion_toggle = None
+            self._new_chat_button = QPushButton("New Chat", composer_frame)
+            button_stack.addWidget(self._new_chat_button, 0)
+
+        button_stack.addStretch(1)
+
+        composer_shell = QFrame(composer_frame)
+        composer_shell.setObjectName("tb-chat-composer-shell")
+        composer_shell_layout = QHBoxLayout(composer_shell)
+        composer_shell_layout.setContentsMargins(0, 0, 0, 0)
+        composer_shell_layout.setSpacing(4)
+
+        self._composer_widget = QTextEdit(composer_shell)
         self._composer_widget.setObjectName("tb-chat-composer")
-        composer_layout.addWidget(self._composer_widget, 1)
-        self._send_button = QPushButton("Send", composer_frame)
+        composer_fixed_height = 64
+        try:
+            self._composer_widget.setPlaceholderText("Message the assistant…")
+            self._composer_widget.setFixedHeight(composer_fixed_height)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            composer_fixed_height = None
+        composer_shell_layout.addWidget(self._composer_widget, 1)
+
+        input_row.addWidget(composer_shell, 1)
+
+        if QToolButton is not None:
+            self._send_button = QToolButton(composer_frame)
+            self._send_button.setObjectName("tb-chat-send")
+            self._send_button.setText("➤")
+            self._send_button.setToolTip("Send message")
+            try:
+                self._send_button.setFixedWidth(36)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+        else:
+            self._send_button = QPushButton("Send", composer_frame)
         self._send_button.clicked.connect(self._handle_send_clicked)  # type: ignore[attr-defined]
-        composer_layout.addWidget(self._send_button, 0)
-        layout.addWidget(composer_frame)
+        if composer_fixed_height:
+            try:
+                self._send_button.setFixedHeight(composer_fixed_height)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+        self._new_chat_button.clicked.connect(self._handle_new_chat_clicked)  # type: ignore[attr-defined]
+        input_row.addWidget(self._send_button, 0)
+
+        composer_layout.addLayout(input_row)
+
+        self._suggestion_widget = QListWidget(composer_frame)
+        self._suggestion_widget.setObjectName("tb-chat-suggestions")
+        self._suggestion_widget.itemClicked.connect(self._handle_suggestion_clicked)  # type: ignore[attr-defined]
+        self._suggestion_widget.setVisible(False)
+        composer_layout.addWidget(self._suggestion_widget)
+        if self._suggestion_toggle is not None:
+            try:
+                self._suggestion_toggle.setEnabled(bool(self._suggestions))
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+
+        layout.addWidget(composer_frame, 0)
 
         if QLabel is not None and QListWidget is not None:
-            suggestion_label = QLabel("Suggestions", self)
-            layout.addWidget(suggestion_label)
-            self._suggestion_widget = QListWidget(self)
-            self._suggestion_widget.setObjectName("tb-chat-suggestions")
-            self._suggestion_widget.itemClicked.connect(self._handle_suggestion_clicked)  # type: ignore[attr-defined]
-            layout.addWidget(self._suggestion_widget)
-
             trace_label = QLabel("Tool Activity", self)
             self._tool_trace_label = trace_label
             layout.addWidget(trace_label)
@@ -397,6 +570,10 @@ class ChatPanel(QWidgetBase):
         for listener in list(self._request_listeners):
             listener(prompt, metadata)
 
+    def _emit_session_reset(self) -> None:
+        for listener in list(self._session_reset_listeners):
+            listener()
+
     def _trim_history(self) -> None:
         overflow = len(self._messages) - self._history_limit
         if overflow > 0:
@@ -406,11 +583,25 @@ class ChatPanel(QWidgetBase):
         widget = self._history_widget
         if widget is None:
             return
+        viewport_width = 0
+        try:
+            viewport = widget.viewport()
+            if viewport is not None:
+                viewport_width = viewport.width()
+        except Exception:  # pragma: no cover - Qt defensive guard
+            viewport_width = 0
         try:
             widget.blockSignals(True)
             widget.clear()
             for message in self._messages:
-                widget.addItem(self._render_message_text(message))
+                bubble_widget = self._create_message_bubble(message, viewport_width)
+                if bubble_widget is None:
+                    widget.addItem(self._render_message_text(message))
+                    continue
+                item = QListWidgetItem(widget)
+                item.setSizeHint(bubble_widget.sizeHint())
+                item.setToolTip(self._render_message_text(message))
+                widget.setItemWidget(item, bubble_widget)
         finally:  # pragma: no branch - ensure unblock
             widget.blockSignals(False)
 
@@ -425,6 +616,20 @@ class ChatPanel(QWidgetBase):
                 widget.addItem(suggestion)
         finally:
             widget.blockSignals(False)
+        has_suggestions = bool(self._suggestions)
+        if not has_suggestions:
+            self._suggestion_panel_open = False
+        should_show = has_suggestions and self._suggestion_panel_open
+        try:
+            widget.setVisible(should_show)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+        toggle = self._suggestion_toggle
+        if toggle is not None:
+            try:
+                toggle.setEnabled(bool(self._suggestions))
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
 
     def _refresh_tool_trace_widget(self) -> None:
         widget = self._tool_trace_widget
@@ -453,6 +658,96 @@ class ChatPanel(QWidgetBase):
         prefix = message.role.upper()
         return f"[{prefix}] {message.content.strip()}"
 
+    def _create_message_bubble(self, message: ChatMessage, viewport_width: int | None = None) -> Any:
+        if QFrame is None or QLabel is None or QHBoxLayout is None or QVBoxLayout is None:
+            return None
+        container = QFrame(self._history_widget)
+        container.setObjectName("tb-chat-bubble-container")
+        row_layout = QHBoxLayout(container)
+        row_layout.setContentsMargins(4, 2, 4, 2)
+        row_layout.setSpacing(4)
+
+        bubble = QFrame(container)
+        bubble.setObjectName(f"tb-chat-bubble-{message.role}")
+        bubble_layout = QVBoxLayout(bubble)
+        bubble_layout.setContentsMargins(12, 8, 12, 8)
+        bubble_layout.setSpacing(4)
+
+        text_label = QLabel(message.content.strip() or "\u200b", bubble)
+        text_label.setWordWrap(True)
+        bubble_layout.addWidget(text_label)
+
+        if message.metadata:
+            meta_text = ", ".join(f"{key}: {value}" for key, value in message.metadata.items())
+            meta_label = QLabel(meta_text, bubble)
+            meta_label.setStyleSheet("color: rgba(255, 255, 255, 0.65); font-size: 10px;")
+            try:
+                meta_label.setWordWrap(True)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+            bubble_layout.addWidget(meta_label)
+
+        bubble_max_width = 420
+        if viewport_width:
+            safe_width = max(120, viewport_width - 24)
+            bubble_max_width = min(bubble_max_width, safe_width)
+        bubble.setMaximumWidth(bubble_max_width)
+        if message.role == "user":
+            bubble.setStyleSheet("background-color: #2d7dff; color: white; border-radius: 16px;")
+            row_layout.addStretch(1)
+            row_layout.addWidget(bubble, 0)
+        else:
+            bubble.setStyleSheet("background-color: #2f333a; color: #f5f5f5; border-radius: 16px;")
+            row_layout.addWidget(bubble, 0)
+            row_layout.addStretch(1)
+
+        self._attach_bubble_context_menu(bubble, message)
+
+        return container
+
+    def _attach_bubble_context_menu(self, bubble: Any, message: ChatMessage) -> None:
+        if Qt is None or QMenu is None:
+            return
+        try:
+            bubble.setContextMenuPolicy(Qt.CustomContextMenu)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            return
+
+        def _open_menu(point: Any, bubble_ref: Any = bubble, message_ref: ChatMessage = message) -> None:
+            self._show_bubble_context_menu(bubble_ref, point, message_ref)
+
+        try:
+            bubble.customContextMenuRequested.connect(_open_menu)  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+
+    def _show_bubble_context_menu(self, bubble: Any, point: Any, message: ChatMessage | str) -> None:
+        if QMenu is None:
+            return
+        text = message.content if isinstance(message, ChatMessage) else str(message)
+        if text is None:
+            text = ""
+        try:
+            menu = QMenu(bubble)
+            copy_action = menu.addAction("Copy message")
+            global_pos = bubble.mapToGlobal(point)
+            selected = menu.exec(global_pos)
+            if selected == copy_action:
+                self.copy_text_to_clipboard(text)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+
+    def _toggle_suggestion_panel(self) -> None:
+        widget = self._suggestion_widget
+        if widget is None:
+            return
+        if not self._suggestions:
+            widget.setVisible(False)
+            self._suggestion_panel_open = False
+            return
+        self._suggestion_panel_open = not widget.isVisible()
+        widget.setVisible(self._suggestion_panel_open)
+
     # Qt callbacks ----------------------------------------------------
     def _handle_send_clicked(self) -> None:
         try:
@@ -460,10 +755,19 @@ class ChatPanel(QWidgetBase):
         except ValueError:
             pass
 
+    def _handle_new_chat_clicked(self) -> None:
+        self.start_new_chat()
+
     def _handle_suggestion_clicked(self, item: Any) -> None:
         try:
             text = str(item.text())
         except Exception:  # pragma: no cover - Qt defensive guard
             return
         self.set_composer_text(text)
+        if self._suggestion_widget is not None:
+            try:
+                self._suggestion_widget.setVisible(False)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+        self._suggestion_panel_open = False
 
