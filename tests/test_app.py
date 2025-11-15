@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import Any, cast
 
 import pytest
 
@@ -59,3 +60,85 @@ def test_build_ai_controller_clamps_iteration_limit() -> None:
 
     assert high_controller is not None
     assert high_controller.max_tool_iterations == 50
+
+
+def test_drain_event_loop_cancels_pending_tasks() -> None:
+    loop = asyncio.new_event_loop()
+
+    cancellation_flag = {"called": False}
+
+    async def pending() -> None:
+        try:
+            await asyncio.sleep(0.1)
+        except asyncio.CancelledError:  # pragma: no cover - cancellation path exercised
+            cancellation_flag["called"] = True
+            raise
+
+    loop.create_task(pending())
+
+    try:
+        app._drain_event_loop(loop)
+        assert cancellation_flag["called"] is True
+    finally:
+        loop.close()
+
+
+def test_drain_event_loop_ignores_closed_loop() -> None:
+    loop = asyncio.new_event_loop()
+    loop.close()
+
+    app._drain_event_loop(loop)
+
+
+def test_drain_event_loop_skips_current_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    loop = asyncio.new_event_loop()
+
+    real_all_tasks = asyncio.all_tasks
+    recorded: dict[str, asyncio.Task[Any] | None] = {"current": None}
+
+    def fake_all_tasks(target_loop: asyncio.AbstractEventLoop | None = None):
+        tasks = set(real_all_tasks(target_loop))
+        try:
+            current = asyncio.current_task(loop=target_loop)
+        except RuntimeError:
+            current = None
+        recorded["current"] = current
+        if current is not None:
+            tasks.add(current)
+        return tasks
+
+    monkeypatch.setattr(app.asyncio, "all_tasks", fake_all_tasks)
+
+    try:
+        app._drain_event_loop(loop)
+        current = recorded["current"]
+        if current is not None:
+            assert not current.cancelled()
+    finally:
+        loop.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_ai_controller_closes_controller() -> None:
+    class _StubController:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    controller = _StubController()
+
+    await app._shutdown_ai_controller(cast(app.AIController, controller))
+
+    assert controller.closed is True
+
+
+@pytest.mark.asyncio
+async def test_shutdown_ai_controller_ignores_missing_method() -> None:
+    class _StubController:
+        pass
+
+    controller = _StubController()
+
+    await app._shutdown_ai_controller(cast(app.AIController, controller))

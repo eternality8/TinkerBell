@@ -19,7 +19,7 @@ the headless tests simple while remaining Qt-friendly for the full app.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Protocol, Sequence, cast
+from typing import Any, Callable, Iterable, List, Optional, Protocol, Sequence, cast
 
 from .message_model import ChatMessage, ToolTrace
 
@@ -166,6 +166,12 @@ class ChatPanel(QWidgetBase):
         self._tool_trace_label: Any = None
         self._suggestion_panel_open = False
         self._last_copied_text: Optional[str] = None
+        self._stop_ai_callback: Optional[Callable[[], None]] = None
+        self._ai_running = False
+        self._send_button_idle_text = "Send"
+        self._send_button_idle_tooltip = "Send message"
+        self._action_button_busy_text = "■"
+        self._action_button_busy_tooltip = "Stop the current AI response"
 
         self._build_ui()
 
@@ -458,6 +464,30 @@ class ChatPanel(QWidgetBase):
         except ValueError:  # pragma: no cover - defensive guard
             pass
 
+    def set_stop_ai_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        """Configure a callable invoked when the user requests to stop the AI run."""
+
+        self._stop_ai_callback = callback
+
+    def set_ai_running(self, active: bool) -> None:
+        """Toggle the composer/button state based on whether the AI is processing."""
+
+        state = bool(active)
+        if state == self._ai_running:
+            return
+        self._ai_running = state
+        self._refresh_action_button_state()
+        self._refresh_composer_enablement()
+
+    def _emit_stop_ai_request(self) -> None:
+        callback = self._stop_ai_callback
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+
     def send_prompt(
         self,
         prompt: Optional[str] = None,
@@ -583,7 +613,11 @@ class ChatPanel(QWidgetBase):
                 pass
         else:
             self._send_button = QPushButton("Send", composer_frame)
-        self._send_button.clicked.connect(self._handle_send_clicked)  # type: ignore[attr-defined]
+        self._send_button_idle_text = self._coerce_button_text(self._send_button) or self._send_button_idle_text
+        self._send_button_idle_tooltip = (
+            self._coerce_button_tooltip(self._send_button) or self._send_button_idle_tooltip
+        )
+        self._send_button.clicked.connect(self._handle_action_button_clicked)  # type: ignore[attr-defined]
         if composer_fixed_height:
             try:
                 self._send_button.setFixedHeight(composer_fixed_height)
@@ -616,6 +650,9 @@ class ChatPanel(QWidgetBase):
             self._configure_tool_trace_widget()
             layout.addWidget(self._tool_trace_widget)
             self._sync_tool_trace_visibility()
+
+        self._refresh_action_button_state()
+        self._refresh_composer_enablement()
 
     def _install_composer_shortcuts(self) -> None:
         widget = self._composer_widget
@@ -696,7 +733,7 @@ class ChatPanel(QWidgetBase):
                     continue
                 item = QListWidgetItem(widget)
                 item.setSizeHint(bubble_widget.sizeHint())
-                item.setToolTip(self._render_message_text(message))
+                item.setToolTip(self._tooltip_label_for_message(message))
                 widget.setItemWidget(item, bubble_widget)
         finally:  # pragma: no branch - ensure unblock
             widget.blockSignals(False)
@@ -799,13 +836,80 @@ class ChatPanel(QWidgetBase):
             visible_traces = list(self._tool_traces[-10:])
             self._visible_tool_traces = visible_traces
             for trace in visible_traces:
-                item_text = f"{trace.name}: {trace.output_summary}"
+                name = trace.name or "tool"
+                badge = " [patch]" if str(name).endswith("patch") else ""
+                item_text = f"{name}{badge}: {trace.output_summary}"
+                preview = (trace.metadata or {}).get("diff_preview") if trace.metadata else None
+                if isinstance(preview, str) and preview.strip():
+                    first_line = preview.strip().splitlines()[0]
+                    snippet = first_line[:80]
+                    item_text = f"{item_text} – {snippet}"
                 if QListWidgetItem is not None:
                     QListWidgetItem(item_text, widget)
                 else:
                     widget.addItem(item_text)
         finally:
             widget.blockSignals(False)
+
+    def _refresh_composer_enablement(self) -> None:
+        widget = self._composer_widget
+        if widget is None:
+            return
+        try:
+            widget.setReadOnly(self._ai_running)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+        try:
+            widget.setEnabled(not self._ai_running)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+
+    def _refresh_action_button_state(self) -> None:
+        button = self._send_button
+        if button is None:
+            return
+        label = self._action_button_busy_text if self._ai_running else self._send_button_idle_text
+        tooltip = self._action_button_busy_tooltip if self._ai_running else self._send_button_idle_tooltip
+        try:
+            button.setText(label)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+        try:
+            button.setToolTip(tooltip)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+        try:
+            button.setEnabled(True)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+
+    def _coerce_button_text(self, button: Any) -> str:
+        if button is None:
+            return ""
+        getter = getattr(button, "text", None)
+        if callable(getter):
+            try:
+                value = getter()
+            except Exception:  # pragma: no cover - Qt defensive guard
+                return ""
+            if value is None:
+                return ""
+            return str(value)
+        return ""
+
+    def _coerce_button_tooltip(self, button: Any) -> str:
+        if button is None:
+            return ""
+        getter = getattr(button, "toolTip", None)
+        if callable(getter):
+            try:
+                value = getter()
+            except Exception:  # pragma: no cover - Qt defensive guard
+                return ""
+            if value is None:
+                return ""
+            return str(value)
+        return ""
 
     def _configure_tool_trace_widget(self) -> None:
         widget = self._tool_trace_widget
@@ -906,6 +1010,10 @@ class ChatPanel(QWidgetBase):
                 ]
             )
 
+        diff_preview = metadata.get("diff_preview")
+        if diff_preview:
+            lines.extend(["", "Diff preview:", _normalize_block(str(diff_preview))])
+
         return "\n".join(lines)
 
     def _resolve_tool_trace(self, index: Optional[int]) -> Optional[ToolTrace]:
@@ -921,6 +1029,18 @@ class ChatPanel(QWidgetBase):
     def _render_message_text(self, message: ChatMessage) -> str:
         prefix = message.role.upper()
         return f"[{prefix}] {message.content.strip()}"
+
+    def _tooltip_label_for_message(self, message: ChatMessage) -> str:
+        role = (message.role or "").lower()
+        if role == "user":
+            return "user message"
+        if role == "assistant":
+            return "AI message"
+        if role == "system":
+            return "system message"
+        if role == "tool":
+            return "tool message"
+        return "message"
 
     def _create_message_bubble(self, message: ChatMessage, viewport_width: int | None = None) -> Any:
         if QFrame is None or QLabel is None or QHBoxLayout is None or QVBoxLayout is None:
@@ -1045,6 +1165,8 @@ class ChatPanel(QWidgetBase):
         return False
 
     def _handle_composer_key_event(self, key: Optional[int], modifiers: Optional[int]) -> bool:
+        if self._ai_running:
+            return False
         if key is None or modifiers is None:
             return False
 
@@ -1120,6 +1242,12 @@ class ChatPanel(QWidgetBase):
         self._refresh_history_widget()
 
     # Qt callbacks ----------------------------------------------------
+    def _handle_action_button_clicked(self) -> None:
+        if self._ai_running:
+            self._emit_stop_ai_request()
+            return
+        self._handle_send_clicked()
+
     def _handle_send_clicked(self) -> None:
         try:
             self.send_prompt()

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, cast
 
@@ -93,8 +93,12 @@ class AIController:
     client: AIClient
     tools: MutableMapping[str, ToolRegistration] = field(default_factory=dict)
     max_tool_iterations: int = 8
+    use_patch_edits: bool = True
+    diff_builder_reminder_threshold: int = 3
+    max_pending_patch_reminders: int = 2
     _graph: Dict[str, Any] = field(init=False, repr=False)
     _max_tool_iterations: int = field(init=False, repr=False)
+    _use_patch_edits: bool = field(init=False, repr=False, default=True)
     _active_task: asyncio.Task[dict] | None = field(default=None, init=False, repr=False)
     _task_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
 
@@ -109,6 +113,7 @@ class AIController:
             self.tools = normalized
         self._max_tool_iterations = self._normalize_iterations(self.max_tool_iterations)
         self.max_tool_iterations = self._max_tool_iterations
+        self._use_patch_edits = bool(self.use_patch_edits)
         self._rebuild_graph()
 
     @property
@@ -162,6 +167,11 @@ class AIController:
 
         self.client = client
 
+    def set_patch_mode(self, enabled: bool) -> None:
+        """Toggle whether the system prompt instructs models to use diff-based patches."""
+
+        self._use_patch_edits = bool(enabled)
+
     async def run_chat(
         self,
         prompt: str,
@@ -193,6 +203,9 @@ class AIController:
             turn_count = 0
             tool_iterations = 0
             executed_tool_calls: list[dict[str, Any]] = []
+            pending_patch_application = False
+            diff_builders_since_edit = 0
+            patch_reminders_sent = 0
 
             while True:
                 turn_count += 1
@@ -206,6 +219,12 @@ class AIController:
                 response_text = turn.response_text
 
                 if not turn.tool_calls:
+                    if pending_patch_application and patch_reminders_sent < self.max_pending_patch_reminders:
+                        reminder = self._pending_patch_prompt()
+                        LOGGER.debug("Injected patch reminder (pending diff)")
+                        conversation.append({"role": "system", "content": reminder})
+                        patch_reminders_sent += 1
+                        continue
                     break
 
                 tool_iterations += 1
@@ -219,6 +238,31 @@ class AIController:
                 tool_messages, tool_records = await self._handle_tool_calls(turn.tool_calls, on_event)
                 executed_tool_calls.extend(tool_records)
                 conversation.extend(tool_messages)
+
+                for record in tool_records:
+                    name = str(record.get("name") or "").lower()
+                    if name == "diff_builder" and not self._tool_call_failed(record):
+                        pending_patch_application = True
+                        diff_builders_since_edit += 1
+                    elif name == "document_edit":
+                        if self._tool_call_failed(record):
+                            pending_patch_application = True
+                        else:
+                            pending_patch_application = False
+                            diff_builders_since_edit = 0
+                            patch_reminders_sent = 0
+
+                if (
+                    pending_patch_application
+                    and diff_builders_since_edit >= self.diff_builder_reminder_threshold
+                ):
+                    reminder_text = self._diff_accumulation_prompt(diff_builders_since_edit)
+                    LOGGER.debug(
+                        "Injected diff_builder consolidation reminder (count=%s)", diff_builders_since_edit
+                    )
+                    conversation.append({"role": "system", "content": reminder_text})
+                    diff_builders_since_edit = 0
+                    continue
 
             self._log_response_text(response_text)
             LOGGER.debug(
@@ -270,6 +314,22 @@ class AIController:
         """Return the names of the registered tools."""
 
         return tuple(self.tools.keys())
+
+    async def aclose(self) -> None:
+        """Cancel any active work and close the underlying AI client."""
+
+        task = self._active_task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            if self._active_task is task:
+                self._active_task = None
+        close = getattr(self.client, "aclose", None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
 
     def _rebuild_graph(self) -> None:
         self._graph = build_agent_graph(
@@ -367,6 +427,27 @@ class AIController:
                 break
         return sanitized
 
+    @staticmethod
+    def _tool_call_failed(record: Mapping[str, Any]) -> bool:
+        result = record.get("result")
+        if not isinstance(result, str):
+            return False
+        name = record.get("name") or ""
+        failure_prefix = f"Tool '{name}' failed:"
+        return result.startswith(failure_prefix)
+
+    def _pending_patch_prompt(self) -> str:
+        return (
+            "You generated a diff via diff_builder but did not call document_edit to apply it yet. "
+            "Use document_edit with action=\"patch\", include the diff text, and pass the latest document_version before responding."
+        )
+
+    def _diff_accumulation_prompt(self, diff_count: int) -> str:
+        return (
+            f"You've produced {diff_count} diff_builder results without applying them. "
+            "Consolidate the change into a single diff and immediately call document_edit (action=\"patch\")."
+        )
+
     def _build_messages(
         self,
         prompt: str,
@@ -374,8 +455,9 @@ class AIController:
         history: Sequence[Mapping[str, Any]] | None = None,
     ) -> list[dict[str, str]]:
         user_prompt = prompts.format_user_prompt(prompt, dict(snapshot))
+        system_text = prompts.base_system_prompt(patch_edits_enabled=self._use_patch_edits)
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": prompts.base_system_prompt()},
+            {"role": "system", "content": system_text},
         ]
         if history:
             messages.extend(self._sanitize_history(history))
@@ -617,6 +699,13 @@ class AIController:
         if candidate:
             return candidate
         name = (event.tool_name or "tool").strip() or "tool"
-        return f"{name}-{ordinal}-{uuid.uuid4().hex[:8]}"
+        index = getattr(event, "tool_index", None)
+        if index is None:
+            index = ordinal
+        try:
+            index_text = str(int(index))
+        except (TypeError, ValueError):
+            index_text = str(ordinal)
+        return f"{name}:{index_text}"
 
 

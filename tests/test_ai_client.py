@@ -190,3 +190,23 @@ async def test_debug_logging_captures_prompt_payload(monkeypatch: pytest.MonkeyP
 
     assert "payload" in captured
     assert captured["payload"]["messages"][0]["content"] == "Hello"
+
+
+@pytest.mark.asyncio
+async def test_aclose_closes_underlying_client() -> None:
+    class _StubAsyncOpenAI:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    stub = _StubAsyncOpenAI()
+    client = AIClient(
+        ClientSettings(base_url="http://local", api_key="test", model="stub-model"),
+        client=cast(AsyncOpenAI, stub),
+    )
+
+    await client.aclose()
+
+    assert stub.closed is True

@@ -69,6 +69,23 @@ def test_chat_panel_streaming_ai_messages_merge_chunks():
     assert final_message is history[0]
 
 
+def test_chat_panel_message_tooltips_are_generic():
+    panel = _make_panel()
+    assert panel._tooltip_label_for_message(ChatMessage(role="user", content="Hello")) == "user message"
+    assert (
+        panel._tooltip_label_for_message(ChatMessage(role="assistant", content="Hi"))
+        == "AI message"
+    )
+    assert (
+        panel._tooltip_label_for_message(ChatMessage(role="system", content="Notice"))
+        == "system message"
+    )
+    assert (
+        panel._tooltip_label_for_message(ChatMessage(role="tool", content="details"))
+        == "tool message"
+    )
+
+
 def test_chat_panel_notifies_request_listeners_and_clears_composer():
     panel = _make_panel()
     captured: list[tuple[str, dict]] = []
@@ -172,6 +189,42 @@ def test_copy_tool_trace_details_includes_replacement_text(monkeypatch):
     assert "old text" in text
     assert "New text:" in text
     assert "new text" in text
+
+
+def test_copy_tool_trace_details_includes_diff_preview(monkeypatch):
+    panel = _make_panel()
+    trace = ToolTrace(
+        name="edit:patch",
+        input_summary="range=(0, 0)",
+        output_summary="patch: +2 chars",
+        metadata={"diff_preview": "@@ -1 +1 @@\n-old\n+new"},
+    )
+    panel.show_tool_trace(trace)
+
+    class _Clipboard:
+        def __init__(self) -> None:
+            self.text = ""
+
+        def setText(self, text: str) -> None:
+            self.text = text
+
+    class _QtAppStub:
+        _clipboard = _Clipboard()
+
+        @staticmethod
+        def instance() -> object:
+            return object()
+
+        @staticmethod
+        def clipboard() -> _Clipboard:
+            return _QtAppStub._clipboard
+
+    monkeypatch.setattr(chat_panel, "QApplication", _QtAppStub)
+
+    copied = panel.copy_tool_trace_details(trace)
+
+    assert copied is True
+    assert "Diff preview:" in (panel.last_copied_text or "")
 
 
 def test_copy_tool_trace_details_prefers_raw_metadata(monkeypatch):
@@ -307,6 +360,95 @@ def test_chat_panel_start_new_chat_resets_state():
 
     assert panel.history() == []
     assert panel.composer_text == ""
+
+
+def test_chat_panel_set_ai_running_updates_button_and_composer():
+    panel = _make_panel()
+
+    class _Composer:
+        def __init__(self) -> None:
+            self.readonly = False
+            self.enabled = True
+
+        def setReadOnly(self, value: bool) -> None:
+            self.readonly = value
+
+        def setEnabled(self, value: bool) -> None:
+            self.enabled = value
+
+    class _Button:
+        def __init__(self) -> None:
+            self._text = "Send"
+            self._tooltip = "Send"
+            self.enabled = True
+
+        def text(self) -> str:
+            return self._text
+
+        def setText(self, value: str) -> None:
+            self._text = value
+
+        def toolTip(self) -> str:
+            return self._tooltip
+
+        def setToolTip(self, value: str) -> None:
+            self._tooltip = value
+
+        def setEnabled(self, value: bool) -> None:
+            self.enabled = value
+
+    panel._composer_widget = _Composer()
+    panel._send_button = _Button()
+    panel._send_button_idle_text = "Send"
+    panel._send_button_idle_tooltip = "Send message"
+
+    panel.set_ai_running(True)
+
+    assert panel._composer_widget.readonly is True
+    assert panel._composer_widget.enabled is False
+    assert panel._send_button._text == "■"
+    assert panel._send_button.enabled is True
+
+    panel.set_ai_running(False)
+
+    assert panel._composer_widget.readonly is False
+    assert panel._composer_widget.enabled is True
+    assert panel._send_button._text == "Send"
+
+
+def test_chat_panel_stop_callback_invoked_when_running():
+    panel = _make_panel()
+    called: list[bool] = []
+
+    panel.set_stop_ai_callback(lambda: called.append(True))
+    panel.set_ai_running(True)
+    panel._handle_action_button_clicked()
+
+    assert called == [True]
+
+
+def test_chat_panel_action_button_sends_when_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel()
+    called: list[bool] = []
+
+    monkeypatch.setattr(panel, "_handle_send_clicked", lambda: called.append(True))
+
+    panel._handle_action_button_clicked()
+
+    assert called == [True]
+
+
+def test_chat_panel_enter_key_ignored_when_ai_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel()
+    called: list[bool] = []
+    monkeypatch.setattr(panel, "_handle_send_clicked", lambda: called.append(True))
+
+    panel.set_ai_running(True)
+
+    handled = panel._handle_composer_key_event(chat_panel.FALLBACK_ENTER_KEYS[0], 0)
+
+    assert handled is False
+    assert called == []
 
 
 def test_copy_text_to_clipboard_records_text_when_qt_missing(monkeypatch):

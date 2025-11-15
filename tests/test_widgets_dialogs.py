@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QComboBox, QLineEdit, QPushButton
+from PySide6.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QLineEdit, QPushButton
 
 from tinkerbell.services.settings import Settings
 from tinkerbell.widgets import dialogs
@@ -21,6 +21,7 @@ def dialog_settings() -> Settings:
         model="gpt-4o-mini",
         theme="light",
         organization="legacy",
+        request_timeout=75.0,
     )
 
 
@@ -33,13 +34,24 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     model_combo = dialog.findChild(QComboBox, "model_combo")
     organization_input = dialog.findChild(QLineEdit, "organization_input")
     theme_input = dialog.findChild(QLineEdit, "theme_input")
-    assert base_input and api_input and model_combo and organization_input and theme_input
+    patch_checkbox = dialog.findChild(QCheckBox, "patch_edit_checkbox")
+    timeout_input = dialog.findChild(QDoubleSpinBox, "request_timeout_input")
+
+    assert base_input is not None
+    assert api_input is not None
+    assert model_combo is not None
+    assert organization_input is not None
+    assert theme_input is not None
+    assert patch_checkbox is not None
+    assert timeout_input is not None
 
     base_input.setText("https://example.com/v2")
     api_input.setText("new-key")
     model_combo.setEditText("gpt-custom")
     organization_input.setText("acme")
     theme_input.setText("dracula")
+    patch_checkbox.setChecked(False)
+    timeout_input.setValue(42.5)
 
     updated = dialog.gather_settings()
 
@@ -48,6 +60,8 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert updated.model == "gpt-custom"
     assert updated.organization == "acme"
     assert updated.theme == "dracula"
+    assert updated.use_patch_edits is False
+    assert updated.request_timeout == pytest.approx(42.5)
 
 
 def test_settings_dialog_validation_uses_validator(qtbot, dialog_settings: Settings) -> None:
@@ -139,6 +153,7 @@ def test_test_ai_api_settings_success(monkeypatch: pytest.MonkeyPatch, dialog_se
     class FakeClient:
         def __init__(self, *_, **kwargs) -> None:
             called["headers"] = kwargs.get("headers", {})
+            called["timeout"] = kwargs.get("timeout")
 
         def __enter__(self):  # noqa: D401 - context manager helper
             return self
@@ -159,6 +174,7 @@ def test_test_ai_api_settings_success(monkeypatch: pytest.MonkeyPatch, dialog_se
     headers_obj = called["headers"]
     assert isinstance(headers_obj, dict)
     assert str(headers_obj.get("Authorization", "")).startswith("Bearer ")
+    assert called["timeout"] == pytest.approx(dialog_settings.request_timeout)
 
 
 def test_test_ai_api_settings_failure(monkeypatch: pytest.MonkeyPatch, dialog_settings: Settings) -> None:

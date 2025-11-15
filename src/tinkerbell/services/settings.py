@@ -28,6 +28,10 @@ _ENV_OVERRIDES: Mapping[str, str] = {
 _BOOL_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_DEBUG_LOGGING": "debug_logging",
     "TINKERBELL_TOOL_ACTIVITY_PANEL": "show_tool_activity_panel",
+    "TINKERBELL_USE_PATCH_EDITS": "use_patch_edits",
+}
+_FLOAT_ENV_OVERRIDES: Mapping[str, str] = {
+    "TINKERBELL_REQUEST_TIMEOUT": "request_timeout",
 }
 _TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
 _API_KEY_FIELD = "api_key_ciphertext"
@@ -42,7 +46,7 @@ class Settings:
     model: str = "gpt-4o-mini"
     theme: str = "default"
     organization: str | None = None
-    request_timeout: float = 30.0
+    request_timeout: float = 90.0
     max_retries: int = 3
     retry_min_seconds: float = 0.5
     retry_max_seconds: float = 6.0
@@ -59,6 +63,7 @@ class Settings:
     window_geometry: str | None = None
     debug_logging: bool = False
     show_tool_activity_panel: bool = False
+    use_patch_edits: bool = True
 
 
 class SettingsStore:
@@ -133,6 +138,16 @@ class SettingsStore:
             value = os.environ.get(env_name)
             if value is not None:
                 overrides[field_name] = value.strip().lower() in _TRUE_VALUES
+        for env_name, field_name in _FLOAT_ENV_OVERRIDES.items():
+            value = os.environ.get(env_name)
+            if value is None:
+                continue
+            try:
+                overrides[field_name] = float(value)
+            except ValueError:
+                LOGGER.warning(
+                    "Environment override %s=%s is not a valid float", env_name, value
+                )
         if overrides:
             LOGGER.debug("Applying settings overrides from environment: %s", sorted(overrides))
             settings = replace(settings, **overrides)

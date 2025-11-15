@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -199,6 +200,9 @@ class SettingsDialog(QDialog):
         self._tool_panel_checkbox.setChecked(
             bool(getattr(self._original, "show_tool_activity_panel", False))
         )
+        self._patch_mode_checkbox = QCheckBox("Prefer diff-based patch edits (beta)")
+        self._patch_mode_checkbox.setObjectName("patch_edit_checkbox")
+        self._patch_mode_checkbox.setChecked(bool(getattr(self._original, "use_patch_edits", True)))
         self._max_tool_iterations_input = QSpinBox()
         self._max_tool_iterations_input.setObjectName("max_tool_iterations_input")
         self._max_tool_iterations_input.setRange(1, 25)
@@ -208,6 +212,17 @@ class SettingsDialog(QDialog):
         self._max_tool_iterations_input.setSuffix(" loops")
         self._max_tool_iterations_input.setToolTip(
             "Maximum times the agent may invoke tools before returning a response."
+        )
+        self._request_timeout_input = QDoubleSpinBox()
+        self._request_timeout_input.setObjectName("request_timeout_input")
+        self._request_timeout_input.setRange(5.0, 600.0)
+        self._request_timeout_input.setSingleStep(5.0)
+        self._request_timeout_input.setSuffix(" s")
+        self._request_timeout_input.setDecimals(1)
+        timeout_value = float(getattr(self._original, "request_timeout", 90.0) or 90.0)
+        self._request_timeout_input.setValue(max(5.0, min(timeout_value, 600.0)))
+        self._request_timeout_input.setToolTip(
+            "Maximum seconds to wait for AI responses before timing out."
         )
 
         form_layout = QFormLayout()
@@ -228,7 +243,9 @@ class SettingsDialog(QDialog):
         form_layout.addRow("Theme", self._theme_input)
         form_layout.addRow("Debug", self._debug_checkbox)
         form_layout.addRow("Tool Traces", self._tool_panel_checkbox)
+        form_layout.addRow("Patch Mode", self._patch_mode_checkbox)
         form_layout.addRow("Max Tool Iterations", self._max_tool_iterations_input)
+        form_layout.addRow("AI Timeout", self._request_timeout_input)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form_layout)
@@ -305,7 +322,9 @@ class SettingsDialog(QDialog):
         theme = self._theme_input.text().strip() or self._original.theme
         debug_logging = self._debug_checkbox.isChecked()
         show_tool_activity_panel = self._tool_panel_checkbox.isChecked()
+        use_patch_edits = self._patch_mode_checkbox.isChecked()
         max_tool_iterations = int(self._max_tool_iterations_input.value())
+        request_timeout = float(self._request_timeout_input.value())
         return replace(
             self._original,
             base_url=base_url,
@@ -315,7 +334,9 @@ class SettingsDialog(QDialog):
             theme=theme,
             debug_logging=debug_logging,
             show_tool_activity_panel=show_tool_activity_panel,
+            use_patch_edits=use_patch_edits,
             max_tool_iterations=max_tool_iterations,
+            request_timeout=request_timeout,
         )
 
     # ------------------------------------------------------------------

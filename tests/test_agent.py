@@ -6,6 +6,8 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Iterable, List, cast
 
+import pytest
+
 from tinkerbell.ai.agents.executor import AIController
 from tinkerbell.ai.client import AIClient, AIStreamEvent
 
@@ -151,6 +153,50 @@ def test_ai_controller_executes_tool_and_continues(sample_snapshot):
     assert result["tool_calls"][0]["resolved_arguments"] == {"delta_only": True}
 
 
+def test_ai_controller_emits_result_events_with_fallback_ids(sample_snapshot):
+    first_turn = [
+        AIStreamEvent(
+            type="tool_calls.function.arguments.delta",
+            tool_name="snapshot",
+            tool_index=0,
+            arguments_delta='{"delta_only": true',
+        ),
+        AIStreamEvent(
+            type="tool_calls.function.arguments.done",
+            tool_name="snapshot",
+            tool_index=0,
+            tool_arguments='{"delta_only": true}',
+            parsed={"delta_only": True},
+        ),
+    ]
+    second_turn = [
+        AIStreamEvent(type="content.delta", content="All done"),
+        AIStreamEvent(type="content.done", content="All done"),
+    ]
+    stub_client = _StubClient([first_turn, second_turn])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    recorded: list[AIStreamEvent] = []
+
+    def _on_event(event: AIStreamEvent) -> None:
+        recorded.append(event)
+
+    class _SnapshotTool:
+        def run(self, delta_only: bool = False) -> str:
+            return f"delta_only={delta_only}"  # pragma: no cover - deterministic
+
+    controller.register_tool("snapshot", _SnapshotTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("use tool", sample_snapshot, on_event=_on_event)
+
+    asyncio.run(run())
+
+    result_event = next(evt for evt in recorded if evt.type == "tool_calls.result")
+    assert result_event.tool_call_id == "snapshot:0"
+    assert result_event.tool_index == 0
+
+
 def test_ai_controller_includes_history_before_latest_prompt(sample_snapshot):
     stub_client = _StubClient([AIStreamEvent(type="content.done", content="ready")])
     controller = AIController(client=cast(AIClient, stub_client))
@@ -194,3 +240,88 @@ def test_ai_controller_suggest_followups_returns_parsed_json():
     payload = stub_client.calls[-1]
     assert payload["messages"][0]["role"] == "system"
     assert payload["messages"][1]["role"] == "user"
+
+
+def test_ai_controller_prompts_until_document_edit_runs(sample_snapshot):
+    diff_turn = [
+        AIStreamEvent(
+            type="tool_calls.function.arguments.done",
+            tool_name="diff_builder",
+            tool_index=0,
+            tool_arguments='{"original":"hello","updated":"HELLO"}',
+            parsed={"original": "hello", "updated": "HELLO"},
+        )
+    ]
+    idle_turn = [AIStreamEvent(type="content.done", content="Working on it")]
+    edit_turn = [
+        AIStreamEvent(
+            type="tool_calls.function.arguments.done",
+            tool_name="document_edit",
+            tool_index=0,
+            tool_arguments='{"action":"patch","diff":"diff","document_version":"digest"}',
+            parsed={"action": "patch", "diff": "diff", "document_version": "digest"},
+        )
+    ]
+    final_turn = [AIStreamEvent(type="content.done", content="Applied!")]
+
+    stub_client = _StubClient([diff_turn, idle_turn, edit_turn, final_turn])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    diff_calls: list[tuple[str, str]] = []
+    edit_calls: list[dict[str, Any]] = []
+
+    class _DiffTool:
+        def run(self, original: str, updated: str) -> str:
+            diff_calls.append((original, updated))
+            return "--- a/doc\n+++ b/doc\n@@ -1 +1 @@\n-old\n+new\n"
+
+    class _EditTool:
+        def run(self, action: str, diff: str, document_version: str) -> str:
+            edit_calls.append({"action": action, "diff": diff, "version": document_version})
+            return "applied"
+
+    controller.register_tool("diff_builder", _DiffTool())
+    controller.register_tool("document_edit", _EditTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("please edit", sample_snapshot)
+
+    result = asyncio.run(run())
+
+    assert len(diff_calls) == 1
+    assert len(edit_calls) == 1
+    assert len(result["tool_calls"]) == 2
+    assert len(stub_client.calls) == 4
+    reminder_payload = stub_client.calls[2]
+    assert reminder_payload["messages"][-1]["role"] == "system"
+    assert "document_edit" in reminder_payload["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_ai_controller_aclose_cancels_active_task(sample_snapshot) -> None:
+    pending = asyncio.Event()
+
+    class _BlockingClient:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(debug_logging=False)
+            self.closed = False
+
+        async def stream_chat(self, **kwargs: Any) -> AsyncIterator[AIStreamEvent]:
+            del kwargs
+            yield AIStreamEvent(type="content.delta", content="hi")
+            await pending.wait()
+
+        async def aclose(self) -> None:
+            self.closed = True
+            pending.set()
+
+    stub_client = _BlockingClient()
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    run_task = asyncio.create_task(controller.run_chat("hello", sample_snapshot))
+    await asyncio.sleep(0)
+
+    await controller.aclose()
+
+    assert stub_client.closed is True
+    assert run_task.cancelled()

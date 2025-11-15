@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -118,6 +119,9 @@ def main() -> None:
     except KeyboardInterrupt:  # pragma: no cover - manual shutdown path
         _LOGGER.info("Shutdown requested by user.")
     finally:
+        with contextlib.suppress(RuntimeError):
+            loop.run_until_complete(_shutdown_ai_controller(ai_controller))
+        _drain_event_loop(loop)
         loop.close()
 
 
@@ -126,6 +130,60 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in _TRUE_VALUES
+
+
+def _drain_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel outstanding tasks and shutdown async machinery before closing."""
+
+    if loop.is_closed():
+        return
+
+    async def _cleanup() -> None:
+        current_task = None
+        with contextlib.suppress(RuntimeError):
+            current_task = asyncio.current_task(loop=loop)
+
+        tasks = [
+            task
+            for task in asyncio.all_tasks(loop)
+            if not task.done() and task is not current_task
+        ]
+        if tasks:
+            _LOGGER.debug("Canceling %s pending asyncio task(s) before shutdown.", len(tasks))
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        shutdown_steps = [
+            getattr(loop, "shutdown_asyncgens", None),
+            getattr(loop, "shutdown_default_executor", None),
+        ]
+        for step in shutdown_steps:
+            if step is None:
+                continue
+            with contextlib.suppress(RuntimeError, NotImplementedError):
+                await step()
+
+    try:
+        loop.run_until_complete(_cleanup())
+    except RuntimeError as exc:  # pragma: no cover - defensive guard
+        _LOGGER.debug("Unable to drain asyncio loop: %s", exc)
+
+
+async def _shutdown_ai_controller(controller: AIController | None) -> None:
+    """Close the AI controller to release background network resources."""
+
+    if controller is None:
+        return
+
+    close = getattr(controller, "aclose", None)
+    if close is None:
+        return
+
+    try:
+        await close()
+    except Exception as exc:  # pragma: no cover - defensive logging
+        _LOGGER.debug("AI controller shutdown failed: %s", exc)
 
 
 def _install_qt_message_handler() -> None:
@@ -194,7 +252,11 @@ def _build_ai_controller(settings: Settings, *, debug_logging: bool = False) -> 
         return None
 
     limit = _resolve_max_tool_iterations(settings)
-    return AIController(client=client, max_tool_iterations=limit)
+    return AIController(
+        client=client,
+        max_tool_iterations=limit,
+        use_patch_edits=bool(getattr(settings, "use_patch_edits", True)),
+    )
 
 
 def _resolve_max_tool_iterations(settings: Settings | None) -> int:

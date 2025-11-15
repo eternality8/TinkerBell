@@ -6,6 +6,8 @@ from typing import Any, Mapping
 
 import pytest
 
+from tinkerbell.ai.tools.diff_builder import DiffBuilderTool
+from tinkerbell.ai.tools.document_apply_patch import DocumentApplyPatchTool
 from tinkerbell.ai.tools.document_edit import DocumentEditTool
 from tinkerbell.ai.tools.document_snapshot import DocumentSnapshotTool
 from tinkerbell.ai.tools.search_replace import SearchReplaceTool
@@ -18,9 +20,14 @@ class _EditBridgeStub:
         self.calls: list[dict[str, Any]] = []
         self.last_diff_summary: str | None = None
         self.last_snapshot_version: str | None = None
+        self.snapshot = {"text": "", "selection": (0, 0), "version": "digest-base", "path": "doc.txt"}
 
     def queue_edit(self, directive) -> None:  # type: ignore[override]
         self.calls.append(directive)
+
+    def generate_snapshot(self, *, delta_only: bool = False):  # type: ignore[override]
+        assert delta_only is False
+        return dict(self.snapshot)
 
 
 class _SnapshotProviderStub:
@@ -48,6 +55,17 @@ class _SearchReplaceBridgeStub:
     def queue_edit(self, directive: Mapping[str, Any]):  # type: ignore[override]
         self.queue_calls.append(directive)
         self.last_snapshot_version = "updated"
+
+
+class _PatchBridgeStub(_EditBridgeStub):
+    def __init__(self, *, text: str = "Hello world", selection: tuple[int, int] = (0, 0), version: str = "digest-0") -> None:
+        super().__init__()
+        self.snapshot = {"text": text, "selection": selection, "version": version, "path": "doc.md"}
+        self.last_snapshot_version = version
+
+    def generate_snapshot(self, *, delta_only: bool = False):  # type: ignore[override]
+        assert delta_only is False
+        return dict(self.snapshot)
 
 
 def test_document_edit_tool_accepts_json_payload_and_reports_status():
@@ -121,6 +139,125 @@ def test_document_edit_tool_handles_special_characters_in_sentence():
     assert recorded["content"].startswith("“smart quotes” & emojis 🎉")
     assert recorded["content"].endswith("Next line")
     assert recorded["target_range"] == [25, 52]
+
+
+def test_document_edit_tool_accepts_patch_payload():
+    bridge = _EditBridgeStub()
+    bridge.last_diff_summary = "patch: +4 chars"
+    bridge.last_snapshot_version = "digest-xyz"
+    tool = DocumentEditTool(bridge=bridge)
+
+    diff = """--- a/doc.txt
++++ b/doc.txt
+@@ -1 +1 @@
+-old
++new
+"""
+
+    status = tool.run(action="patch", diff=diff, document_version="digest-xyz")
+
+    assert bridge.calls[-1]["action"] == "patch"
+    assert "patch" in status and "digest-xyz" in status
+
+
+def test_document_edit_tool_rejects_patch_without_snapshot_version():
+    bridge = _EditBridgeStub()
+    bridge.last_snapshot_version = "digest-present"
+    tool = DocumentEditTool(bridge=bridge)
+
+    diff = """--- a/doc.txt\n+++ b/doc.txt\n@@ -1 +1 @@\n-old\n+new\n"""
+
+    with pytest.raises(ValueError, match="document_snapshot"):
+        tool.run(action="patch", diff=diff)
+
+
+def test_document_edit_tool_enforces_patch_only_mode_for_non_patch_actions():
+    bridge = _EditBridgeStub()
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+
+    with pytest.raises(ValueError):
+        tool.run(action="annotate", content="Note", target_range=(0, 0))
+
+    assert bridge.calls == []
+
+
+def test_document_edit_tool_auto_converts_replace_when_patch_only_enabled():
+    bridge = _PatchBridgeStub(text="Goodbye moon", selection=(0, 7), version="digest-42")
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+
+    status = tool.run(action="replace", content="Hello", target_range=(0, 7))
+
+    assert bridge.calls and bridge.calls[-1]["action"] == "patch"
+    assert bridge.calls[-1]["document_version"] == "digest-42"
+    assert "digest-42" in status
+
+
+def test_document_edit_tool_allows_patches_when_patch_only_enabled():
+    bridge = _EditBridgeStub()
+    bridge.last_diff_summary = "patch"
+    bridge.last_snapshot_version = "digest"
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+
+    diff = """--- a/doc.txt\n+++ b/doc.txt\n@@ -1 +1 @@\n-old\n+new\n"""
+    status = tool.run(action="patch", diff=diff, document_version="digest")
+
+    assert bridge.calls and bridge.calls[-1]["action"] == "patch"
+    assert "patch" in status
+
+
+def test_document_apply_patch_tool_builds_and_applies_diff():
+    bridge = _PatchBridgeStub(text="Alpha beta", selection=(6, 10), version="digest-7")
+    edit_tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+
+    status = tool.run(content="BETA", target_range=(6, 10))
+
+    assert bridge.calls and bridge.calls[-1]["action"] == "patch"
+    assert "digest-7" in status
+    assert bridge.calls[-1]["document_version"] == "digest-7"
+
+
+def test_document_apply_patch_tool_validates_snapshot_version():
+    bridge = _PatchBridgeStub(text="Hello world", selection=(0, 5), version="digest-1")
+    edit_tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+
+    with pytest.raises(ValueError, match="document_version"):
+        tool.run(content="Hola", target_range=(0, 5), document_version="digest-old")
+
+
+def test_document_apply_patch_tool_skips_noop_edits():
+    bridge = _PatchBridgeStub(text="Hello world", selection=(0, 5), version="digest-2")
+    edit_tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+
+    outcome = tool.run(content="Hello", target_range=(0, 5))
+
+    assert outcome.startswith("skipped")
+    assert bridge.calls == []
+
+
+def test_document_apply_patch_tool_handles_missing_rationale():
+    bridge = _PatchBridgeStub(text="", selection=(0, 0), version="digest-9")
+    edit_tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+
+    status = tool.run(content="Hello world")
+
+    assert bridge.calls and bridge.calls[-1]["action"] == "patch"
+    assert "digest-9" in status
+
+
+def test_diff_builder_tool_generates_diff_and_detects_noop():
+    tool = DiffBuilderTool()
+
+    diff = tool.run("alpha\n", "beta\n")
+
+    assert diff.startswith("--- a/")
+    assert "beta" in diff
+
+    with pytest.raises(ValueError):
+        tool.run("same", "same")
 
 
 def test_document_snapshot_tool_includes_diff_summary_and_version():

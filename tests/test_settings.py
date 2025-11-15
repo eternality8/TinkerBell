@@ -34,6 +34,7 @@ def test_save_and_load_roundtrip(tmp_path: Path) -> None:
         unsaved_snapshot={"text": "draft", "language": "markdown", "selection": [0, 5]},
         unsaved_snapshots={"/tmp/demo.md": {"text": "draft", "language": "markdown", "selection": [0, 5]}},
         max_tool_iterations=12,
+        use_patch_edits=False,
     )
 
     store.save(original)
@@ -81,3 +82,13 @@ def test_bool_env_overrides_enable_debug_logging(monkeypatch: pytest.MonkeyPatch
     overridden = SettingsStore(path).load()
 
     assert overridden.debug_logging is True
+
+
+def test_patch_edit_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    SettingsStore(path).save(Settings(use_patch_edits=True))
+    monkeypatch.setenv("TINKERBELL_USE_PATCH_EDITS", "false")
+
+    overridden = SettingsStore(path).load()
+
+    assert overridden.use_patch_edits is False

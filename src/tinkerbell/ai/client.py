@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from dataclasses import dataclass
@@ -30,7 +31,7 @@ class ClientSettings:
     api_key: str
     model: str
     organization: str | None = None
-    request_timeout: float | None = 30.0
+    request_timeout: float | None = 90.0
     max_retries: int = 3
     retry_min_seconds: float = 0.5
     retry_max_seconds: float = 6.0
@@ -268,4 +269,18 @@ class AIClient:
             LOGGER.debug("AI prompt payload (unserializable): %s", payload)
         else:
             LOGGER.debug("AI prompt payload:\n%s", serialized)
+
+    async def aclose(self) -> None:
+        """Close the underlying OpenAI client to release network resources."""
+
+        close = getattr(self._client, "close", None)
+        if close is None:
+            return
+        try:
+            result = close()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.debug("AI client close failed to start: %s", exc)
+            return
+        if inspect.isawaitable(result):
+            await result
 

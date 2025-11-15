@@ -61,6 +61,49 @@ def test_chat_panel_visibility_controlled_by_settings():
     assert window.chat_panel.tool_activity_visible is True
 
 
+def test_patch_mode_setting_passes_to_controller_on_startup():
+    controller = _StubAIController()
+    _make_window(controller, settings=Settings(api_key="key", use_patch_edits=False))
+
+    assert controller.patch_mode_values and controller.patch_mode_values[-1] is False
+
+
+def test_patch_mode_toggle_updates_controller(monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = _StubAIController()
+    window = _make_window(controller, settings=Settings(api_key="key", use_patch_edits=True))
+    controller.patch_mode_values.clear()
+    updated = Settings(api_key="key", use_patch_edits=False)
+
+    monkeypatch.setattr(
+        window,
+        "_show_settings_dialog",
+        lambda current: SimpleNamespace(accepted=True, settings=updated),
+    )
+
+    window._handle_settings_requested()
+
+    assert controller.patch_mode_values and controller.patch_mode_values[-1] is False
+
+
+def test_patch_mode_toggle_updates_document_edit_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = _StubAIController()
+    window = _make_window(controller, settings=Settings(api_key="key", use_patch_edits=True))
+    edit_tool = controller.registered_tools["document_edit"]["impl"]
+    assert getattr(edit_tool, "patch_only", None) is True
+
+    updated = Settings(api_key="key", use_patch_edits=False)
+
+    monkeypatch.setattr(
+        window,
+        "_show_settings_dialog",
+        lambda current: SimpleNamespace(accepted=True, settings=updated),
+    )
+
+    window._handle_settings_requested()
+
+    assert edit_tool.patch_only is False
+
+
 def test_settings_dialog_toggle_updates_tool_panel(monkeypatch: pytest.MonkeyPatch):
     initial = Settings(show_tool_activity_panel=False)
     window = _make_window(settings=initial)
@@ -639,6 +682,7 @@ class _StubAIController:
         self.stream_scripts: list[list[Any]] = []
         self.response_texts: list[str] = []
         self.history_payloads: list[Sequence[Mapping[str, str]] | None] = []
+        self.patch_mode_values: list[bool] = []
 
     async def run_chat(
         self,
@@ -695,6 +739,9 @@ class _StubAIController:
     def update_client(self, client: Any) -> None:
         self.client = client
         self.updated_clients.append(client)
+
+    def set_patch_mode(self, enabled: bool) -> None:
+        self.patch_mode_values.append(bool(enabled))
 
 
 def test_chat_prompt_without_controller_emits_notice():
@@ -826,13 +873,50 @@ def test_tool_call_stream_events_coalesce_into_single_trace():
     assert window._pending_tool_traces == {}
 
 
+def test_tool_trace_completes_when_stream_events_lack_ids():
+    controller = _StubAIController()
+    window = _make_window(controller)
+
+    events = [
+        SimpleNamespace(
+            type="tool_calls.function.arguments.delta",
+            tool_name="document_edit",
+            tool_index=0,
+            arguments_delta='{"action":"patch"',
+        ),
+        SimpleNamespace(
+            type="tool_calls.function.arguments.done",
+            tool_name="document_edit",
+            tool_index=0,
+            tool_arguments='{"action":"patch","diff":"---"}',
+        ),
+        SimpleNamespace(
+            type="tool_calls.result",
+            tool_name="document_edit",
+            tool_index=0,
+            tool_call_id="document_edit:0",
+            content="Applied patch",
+        ),
+    ]
+
+    for payload in events:
+        window._process_stream_event(payload)  # type: ignore[arg-type]
+
+    traces = getattr(window.chat_panel, "_tool_traces")
+    assert traces
+    assert traces[-1].output_summary == "Applied patch"
+    assert window._pending_tool_traces == {}
+
+
 def test_default_ai_tools_register_when_controller_available():
     controller = _StubAIController()
     window = _make_window(controller)
     del window  # window retains references to editor/bridge but is unused in assertions
 
     tool_names = set(controller.registered_tools)
-    assert {"document_snapshot", "document_edit", "validate_snippet"}.issubset(tool_names)
+    assert {"document_snapshot", "document_edit", "document_apply_patch", "validate_snippet"}.issubset(
+        tool_names
+    )
 
     assert controller.registered_tools["document_snapshot"]["strict"] is True
 
@@ -844,3 +928,23 @@ def test_default_ai_tools_register_when_controller_available():
     validator = controller.registered_tools["validate_snippet"]["impl"]
     outcome = validator("foo: bar", "yaml")
     assert hasattr(outcome, "ok")
+
+
+def test_close_event_cancels_background_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
+    window = _make_window()
+    calls: list[str] = []
+    monkeypatch.setattr(window, "_cancel_active_ai_turn", lambda: calls.append("ai"))
+    monkeypatch.setattr(window, "_cancel_dynamic_suggestions", lambda: calls.append("suggestions"))
+    monkeypatch.setattr(window, "_clear_suggestion_cache", lambda: calls.append("cache"))
+
+    accepted = {"value": False}
+
+    def _accept() -> None:
+        accepted["value"] = True
+
+    event = SimpleNamespace(accept=_accept)
+
+    window.closeEvent(event)  # type: ignore[arg-type]
+
+    assert calls == ["ai", "suggestions", "cache"]
+    assert accepted["value"] is True

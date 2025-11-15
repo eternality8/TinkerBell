@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING
 
 from .chat.chat_panel import ChatPanel
-from .chat.commands import DIRECTIVE_SCHEMA
+from .chat.commands import ActionType, DIRECTIVE_SCHEMA
 from .chat.message_model import ChatMessage, EditDirective, ToolTrace
 from .editor.document_model import DocumentMetadata, DocumentState, SelectionRange
 from .editor.editor_widget import EditorWidget
@@ -21,8 +21,10 @@ from .services.bridge import DocumentBridge
 from .services.settings import Settings, SettingsStore
 from .utils import file_io, logging as logging_utils
 from .widgets.status_bar import StatusBar
+from .ai.tools.diff_builder import DiffBuilderTool
 from .ai.tools.document_snapshot import DocumentSnapshotTool
 from .ai.tools.document_edit import DocumentEditTool
+from .ai.tools.document_apply_patch import DocumentApplyPatchTool
 from .ai.tools.search_replace import SearchReplaceTool
 from .ai.tools.validation import validate_snippet
 
@@ -191,8 +193,33 @@ class MainWindow(QMainWindow):
         self._snapshot_persistence_block = 0
         self._debug_logging_enabled = bool(getattr(initial_settings, "debug_logging", False))
         self._active_theme = (getattr(initial_settings, "theme", "") or "default").strip() or "default"
+        patch_preference = bool(getattr(initial_settings, "use_patch_edits", True)) if initial_settings else True
+        self._patch_mode_enabled = patch_preference
+        self._document_edit_tool: DocumentEditTool | None = None
+        self._auto_patch_tool: DocumentApplyPatchTool | None = None
         self._ai_client_signature: tuple[Any, ...] | None = self._ai_settings_signature(initial_settings)
         self._initialize_ui()
+
+    # ------------------------------------------------------------------
+    # Qt lifecycle hooks
+    # ------------------------------------------------------------------
+    def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt naming
+        """Ensure background tasks are canceled before the window closes."""
+
+        self._cancel_active_ai_turn()
+        self._cancel_dynamic_suggestions()
+        self._clear_suggestion_cache()
+
+        super_close = getattr(super(), "closeEvent", None)
+        if callable(super_close):  # pragma: no branch - defensive wiring
+            try:
+                super_close(event)
+            except Exception:  # pragma: no cover - Qt stubs/tests
+                _LOGGER.debug("Base closeEvent handler raised", exc_info=True)
+
+        accept = getattr(event, "accept", None)
+        if callable(accept):
+            accept()
 
     # ------------------------------------------------------------------
     # UI setup helpers
@@ -389,7 +416,9 @@ class MainWindow(QMainWindow):
         self._chat_panel.add_request_listener(self._handle_chat_request)
         self._chat_panel.add_session_reset_listener(self._handle_chat_session_reset)
         self._chat_panel.add_suggestion_panel_listener(self._handle_suggestion_panel_toggled)
+        self._chat_panel.set_stop_ai_callback(self._cancel_active_ai_turn)
         self._bridge.add_edit_listener(self._handle_edit_applied)
+        self._bridge.add_failure_listener(self._handle_edit_failure)
         self._handle_editor_selection_changed(self._editor.to_document().selection)
 
     def _register_default_ai_tools(self) -> None:
@@ -403,6 +432,8 @@ class MainWindow(QMainWindow):
         if not callable(register):
             _LOGGER.debug("AI controller does not expose register_tool; skipping tool wiring.")
             return
+
+        self._apply_controller_patch_mode(controller)
 
         try:
             snapshot_tool = DocumentSnapshotTool(provider=self._bridge)
@@ -424,14 +455,84 @@ class MainWindow(QMainWindow):
                 },
             )
 
-            edit_tool = DocumentEditTool(bridge=self._bridge)
+            edit_tool = DocumentEditTool(bridge=self._bridge, patch_only=self._patch_mode_enabled)
+            self._document_edit_tool = edit_tool
             register(
                 "document_edit",
                 edit_tool,
                 description=(
-                    "Apply a structured edit directive (insert, replace, annotate) against the active document."
+                    "Apply a structured edit directive (insert, replace, annotate, or unified diff patch) against the active document."
                 ),
                 parameters=self._directive_parameters_schema(),
+            )
+            self._update_tool_patch_mode()
+
+            apply_patch_tool = DocumentApplyPatchTool(bridge=self._bridge, edit_tool=edit_tool)
+            self._auto_patch_tool = apply_patch_tool
+            register(
+                "document_apply_patch",
+                apply_patch_tool,
+                description=(
+                    "Replace a target_range with new content by automatically building and applying a unified diff."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "Replacement text that should occupy the specified target_range.",
+                        },
+                        "target_range": DIRECTIVE_SCHEMA["properties"]["target_range"],
+                        "document_version": {
+                            "type": "string",
+                            "description": "Document snapshot version captured before drafting the edit.",
+                        },
+                        "rationale": {
+                            "type": "string",
+                            "description": "Optional explanation stored alongside the edit directive.",
+                        },
+                        "context_lines": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Override the number of context lines included in the generated diff.",
+                        },
+                    },
+                    "required": ["content"],
+                    "additionalProperties": False,
+                },
+            )
+
+            diff_tool = DiffBuilderTool()
+            register(
+                "diff_builder",
+                diff_tool,
+                description=(
+                    "Return a unified diff given original and updated text snippets to drive patch directives."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "original": {
+                            "type": "string",
+                            "description": "The prior version of the text block.",
+                        },
+                        "updated": {
+                            "type": "string",
+                            "description": "The revised text block.",
+                        },
+                        "filename": {
+                            "type": "string",
+                            "description": "Optional virtual filename used in diff headers.",
+                        },
+                        "context": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Number of context lines to include in the diff (default 3).",
+                        },
+                    },
+                    "required": ["original", "updated"],
+                    "additionalProperties": False,
+                },
             )
 
             search_tool = SearchReplaceTool(bridge=self._bridge)
@@ -507,7 +608,7 @@ class MainWindow(QMainWindow):
             )
 
             _LOGGER.debug(
-                "Default AI tools registered: document_snapshot, document_edit, search_replace, validate_snippet"
+                "Default AI tools registered: document_snapshot, document_edit, document_apply_patch, diff_builder, search_replace, validate_snippet"
             )
         except Exception as exc:  # pragma: no cover - defensive logging
             _LOGGER.warning("Failed to register default AI tools: %s", exc)
@@ -519,7 +620,7 @@ class MainWindow(QMainWindow):
         schema = deepcopy(DIRECTIVE_SCHEMA)
         schema.setdefault(
             "description",
-            "Structured edit directive containing action, content, optional rationale, and target range.",
+            "Structured edit directive containing action, content, optional rationale, and target range. Prefer action='patch' with a unified diff and document_version when modifying existing text.",
         )
         return schema
 
@@ -533,6 +634,7 @@ class MainWindow(QMainWindow):
                 "AI assistant is unavailable. Open Settings to configure your API key and model."
             )
             self.update_status("AI unavailable")
+            self._chat_panel.set_ai_running(False)
             return
 
         if self._ai_task and not self._ai_task.done():
@@ -545,10 +647,13 @@ class MainWindow(QMainWindow):
             limit=12,
             exclude_latest=True,
         )
+        self._chat_panel.set_ai_running(True)
         task = self._run_coroutine(
             self._run_ai_turn(controller, prompt, snapshot, metadata or {}, history_payload)
         )
         self._ai_task = task
+        if task is None:
+            self._chat_panel.set_ai_running(False)
 
     async def _run_ai_turn(
         self,
@@ -751,6 +856,7 @@ class MainWindow(QMainWindow):
         self._ai_stream_active = False
         self._post_assistant_notice(f"AI request failed: {exc}")
         self.update_status("AI error")
+        self._chat_panel.set_ai_running(False)
 
     def _post_assistant_notice(self, message: str) -> None:
         message = message.strip()
@@ -786,6 +892,7 @@ class MainWindow(QMainWindow):
                 _LOGGER.debug("AI task cancellation failed", exc_info=True)
         self._ai_task = None
         self._ai_stream_active = False
+        self._chat_panel.set_ai_running(False)
 
     def _handle_chat_session_reset(self) -> None:
         self._cancel_active_ai_turn()
@@ -929,6 +1036,8 @@ class MainWindow(QMainWindow):
             task.result()
         except Exception as exc:  # pragma: no cover - surfaced via handler
             self._handle_ai_failure(exc)
+        finally:
+            self._chat_panel.set_ai_running(False)
 
     def _normalize_metadata(self, metadata: Mapping[str, Any] | None) -> Dict[str, str] | None:
         if not metadata:
@@ -942,20 +1051,37 @@ class MainWindow(QMainWindow):
         summary = f"Applied {directive.action} ({diff})"
         self.update_status(summary)
         metadata: Dict[str, Any] = {}
+        range_hint: tuple[int, int] = directive.target_range
+        context = getattr(self._bridge, "last_edit_context", None)
+        if directive.action == ActionType.PATCH.value and context is not None:
+            range_hint = context.target_range
         if directive.action == "replace":
-            context = getattr(self._bridge, "last_edit_context", None)
             if context is not None and context.action == "replace":
                 metadata["text_before"] = context.replaced_text
                 metadata["text_after"] = context.content
             else:
                 metadata["text_after"] = directive.content
+        elif directive.action == ActionType.PATCH.value:
+            if context is not None and context.diff:
+                metadata["diff_preview"] = context.diff
+            if context is not None and context.spans:
+                metadata["spans"] = context.spans
         trace = ToolTrace(
             name=f"edit:{directive.action}",
-            input_summary=f"range={directive.target_range}",
+            input_summary=f"range={range_hint}",
             output_summary=diff,
             metadata=metadata,
         )
         self._chat_panel.show_tool_trace(trace)
+
+    def _handle_edit_failure(self, directive: EditDirective, message: str) -> None:
+        action = (directive.action or "").strip().lower()
+        if action == ActionType.PATCH.value:
+            notice = message or "Patch rejected"
+            self.update_status("Patch rejected – ask TinkerBell to re-sync")
+            self._post_assistant_notice(f"Patch apply failed: {notice}. Please request a fresh snapshot.")
+        else:
+            self.update_status(f"Edit failed: {message or 'Unknown error'}")
 
     # ------------------------------------------------------------------
     # Action callbacks
@@ -1502,6 +1628,7 @@ class MainWindow(QMainWindow):
         self._apply_chat_panel_settings(settings)
         self._apply_debug_logging_setting(settings)
         self._apply_theme_setting(settings)
+        self._apply_patch_mode_setting(settings)
         self._refresh_ai_runtime(settings)
 
     def _apply_chat_panel_settings(self, settings: Settings) -> None:
@@ -1509,6 +1636,32 @@ class MainWindow(QMainWindow):
         setter = getattr(self._chat_panel, "set_tool_activity_visibility", None)
         if callable(setter):
             setter(visible)
+
+    def _apply_patch_mode_setting(self, settings: Settings) -> None:
+        enabled = bool(getattr(settings, "use_patch_edits", True))
+        self._patch_mode_enabled = enabled
+        self._apply_controller_patch_mode(self._context.ai_controller)
+        self._update_tool_patch_mode()
+
+    def _apply_controller_patch_mode(self, controller: Any | None) -> None:
+        if controller is None:
+            return
+        setter = getattr(controller, "set_patch_mode", None)
+        if not callable(setter):
+            return
+        try:
+            setter(self._patch_mode_enabled)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to update controller patch mode: %s", exc)
+
+    def _update_tool_patch_mode(self) -> None:
+        tool = self._document_edit_tool
+        if tool is None:
+            return
+        try:
+            tool.patch_only = self._patch_mode_enabled
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to update document_edit tool patch mode: %s", exc)
 
     def _update_logging_configuration(self, debug_enabled: bool) -> None:
         level = logging.DEBUG if debug_enabled else logging.INFO
@@ -1629,6 +1782,7 @@ class MainWindow(QMainWindow):
             self._ai_client_signature = signature
 
         if controller is not None:
+            self._apply_controller_patch_mode(controller)
             self._apply_max_tool_iterations(controller, iteration_limit)
 
         self._update_ai_debug_logging(bool(getattr(settings, "debug_logging", False)))
@@ -1692,7 +1846,11 @@ class MainWindow(QMainWindow):
 
         try:
             limit = self._resolve_max_tool_iterations(settings)
-            return AIController(client=client, max_tool_iterations=limit)
+            return AIController(
+                client=client,
+                max_tool_iterations=limit,
+                use_patch_edits=bool(getattr(settings, "use_patch_edits", True)),
+            )
         except Exception as exc:
             _LOGGER.warning("Failed to initialize AI controller: %s", exc)
             return None

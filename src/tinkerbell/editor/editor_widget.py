@@ -14,6 +14,7 @@ from typing import Any, Optional, Protocol
 
 from ..chat.message_model import EditDirective
 from .document_model import DocumentState, SelectionRange
+from .patches import PatchResult
 from .syntax.markdown import MarkdownPreview, render_preview
 from .syntax.themes import Theme, load_theme
 Qt: Any = None
@@ -242,6 +243,34 @@ class EditorWidget(QWidgetBase):
             self.insert_text(annotation, position=insert_at)
         else:
             raise ValueError(f"Unsupported directive action: {directive.action}")
+        return self.to_document()
+
+    def apply_patch_result(self, result: PatchResult, selection_hint: tuple[int, int] | None = None) -> DocumentState:
+        """Apply a diff-based patch result while emitting a single undo snapshot."""
+
+        previous = self._text_buffer
+        if previous == result.text:
+            return self.to_document()
+
+        self._push_undo_snapshot(previous)
+        self._text_buffer = result.text
+        self._state.update_text(result.text)
+        if self._qt_editor is not None:
+            self._qt_editor.blockSignals(True)
+            self._qt_editor.setPlainText(result.text)
+            self._qt_editor.blockSignals(False)
+        self._refresh_preview(if_enabled=True)
+        self._emit_text_changed()
+
+        spans = result.spans or ()
+        if spans:
+            start, end = spans[-1]
+        elif selection_hint is not None:
+            start, end = selection_hint
+        else:
+            start = end = len(result.text)
+
+        self.apply_selection(SelectionRange(start, end))
         return self.to_document()
 
     # ------------------------------------------------------------------

@@ -29,6 +29,16 @@ def test_write_text_enforces_newline_policy(tmp_path: Path) -> None:
     assert target.read_bytes() == b"Line1\r\nLine2"
 
 
+def test_read_text_prefers_utf8_over_locale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "quote.txt"
+    original = "“Are you sure you want to do this?” he asked."
+    target.write_bytes(original.encode("utf-8"))
+
+    monkeypatch.setattr(file_io.locale, "getpreferredencoding", lambda _use_locale: "cp1252")
+
+    assert file_io.read_text(target) == original
+
+
 def test_detect_format_uses_suffix_and_content() -> None:
     assert file_io.detect_format(path=Path("note.md")) is file_io.DocumentFormat.MARKDOWN
     assert file_io.detect_format(text="{\"a\": 1}") is file_io.DocumentFormat.JSON

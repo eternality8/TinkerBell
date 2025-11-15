@@ -213,7 +213,11 @@ def _detect_encoding(raw: bytes) -> str:
             return encoding
 
     preferred = locale.getpreferredencoding(False) or "utf-8"
-    for candidate in {"utf-8", preferred, "latin-1"}:
+    seen: set[str] = set()
+    for candidate in ("utf-8", preferred, "latin-1"):
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
         try:
             raw.decode(candidate)
             return candidate

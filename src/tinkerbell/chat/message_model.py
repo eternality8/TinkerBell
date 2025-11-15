@@ -56,3 +56,5 @@ class EditDirective:
     target_range: tuple[int, int]
     content: str
     rationale: Optional[str] = None
+    diff: Optional[str] = None
+    selection_fingerprint: Optional[str] = None

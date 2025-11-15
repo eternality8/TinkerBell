@@ -19,6 +19,7 @@ class ActionType(str, Enum):
     INSERT = "insert"
     REPLACE = "replace"
     ANNOTATE = "annotate"
+    PATCH = "patch"
 
 
 @dataclass(slots=True)
@@ -34,13 +35,14 @@ _JSON_DECODER = json.JSONDecoder()
 
 DIRECTIVE_SCHEMA: Dict[str, Any] = {
     "type": "object",
-    "required": ["action", "content"],
+    "required": ["action"],
     "properties": {
         "action": {
             "type": "string",
             "enum": [item.value for item in ActionType],
         },
         "content": {"type": "string", "minLength": 1},
+        "diff": {"type": "string", "minLength": 1},
         "rationale": {"type": "string"},
         "target_range": {
             "anyOf": [
@@ -66,8 +68,24 @@ DIRECTIVE_SCHEMA: Dict[str, Any] = {
         "version": {"type": "string"},
         "document_digest": {"type": "string"},
         "metadata": {"type": "object"},
+        "selection_fingerprint": {"type": "string", "minLength": 1},
     },
     "additionalProperties": True,
+    "allOf": [
+        {
+            "if": {"properties": {"action": {"const": ActionType.PATCH.value}}},
+            "then": {
+                "required": ["diff"],
+                "not": {
+                    "anyOf": [
+                        {"required": ["content"]},
+                        {"required": ["target_range"]},
+                    ]
+                },
+            },
+            "else": {"required": ["content"]},
+        }
+    ],
 }
 
 _DIRECTIVE_VALIDATOR = Draft7Validator(DIRECTIVE_SCHEMA)
@@ -100,7 +118,34 @@ def validate_directive(payload: Mapping[str, Any]) -> ValidationResult:
     if isinstance(content, str) and not content.strip():
         return ValidationResult(ok=False, message="content must not be empty")
 
+    action = candidate.get("action")
+    if action == ActionType.PATCH.value:
+        diff = candidate.get("diff")
+        if not isinstance(diff, str) or not diff.strip():
+            return ValidationResult(ok=False, message="diff must not be empty for patch directives")
+        version_token = _extract_version_token(candidate)
+        if not version_token:
+            return ValidationResult(ok=False, message="patch directives require a document_version token")
+
     return ValidationResult(ok=True)
+
+
+def create_patch_directive(diff: str, version: str, rationale: str | None = None) -> Dict[str, Any]:
+    """Helper used by agents/tests to construct a valid patch directive payload."""
+
+    if not diff or not diff.strip():
+        raise ValueError("diff must be a non-empty unified diff string")
+    version_token = str(version).strip()
+    if not version_token:
+        raise ValueError("version must be a non-empty string")
+    directive: Dict[str, Any] = {
+        "action": ActionType.PATCH.value,
+        "diff": diff,
+        "document_version": version_token,
+    }
+    if rationale:
+        directive["rationale"] = rationale
+    return directive
 
 
 def _coerce_payload(payload: Mapping[str, Any] | str | bytes) -> Dict[str, Any]:
@@ -166,4 +211,15 @@ def _format_validation_error(error: ValidationError) -> str:
     if path:
         return f"{path}: {error.message}"
     return error.message
+
+
+def _extract_version_token(payload: Mapping[str, Any]) -> str | None:
+    for key in ("document_version", "snapshot_version", "version", "document_digest"):
+        token = payload.get(key)
+        if token is None:
+            continue
+        token_str = str(token).strip()
+        if token_str:
+            return token_str
+    return None
 

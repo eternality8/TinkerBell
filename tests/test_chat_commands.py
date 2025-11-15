@@ -74,3 +74,22 @@ def test_validate_rejects_bad_target_range_type() -> None:
 
     assert not result.ok
     assert "target_range" in result.message
+
+
+def test_validate_accepts_patch_with_diff_and_version() -> None:
+    payload = {
+        "action": "patch",
+        "diff": "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new",
+        "document_version": "digest",
+    }
+
+    result = validate_directive(payload)
+
+    assert result.ok is True
+
+
+def test_validate_rejects_patch_without_version() -> None:
+    result = validate_directive({"action": "patch", "diff": "@@ -1 +1 @@"})
+
+    assert result.ok is False
+    assert "document_version" in result.message.lower()
