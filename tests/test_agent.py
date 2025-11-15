@@ -62,6 +62,17 @@ def test_ai_controller_collects_streamed_response(sample_snapshot):
     assert stub_client.calls[0]["metadata"] == {"tab": "notes"}
 
 
+def test_ai_controller_updates_max_tool_iterations():
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="done")])
+    controller = AIController(client=cast(AIClient, stub_client), max_tool_iterations=3)
+
+    assert controller.graph["metadata"]["max_iterations"] == 3
+
+    controller.set_max_tool_iterations(5)
+
+    assert controller.graph["metadata"]["max_iterations"] == 5
+
+
 def test_ai_controller_tracks_registered_tools(sample_snapshot):
     stub_client = _StubClient([AIStreamEvent(type="content.done", content="done")])
     controller = AIController(client=cast(AIClient, stub_client))

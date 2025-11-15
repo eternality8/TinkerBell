@@ -1,6 +1,7 @@
 """Chat panel behavior tests running in headless mode."""
 
 from typing import Any
+import types
 
 import pytest
 
@@ -105,6 +106,36 @@ def test_chat_panel_suggestions_update_composer():
         panel.select_suggestion(5)
 
 
+def test_chat_panel_enter_key_sends_message():
+    panel = _make_panel()
+    captured: list[str] = []
+
+    def _listener(prompt: str, metadata: dict[str, Any]) -> None:
+        del metadata
+        captured.append(prompt)
+
+    panel.add_request_listener(_listener)
+    panel.set_composer_text("Send via enter")
+
+    handled = panel._handle_composer_key_event(chat_panel.FALLBACK_ENTER_KEYS[0], 0)
+
+    assert handled is True
+    assert captured == ["Send via enter"]
+    assert panel.composer_text == ""
+
+
+def test_chat_panel_shift_enter_inserts_newline():
+    panel = _make_panel()
+    panel.set_composer_text("First line")
+
+    handled = panel._handle_composer_key_event(
+        chat_panel.FALLBACK_ENTER_KEYS[0], chat_panel.FALLBACK_SHIFT_MODIFIER
+    )
+
+    assert handled is False
+    assert panel.composer_text == "First line"
+
+
 def test_chat_panel_set_selection_summary_updates_metadata():
     panel = _make_panel()
     panel.set_selection_summary("Intro", extras={"cursor": "top"})
@@ -162,6 +193,20 @@ def test_copy_text_to_clipboard_records_text_when_qt_missing(monkeypatch):
     assert panel.last_copied_text == "Example message"
 
 
+def test_chat_panel_resize_event_refreshes_history(monkeypatch):
+    panel = ChatPanel()
+    calls: list[bool] = []
+
+    def _fake_refresh() -> None:
+        calls.append(True)
+
+    monkeypatch.setattr(panel, "_refresh_history_widget", _fake_refresh)
+
+    panel.resizeEvent(object())
+
+    assert calls == [True]
+
+
 def test_copy_text_to_clipboard_uses_qt_clipboard(monkeypatch):
     panel = ChatPanel()
 
@@ -188,3 +233,47 @@ def test_copy_text_to_clipboard_uses_qt_clipboard(monkeypatch):
     assert panel.copy_text_to_clipboard("Persist me") is True
     assert _QtAppStub._clipboard.text == "Persist me"
     assert panel.last_copied_text == "Persist me"
+
+
+def test_history_widget_reserves_bottom_padding(monkeypatch):
+    panel = ChatPanel()
+
+    class _StubHistory:
+        def __init__(self) -> None:
+            self.margins: tuple[int, int, int, int] | None = None
+            self.scroll_mode: Any = None
+
+        def setObjectName(self, name: str) -> None:
+            self.object_name = name
+
+        def setAlternatingRowColors(self, value: bool) -> None:
+            self.alternating = value
+
+        def setSpacing(self, spacing: int) -> None:
+            self.spacing = spacing
+
+        def setSelectionMode(self, mode: Any) -> None:
+            self.selection_mode = mode
+
+        def setHorizontalScrollBarPolicy(self, policy: Any) -> None:
+            self.h_scroll_policy = policy
+
+        def setWordWrap(self, enabled: bool) -> None:
+            self.word_wrap = enabled
+
+        def setViewportMargins(self, left: int, top: int, right: int, bottom: int) -> None:
+            self.margins = (left, top, right, bottom)
+
+        def setVerticalScrollMode(self, mode: Any) -> None:
+            self.scroll_mode = mode
+
+    panel._history_widget = _StubHistory()
+    selection_stub = types.SimpleNamespace(NoSelection="noselect", ScrollPerPixel="per-pixel")
+    qt_stub = types.SimpleNamespace(ScrollBarAlwaysOff="always-off")
+    monkeypatch.setattr(chat_panel, "QAbstractItemView", selection_stub)
+    monkeypatch.setattr(chat_panel, "Qt", qt_stub)
+
+    panel._configure_history_widget()
+
+    assert panel._history_widget.margins == (0, 0, 0, panel.HISTORY_BOTTOM_PADDING)
+    assert panel._history_widget.scroll_mode == selection_stub.ScrollPerPixel

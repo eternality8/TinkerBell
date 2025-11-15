@@ -92,7 +92,9 @@ class AIController:
 
     client: AIClient
     tools: MutableMapping[str, ToolRegistration] = field(default_factory=dict)
+    max_tool_iterations: int = 8
     _graph: Dict[str, Any] = field(init=False, repr=False)
+    _max_tool_iterations: int = field(init=False, repr=False)
     _active_task: asyncio.Task[dict] | None = field(default=None, init=False, repr=False)
     _task_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
 
@@ -105,6 +107,8 @@ class AIController:
                 else:
                     normalized[name] = ToolRegistration(name=name, impl=value)
             self.tools = normalized
+        self._max_tool_iterations = self._normalize_iterations(self.max_tool_iterations)
+        self.max_tool_iterations = self._max_tool_iterations
         self._rebuild_graph()
 
     @property
@@ -133,6 +137,16 @@ class AIController:
         )
         self.tools[name] = registration
         LOGGER.debug("Registered tool: %s", name)
+        self._rebuild_graph()
+
+    def set_max_tool_iterations(self, iterations: int) -> None:
+        """Update the maximum allowed tool iterations and rebuild the graph if needed."""
+
+        normalized = self._normalize_iterations(iterations)
+        if normalized == self._max_tool_iterations:
+            return
+        self._max_tool_iterations = normalized
+        self.max_tool_iterations = normalized
         self._rebuild_graph()
 
     def unregister_tool(self, name: str) -> None:
@@ -257,7 +271,10 @@ class AIController:
         return tuple(self.tools.keys())
 
     def _rebuild_graph(self) -> None:
-        self._graph = build_agent_graph(tools={name: registration.impl for name, registration in self.tools.items()})
+        self._graph = build_agent_graph(
+            tools={name: registration.impl for name, registration in self.tools.items()},
+            max_iterations=self._max_tool_iterations,
+        )
 
     def _build_suggestion_messages(
         self,
@@ -326,6 +343,14 @@ class AIController:
         if isinstance(parsed, list):
             return self._sanitize_suggestions(parsed, max_suggestions)
         return []
+
+    @staticmethod
+    def _normalize_iterations(value: int | None) -> int:
+        try:
+            candidate = int(value) if value is not None else 8
+        except (TypeError, ValueError):
+            candidate = 8
+        return max(1, min(candidate, 50))
 
     def _sanitize_suggestions(self, raw_items: Iterable[Any], max_suggestions: int) -> list[str]:
         sanitized: list[str] = []

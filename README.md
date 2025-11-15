@@ -117,6 +117,13 @@ Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat m
 
 You can register custom tools at runtime via `AIController.register_tool`, and the LangGraph plan automatically picks them up.
 
+### Tool parameter reference
+
+- **`document_snapshot`** — accepts `delta_only` (bool) to request only changed fields; the tool also appends the latest diff summary and document digest so agents can detect drift between turns.
+- **`document_edit`** — consumes either a native `EditDirective` or a JSON/mapping payload matching the schema exposed during registration. It normalizes the directive, queues it through the bridge, and returns a short status string such as `applied: +34 chars (version=abcd1234)` so the agent knows exactly what changed.
+- **`search_replace`** — parameters include `pattern`, `replacement`, `is_regex`, `scope` (`document` or `selection`), `dry_run`, `max_replacements`, `match_case`, and `whole_word`. With `dry_run=True`, the tool performs no edit and instead returns a preview plus match counts; otherwise it enqueues a single replace directive scoped to the resolved range and refreshes the document version.
+- **`validate_snippet`** — requires `text` and `fmt` (`yaml`, `yml`, or `json`) and responds with a `ValidationOutcome` describing the first issue along with a count of remaining problems so agents can deliver actionable feedback.
+
 ## Safety, privacy, and reliability
 
 - **Document versioning** – Every snapshot includes a SHA-1 digest so stale edits are rejected before they touch the editor.

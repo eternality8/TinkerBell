@@ -19,7 +19,7 @@ the headless tests simple while remaining Qt-friendly for the full app.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Protocol, Sequence
+from typing import Any, Iterable, List, Optional, Protocol, Sequence, cast
 
 from .message_model import ChatMessage, ToolTrace
 
@@ -37,9 +37,15 @@ QVBoxLayout: Any = None
 QWidgetBase: Any = None
 QAbstractItemView: Any = None
 Qt: Any = None
+QEvent: Any = None
+
+# Fallback Qt constants for environments where PySide6 isn't available during tests.
+FALLBACK_ENTER_KEYS = (0x01000004, 0x01000005)  # Qt.Key_Return, Qt.Key_Enter
+FALLBACK_SHIFT_MODIFIER = 0x02000000  # Qt.ShiftModifier bit mask
+FALLBACK_KEY_PRESS_EVENT = 6  # QEvent.KeyPress
 
 try:  # pragma: no cover - PySide6 optional in CI
-    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtCore import Qt as _Qt, QEvent as _QtEvent
     from PySide6.QtWidgets import (
         QApplication as _QtApplication,
         QFrame as _QtFrame,
@@ -70,6 +76,7 @@ try:  # pragma: no cover - PySide6 optional in CI
     QWidgetBase = _QtWidget
     QAbstractItemView = _QtAbstractItemView
     Qt = _Qt
+    QEvent = _QtEvent
 except Exception:  # pragma: no cover - runtime fallback keeps dependencies optional
 
     class _StubQWidget:  # type: ignore[too-many-ancestors]
@@ -122,6 +129,10 @@ class ChatPanel(QWidgetBase):
     """Pane showing chat history, composer controls, and tool traces."""
 
     MAX_HISTORY = 200
+    HISTORY_BOTTOM_PADDING = 12
+    SMOOTH_SCROLL_STEP = 12
+    SMOOTH_SCROLL_PAGE = 72
+    AUTOLOCK_THRESHOLD = 80
 
     def __init__(
         self,
@@ -257,12 +268,16 @@ class ChatPanel(QWidgetBase):
         message = ChatMessage(role="user", content=content, metadata=metadata)
         self._messages.append(message)
         self._trim_history()
+        should_autoscroll = self._should_auto_scroll()
         self._refresh_history_widget()
+        if should_autoscroll:
+            self._scroll_history_to_bottom(force=True)
         return message
 
     def append_ai_message(self, message: ChatMessage, *, streaming: bool = False) -> ChatMessage:
         """Add an AI-authored message, optionally streaming partial chunks."""
 
+        should_autoscroll = self._should_auto_scroll()
         if streaming:
             target = self._active_stream
             if target is None:
@@ -277,6 +292,8 @@ class ChatPanel(QWidgetBase):
                 target.tool_traces.extend(message.tool_traces)
             self._trim_history()
             self._refresh_history_widget()
+            if should_autoscroll:
+                self._scroll_history_to_bottom(force=True)
             return target
 
         if self._active_stream is not None:
@@ -290,11 +307,15 @@ class ChatPanel(QWidgetBase):
             self._active_stream = None
             self._trim_history()
             self._refresh_history_widget()
+            if should_autoscroll:
+                self._scroll_history_to_bottom(force=True)
             return target
 
         self._messages.append(message)
         self._trim_history()
         self._refresh_history_widget()
+        if should_autoscroll:
+            self._scroll_history_to_bottom(force=True)
         return message
 
     def show_tool_trace(self, trace: ToolTrace) -> ToolTrace:
@@ -317,6 +338,7 @@ class ChatPanel(QWidgetBase):
         self._messages = list(messages)
         self._trim_history()
         self._refresh_history_widget()
+        self._scroll_history_to_bottom(force=True)
 
     # ------------------------------------------------------------------
     # Suggestions management
@@ -462,23 +484,7 @@ class ChatPanel(QWidgetBase):
         layout.setSpacing(10)
 
         self._history_widget = QListWidget(self)
-        self._history_widget.setObjectName("tb-chat-history")
-        self._history_widget.setAlternatingRowColors(False)
-        self._history_widget.setSpacing(4)
-        if QAbstractItemView is not None:
-            try:
-                self._history_widget.setSelectionMode(QAbstractItemView.NoSelection)
-            except Exception:  # pragma: no cover - Qt defensive guard
-                pass
-        if Qt is not None:
-            try:
-                self._history_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            except Exception:  # pragma: no cover - Qt defensive guard
-                pass
-        try:
-            self._history_widget.setWordWrap(True)
-        except Exception:  # pragma: no cover - Qt defensive guard
-            pass
+        self._configure_history_widget()
         layout.addWidget(self._history_widget, 1)
 
         composer_frame = QFrame(self)
@@ -540,6 +546,7 @@ class ChatPanel(QWidgetBase):
         except Exception:  # pragma: no cover - Qt defensive guard
             composer_fixed_height = None
         composer_shell_layout.addWidget(self._composer_widget, 1)
+        self._install_composer_shortcuts()
 
         input_row.addWidget(composer_shell, 1)
 
@@ -587,6 +594,51 @@ class ChatPanel(QWidgetBase):
             layout.addWidget(self._tool_trace_widget)
             self._sync_tool_trace_visibility()
 
+    def _install_composer_shortcuts(self) -> None:
+        widget = self._composer_widget
+        if widget is None:
+            return
+        installer = getattr(widget, "installEventFilter", None)
+        if not callable(installer):
+            return
+        try:
+            installer(self)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+
+    def _configure_history_widget(self) -> None:
+        widget = self._history_widget
+        if widget is None:
+            return
+        try:
+            widget.setObjectName("tb-chat-history")
+            widget.setAlternatingRowColors(False)
+            widget.setSpacing(4)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+        if QAbstractItemView is not None:
+            try:
+                widget.setSelectionMode(QAbstractItemView.NoSelection)
+                widget.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+        if Qt is not None:
+            try:
+                widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+        try:
+            widget.setWordWrap(True)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+        # Reserve a little empty space after the final chat bubble so the
+        # scrollbar can travel far enough for the bubble to be fully visible.
+        try:
+            widget.setViewportMargins(0, 0, 0, self.HISTORY_BOTTOM_PADDING)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+        self._configure_history_scrollbar(widget)
+
     def _emit_request(self, prompt: str, metadata: dict[str, Any]) -> None:
         for listener in list(self._request_listeners):
             listener(prompt, metadata)
@@ -625,6 +677,68 @@ class ChatPanel(QWidgetBase):
                 widget.setItemWidget(item, bubble_widget)
         finally:  # pragma: no branch - ensure unblock
             widget.blockSignals(False)
+
+    def _configure_history_scrollbar(self, widget: Any) -> None:
+        if widget is None:
+            return
+        getter = getattr(widget, "verticalScrollBar", None)
+        if not callable(getter):
+            return
+        try:
+            scrollbar = cast(Any, getter())
+        except Exception:  # pragma: no cover - Qt defensive guard
+            return
+        if scrollbar is None:
+            return
+        try:
+            scrollbar.setSingleStep(self.SMOOTH_SCROLL_STEP)
+            scrollbar.setPageStep(self.SMOOTH_SCROLL_PAGE)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+
+    def _should_auto_scroll(self) -> bool:
+        widget = self._history_widget
+        if widget is None:
+            return True
+        getter = getattr(widget, "verticalScrollBar", None)
+        if not callable(getter):
+            return True
+        try:
+            scrollbar = cast(Any, getter())
+        except Exception:  # pragma: no cover - Qt defensive guard
+            return True
+        if scrollbar is None:
+            return True
+        try:
+            maximum = int(scrollbar.maximum())
+            value = int(scrollbar.value())
+        except Exception:  # pragma: no cover - Qt defensive guard
+            return True
+        return (maximum - value) <= self.AUTOLOCK_THRESHOLD
+
+    def _scroll_history_to_bottom(self, *, force: bool = False) -> None:
+        widget = self._history_widget
+        if widget is None:
+            return
+        if not force and not self._should_auto_scroll():
+            return
+        try:
+            widget.scrollToBottom()
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+        getter = getattr(widget, "verticalScrollBar", None)
+        if not callable(getter):
+            return
+        try:
+            scrollbar = cast(Any, getter())
+        except Exception:  # pragma: no cover - Qt defensive guard
+            return
+        if scrollbar is None:
+            return
+        try:
+            scrollbar.setValue(scrollbar.maximum())
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
 
     def _refresh_suggestion_widget(self) -> None:
         widget = self._suggestion_widget
@@ -779,6 +893,102 @@ class ChatPanel(QWidgetBase):
     def _emit_suggestion_panel_event(self, is_open: bool) -> None:
         for listener in list(self._suggestion_panel_listeners):
             listener(is_open)
+
+    def eventFilter(self, obj: Any, event: Any) -> bool:  # type: ignore[override]
+        if obj is self._composer_widget:
+            event_type = self._extract_event_type(event)
+            keypress_code = self._coerce_int(getattr(QEvent, "KeyPress", None), FALLBACK_KEY_PRESS_EVENT)
+            if event_type is not None and keypress_code is not None and event_type == keypress_code:
+                key_code = self._extract_event_code(event, "key")
+                modifier_code = self._extract_event_code(event, "modifiers")
+                if self._handle_composer_key_event(key_code, modifier_code):
+                    try:
+                        event.accept()
+                    except Exception:  # pragma: no cover - Qt defensive guard
+                        pass
+                    return True
+        parent_filter = getattr(super(), "eventFilter", None)
+        if callable(parent_filter):
+            try:
+                return bool(parent_filter(obj, event))
+            except Exception:  # pragma: no cover - Qt defensive guard
+                return False
+        return False
+
+    def _handle_composer_key_event(self, key: Optional[int], modifiers: Optional[int]) -> bool:
+        if key is None or modifiers is None:
+            return False
+
+        enter_keys: set[int] = set(FALLBACK_ENTER_KEYS)
+        qt_return = self._coerce_int(getattr(Qt, "Key_Return", None))
+        if qt_return is not None:
+            enter_keys.add(qt_return)
+        qt_enter = self._coerce_int(getattr(Qt, "Key_Enter", None))
+        if qt_enter is not None:
+            enter_keys.add(qt_enter)
+
+        if key not in enter_keys:
+            return False
+
+        shift_mask = self._coerce_int(getattr(Qt, "ShiftModifier", None), FALLBACK_SHIFT_MODIFIER)
+        modifiers_int = self._coerce_int(modifiers, 0) or 0
+
+        if shift_mask and (modifiers_int & shift_mask):
+            return False
+
+        self._handle_send_clicked()
+        return True
+
+    def _extract_event_type(self, event: Any) -> Optional[int]:
+        if event is None:
+            return None
+        getter = getattr(event, "type", None)
+        if not callable(getter):
+            return None
+        try:
+            value = getter()
+        except Exception:  # pragma: no cover - Qt defensive guard
+            return None
+        return self._coerce_int(value)
+
+    def _extract_event_code(self, event: Any, attr: str) -> Optional[int]:
+        if event is None:
+            return None
+        getter = getattr(event, attr, None)
+        if not callable(getter):
+            return None
+        try:
+            value = getter()
+        except Exception:  # pragma: no cover - Qt defensive guard
+            return None
+        return self._coerce_int(value)
+
+    @staticmethod
+    def _coerce_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except Exception:
+            pass
+        candidate = getattr(value, "value", None)
+        if candidate is not None:
+            try:
+                return int(candidate)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+        return default
+
+    def resizeEvent(self, event: Any) -> None:  # type: ignore[override]
+        """Ensure chat bubbles adapt to the latest viewport width on resize."""
+
+        parent_resize = getattr(super(), "resizeEvent", None)
+        if callable(parent_resize):
+            try:
+                parent_resize(event)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
+        self._refresh_history_widget()
 
     # Qt callbacks ----------------------------------------------------
     def _handle_send_clicked(self) -> None:

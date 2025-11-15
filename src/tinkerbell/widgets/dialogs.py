@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -198,6 +199,16 @@ class SettingsDialog(QDialog):
         self._tool_panel_checkbox.setChecked(
             bool(getattr(self._original, "show_tool_activity_panel", False))
         )
+        self._max_tool_iterations_input = QSpinBox()
+        self._max_tool_iterations_input.setObjectName("max_tool_iterations_input")
+        self._max_tool_iterations_input.setRange(1, 25)
+        self._max_tool_iterations_input.setValue(
+            max(1, int(getattr(self._original, "max_tool_iterations", 8) or 8))
+        )
+        self._max_tool_iterations_input.setSuffix(" loops")
+        self._max_tool_iterations_input.setToolTip(
+            "Maximum times the agent may invoke tools before returning a response."
+        )
 
         form_layout = QFormLayout()
         form_layout.addRow("Base URL", self._base_url_input)
@@ -217,6 +228,7 @@ class SettingsDialog(QDialog):
         form_layout.addRow("Theme", self._theme_input)
         form_layout.addRow("Debug", self._debug_checkbox)
         form_layout.addRow("Tool Traces", self._tool_panel_checkbox)
+        form_layout.addRow("Max Tool Iterations", self._max_tool_iterations_input)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form_layout)
@@ -293,6 +305,7 @@ class SettingsDialog(QDialog):
         theme = self._theme_input.text().strip() or self._original.theme
         debug_logging = self._debug_checkbox.isChecked()
         show_tool_activity_panel = self._tool_panel_checkbox.isChecked()
+        max_tool_iterations = int(self._max_tool_iterations_input.value())
         return replace(
             self._original,
             base_url=base_url,
@@ -302,6 +315,7 @@ class SettingsDialog(QDialog):
             theme=theme,
             debug_logging=debug_logging,
             show_tool_activity_panel=show_tool_activity_panel,
+            max_tool_iterations=max_tool_iterations,
         )
 
     # ------------------------------------------------------------------

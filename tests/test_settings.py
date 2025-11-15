@@ -33,6 +33,7 @@ def test_save_and_load_roundtrip(tmp_path: Path) -> None:
         recent_files=["notes.md"],
         unsaved_snapshot={"text": "draft", "language": "markdown", "selection": [0, 5]},
         unsaved_snapshots={"/tmp/demo.md": {"text": "draft", "language": "markdown", "selection": [0, 5]}},
+        max_tool_iterations=12,
     )
 
     store.save(original)

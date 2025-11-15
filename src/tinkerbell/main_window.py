@@ -22,6 +22,7 @@ from .utils import file_io, logging as logging_utils
 from .widgets.status_bar import StatusBar
 from .ai.tools.document_snapshot import DocumentSnapshotTool
 from .ai.tools.document_edit import DocumentEditTool
+from .ai.tools.search_replace import SearchReplaceTool
 from .ai.tools.validation import validate_snippet
 
 if TYPE_CHECKING:  # pragma: no cover - import only for static analysis
@@ -411,6 +412,56 @@ class MainWindow(QMainWindow):
                 parameters=self._directive_parameters_schema(),
             )
 
+            search_tool = SearchReplaceTool(bridge=self._bridge)
+            register(
+                "search_replace",
+                search_tool,
+                description=(
+                    "Search the current document or selection and optionally apply replacements with regex/literal matching."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Text or regex pattern to find.",
+                        },
+                        "replacement": {
+                            "type": "string",
+                            "description": "Content that will replace each match.",
+                        },
+                        "is_regex": {
+                            "type": "boolean",
+                            "description": "Interpret the pattern as a regular expression.",
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["document", "selection"],
+                            "description": "Limit replacements to the entire document or just the current selection.",
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "description": "When true, do not apply edits—only preview the outcome.",
+                        },
+                        "max_replacements": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Optional cap on the number of replacements to perform.",
+                        },
+                        "match_case": {
+                            "type": "boolean",
+                            "description": "Respect character casing when matching (defaults to true).",
+                        },
+                        "whole_word": {
+                            "type": "boolean",
+                            "description": "Only match full words when true.",
+                        },
+                    },
+                    "required": ["pattern", "replacement"],
+                    "additionalProperties": False,
+                },
+            )
+
             register(
                 "validate_snippet",
                 validate_snippet,
@@ -433,7 +484,9 @@ class MainWindow(QMainWindow):
                 },
             )
 
-            _LOGGER.debug("Default AI tools registered: document_snapshot, document_edit, validate_snippet")
+            _LOGGER.debug(
+                "Default AI tools registered: document_snapshot, document_edit, search_replace, validate_snippet"
+            )
         except Exception as exc:  # pragma: no cover - defensive logging
             _LOGGER.warning("Failed to register default AI tools: %s", exc)
 
@@ -503,11 +556,23 @@ class MainWindow(QMainWindow):
 
     def _process_stream_event(self, event: "AIStreamEvent") -> None:
         event_type = getattr(event, "type", "") or ""
-        if event_type in {"content.delta", "content.done", "refusal.delta", "refusal.done"}:
-            chunk = getattr(event, "content", None)
+        if event_type in {"content.delta", "refusal.delta"}:
+            chunk = self._coerce_stream_text(getattr(event, "content", None))
             if chunk:
                 self._chat_panel.append_ai_message(
-                    ChatMessage(role="assistant", content=str(chunk)),
+                    ChatMessage(role="assistant", content=chunk),
+                    streaming=True,
+                )
+                self._ai_stream_active = True
+            return
+
+        if event_type in {"content.done", "refusal.done"}:
+            if self._ai_stream_active:
+                return
+            chunk = self._coerce_stream_text(getattr(event, "content", None))
+            if chunk:
+                self._chat_panel.append_ai_message(
+                    ChatMessage(role="assistant", content=chunk),
                     streaming=True,
                 )
                 self._ai_stream_active = True
@@ -523,6 +588,30 @@ class MainWindow(QMainWindow):
                 output_summary=(getattr(event, "tool_arguments", None) or arguments)[:120],
             )
             self._chat_panel.show_tool_trace(trace)
+
+    def _coerce_stream_text(self, payload: Any) -> str:
+        if payload is None:
+            return ""
+        if isinstance(payload, str):
+            return payload
+        if isinstance(payload, Mapping):
+            for key in ("text", "content", "value"):
+                if key in payload:
+                    text = self._coerce_stream_text(payload[key])
+                    if text:
+                        return text
+        if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+            parts = [self._coerce_stream_text(item) for item in payload]
+            return "".join(part for part in parts if part)
+        text_attr = getattr(payload, "text", None)
+        if text_attr:
+            return self._coerce_stream_text(text_attr)
+        content_attr = getattr(payload, "content", None)
+        if content_attr is not None and content_attr is not payload:
+            text = self._coerce_stream_text(content_attr)
+            if text:
+                return text
+        return str(payload)
 
     def _finalize_ai_response(self, content: str) -> None:
         if self._ai_stream_active:
@@ -1264,6 +1353,24 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # pragma: no cover - defensive logging
             _LOGGER.debug("Unable to update AI client debug flag: %s", exc)
 
+    def _apply_max_tool_iterations(self, controller: Any, limit: int) -> None:
+        setter = getattr(controller, "set_max_tool_iterations", None)
+        if not callable(setter):
+            return
+        try:
+            setter(limit)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to update max tool iterations: %s", exc)
+
+    @staticmethod
+    def _resolve_max_tool_iterations(settings: Settings | None) -> int:
+        raw = getattr(settings, "max_tool_iterations", 8) if settings else 8
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 8
+        return max(1, min(value, 50))
+
     def _apply_debug_logging_setting(self, settings: Settings) -> None:
         new_debug = bool(getattr(settings, "debug_logging", False))
         if new_debug != self._debug_logging_enabled:
@@ -1324,6 +1431,7 @@ class MainWindow(QMainWindow):
 
         signature = self._ai_settings_signature(settings)
         controller = self._context.ai_controller
+        iteration_limit = self._resolve_max_tool_iterations(settings)
 
         if controller is None:
             controller = self._build_ai_controller_from_settings(settings)
@@ -1338,6 +1446,9 @@ class MainWindow(QMainWindow):
                 return
             controller.update_client(client)
             self._ai_client_signature = signature
+
+        if controller is not None:
+            self._apply_max_tool_iterations(controller, iteration_limit)
 
         self._update_ai_debug_logging(bool(getattr(settings, "debug_logging", False)))
 
@@ -1399,7 +1510,8 @@ class MainWindow(QMainWindow):
             return None
 
         try:
-            return AIController(client=client)
+            limit = self._resolve_max_tool_iterations(settings)
+            return AIController(client=client, max_tool_iterations=limit)
         except Exception as exc:
             _LOGGER.warning("Failed to initialize AI controller: %s", exc)
             return None

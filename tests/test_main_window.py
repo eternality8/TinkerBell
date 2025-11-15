@@ -599,13 +599,22 @@ class _StubAIController:
         self.client = SimpleNamespace(settings=SimpleNamespace(debug_logging=False))
         self.suggestion_calls: list[dict[str, Any]] = []
         self.suggestion_responses: list[list[str]] = []
+        self.stream_scripts: list[list[Any]] = []
+        self.response_texts: list[str] = []
 
     async def run_chat(self, prompt: str, snapshot: dict, *, metadata=None, on_event=None) -> dict:
         self.prompts.append(prompt)
         if on_event is not None:
-            await on_event(SimpleNamespace(type="content.delta", content="Hello "))
-            await on_event(SimpleNamespace(type="content.done", content="world!"))
-        return {"response": "Hello world!"}
+            script = self.stream_scripts.pop(0) if self.stream_scripts else None
+            events = script or [
+                SimpleNamespace(type="content.delta", content="Hello "),
+                SimpleNamespace(type="content.delta", content="world!"),
+                SimpleNamespace(type="content.done", content="Hello world!"),
+            ]
+            for payload in events:
+                await on_event(payload)
+        response_text = self.response_texts.pop(0) if self.response_texts else "Hello world!"
+        return {"response": response_text}
 
     def cancel(self) -> None:
         self.cancelled = True
@@ -662,6 +671,44 @@ def test_chat_prompt_routes_to_ai_controller():
     assert history[-1].role == "assistant"
     assert "hello world" in history[-1].content.lower()
     assert controller.prompts == ["Summarize this"]
+
+
+def test_stream_done_event_does_not_duplicate_text():
+    controller = _StubAIController()
+    controller.stream_scripts.append(
+        [
+            SimpleNamespace(
+                type="content.delta",
+                content="Ooh, I'd love to help you write a story! Let me take a peek… ",
+            ),
+            SimpleNamespace(
+                type="content.delta",
+                content="Ooh, I see we have a fresh, blank canvas to work with! ",
+            ),
+            SimpleNamespace(
+                type="content.done",
+                content=(
+                    "Ooh, I'd love to help you write a story! Let me take a peek… "
+                    "Ooh, I see we have a fresh, blank canvas to work with! "
+                ),
+            ),
+        ]
+    )
+    controller.response_texts.append(
+        "Ooh, I'd love to help you write a story! Let me take a peek… "
+        "Ooh, I see we have a fresh, blank canvas to work with! "
+    )
+
+    window = _make_window(controller)
+    panel = window.chat_panel
+    panel.set_composer_text("Tell me a story")
+    panel.send_prompt()
+
+    assistant_messages = [msg for msg in panel.history() if msg.role == "assistant"]
+    assert assistant_messages
+    final_text = assistant_messages[-1].content
+    assert final_text.count("Ooh, I'd love to help you write a story!") == 1
+    assert final_text.count("Ooh, I see we have a fresh, blank canvas") == 1
 
 
 def test_default_ai_tools_register_when_controller_available():

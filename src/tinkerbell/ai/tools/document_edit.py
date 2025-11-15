@@ -5,12 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
-
-class EditDirective(Protocol):
-    """Protocol describing edit directives."""
-
-    action: str
-    content: str
+from ...chat.commands import parse_agent_payload
+from ...chat.message_model import EditDirective
 
 
 class Bridge(Protocol):
@@ -19,6 +15,17 @@ class Bridge(Protocol):
     def queue_edit(self, directive: EditDirective | Mapping[str, Any]) -> None:
         ...
 
+    @property
+    def last_diff_summary(self) -> str | None:
+        ...
+
+    @property
+    def last_snapshot_version(self) -> str | None:
+        ...
+
+
+DirectiveInput = EditDirective | Mapping[str, Any] | str | bytes
+
 
 @dataclass(slots=True)
 class DocumentEditTool:
@@ -26,7 +33,25 @@ class DocumentEditTool:
 
     bridge: Bridge
 
-    def run(self, directive: EditDirective | Mapping[str, Any]) -> str:
-        self.bridge.queue_edit(directive)
+    def run(self, directive: DirectiveInput) -> str:
+        payload = self._coerce_input(directive)
+        self.bridge.queue_edit(payload)
+
+        diff = getattr(self.bridge, "last_diff_summary", None)
+        version = getattr(self.bridge, "last_snapshot_version", None)
+        if diff and version:
+            return f"applied: {diff} (version={version})"
+        if diff:
+            return f"applied: {diff}"
+        if version:
+            return f"queued (version={version})"
         return "queued"
+
+    @staticmethod
+    def _coerce_input(directive: DirectiveInput) -> EditDirective | Mapping[str, Any]:
+        if isinstance(directive, (str, bytes)):
+            return parse_agent_payload(directive)
+        if isinstance(directive, (Mapping, EditDirective)):
+            return directive
+        raise TypeError("Directive must be a mapping, EditDirective, or JSON string.")
 
