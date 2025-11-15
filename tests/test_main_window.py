@@ -61,47 +61,12 @@ def test_chat_panel_visibility_controlled_by_settings():
     assert window.chat_panel.tool_activity_visible is True
 
 
-def test_patch_mode_setting_passes_to_controller_on_startup():
+def test_document_edit_tool_runs_in_patch_only_mode():
     controller = _StubAIController()
-    _make_window(controller, settings=Settings(api_key="key", use_patch_edits=False))
-
-    assert controller.patch_mode_values and controller.patch_mode_values[-1] is False
-
-
-def test_patch_mode_toggle_updates_controller(monkeypatch: pytest.MonkeyPatch) -> None:
-    controller = _StubAIController()
-    window = _make_window(controller, settings=Settings(api_key="key", use_patch_edits=True))
-    controller.patch_mode_values.clear()
-    updated = Settings(api_key="key", use_patch_edits=False)
-
-    monkeypatch.setattr(
-        window,
-        "_show_settings_dialog",
-        lambda current: SimpleNamespace(accepted=True, settings=updated),
-    )
-
-    window._handle_settings_requested()
-
-    assert controller.patch_mode_values and controller.patch_mode_values[-1] is False
-
-
-def test_patch_mode_toggle_updates_document_edit_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    controller = _StubAIController()
-    window = _make_window(controller, settings=Settings(api_key="key", use_patch_edits=True))
+    _make_window(controller, settings=Settings(api_key="key"))
     edit_tool = controller.registered_tools["document_edit"]["impl"]
+
     assert getattr(edit_tool, "patch_only", None) is True
-
-    updated = Settings(api_key="key", use_patch_edits=False)
-
-    monkeypatch.setattr(
-        window,
-        "_show_settings_dialog",
-        lambda current: SimpleNamespace(accepted=True, settings=updated),
-    )
-
-    window._handle_settings_requested()
-
-    assert edit_tool.patch_only is False
 
 
 def test_settings_dialog_toggle_updates_tool_panel(monkeypatch: pytest.MonkeyPatch):
@@ -682,7 +647,6 @@ class _StubAIController:
         self.stream_scripts: list[list[Any]] = []
         self.response_texts: list[str] = []
         self.history_payloads: list[Sequence[Mapping[str, str]] | None] = []
-        self.patch_mode_values: list[bool] = []
 
     async def run_chat(
         self,
@@ -739,9 +703,6 @@ class _StubAIController:
     def update_client(self, client: Any) -> None:
         self.client = client
         self.updated_clients.append(client)
-
-    def set_patch_mode(self, enabled: bool) -> None:
-        self.patch_mode_values.append(bool(enabled))
 
 
 def test_chat_prompt_without_controller_emits_notice():

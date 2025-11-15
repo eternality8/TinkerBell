@@ -34,7 +34,7 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     model_combo = dialog.findChild(QComboBox, "model_combo")
     organization_input = dialog.findChild(QLineEdit, "organization_input")
     theme_input = dialog.findChild(QLineEdit, "theme_input")
-    patch_checkbox = dialog.findChild(QCheckBox, "patch_edit_checkbox")
+    tool_checkbox = dialog.findChild(QCheckBox, "tool_activity_checkbox")
     timeout_input = dialog.findChild(QDoubleSpinBox, "request_timeout_input")
 
     assert base_input is not None
@@ -42,7 +42,7 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert model_combo is not None
     assert organization_input is not None
     assert theme_input is not None
-    assert patch_checkbox is not None
+    assert tool_checkbox is not None
     assert timeout_input is not None
 
     base_input.setText("https://example.com/v2")
@@ -50,7 +50,7 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     model_combo.setEditText("gpt-custom")
     organization_input.setText("acme")
     theme_input.setText("dracula")
-    patch_checkbox.setChecked(False)
+    tool_checkbox.setChecked(True)
     timeout_input.setValue(42.5)
 
     updated = dialog.gather_settings()
@@ -60,7 +60,7 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert updated.model == "gpt-custom"
     assert updated.organization == "acme"
     assert updated.theme == "dracula"
-    assert updated.use_patch_edits is False
+    assert updated.show_tool_activity_panel is True
     assert updated.request_timeout == pytest.approx(42.5)
 
 

@@ -255,7 +255,6 @@ def _build_ai_controller(settings: Settings, *, debug_logging: bool = False) -> 
     return AIController(
         client=client,
         max_tool_iterations=limit,
-        use_patch_edits=bool(getattr(settings, "use_patch_edits", True)),
     )
 
 

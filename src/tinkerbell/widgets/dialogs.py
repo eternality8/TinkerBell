@@ -200,9 +200,6 @@ class SettingsDialog(QDialog):
         self._tool_panel_checkbox.setChecked(
             bool(getattr(self._original, "show_tool_activity_panel", False))
         )
-        self._patch_mode_checkbox = QCheckBox("Prefer diff-based patch edits (beta)")
-        self._patch_mode_checkbox.setObjectName("patch_edit_checkbox")
-        self._patch_mode_checkbox.setChecked(bool(getattr(self._original, "use_patch_edits", True)))
         self._max_tool_iterations_input = QSpinBox()
         self._max_tool_iterations_input.setObjectName("max_tool_iterations_input")
         self._max_tool_iterations_input.setRange(1, 25)
@@ -243,7 +240,6 @@ class SettingsDialog(QDialog):
         form_layout.addRow("Theme", self._theme_input)
         form_layout.addRow("Debug", self._debug_checkbox)
         form_layout.addRow("Tool Traces", self._tool_panel_checkbox)
-        form_layout.addRow("Patch Mode", self._patch_mode_checkbox)
         form_layout.addRow("Max Tool Iterations", self._max_tool_iterations_input)
         form_layout.addRow("AI Timeout", self._request_timeout_input)
 
@@ -322,7 +318,6 @@ class SettingsDialog(QDialog):
         theme = self._theme_input.text().strip() or self._original.theme
         debug_logging = self._debug_checkbox.isChecked()
         show_tool_activity_panel = self._tool_panel_checkbox.isChecked()
-        use_patch_edits = self._patch_mode_checkbox.isChecked()
         max_tool_iterations = int(self._max_tool_iterations_input.value())
         request_timeout = float(self._request_timeout_input.value())
         return replace(
@@ -334,7 +329,6 @@ class SettingsDialog(QDialog):
             theme=theme,
             debug_logging=debug_logging,
             show_tool_activity_panel=show_tool_activity_panel,
-            use_patch_edits=use_patch_edits,
             max_tool_iterations=max_tool_iterations,
             request_timeout=request_timeout,
         )

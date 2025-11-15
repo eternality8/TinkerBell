@@ -93,12 +93,10 @@ class AIController:
     client: AIClient
     tools: MutableMapping[str, ToolRegistration] = field(default_factory=dict)
     max_tool_iterations: int = 8
-    use_patch_edits: bool = True
     diff_builder_reminder_threshold: int = 3
     max_pending_patch_reminders: int = 2
     _graph: Dict[str, Any] = field(init=False, repr=False)
     _max_tool_iterations: int = field(init=False, repr=False)
-    _use_patch_edits: bool = field(init=False, repr=False, default=True)
     _active_task: asyncio.Task[dict] | None = field(default=None, init=False, repr=False)
     _task_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
 
@@ -113,7 +111,6 @@ class AIController:
             self.tools = normalized
         self._max_tool_iterations = self._normalize_iterations(self.max_tool_iterations)
         self.max_tool_iterations = self._max_tool_iterations
-        self._use_patch_edits = bool(self.use_patch_edits)
         self._rebuild_graph()
 
     @property
@@ -166,11 +163,6 @@ class AIController:
         """Swap the underlying AI client (e.g., when settings change)."""
 
         self.client = client
-
-    def set_patch_mode(self, enabled: bool) -> None:
-        """Toggle whether the system prompt instructs models to use diff-based patches."""
-
-        self._use_patch_edits = bool(enabled)
 
     async def run_chat(
         self,
@@ -455,7 +447,7 @@ class AIController:
         history: Sequence[Mapping[str, Any]] | None = None,
     ) -> list[dict[str, str]]:
         user_prompt = prompts.format_user_prompt(prompt, dict(snapshot))
-        system_text = prompts.base_system_prompt(patch_edits_enabled=self._use_patch_edits)
+        system_text = prompts.base_system_prompt()
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_text},
         ]

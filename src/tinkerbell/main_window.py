@@ -193,9 +193,6 @@ class MainWindow(QMainWindow):
         self._snapshot_persistence_block = 0
         self._debug_logging_enabled = bool(getattr(initial_settings, "debug_logging", False))
         self._active_theme = (getattr(initial_settings, "theme", "") or "default").strip() or "default"
-        patch_preference = bool(getattr(initial_settings, "use_patch_edits", True)) if initial_settings else True
-        self._patch_mode_enabled = patch_preference
-        self._document_edit_tool: DocumentEditTool | None = None
         self._auto_patch_tool: DocumentApplyPatchTool | None = None
         self._ai_client_signature: tuple[Any, ...] | None = self._ai_settings_signature(initial_settings)
         self._initialize_ui()
@@ -433,8 +430,6 @@ class MainWindow(QMainWindow):
             _LOGGER.debug("AI controller does not expose register_tool; skipping tool wiring.")
             return
 
-        self._apply_controller_patch_mode(controller)
-
         try:
             snapshot_tool = DocumentSnapshotTool(provider=self._bridge)
             register(
@@ -455,8 +450,7 @@ class MainWindow(QMainWindow):
                 },
             )
 
-            edit_tool = DocumentEditTool(bridge=self._bridge, patch_only=self._patch_mode_enabled)
-            self._document_edit_tool = edit_tool
+            edit_tool = DocumentEditTool(bridge=self._bridge, patch_only=True)
             register(
                 "document_edit",
                 edit_tool,
@@ -465,7 +459,6 @@ class MainWindow(QMainWindow):
                 ),
                 parameters=self._directive_parameters_schema(),
             )
-            self._update_tool_patch_mode()
 
             apply_patch_tool = DocumentApplyPatchTool(bridge=self._bridge, edit_tool=edit_tool)
             self._auto_patch_tool = apply_patch_tool
@@ -1628,7 +1621,6 @@ class MainWindow(QMainWindow):
         self._apply_chat_panel_settings(settings)
         self._apply_debug_logging_setting(settings)
         self._apply_theme_setting(settings)
-        self._apply_patch_mode_setting(settings)
         self._refresh_ai_runtime(settings)
 
     def _apply_chat_panel_settings(self, settings: Settings) -> None:
@@ -1636,32 +1628,6 @@ class MainWindow(QMainWindow):
         setter = getattr(self._chat_panel, "set_tool_activity_visibility", None)
         if callable(setter):
             setter(visible)
-
-    def _apply_patch_mode_setting(self, settings: Settings) -> None:
-        enabled = bool(getattr(settings, "use_patch_edits", True))
-        self._patch_mode_enabled = enabled
-        self._apply_controller_patch_mode(self._context.ai_controller)
-        self._update_tool_patch_mode()
-
-    def _apply_controller_patch_mode(self, controller: Any | None) -> None:
-        if controller is None:
-            return
-        setter = getattr(controller, "set_patch_mode", None)
-        if not callable(setter):
-            return
-        try:
-            setter(self._patch_mode_enabled)
-        except Exception as exc:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to update controller patch mode: %s", exc)
-
-    def _update_tool_patch_mode(self) -> None:
-        tool = self._document_edit_tool
-        if tool is None:
-            return
-        try:
-            tool.patch_only = self._patch_mode_enabled
-        except Exception as exc:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to update document_edit tool patch mode: %s", exc)
 
     def _update_logging_configuration(self, debug_enabled: bool) -> None:
         level = logging.DEBUG if debug_enabled else logging.INFO
@@ -1782,7 +1748,6 @@ class MainWindow(QMainWindow):
             self._ai_client_signature = signature
 
         if controller is not None:
-            self._apply_controller_patch_mode(controller)
             self._apply_max_tool_iterations(controller, iteration_limit)
 
         self._update_ai_debug_logging(bool(getattr(settings, "debug_logging", False)))
@@ -1849,7 +1814,6 @@ class MainWindow(QMainWindow):
             return AIController(
                 client=client,
                 max_tool_iterations=limit,
-                use_patch_edits=bool(getattr(settings, "use_patch_edits", True)),
             )
         except Exception as exc:
             _LOGGER.warning("Failed to initialize AI controller: %s", exc)

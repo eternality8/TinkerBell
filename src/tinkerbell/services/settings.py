@@ -28,7 +28,6 @@ _ENV_OVERRIDES: Mapping[str, str] = {
 _BOOL_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_DEBUG_LOGGING": "debug_logging",
     "TINKERBELL_TOOL_ACTIVITY_PANEL": "show_tool_activity_panel",
-    "TINKERBELL_USE_PATCH_EDITS": "use_patch_edits",
 }
 _FLOAT_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_REQUEST_TIMEOUT": "request_timeout",
@@ -63,7 +62,6 @@ class Settings:
     window_geometry: str | None = None
     debug_logging: bool = False
     show_tool_activity_panel: bool = False
-    use_patch_edits: bool = True
 
 
 class SettingsStore:
