@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Mapping, Protocol
 
 
 class EditDirective(Protocol):
@@ -16,7 +16,7 @@ class EditDirective(Protocol):
 class Bridge(Protocol):
     """Subset of the document bridge interface used by the tool."""
 
-    def queue_edit(self, directive: EditDirective) -> None:
+    def queue_edit(self, directive: EditDirective | Mapping[str, Any]) -> None:
         ...
 
 
@@ -26,7 +26,7 @@ class DocumentEditTool:
 
     bridge: Bridge
 
-    def run(self, directive: EditDirective) -> str:
+    def run(self, directive: EditDirective | Mapping[str, Any]) -> str:
         self.bridge.queue_edit(directive)
         return "queued"
 

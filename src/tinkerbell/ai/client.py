@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, Iterable, List, Mapping, MutableMapping, Sequence, cast
@@ -35,6 +36,7 @@ class ClientSettings:
     retry_max_seconds: float = 6.0
     default_headers: Mapping[str, str] | None = None
     metadata: Mapping[str, str] | None = None
+    debug_logging: bool = False
 
 
 @dataclass(slots=True)
@@ -95,6 +97,8 @@ class AIClient:
             self._settings.model,
             message_count,
         )
+        if self._settings.debug_logging:
+            self._log_prompt_payload(payload)
 
         async for attempt in self._retrying():
             with attempt:
@@ -251,4 +255,12 @@ class AIClient:
                 parsed=getattr(event, "parsed_arguments", None),
             )
         return None
+
+    def _log_prompt_payload(self, payload: Mapping[str, Any]) -> None:
+        try:
+            serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            LOGGER.debug("AI prompt payload (unserializable): %s", payload)
+        else:
+            LOGGER.debug("AI prompt payload:\n%s", serialized)
 

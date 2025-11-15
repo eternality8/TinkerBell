@@ -190,6 +190,9 @@ class SettingsDialog(QDialog):
         self._organization_input.setObjectName("organization_input")
         self._theme_input = QLineEdit(self._original.theme)
         self._theme_input.setObjectName("theme_input")
+        self._debug_checkbox = QCheckBox("Enable debug logging")
+        self._debug_checkbox.setObjectName("debug_logging_checkbox")
+        self._debug_checkbox.setChecked(self._original.debug_logging)
 
         form_layout = QFormLayout()
         form_layout.addRow("Base URL", self._base_url_input)
@@ -207,6 +210,7 @@ class SettingsDialog(QDialog):
         form_layout.addRow("Model", self._model_combo)
         form_layout.addRow("Organization", self._organization_input)
         form_layout.addRow("Theme", self._theme_input)
+        form_layout.addRow("Debug", self._debug_checkbox)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form_layout)
@@ -281,6 +285,7 @@ class SettingsDialog(QDialog):
         model = self._model_combo.currentText().strip() or self._original.model
         organization = self._organization_input.text().strip() or None
         theme = self._theme_input.text().strip() or self._original.theme
+        debug_logging = self._debug_checkbox.isChecked()
         return replace(
             self._original,
             base_url=base_url,
@@ -288,6 +293,7 @@ class SettingsDialog(QDialog):
             model=model,
             organization=organization,
             theme=theme,
+            debug_logging=debug_logging,
         )
 
     # ------------------------------------------------------------------

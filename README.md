@@ -92,6 +92,7 @@ You can supply OpenAI-compatible credentials in three interchangeable ways:
 	 - `TINKERBELL_BASE_URL` (e.g., `https://api.openai.com/v1` or your proxy)
 	 - `TINKERBELL_MODEL` (defaults to `gpt-4o-mini`)
 	 - `TINKERBELL_THEME` / `TINKERBELL_ORGANIZATION`
+	 - `TINKERBELL_DEBUG_LOGGING` (set to `1`/`true` to force verbose logging and prompt dumps)
 3. **Programmatic injection** – Instantiate `Settings` or `ClientSettings` yourself if you embed TinkerBell in a larger Python workflow.
 
 Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat message. Failures are surfaced in the chat panel and status bar, and logs are written to your platform-specific temp directory.
@@ -135,6 +136,7 @@ You can register custom tools at runtime via `AIController.register_tool`, and t
 
 - **Static analysis**: `ruff`, `black`, and `mypy` configs live in `pyproject.toml`. Run `uv run ruff check .` or `uv run mypy src` as needed.
 - **Logging**: Set `TINKERBELL_DEBUG=1` before launching to enable verbose logs (including Qt message handler output).
+- **Debug prompt logging**: Toggle **Enable debug logging** inside the Settings dialog (or set `TINKERBELL_DEBUG_LOGGING=1`) to emit full AI prompt payloads to the log file for troubleshooting.
 - **Scripts**: `src/tinkerbell/scripts/seed_examples.py` seeds demonstration docs; extend it when adding new showcase flows.
 
 ## Roadmap & contributing

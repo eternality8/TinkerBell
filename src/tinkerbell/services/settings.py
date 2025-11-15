@@ -25,6 +25,10 @@ _ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_THEME": "theme",
     "TINKERBELL_ORGANIZATION": "organization",
 }
+_BOOL_ENV_OVERRIDES: Mapping[str, str] = {
+    "TINKERBELL_DEBUG_LOGGING": "debug_logging",
+}
+_TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
 _API_KEY_FIELD = "api_key_ciphertext"
 
 
@@ -45,9 +49,13 @@ class Settings:
     default_headers: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, str] = field(default_factory=dict)
     recent_files: list[str] = field(default_factory=list)
+    last_open_file: str | None = None
+    unsaved_snapshot: dict[str, Any] | None = None
+    unsaved_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     font_family: str = "JetBrains Mono"
     font_size: int = 13
     window_geometry: str | None = None
+    debug_logging: bool = False
 
 
 class SettingsStore:
@@ -118,6 +126,10 @@ class SettingsStore:
             value = os.environ.get(env_name)
             if value is not None:
                 overrides[field_name] = value
+        for env_name, field_name in _BOOL_ENV_OVERRIDES.items():
+            value = os.environ.get(env_name)
+            if value is not None:
+                overrides[field_name] = value.strip().lower() in _TRUE_VALUES
         if overrides:
             LOGGER.debug("Applying settings overrides from environment: %s", sorted(overrides))
             settings = replace(settings, **overrides)

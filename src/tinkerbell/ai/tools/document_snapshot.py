@@ -9,7 +9,7 @@ from typing import Protocol
 class SnapshotProvider(Protocol):
     """Protocol implemented by the document bridge for retrieving snapshots."""
 
-    def generate_snapshot(self, delta_only: bool = False) -> dict:
+    def generate_snapshot(self, *, delta_only: bool = False) -> dict:
         ...
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Iterable, List, cast
 
 from tinkerbell.ai.agents.executor import AIController
@@ -13,6 +14,7 @@ class _StubClient:
     def __init__(self, events: Iterable[AIStreamEvent]):
         self._events: List[AIStreamEvent] = list(events)
         self.calls: list[dict[str, Any]] = []
+        self.settings: Any = SimpleNamespace(debug_logging=False)
 
     async def stream_chat(self, **kwargs: Any) -> AsyncIterator[AIStreamEvent]:
         self.calls.append(kwargs)
@@ -68,3 +70,23 @@ def test_ai_controller_tracks_registered_tools(sample_snapshot):
 
     result = asyncio.run(run())
     assert result["tool_calls"] == []
+
+
+def test_ai_controller_logs_response_when_debug_enabled(sample_snapshot, caplog):
+    stub_client = _StubClient(
+        [
+            AIStreamEvent(type="content.delta", content="final"),
+            AIStreamEvent(type="content.delta", content=" answer"),
+        ]
+    )
+    stub_client.settings = SimpleNamespace(debug_logging=True)
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    async def run() -> dict:
+        return await controller.run_chat("Explain", sample_snapshot)
+
+    with caplog.at_level("DEBUG"):
+        result = asyncio.run(run())
+
+    assert result["response"] == "final answer"
+    assert any("AI response text" in record.message and "final answer" in record.message for record in caplog.records)

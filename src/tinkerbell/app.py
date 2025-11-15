@@ -28,11 +28,11 @@ class QtRuntime:
     loop: asyncio.AbstractEventLoop
 
 
-def configure_logging(debug: bool = False) -> None:
+def configure_logging(debug: bool = False, *, force: bool = False) -> None:
     """Configure structured logging for the application."""
 
     level = logging.DEBUG if debug else logging.INFO
-    logging_utils.setup_logging(level)
+    logging_utils.setup_logging(level, force=force)
     _LOGGER.debug("Logging configured (level=%s)", logging.getLevelName(level))
     _install_qt_message_handler()
 
@@ -98,9 +98,13 @@ def main() -> None:
     settings_store = SettingsStore(resolved_path)
     settings = load_settings(resolved_path, store=settings_store)
 
+    if settings.debug_logging and not debug:
+        configure_logging(True, force=True)
+        debug = True
+
     _warmup_vector_store()
 
-    ai_controller = _build_ai_controller(settings)
+    ai_controller = _build_ai_controller(settings, debug_logging=debug)
 
     runtime = create_qapp(settings)
     window = MainWindow(
@@ -167,7 +171,7 @@ def _warmup_vector_store() -> None:
         _LOGGER.debug("FAISS import succeeded.")
 
 
-def _build_ai_controller(settings: Settings) -> AIController | None:
+def _build_ai_controller(settings: Settings, *, debug_logging: bool = False) -> AIController | None:
     """Construct the AI controller using the current settings, if possible."""
 
     try:
@@ -182,6 +186,7 @@ def _build_ai_controller(settings: Settings) -> AIController | None:
             retry_max_seconds=settings.retry_max_seconds,
             default_headers=settings.default_headers,
             metadata=settings.metadata,
+            debug_logging=debug_logging or settings.debug_logging,
         )
         client = AIClient(client_settings)
     except Exception as exc:  # pragma: no cover - dependency/config errors

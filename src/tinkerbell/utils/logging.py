@@ -10,7 +10,7 @@ from pathlib import Path
 __all__ = ["setup_logging", "get_logger", "get_log_path"]
 
 _DEFAULT_LOG_DIR = Path.home() / ".tinkerbell" / "logs"
-_NOISY_LOGGERS: tuple[str, ...] = ("asyncio", "httpx", "langchain", "openai")
+_NOISY_LOGGERS: tuple[str, ...] = ("asyncio", "qasync", "httpx", "langchain", "openai")
 _CONFIGURED = False
 _LOG_PATH: Path | None = None
 

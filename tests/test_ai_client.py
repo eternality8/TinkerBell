@@ -165,3 +165,28 @@ async def test_stream_chat_requires_messages() -> None:
     generator = client.stream_chat(messages=[])
     with pytest.raises(ValueError):
         await generator.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_debug_logging_captures_prompt_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = [_FakeEvent(type="content.done", content="done")]
+    fake_client = _make_client(events)
+    client = AIClient(
+        ClientSettings(base_url="http://local", api_key="test", model="debug", debug_logging=True),
+        client=cast(AsyncOpenAI, fake_client),
+    )
+    captured: dict[str, Any] = {}
+
+    async def _noop_handler(event: AIStreamEvent) -> None:  # pragma: no cover - helper
+        del event
+
+    def _capture(payload: Any) -> None:
+        captured["payload"] = payload
+
+    monkeypatch.setattr(client, "_log_prompt_payload", _capture)
+
+    async for _event in client.stream_chat(messages=[{"role": "user", "content": "Hello"}]):
+        await _noop_handler(_event)
+
+    assert "payload" in captured
+    assert captured["payload"]["messages"][0]["content"] == "Hello"

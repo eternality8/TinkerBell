@@ -27,6 +27,7 @@ class ToolRegistration:
     impl: Any
     description: str | None = None
     parameters: Mapping[str, Any] | None = None
+    strict: bool = True
 
     def as_openai_tool(self) -> ChatCompletionToolParam:
         """Return an OpenAI-compatible tool spec for the AI client."""
@@ -52,6 +53,7 @@ class ToolRegistration:
                     "name": self.name,
                     "description": description,
                     "parameters": parameters,
+                    "strict": bool(self.strict),
                 },
             },
         )
@@ -91,10 +93,18 @@ class AIController:
         *,
         description: str | None = None,
         parameters: Mapping[str, Any] | None = None,
+        strict: bool | None = None,
     ) -> None:
         """Register (or replace) a tool available to the agent."""
 
-        self.tools[name] = ToolRegistration(name=name, impl=tool, description=description, parameters=parameters)
+        registration = ToolRegistration(
+            name=name,
+            impl=tool,
+            description=description,
+            parameters=parameters,
+            strict=True if strict is None else bool(strict),
+        )
+        self.tools[name] = registration
         LOGGER.debug("Registered tool: %s", name)
         self._rebuild_graph()
 
@@ -156,6 +166,7 @@ class AIController:
                     )
 
             response_text = "".join(deltas).strip()
+            self._log_response_text(response_text)
             LOGGER.debug("Chat turn complete (chars=%s, tools used=%s)", len(response_text), len(tool_calls))
             return {
                 "prompt": prompt,
@@ -214,6 +225,17 @@ class AIController:
         if runtime_metadata:
             metadata.update(runtime_metadata)
         return metadata or None
+
+    def _log_response_text(self, response_text: str) -> None:
+        settings = getattr(self.client, "settings", None)
+        debug_logging_enabled = bool(getattr(settings, "debug_logging", False)) if settings else False
+        if not debug_logging_enabled:
+            return
+
+        if response_text:
+            LOGGER.debug("AI response text:\n%s", response_text)
+        else:
+            LOGGER.debug("AI response text: <empty>")
 
     async def _dispatch_event(self, event: AIStreamEvent, handler: ToolCallback | None) -> None:
         if handler is None:

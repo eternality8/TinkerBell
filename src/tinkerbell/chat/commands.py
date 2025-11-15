@@ -32,7 +32,7 @@ class ValidationResult:
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*(?P<body>.*)```$", re.IGNORECASE | re.DOTALL)
 _JSON_DECODER = json.JSONDecoder()
 
-_DIRECTIVE_SCHEMA: Dict[str, Any] = {
+DIRECTIVE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "required": ["action", "content"],
     "properties": {
@@ -70,7 +70,7 @@ _DIRECTIVE_SCHEMA: Dict[str, Any] = {
     "additionalProperties": True,
 }
 
-_DIRECTIVE_VALIDATOR = Draft7Validator(_DIRECTIVE_SCHEMA)
+_DIRECTIVE_VALIDATOR = Draft7Validator(DIRECTIVE_SCHEMA)
 
 
 def parse_agent_payload(payload: Mapping[str, Any] | str | bytes) -> Dict[str, Any]:

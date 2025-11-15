@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, TYPE_CHECKING
 
 from .chat.chat_panel import ChatPanel
+from .chat.commands import DIRECTIVE_SCHEMA
 from .chat.message_model import ChatMessage, EditDirective, ToolTrace
-from .editor.document_model import DocumentMetadata, DocumentState
+from .editor.document_model import DocumentMetadata, DocumentState, SelectionRange
 from .editor.editor_widget import EditorWidget
 from .services.bridge import DocumentBridge
 from .services.settings import Settings, SettingsStore
-from .utils import file_io
+from .utils import file_io, logging as logging_utils
 from .widgets.status_bar import StatusBar
+from .ai.tools.document_snapshot import DocumentSnapshotTool
+from .ai.tools.document_edit import DocumentEditTool
+from .ai.tools.validation import validate_snippet
 
 if TYPE_CHECKING:  # pragma: no cover - import only for static analysis
     from .ai.agents.executor import AIController
@@ -138,6 +143,7 @@ class MainWindow(QMainWindow):
     """Primary application window hosting the editor and chat splitter."""
 
     _WINDOW_BASE_TITLE = WINDOW_APP_NAME
+    _UNTITLED_SNAPSHOT_KEY = "__untitled__"
 
     def __init__(self, context: WindowContext):  # noqa: D401 - doc inherited
         super().__init__()
@@ -156,6 +162,12 @@ class MainWindow(QMainWindow):
         self._current_document_path: Optional[Path] = None
         self._ai_task: asyncio.Task[Any] | None = None
         self._ai_stream_active = False
+        self._unsaved_snapshot_digests: dict[str, str] = {}
+        self._snapshot_persistence_block = 0
+        initial_settings = context.settings
+        self._debug_logging_enabled = bool(getattr(initial_settings, "debug_logging", False))
+        self._active_theme = (getattr(initial_settings, "theme", "") or "default").strip() or "default"
+        self._ai_client_signature: tuple[Any, ...] | None = self._ai_settings_signature(initial_settings)
         self._initialize_ui()
 
     # ------------------------------------------------------------------
@@ -175,8 +187,10 @@ class MainWindow(QMainWindow):
         self._toolbars = self._create_toolbars()
         self._install_qt_menus()
         self._wire_signals()
+        self._register_default_ai_tools()
 
         self.update_status("Ready")
+        self._restore_last_session_document()
 
     def _build_splitter(self) -> Any:
         """Create the editor/chat splitter, falling back to a lightweight state."""
@@ -343,6 +357,85 @@ class MainWindow(QMainWindow):
         self._chat_panel.add_request_listener(self._handle_chat_request)
         self._bridge.add_edit_listener(self._handle_edit_applied)
 
+    def _register_default_ai_tools(self) -> None:
+        """Register the default document-aware tools with the AI controller."""
+
+        controller = self._context.ai_controller
+        if controller is None:
+            return
+
+        register = getattr(controller, "register_tool", None)
+        if not callable(register):
+            _LOGGER.debug("AI controller does not expose register_tool; skipping tool wiring.")
+            return
+
+        try:
+            snapshot_tool = DocumentSnapshotTool(provider=self._bridge)
+            register(
+                "document_snapshot",
+                snapshot_tool,
+                description=(
+                    "Return the latest editor snapshot including text, selection, metadata, and diff markers."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "delta_only": {
+                            "type": "boolean",
+                            "description": "Return only fields that changed since the previous snapshot.",
+                        }
+                    },
+                    "additionalProperties": False,
+                },
+            )
+
+            edit_tool = DocumentEditTool(bridge=self._bridge)
+            register(
+                "document_edit",
+                edit_tool,
+                description=(
+                    "Apply a structured edit directive (insert, replace, annotate) against the active document."
+                ),
+                parameters=self._directive_parameters_schema(),
+            )
+
+            register(
+                "validate_snippet",
+                validate_snippet,
+                description="Validate YAML/JSON snippets before inserting them into the document.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "Snippet contents that should be validated.",
+                        },
+                        "fmt": {
+                            "type": "string",
+                            "description": "Declared format of the snippet.",
+                            "enum": ["yaml", "yml", "json"],
+                        },
+                    },
+                    "required": ["text", "fmt"],
+                    "additionalProperties": False,
+                },
+            )
+
+            _LOGGER.debug("Default AI tools registered: document_snapshot, document_edit, validate_snippet")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            _LOGGER.warning("Failed to register default AI tools: %s", exc)
+
+    @staticmethod
+    def _directive_parameters_schema() -> Dict[str, Any]:
+        """Return a copy of the directive schema used by the document edit tool."""
+
+        schema = deepcopy(DIRECTIVE_SCHEMA)
+        schema.setdefault(
+            "description",
+            "Structured edit directive containing action, content, optional rationale, and target range.",
+        )
+        return schema
+
     # ------------------------------------------------------------------
     # AI coordination
     # ------------------------------------------------------------------
@@ -488,8 +581,10 @@ class MainWindow(QMainWindow):
     def _handle_editor_text_changed(self, text: str, state: DocumentState) -> None:
         """Update window title when the editor content or metadata shifts."""
 
-        del text
         self._refresh_window_title(state)
+        if self._snapshot_persistence_block > 0:
+            return
+        self._persist_unsaved_snapshot(state)
 
     def _handle_snapshot_requested(self) -> None:
         """Force a snapshot refresh and log the event."""
@@ -552,6 +647,7 @@ class MainWindow(QMainWindow):
             return
 
         self._context.settings = result.settings
+        self._apply_runtime_settings(result.settings)
         self._persist_settings(result.settings)
         self.update_status("Settings updated")
 
@@ -594,15 +690,22 @@ class MainWindow(QMainWindow):
         document = DocumentState(text=text, metadata=metadata)
         document.dirty = False
 
-        self._editor.load_document(document)
+        self._snapshot_persistence_block += 1
+        try:
+            self._editor.load_document(document)
+        finally:
+            self._snapshot_persistence_block = max(0, self._snapshot_persistence_block - 1)
         self._current_document_path = target
         self._remember_recent_file(target)
+        if self._apply_pending_snapshot_for_path(target):
+            return
         self.update_status(f"Loaded {target.name}")
 
     def save_document(self, path: str | Path | None = None) -> Path:
         """Persist the current document to disk and return the saved path."""
 
         document = self._editor.to_document()
+        previous_path = document.metadata.path or self._current_document_path
         target_path: Path | None
         if path is not None:
             target_path = Path(path)
@@ -621,6 +724,9 @@ class MainWindow(QMainWindow):
         document.dirty = False
         self._current_document_path = target_path
         self._remember_recent_file(target_path)
+        self._clear_unsaved_snapshot(path=target_path)
+        if previous_path is None:
+            self._clear_unsaved_snapshot(path=None)
         self.update_status(f"Saved {target_path.name}")
         self._refresh_window_title(document)
         return target_path
@@ -714,7 +820,165 @@ class MainWindow(QMainWindow):
             if len(updated) >= 10:
                 break
         settings.recent_files = updated
+        settings.last_open_file = normalized
         self._persist_settings(settings)
+
+    def _restore_last_session_document(self) -> None:
+        settings = self._context.settings
+        if settings is None:
+            return
+
+        restored_file = self._try_restore_last_file(settings)
+        if restored_file:
+            return
+        self._restore_unsaved_snapshot(settings)
+
+    def _try_restore_last_file(self, settings: Settings) -> bool:
+        last_path = (settings.last_open_file or "").strip()
+        if not last_path:
+            return False
+
+        target = Path(last_path).expanduser()
+        if not target.exists() or target.is_dir():
+            self._handle_missing_last_file(settings)
+            return False
+
+        try:
+            self.open_document(target)
+            return True
+        except FileNotFoundError:
+            self._handle_missing_last_file(settings)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            _LOGGER.warning("Failed to restore last-open file %s: %s", target, exc)
+            self.update_status("Failed to restore last session file")
+        return False
+
+    def _restore_unsaved_snapshot(self, settings: Settings) -> None:
+        snapshot = settings.unsaved_snapshot
+        if not isinstance(snapshot, dict) or "text" not in snapshot:
+            return
+
+        self._load_snapshot_document(snapshot, path=None)
+        self.update_status("Restored unsaved draft")
+
+    def _apply_pending_snapshot_for_path(self, path: Path) -> bool:
+        restored = self._restore_unsaved_snapshot_for_path(path)
+        if restored:
+            self.update_status(f"Restored unsaved changes for {path.name}")
+        return restored
+
+    def _restore_unsaved_snapshot_for_path(self, path: Path | str) -> bool:
+        settings = self._context.settings
+        if settings is None:
+            return False
+
+        normalized_key = self._snapshot_key(path)
+        snapshot = (settings.unsaved_snapshots or {}).get(normalized_key)
+        if not isinstance(snapshot, dict) or "text" not in snapshot:
+            return False
+
+        resolved_path = Path(normalized_key)
+        self._load_snapshot_document(snapshot, path=resolved_path)
+        return True
+
+    def _load_snapshot_document(self, snapshot: dict[str, Any], *, path: Path | None) -> None:
+        text = str(snapshot.get("text", ""))
+        language = str(
+            snapshot.get("language")
+            or (self._infer_language(path) if path is not None else "markdown")
+        )
+        selection_raw = snapshot.get("selection")
+        if isinstance(selection_raw, (tuple, list)) and len(selection_raw) == 2:
+            selection = SelectionRange(int(selection_raw[0]), int(selection_raw[1]))
+        else:
+            selection = SelectionRange()
+
+        document = DocumentState(
+            text=text,
+            metadata=DocumentMetadata(path=path, language=language),
+            selection=selection,
+            dirty=True,
+        )
+        self._editor.load_document(document)
+        self._current_document_path = path
+        digest_key = self._snapshot_key(path)
+        self._unsaved_snapshot_digests[digest_key] = file_io.compute_text_digest(text)
+
+    def _handle_missing_last_file(self, settings: Settings) -> None:
+        if settings.last_open_file:
+            settings.last_open_file = None
+            self._persist_settings(settings)
+        self.update_status("Last session file missing")
+
+    def _persist_unsaved_snapshot(self, state: DocumentState | None = None) -> None:
+        settings = self._context.settings
+        if settings is None:
+            return
+
+        document = state or self._editor.to_document()
+        path = document.metadata.path or self._current_document_path
+        key = self._snapshot_key(path)
+
+        if not document.dirty:
+            self._clear_unsaved_snapshot(settings=settings, path=path)
+            return
+
+        snapshot = {
+            "text": document.text,
+            "language": document.metadata.language,
+            "selection": list(document.selection.as_tuple()),
+        }
+        digest = file_io.compute_text_digest(snapshot["text"])
+        if self._unsaved_snapshot_digests.get(key) == digest:
+            existing = self._get_snapshot_entry(settings, key)
+            if existing == snapshot:
+                return
+
+        if key == self._UNTITLED_SNAPSHOT_KEY:
+            settings.unsaved_snapshot = snapshot
+        else:
+            snapshots = dict(settings.unsaved_snapshots or {})
+            snapshots[key] = snapshot
+            settings.unsaved_snapshots = snapshots
+
+        self._unsaved_snapshot_digests[key] = digest
+        self._persist_settings(settings)
+
+    def _clear_unsaved_snapshot(
+        self,
+        *,
+        settings: Settings | None = None,
+        path: Path | str | None = None,
+        persist: bool = True,
+    ) -> None:
+        key = self._snapshot_key(path)
+        target_settings = settings or self._context.settings
+        changed = False
+
+        if target_settings is not None:
+            if key == self._UNTITLED_SNAPSHOT_KEY:
+                if target_settings.unsaved_snapshot is not None:
+                    target_settings.unsaved_snapshot = None
+                    changed = True
+            else:
+                snapshots = dict(target_settings.unsaved_snapshots or {})
+                if snapshots.pop(key, None) is not None:
+                    target_settings.unsaved_snapshots = snapshots
+                    changed = True
+
+        self._unsaved_snapshot_digests.pop(key, None)
+        if changed and persist and target_settings is not None:
+            self._persist_settings(target_settings)
+
+    def _get_snapshot_entry(self, settings: Settings, key: str) -> dict[str, Any] | None:
+        if key == self._UNTITLED_SNAPSHOT_KEY:
+            return settings.unsaved_snapshot
+        return (settings.unsaved_snapshots or {}).get(key)
+
+    def _snapshot_key(self, path: Path | str | None) -> str:
+        if path is None:
+            return self._UNTITLED_SNAPSHOT_KEY
+        return str(Path(path).expanduser().resolve())
 
     def _qt_parent_widget(self) -> Any | None:
         try:
@@ -744,6 +1008,190 @@ class MainWindow(QMainWindow):
             store.save(settings)
         except Exception as exc:  # pragma: no cover - disk write failures are rare
             _LOGGER.warning("Failed to persist settings: %s", exc)
+
+    def _apply_runtime_settings(self, settings: Settings) -> None:
+        self._apply_debug_logging_setting(settings)
+        self._apply_theme_setting(settings)
+        self._refresh_ai_runtime(settings)
+
+    def _update_logging_configuration(self, debug_enabled: bool) -> None:
+        level = logging.DEBUG if debug_enabled else logging.INFO
+        try:
+            logging_utils.setup_logging(level, force=True)
+            _LOGGER.debug("Runtime logging level updated to %s", logging.getLevelName(level))
+        except Exception as exc:  # pragma: no cover - defensive logging
+            _LOGGER.warning("Unable to update logging configuration: %s", exc)
+
+    def _update_ai_debug_logging(self, debug_enabled: bool) -> None:
+        controller = self._context.ai_controller
+        if controller is None:
+            return
+        client = getattr(controller, "client", None)
+        if client is None:
+            return
+        client_settings = getattr(client, "settings", None)
+        if client_settings is None:
+            return
+        try:
+            client_settings.debug_logging = debug_enabled
+            _LOGGER.debug("AI client debug logging set to %s", debug_enabled)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            _LOGGER.debug("Unable to update AI client debug flag: %s", exc)
+
+    def _apply_debug_logging_setting(self, settings: Settings) -> None:
+        new_debug = bool(getattr(settings, "debug_logging", False))
+        if new_debug != self._debug_logging_enabled:
+            self._update_logging_configuration(new_debug)
+            self._debug_logging_enabled = new_debug
+        self._update_ai_debug_logging(new_debug)
+
+    def _apply_theme_setting(self, settings: Settings) -> None:
+        theme_name = (getattr(settings, "theme", "") or "default").strip() or "default"
+        if theme_name == self._active_theme:
+            return
+        self._active_theme = theme_name
+        try:
+            self._editor.apply_theme(theme_name)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to apply editor theme %s: %s", theme_name, exc)
+        self._apply_application_theme(theme_name)
+
+    def _apply_application_theme(self, theme_name: str) -> None:
+        try:
+            from PySide6.QtWidgets import QApplication
+        except Exception:  # pragma: no cover - PySide optional during tests
+            return
+
+        app = QApplication.instance()
+        if app is None:
+            return
+
+        normalized = theme_name.lower()
+        setter = getattr(app, "setStyle", None)
+        if not callable(setter):
+            return
+
+        if normalized == "dark":
+            try:
+                setter("Fusion")
+            except Exception:  # pragma: no cover - style availability varies
+                pass
+            return
+
+        if normalized in {"default", "light", ""}:
+            default_style = getattr(app, "_tinkerbell_default_style", None)
+            if default_style is None:
+                style_getter = getattr(app, "style", None)
+                style_obj = style_getter() if callable(style_getter) else None
+                object_name_getter = getattr(style_obj, "objectName", None)
+                default_style = object_name_getter() if callable(object_name_getter) else None
+                setattr(app, "_tinkerbell_default_style", default_style or "Fusion")
+            try:
+                setter(default_style or "Fusion")
+            except Exception:  # pragma: no cover - defensive guard
+                pass
+
+    def _refresh_ai_runtime(self, settings: Settings) -> None:
+        if not self._ai_settings_ready(settings):
+            self._disable_ai_controller()
+            return
+
+        signature = self._ai_settings_signature(settings)
+        controller = self._context.ai_controller
+
+        if controller is None:
+            controller = self._build_ai_controller_from_settings(settings)
+            if controller is None:
+                return
+            self._context.ai_controller = controller
+            self._ai_client_signature = signature
+            self._register_default_ai_tools()
+        elif signature != self._ai_client_signature:
+            client = self._build_ai_client_from_settings(settings)
+            if client is None:
+                return
+            controller.update_client(client)
+            self._ai_client_signature = signature
+
+        self._update_ai_debug_logging(bool(getattr(settings, "debug_logging", False)))
+
+    def _ai_settings_ready(self, settings: Settings) -> bool:
+        return bool((settings.api_key or "").strip() and (settings.base_url or "").strip() and (settings.model or "").strip())
+
+    def _ai_settings_signature(self, settings: Settings | None) -> tuple[Any, ...] | None:
+        if settings is None:
+            return None
+        headers = tuple(sorted((settings.default_headers or {}).items()))
+        metadata = tuple(sorted((settings.metadata or {}).items()))
+        return (
+            settings.base_url,
+            settings.api_key,
+            settings.model,
+            settings.organization,
+            settings.request_timeout,
+            settings.max_retries,
+            settings.retry_min_seconds,
+            settings.retry_max_seconds,
+            headers,
+            metadata,
+        )
+
+    def _build_ai_client_from_settings(self, settings: Settings):
+        try:
+            from .ai.client import AIClient, ClientSettings
+        except Exception as exc:  # pragma: no cover - dependency guard
+            _LOGGER.warning("AI client components unavailable: %s", exc)
+            return None
+
+        client_settings = ClientSettings(
+            base_url=settings.base_url,
+            api_key=settings.api_key,
+            model=settings.model,
+            organization=settings.organization,
+            request_timeout=settings.request_timeout,
+            max_retries=settings.max_retries,
+            retry_min_seconds=settings.retry_min_seconds,
+            retry_max_seconds=settings.retry_max_seconds,
+            default_headers=settings.default_headers or None,
+            metadata=settings.metadata or None,
+            debug_logging=bool(getattr(settings, "debug_logging", False)),
+        )
+        try:
+            return AIClient(client_settings)
+        except Exception as exc:
+            _LOGGER.warning("Failed to build AI client: %s", exc)
+            return None
+
+    def _build_ai_controller_from_settings(self, settings: Settings):
+        client = self._build_ai_client_from_settings(settings)
+        if client is None:
+            return None
+        try:
+            from .ai.agents.executor import AIController
+        except Exception as exc:  # pragma: no cover - dependency guard
+            _LOGGER.warning("AI controller unavailable: %s", exc)
+            return None
+
+        try:
+            return AIController(client=client)
+        except Exception as exc:
+            _LOGGER.warning("Failed to initialize AI controller: %s", exc)
+            return None
+
+    def _disable_ai_controller(self) -> None:
+        controller = self._context.ai_controller
+        if controller is None and self._ai_client_signature is None:
+            return
+        if self._ai_task and not self._ai_task.done():
+            try:
+                self._ai_task.cancel()
+            except Exception:  # pragma: no cover - defensive guard
+                pass
+        self._context.ai_controller = None
+        self._ai_task = None
+        self._ai_stream_active = False
+        self._ai_client_signature = None
+        _LOGGER.info("AI controller disabled until settings are completed.")
 
     def _refresh_window_title(self, state: Optional[DocumentState] = None) -> None:
         """Construct a descriptive window title for the active document."""

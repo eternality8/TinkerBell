@@ -31,6 +31,8 @@ def test_save_and_load_roundtrip(tmp_path: Path) -> None:
         default_headers={"X-Test": "1"},
         metadata={"env": "dev"},
         recent_files=["notes.md"],
+        unsaved_snapshot={"text": "draft", "language": "markdown", "selection": [0, 5]},
+        unsaved_snapshots={"/tmp/demo.md": {"text": "draft", "language": "markdown", "selection": [0, 5]}},
     )
 
     store.save(original)
@@ -68,3 +70,13 @@ def test_env_overrides_take_precedence(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     assert overridden.base_url == "https://env-base"
     assert overridden.api_key == "env-key"
+
+
+def test_bool_env_overrides_enable_debug_logging(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    SettingsStore(path).save(Settings())
+    monkeypatch.setenv("TINKERBELL_DEBUG_LOGGING", "true")
+
+    overridden = SettingsStore(path).load()
+
+    assert overridden.debug_logging is True
