@@ -193,6 +193,11 @@ class SettingsDialog(QDialog):
         self._debug_checkbox = QCheckBox("Enable debug logging")
         self._debug_checkbox.setObjectName("debug_logging_checkbox")
         self._debug_checkbox.setChecked(self._original.debug_logging)
+        self._tool_panel_checkbox = QCheckBox("Show tool activity panel (debug view)")
+        self._tool_panel_checkbox.setObjectName("tool_activity_checkbox")
+        self._tool_panel_checkbox.setChecked(
+            bool(getattr(self._original, "show_tool_activity_panel", False))
+        )
 
         form_layout = QFormLayout()
         form_layout.addRow("Base URL", self._base_url_input)
@@ -211,6 +216,7 @@ class SettingsDialog(QDialog):
         form_layout.addRow("Organization", self._organization_input)
         form_layout.addRow("Theme", self._theme_input)
         form_layout.addRow("Debug", self._debug_checkbox)
+        form_layout.addRow("Tool Traces", self._tool_panel_checkbox)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form_layout)
@@ -286,6 +292,7 @@ class SettingsDialog(QDialog):
         organization = self._organization_input.text().strip() or None
         theme = self._theme_input.text().strip() or self._original.theme
         debug_logging = self._debug_checkbox.isChecked()
+        show_tool_activity_panel = self._tool_panel_checkbox.isChecked()
         return replace(
             self._original,
             base_url=base_url,
@@ -294,6 +301,7 @@ class SettingsDialog(QDialog):
             organization=organization,
             theme=theme,
             debug_logging=debug_logging,
+            show_tool_activity_panel=show_tool_activity_panel,
         )
 
     # ------------------------------------------------------------------

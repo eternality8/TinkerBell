@@ -148,8 +148,10 @@ class MainWindow(QMainWindow):
     def __init__(self, context: WindowContext):  # noqa: D401 - doc inherited
         super().__init__()
         self._context = context
+        initial_settings = context.settings
+        show_tool_panel = bool(getattr(initial_settings, "show_tool_activity_panel", False))
         self._editor = EditorWidget()
-        self._chat_panel = ChatPanel()
+        self._chat_panel = ChatPanel(show_tool_activity_panel=show_tool_panel)
         self._bridge = DocumentBridge(editor=self._editor)
         self._status_bar = StatusBar()
         self._splitter: Any = None
@@ -164,7 +166,6 @@ class MainWindow(QMainWindow):
         self._ai_stream_active = False
         self._unsaved_snapshot_digests: dict[str, str] = {}
         self._snapshot_persistence_block = 0
-        initial_settings = context.settings
         self._debug_logging_enabled = bool(getattr(initial_settings, "debug_logging", False))
         self._active_theme = (getattr(initial_settings, "theme", "") or "default").strip() or "default"
         self._ai_client_signature: tuple[Any, ...] | None = self._ai_settings_signature(initial_settings)
@@ -354,8 +355,10 @@ class MainWindow(QMainWindow):
 
         self._editor.add_snapshot_listener(self._handle_editor_snapshot)
         self._editor.add_text_listener(self._handle_editor_text_changed)
+        self._editor.add_selection_listener(self._handle_editor_selection_changed)
         self._chat_panel.add_request_listener(self._handle_chat_request)
         self._bridge.add_edit_listener(self._handle_edit_applied)
+        self._handle_editor_selection_changed(self._editor.to_document().selection)
 
     def _register_default_ai_tools(self) -> None:
         """Register the default document-aware tools with the AI controller."""
@@ -582,9 +585,74 @@ class MainWindow(QMainWindow):
         """Update window title when the editor content or metadata shifts."""
 
         self._refresh_window_title(state)
+        self._refresh_chat_suggestions(state=state)
         if self._snapshot_persistence_block > 0:
             return
         self._persist_unsaved_snapshot(state)
+
+    def _handle_editor_selection_changed(self, selection: SelectionRange) -> None:
+        """Refresh suggestions and composer context when the selection moves."""
+
+        self._refresh_chat_suggestions(selection=selection)
+
+    def _refresh_chat_suggestions(
+        self,
+        *,
+        state: DocumentState | None = None,
+        selection: SelectionRange | None = None,
+    ) -> None:
+        document = state or self._editor.to_document()
+        active_selection = selection or document.selection
+        start, end = active_selection.as_tuple()
+        text = document.text[start:end]
+        summary = self._summarize_selection_text(text)
+        self._chat_panel.set_selection_summary(summary)
+        suggestions = self._build_chat_suggestions(document, text)
+        self._chat_panel.set_suggestions(suggestions)
+
+    def _build_chat_suggestions(self, document: DocumentState, selection_text: str) -> list[str]:
+        has_selection = bool(selection_text.strip())
+        has_document_text = bool(document.text.strip())
+        if has_selection:
+            suggestions = [
+                "Summarize the selected text.",
+                "Rewrite the selected text for clarity.",
+                "Extract action items from the selection.",
+            ]
+        elif has_document_text:
+            suggestions = [
+                "Summarize the current document.",
+                "Suggest improvements to the document structure.",
+                "Highlight inconsistencies or missing sections.",
+            ]
+        else:
+            name = self._document_display_name(document)
+            suggestions = [
+                f"Draft an outline for {name}.",
+                "Propose a starter paragraph for this document.",
+                "List the key points this document should cover.",
+            ]
+        suggestions.append("Help me plan the next edits.")
+        return suggestions
+
+    def _document_display_name(self, document: DocumentState) -> str:
+        path = document.metadata.path or self._current_document_path
+        if path is not None:
+            name = path.name
+            return name if name else WINDOW_APP_NAME
+        return UNTITLED_DOCUMENT_NAME
+
+    def _summarize_selection_text(self, selection_text: str) -> Optional[str]:
+        condensed = self._condense_whitespace(selection_text)
+        if not condensed:
+            return None
+        if len(condensed) > 80:
+            condensed = f"{condensed[:77].rstrip()}…"
+        return condensed
+
+    @staticmethod
+    def _condense_whitespace(text: str) -> str:
+        return " ".join(text.split())
 
     def _handle_snapshot_requested(self) -> None:
         """Force a snapshot refresh and log the event."""
@@ -1010,9 +1078,16 @@ class MainWindow(QMainWindow):
             _LOGGER.warning("Failed to persist settings: %s", exc)
 
     def _apply_runtime_settings(self, settings: Settings) -> None:
+        self._apply_chat_panel_settings(settings)
         self._apply_debug_logging_setting(settings)
         self._apply_theme_setting(settings)
         self._refresh_ai_runtime(settings)
+
+    def _apply_chat_panel_settings(self, settings: Settings) -> None:
+        visible = bool(getattr(settings, "show_tool_activity_panel", False))
+        setter = getattr(self._chat_panel, "set_tool_activity_visibility", None)
+        if callable(setter):
+            setter(visible)
 
     def _update_logging_configuration(self, debug_enabled: bool) -> None:
         level = logging.DEBUG if debug_enabled else logging.INFO

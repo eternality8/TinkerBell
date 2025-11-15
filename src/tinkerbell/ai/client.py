@@ -50,6 +50,7 @@ class AIStreamEvent:
     tool_index: int | None = None
     tool_arguments: str | None = None
     arguments_delta: str | None = None
+    tool_call_id: str | None = None
 
 
 class AIClient:
@@ -245,6 +246,8 @@ class AIClient:
                 tool_arguments=getattr(event, "arguments", None),
                 arguments_delta=getattr(event, "arguments_delta", None),
                 parsed=getattr(event, "parsed_arguments", None),
+                tool_call_id=getattr(event, "id", None)
+                or getattr(event, "tool_call_id", None),
             )
         if event_type == "tool_calls.function.arguments.done":
             return AIStreamEvent(
@@ -253,6 +256,8 @@ class AIClient:
                 tool_index=getattr(event, "index", None),
                 tool_arguments=getattr(event, "arguments", None),
                 parsed=getattr(event, "parsed_arguments", None),
+                tool_call_id=getattr(event, "id", None)
+                or getattr(event, "tool_call_id", None),
             )
         return None
 

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tinkerbell.editor.document_model import DocumentState
+from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.main_window import MainWindow, WindowContext
 from tinkerbell.services.settings import Settings, SettingsStore
 
@@ -39,6 +39,58 @@ def test_main_window_registers_default_actions():
     action_keys = set(window.actions.keys())
     assert {"file_open", "file_save", "file_save_as", "settings_open", "ai_snapshot"}.issubset(action_keys)
     assert window.last_status_message == "Ready"
+
+
+def test_chat_suggestions_initialized_on_startup():
+    window = _make_window()
+    suggestions = window.chat_panel.suggestions()
+    assert "Draft an outline for Untitled." in suggestions
+
+
+def test_chat_panel_visibility_controlled_by_settings():
+    window = _make_window(settings=Settings(show_tool_activity_panel=True))
+
+    assert window.chat_panel.tool_activity_visible is True
+
+
+def test_settings_dialog_toggle_updates_tool_panel(monkeypatch: pytest.MonkeyPatch):
+    initial = Settings(show_tool_activity_panel=False)
+    window = _make_window(settings=initial)
+    updated = Settings(show_tool_activity_panel=True)
+
+    monkeypatch.setattr(
+        window,
+        "_show_settings_dialog",
+        lambda current: SimpleNamespace(accepted=True, settings=updated),
+    )
+
+    window._handle_settings_requested()
+
+    assert window.chat_panel.tool_activity_visible is True
+    assert window._context.settings is updated
+
+
+def test_selection_updates_chat_suggestions_and_metadata():
+    window = _make_window()
+    window.editor_widget.set_text("Alpha beta gamma")
+    window.editor_widget.apply_selection(SelectionRange(0, 5))
+
+    suggestions = window.chat_panel.suggestions()
+    assert "Summarize the selected text." in suggestions
+    assert "Rewrite the selected text for clarity." in suggestions
+
+    captured: list[dict[str, Any]] = []
+
+    def _collector(prompt: str, metadata: dict[str, Any]) -> None:
+        del prompt
+        captured.append(metadata)
+
+    window.chat_panel.add_request_listener(_collector)
+    window.chat_panel.set_composer_text("Please help")
+    window.chat_panel.send_prompt()
+
+    assert captured
+    assert captured[0]["selection_summary"] == "Alpha"
 
 
 def test_menu_specs_expose_file_and_settings_actions():

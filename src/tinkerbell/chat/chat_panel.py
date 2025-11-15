@@ -99,6 +99,7 @@ class ChatPanel(QWidgetBase):
         parent: Optional[Any] = None,
         *,
         history_limit: Optional[int] = None,
+        show_tool_activity_panel: bool = False,
     ) -> None:
         super().__init__(parent)
         self._history_limit = max(1, history_limit or self.MAX_HISTORY)
@@ -109,6 +110,7 @@ class ChatPanel(QWidgetBase):
         self._composer_text: str = ""
         self._composer_context = ComposerContext()
         self._request_listeners: list[RequestListener] = []
+        self._tool_activity_visible = bool(show_tool_activity_panel)
 
         # Qt widgets (optional; None when headless)
         self._history_widget: Any = None
@@ -116,6 +118,7 @@ class ChatPanel(QWidgetBase):
         self._send_button: Any = None
         self._suggestion_widget: Any = None
         self._tool_trace_widget: Any = None
+        self._tool_trace_label: Any = None
 
         self._build_ui()
 
@@ -126,6 +129,21 @@ class ChatPanel(QWidgetBase):
         """Return a copy of the recorded chat history."""
 
         return list(self._messages)
+
+    @property
+    def tool_activity_visible(self) -> bool:
+        """Return whether the tool activity panel is currently visible."""
+
+        return self._tool_activity_visible
+
+    def set_tool_activity_visibility(self, visible: bool) -> None:
+        """Show or hide the tool activity panel in the Qt layout."""
+
+        state = bool(visible)
+        if state == self._tool_activity_visible:
+            return
+        self._tool_activity_visible = state
+        self._sync_tool_trace_visibility()
 
     def clear_history(self) -> None:
         """Remove all recorded messages and reset streaming state."""
@@ -165,6 +183,19 @@ class ChatPanel(QWidgetBase):
 
         self.set_composer_text("")
         self._composer_context = ComposerContext()
+
+    def set_selection_summary(
+        self,
+        summary: Optional[str],
+        *,
+        extras: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Update the composer metadata describing the current editor selection."""
+
+        normalized = summary.strip() if summary else None
+        self._composer_context.selection_summary = normalized or None
+        if extras is not None:
+            self._composer_context.extras = extras if extras else None
 
     # ------------------------------------------------------------------
     # Message append helpers
@@ -355,10 +386,12 @@ class ChatPanel(QWidgetBase):
             layout.addWidget(self._suggestion_widget)
 
             trace_label = QLabel("Tool Activity", self)
+            self._tool_trace_label = trace_label
             layout.addWidget(trace_label)
             self._tool_trace_widget = QListWidget(self)
             self._tool_trace_widget.setObjectName("tb-chat-traces")
             layout.addWidget(self._tool_trace_widget)
+            self._sync_tool_trace_visibility()
 
     def _emit_request(self, prompt: str, metadata: dict[str, Any]) -> None:
         for listener in list(self._request_listeners):
@@ -404,6 +437,17 @@ class ChatPanel(QWidgetBase):
                 widget.addItem(f"{trace.name}: {trace.output_summary}")
         finally:
             widget.blockSignals(False)
+
+    def _sync_tool_trace_visibility(self) -> None:
+        label = self._tool_trace_label
+        widget = self._tool_trace_widget
+        for target in (label, widget):
+            if target is None:
+                continue
+            try:
+                target.setVisible(self._tool_activity_visible)
+            except Exception:  # pragma: no cover - depends on Qt availability
+                pass
 
     def _render_message_text(self, message: ChatMessage) -> str:
         prefix = message.role.upper()

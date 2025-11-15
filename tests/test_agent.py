@@ -11,14 +11,23 @@ from tinkerbell.ai.client import AIClient, AIStreamEvent
 
 
 class _StubClient:
-    def __init__(self, events: Iterable[AIStreamEvent]):
-        self._events: List[AIStreamEvent] = list(events)
+    def __init__(self, events: Iterable[Any]):
+        payload = list(events)
+        self._batches: List[List[AIStreamEvent]] = []
+        if payload and isinstance(payload[0], AIStreamEvent):
+            self._batches.append(list(cast(Iterable[AIStreamEvent], payload)))
+        else:
+            for batch in cast(Iterable[Iterable[AIStreamEvent]], payload):
+                self._batches.append(list(cast(Iterable[AIStreamEvent], batch)))
+        if not self._batches:
+            self._batches = [[]]
         self.calls: list[dict[str, Any]] = []
         self.settings: Any = SimpleNamespace(debug_logging=False)
 
     async def stream_chat(self, **kwargs: Any) -> AsyncIterator[AIStreamEvent]:
         self.calls.append(kwargs)
-        for event in self._events:
+        batch_index = min(len(self.calls) - 1, len(self._batches) - 1)
+        for event in self._batches[batch_index]:
             yield event
 
 
@@ -90,3 +99,42 @@ def test_ai_controller_logs_response_when_debug_enabled(sample_snapshot, caplog)
 
     assert result["response"] == "final answer"
     assert any("AI response text" in record.message and "final answer" in record.message for record in caplog.records)
+
+
+def test_ai_controller_executes_tool_and_continues(sample_snapshot):
+    first_turn = [
+        AIStreamEvent(type="content.delta", content="Working"),
+        AIStreamEvent(
+            type="tool_calls.function.arguments.done",
+            tool_name="snapshot",
+            tool_index=0,
+            tool_arguments='{"delta_only": true}',
+            parsed={"delta_only": True},
+            tool_call_id="call-1",
+        ),
+    ]
+    second_turn = [
+        AIStreamEvent(type="content.delta", content="All set"),
+        AIStreamEvent(type="content.done", content="All set"),
+    ]
+    stub_client = _StubClient([first_turn, second_turn])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    calls: list[Any] = []
+
+    class _SnapshotTool:
+        def run(self, delta_only: bool = False) -> dict[str, Any]:
+            calls.append(delta_only)
+            return {"delta_only": delta_only}
+
+    controller.register_tool("snapshot", _SnapshotTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("use tool", sample_snapshot)
+
+    result = asyncio.run(run())
+
+    assert result["response"] == "All set"
+    assert calls == [True]
+    assert result["tool_calls"][0]["name"] == "snapshot"
+    assert result["tool_calls"][0]["resolved_arguments"] == {"delta_only": True}

@@ -1,5 +1,7 @@
 """Chat panel behavior tests running in headless mode."""
 
+from typing import Any
+
 import pytest
 
 from tinkerbell.chat.chat_panel import ChatPanel, ComposerContext
@@ -21,6 +23,21 @@ def _ensure_qapp() -> None:
 def _make_panel() -> ChatPanel:
     _ensure_qapp()
     return ChatPanel()
+
+
+def test_tool_activity_panel_hidden_by_default():
+    panel = _make_panel()
+
+    assert panel.tool_activity_visible is False
+
+
+def test_tool_activity_visibility_toggle():
+    panel = ChatPanel(show_tool_activity_panel=True)
+
+    assert panel.tool_activity_visible is True
+
+    panel.set_tool_activity_visibility(False)
+    assert panel.tool_activity_visible is False
 
 
 def test_chat_panel_appends_user_and_ai_messages():
@@ -85,6 +102,23 @@ def test_chat_panel_suggestions_update_composer():
 
     with pytest.raises(IndexError):
         panel.select_suggestion(5)
+
+
+def test_chat_panel_set_selection_summary_updates_metadata():
+    panel = _make_panel()
+    panel.set_selection_summary("Intro", extras={"cursor": "top"})
+    panel.set_composer_text("Summarize this")
+    captured: list[dict[str, Any]] = []
+
+    def _collect(prompt: str, metadata: dict[str, Any]) -> None:
+        del prompt
+        captured.append(metadata)
+
+    panel.add_request_listener(_collect)
+    panel.send_prompt()
+
+    assert captured[0]["selection_summary"] == "Intro"
+    assert captured[0]["cursor"] == "top"
 
 
 def test_chat_panel_send_prompt_rejects_empty_text():

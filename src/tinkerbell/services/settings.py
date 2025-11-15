@@ -27,6 +27,7 @@ _ENV_OVERRIDES: Mapping[str, str] = {
 }
 _BOOL_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_DEBUG_LOGGING": "debug_logging",
+    "TINKERBELL_TOOL_ACTIVITY_PANEL": "show_tool_activity_panel",
 }
 _TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
 _API_KEY_FIELD = "api_key_ciphertext"
@@ -56,6 +57,7 @@ class Settings:
     font_size: int = 13
     window_geometry: str | None = None
     debug_logging: bool = False
+    show_tool_activity_panel: bool = False
 
 
 class SettingsStore:

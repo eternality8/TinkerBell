@@ -101,7 +101,7 @@ Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat m
 
 1. **Open or create a document** – Markdown, YAML, JSON, or plain text files are supported out of the box. Syntax detection drives highlighting and validation helpers.
 2. **Compose a prompt** – Select the text you want help with, describe the task (“Rewrite the introduction in an encouraging tone”), and hit **Send**. The selection summary and a fresh document snapshot are automatically attached.
-3. **Watch the agent work** – Streaming responses land in the chat history while the tool trace panel shows each LangChain tool invocation (snapshot, validation, edits, etc.).
+3. **Watch the agent work** – Streaming responses land in the chat history. Enable the Tool Activity panel from **Settings → Show tool activity panel** whenever you need to inspect each LangChain tool invocation (snapshot, validation, edits, etc.).
 4. **Apply or rollback edits** – Structured payloads go through the bridge, which enforces document-version checks and emits diff summaries (e.g., `+128 chars`). Undo/redo is still available because edits use the regular editor APIs.
 5. **Iterate rapidly** – Refresh snapshots, toggle Markdown preview, or enable autosave intervals from settings. Each AI turn records metadata so future prompts understand the document state.
 
@@ -137,6 +137,7 @@ You can register custom tools at runtime via `AIController.register_tool`, and t
 - **Static analysis**: `ruff`, `black`, and `mypy` configs live in `pyproject.toml`. Run `uv run ruff check .` or `uv run mypy src` as needed.
 - **Logging**: Set `TINKERBELL_DEBUG=1` before launching to enable verbose logs (including Qt message handler output).
 - **Debug prompt logging**: Toggle **Enable debug logging** inside the Settings dialog (or set `TINKERBELL_DEBUG_LOGGING=1`) to emit full AI prompt payloads to the log file for troubleshooting.
+- **Tool traces**: Toggle **Show tool activity panel** in the Settings dialog (or set `TINKERBELL_TOOL_ACTIVITY_PANEL=1`) when you need the debug-only LangChain trace list; it's hidden by default to maximize editing space.
 - **Scripts**: `src/tinkerbell/scripts/seed_examples.py` seeds demonstration docs; extend it when adding new showcase flows.
 
 ## Roadmap & contributing
