@@ -95,6 +95,13 @@ class SessionResetListener(Protocol):
         ...
 
 
+class SuggestionPanelListener(Protocol):
+    """Protocol fired whenever the suggestion panel visibility changes."""
+
+    def __call__(self, is_open: bool) -> None:
+        ...
+
+
 @dataclass(slots=True)
 class ComposerContext:
     """Metadata passed alongside prompt submissions."""
@@ -133,6 +140,7 @@ class ChatPanel(QWidgetBase):
         self._composer_context = ComposerContext()
         self._request_listeners: list[RequestListener] = []
         self._session_reset_listeners: list[SessionResetListener] = []
+        self._suggestion_panel_listeners: list[SuggestionPanelListener] = []
         self._tool_activity_visible = bool(show_tool_activity_panel)
 
         # Qt widgets (optional; None when headless)
@@ -390,6 +398,19 @@ class ChatPanel(QWidgetBase):
 
         try:
             self._session_reset_listeners.remove(listener)
+        except ValueError:  # pragma: no cover - defensive guard
+            pass
+
+    def add_suggestion_panel_listener(self, listener: SuggestionPanelListener) -> None:
+        """Register a callback fired when the suggestion panel toggles."""
+
+        self._suggestion_panel_listeners.append(listener)
+
+    def remove_suggestion_panel_listener(self, listener: SuggestionPanelListener) -> None:
+        """Remove a previously registered suggestion panel listener."""
+
+        try:
+            self._suggestion_panel_listeners.remove(listener)
         except ValueError:  # pragma: no cover - defensive guard
             pass
 
@@ -739,14 +760,25 @@ class ChatPanel(QWidgetBase):
 
     def _toggle_suggestion_panel(self) -> None:
         widget = self._suggestion_widget
-        if widget is None:
+        has_suggestions = bool(self._suggestions)
+        if not has_suggestions:
+            if widget is not None:
+                widget.setVisible(False)
+            if self._suggestion_panel_open:
+                self._suggestion_panel_open = False
+                self._emit_suggestion_panel_event(False)
             return
-        if not self._suggestions:
-            widget.setVisible(False)
-            self._suggestion_panel_open = False
+        if widget is None:
+            self._suggestion_panel_open = not self._suggestion_panel_open
+            self._emit_suggestion_panel_event(self._suggestion_panel_open)
             return
         self._suggestion_panel_open = not widget.isVisible()
         widget.setVisible(self._suggestion_panel_open)
+        self._emit_suggestion_panel_event(self._suggestion_panel_open)
+
+    def _emit_suggestion_panel_event(self, is_open: bool) -> None:
+        for listener in list(self._suggestion_panel_listeners):
+            listener(is_open)
 
     # Qt callbacks ----------------------------------------------------
     def _handle_send_clicked(self) -> None:

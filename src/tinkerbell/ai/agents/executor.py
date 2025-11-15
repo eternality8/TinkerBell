@@ -8,7 +8,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Mapping, MutableMapping, Optional, Sequence, cast
+from typing import Any, Awaitable, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, cast
 
 from openai.types.chat import ChatCompletionToolParam
 
@@ -17,6 +17,11 @@ from ..client import AIClient, AIStreamEvent
 from .graph import build_agent_graph
 
 LOGGER = logging.getLogger(__name__)
+_SUGGESTION_SYSTEM_PROMPT = (
+    "You are a proactive writing assistant that proposes the next helpful user prompts after reviewing the prior "
+    "conversation. Respond ONLY with a JSON array of concise suggestion strings (each under 120 characters). "
+    "Return at most {max_suggestions} unique ideas tailored to the conversation."
+)
 
 ToolCallback = Callable[[AIStreamEvent], Awaitable[None] | None]
 
@@ -224,6 +229,21 @@ class AIController:
             if self._active_task is task:
                 self._active_task = None
 
+    async def suggest_followups(
+        self,
+        history: Sequence[Mapping[str, str]],
+        *,
+        max_suggestions: int = 4,
+    ) -> list[str]:
+        """Generate contextual follow-up suggestions based on chat history."""
+
+        if not history:
+            return []
+
+        messages = self._build_suggestion_messages(history, max_suggestions)
+        response_text = await self._complete_simple_chat(messages)
+        return self._parse_suggestion_response(response_text, max_suggestions)
+
     def cancel(self) -> None:
         """Cancel the active chat turn, if any."""
 
@@ -238,6 +258,88 @@ class AIController:
 
     def _rebuild_graph(self) -> None:
         self._graph = build_agent_graph(tools={name: registration.impl for name, registration in self.tools.items()})
+
+    def _build_suggestion_messages(
+        self,
+        history: Sequence[Mapping[str, str]],
+        max_suggestions: int,
+    ) -> list[dict[str, str]]:
+        transcript_lines: list[str] = []
+        for entry in history[-10:]:
+            role = (entry.get("role") or "user").lower()
+            label = "User" if role == "user" else "Assistant"
+            content = str(entry.get("content", "")).strip()
+            if not content:
+                continue
+            if len(content) > 400:
+                content = f"{content[:397].rstrip()}…"
+            transcript_lines.append(f"{label}: {content}")
+
+        transcript = "\n".join(transcript_lines) or "(no content)"
+        system_prompt = _SUGGESTION_SYSTEM_PROMPT.format(max_suggestions=max(1, max_suggestions))
+        user_prompt = (
+            "Here is the recent conversation between the user and assistant:\n"
+            f"{transcript}\n\n"
+            "Suggest the next helpful questions or commands the user could ask to keep making progress."
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    async def _complete_simple_chat(self, messages: Sequence[Mapping[str, Any]]) -> str:
+        chunks: list[str] = []
+        final_chunk: str | None = None
+        async for event in self.client.stream_chat(messages=messages, temperature=0.3, max_tokens=300):
+            if event.type == "content.delta" and event.content:
+                chunks.append(str(event.content))
+            elif event.type == "content.done" and event.content:
+                final_chunk = str(event.content)
+        response = "".join(chunks)
+        if final_chunk and final_chunk not in response:
+            response += final_chunk
+        return response.strip()
+
+    def _parse_suggestion_response(self, text: str, max_suggestions: int) -> list[str]:
+        if not text:
+            return []
+
+        suggestions = self._try_parse_json_suggestions(text, max_suggestions)
+        if suggestions:
+            return suggestions
+
+        lines = [line.strip(" -*\t") for line in text.splitlines() if line.strip()]
+        return self._sanitize_suggestions(lines, max_suggestions)
+
+    def _try_parse_json_suggestions(self, text: str, max_suggestions: int) -> list[str]:
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+
+        if isinstance(parsed, dict):
+            if "suggestions" in parsed and isinstance(parsed["suggestions"], list):
+                parsed = parsed["suggestions"]
+            else:
+                parsed = list(parsed.values())
+
+        if isinstance(parsed, list):
+            return self._sanitize_suggestions(parsed, max_suggestions)
+        return []
+
+    def _sanitize_suggestions(self, raw_items: Iterable[Any], max_suggestions: int) -> list[str]:
+        sanitized: list[str] = []
+        seen: set[str] = set()
+        limit = max(1, max_suggestions)
+        for item in raw_items:
+            text = str(item).strip()
+            if not text or text in seen:
+                continue
+            sanitized.append(text)
+            seen.add(text)
+            if len(sanitized) >= limit:
+                break
+        return sanitized
 
     def _build_messages(self, prompt: str, snapshot: Mapping[str, Any]) -> list[dict[str, str]]:
         user_prompt = prompts.format_user_prompt(prompt, dict(snapshot))

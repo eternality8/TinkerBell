@@ -138,3 +138,27 @@ def test_ai_controller_executes_tool_and_continues(sample_snapshot):
     assert calls == [True]
     assert result["tool_calls"][0]["name"] == "snapshot"
     assert result["tool_calls"][0]["resolved_arguments"] == {"delta_only": True}
+
+
+def test_ai_controller_suggest_followups_returns_parsed_json():
+    stub_client = _StubClient(
+        [
+            [
+                AIStreamEvent(type="content.delta", content='["Outline next steps",'),
+                AIStreamEvent(type="content.delta", content='"Review tone"]'),
+            ]
+        ]
+    )
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    async def run() -> list[str]:
+        history = [{"role": "user", "content": "Summarize the intro"}]
+        return await controller.suggest_followups(history, max_suggestions=2)
+
+    suggestions = asyncio.run(run())
+
+    assert suggestions == ["Outline next steps", "Review tone"]
+    assert stub_client.calls
+    payload = stub_client.calls[-1]
+    assert payload["messages"][0]["role"] == "system"
+    assert payload["messages"][1]["role"] == "user"

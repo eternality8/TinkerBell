@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, TYPE_CHECKING
+from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING
 
 from .chat.chat_panel import ChatPanel
 from .chat.commands import DIRECTIVE_SCHEMA
@@ -84,6 +86,7 @@ _LOGGER = logging.getLogger(__name__)
 
 WINDOW_APP_NAME = "TinkerBell"
 UNTITLED_DOCUMENT_NAME = "Untitled"
+SUGGESTION_LOADING_LABEL = "Generating personalized suggestions…"
 
 
 @dataclass(slots=True)
@@ -164,6 +167,10 @@ class MainWindow(QMainWindow):
         self._current_document_path: Optional[Path] = None
         self._ai_task: asyncio.Task[Any] | None = None
         self._ai_stream_active = False
+        self._suggestion_task: asyncio.Task[Any] | None = None
+        self._suggestion_request_id = 0
+        self._suggestion_cache_key: str | None = None
+        self._suggestion_cache_values: tuple[str, ...] | None = None
         self._unsaved_snapshot_digests: dict[str, str] = {}
         self._snapshot_persistence_block = 0
         self._debug_logging_enabled = bool(getattr(initial_settings, "debug_logging", False))
@@ -358,6 +365,7 @@ class MainWindow(QMainWindow):
         self._editor.add_selection_listener(self._handle_editor_selection_changed)
         self._chat_panel.add_request_listener(self._handle_chat_request)
         self._chat_panel.add_session_reset_listener(self._handle_chat_session_reset)
+        self._chat_panel.add_suggestion_panel_listener(self._handle_suggestion_panel_toggled)
         self._bridge.add_edit_listener(self._handle_edit_applied)
         self._handle_editor_selection_changed(self._editor.to_document().selection)
 
@@ -566,7 +574,129 @@ class MainWindow(QMainWindow):
 
     def _handle_chat_session_reset(self) -> None:
         self._cancel_active_ai_turn()
+        self._cancel_dynamic_suggestions()
+        self._clear_suggestion_cache()
+        self._refresh_chat_suggestions()
         self.update_status("Chat reset")
+
+    def _handle_suggestion_panel_toggled(self, is_open: bool) -> None:
+        if not is_open:
+            self._cancel_dynamic_suggestions()
+            return
+
+        history = self._chat_panel.history()
+        if not history:
+            self._refresh_chat_suggestions()
+            return
+
+        history_signature = self._history_signature(history)
+        if history_signature is None:
+            self._refresh_chat_suggestions()
+            return
+
+        if (
+            history_signature == self._suggestion_cache_key
+            and self._suggestion_cache_values
+        ):
+            self._chat_panel.set_suggestions(list(self._suggestion_cache_values))
+            self.update_status("Loaded cached suggestions")
+            return
+
+        controller = self._context.ai_controller
+        if controller is None:
+            self._refresh_chat_suggestions()
+            self.update_status("AI suggestions unavailable")
+            return
+
+        self._cancel_dynamic_suggestions()
+        self._chat_panel.set_suggestions([SUGGESTION_LOADING_LABEL])
+        self._suggestion_request_id += 1
+        request_id = self._suggestion_request_id
+        history_snapshot = tuple(history)
+
+        task = self._run_coroutine(self._generate_dynamic_suggestions(history_snapshot, request_id))
+        if isinstance(task, asyncio.Task):
+            self._suggestion_task = task
+            task.add_done_callback(self._on_suggestion_task_finished)
+        else:
+            self._suggestion_task = None
+
+    def _cancel_dynamic_suggestions(self) -> None:
+        task = self._suggestion_task
+        if task is not None and not task.done():
+            try:
+                task.cancel()
+            except Exception:  # pragma: no cover - defensive logging
+                _LOGGER.debug("Failed to cancel suggestion task", exc_info=True)
+        self._suggestion_task = None
+
+    def _on_suggestion_task_finished(self, task: asyncio.Task[Any]) -> None:
+        if task is self._suggestion_task:
+            self._suggestion_task = None
+
+    def _clear_suggestion_cache(self) -> None:
+        self._suggestion_cache_key = None
+        self._suggestion_cache_values = None
+
+    def _store_suggestion_cache(self, history: Sequence[ChatMessage], suggestions: Sequence[str]) -> None:
+        signature = self._history_signature(history)
+        if signature is None:
+            self._clear_suggestion_cache()
+            return
+        self._suggestion_cache_key = signature
+        self._suggestion_cache_values = tuple(suggestions)
+
+    def _history_signature(self, history: Sequence[ChatMessage]) -> str | None:
+        payload = self._serialize_chat_history(history)
+        if not payload:
+            return None
+        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        return digest
+
+    def _serialize_chat_history(self, history: Sequence[ChatMessage], limit: int = 10) -> list[dict[str, str]]:
+        windowed = list(history)[-limit:]
+        serialized: list[dict[str, str]] = []
+        for message in windowed:
+            text = (message.content or "").strip()
+            if not text:
+                continue
+            serialized.append({"role": message.role, "content": text})
+        return serialized
+
+    async def _generate_dynamic_suggestions(
+        self,
+        history: Sequence[ChatMessage],
+        request_id: int,
+    ) -> None:
+        controller = self._context.ai_controller
+        if controller is None:
+            return
+
+        payload = self._serialize_chat_history(history)
+        if not payload:
+            return
+
+        suggestions: list[str] = []
+        try:
+            suggestions = await controller.suggest_followups(payload, max_suggestions=4)
+        except asyncio.CancelledError:  # pragma: no cover - propagated cancellation
+            raise
+        except Exception as exc:  # pragma: no cover - defensive logging
+            _LOGGER.warning("Contextual suggestions failed: %s", exc)
+
+        if request_id != self._suggestion_request_id:
+            return
+
+        if suggestions:
+            self._store_suggestion_cache(history, suggestions)
+            self._chat_panel.set_suggestions(suggestions)
+            self.update_status("Contextual suggestions ready")
+            return
+
+        self._clear_suggestion_cache()
+        self._refresh_chat_suggestions()
+        self.update_status("Using preset suggestions")
 
     def _on_ai_task_finished(self, task: asyncio.Task[Any]) -> None:
         if task is self._ai_task:

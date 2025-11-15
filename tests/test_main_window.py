@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 from types import SimpleNamespace
 
 import pytest
 
+from tinkerbell.chat.message_model import ChatMessage
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.main_window import MainWindow, WindowContext
 from tinkerbell.services.settings import Settings, SettingsStore
@@ -91,6 +92,74 @@ def test_selection_updates_chat_suggestions_and_metadata():
 
     assert captured
     assert captured[0]["selection_summary"] == "Alpha"
+
+
+def test_suggestion_panel_without_history_keeps_default_suggestions():
+    controller = _StubAIController()
+    window = _make_window(controller)
+    baseline = window.chat_panel.suggestions()
+
+    window._handle_suggestion_panel_toggled(True)
+
+    updated = window.chat_panel.suggestions()
+    assert baseline == updated
+    assert controller.suggestion_calls == []
+
+
+def test_suggestion_panel_with_history_requests_ai_suggestions():
+    controller = _StubAIController()
+    controller.suggestion_responses.append(["Idea A", "Idea B"])
+    window = _make_window(controller)
+    window.chat_panel.append_user_message("Hi there")
+    window.chat_panel.append_ai_message(ChatMessage(role="assistant", content="Welcome back"))
+
+    window._handle_suggestion_panel_toggled(True)
+
+    suggestions = window.chat_panel.suggestions()
+    assert suggestions == ("Idea A", "Idea B")
+    assert controller.suggestion_calls
+    payload = controller.suggestion_calls[-1]
+    assert payload["max"] == 4
+    assert payload["history"][0]["content"] == "Hi there"
+
+
+def test_suggestion_panel_reuses_cached_results_for_same_history():
+    controller = _StubAIController()
+    controller.suggestion_responses.append(["Idea A"])
+    window = _make_window(controller)
+    window.chat_panel.append_user_message("Hi there")
+    window.chat_panel.append_ai_message(ChatMessage(role="assistant", content="Welcome back"))
+
+    window._handle_suggestion_panel_toggled(True)
+    assert window.chat_panel.suggestions() == ("Idea A",)
+    assert len(controller.suggestion_calls) == 1
+
+    window._handle_suggestion_panel_toggled(False)
+    controller.suggestion_responses.append(["Idea B"])
+
+    window._handle_suggestion_panel_toggled(True)
+
+    assert window.chat_panel.suggestions() == ("Idea A",)
+    assert len(controller.suggestion_calls) == 1
+
+
+def test_suggestion_cache_invalidated_when_history_changes():
+    controller = _StubAIController()
+    controller.suggestion_responses.append(["Idea A"])
+    controller.suggestion_responses.append(["Idea B"])
+    window = _make_window(controller)
+    window.chat_panel.append_user_message("Hi there")
+
+    window._handle_suggestion_panel_toggled(True)
+    assert len(controller.suggestion_calls) == 1
+
+    window._handle_suggestion_panel_toggled(False)
+    window.chat_panel.append_ai_message(ChatMessage(role="assistant", content="Adding detail"))
+
+    window._handle_suggestion_panel_toggled(True)
+
+    assert len(controller.suggestion_calls) == 2
+    assert window.chat_panel.suggestions() == ("Idea B",)
 
 
 def test_menu_specs_expose_file_and_settings_actions():
@@ -528,6 +597,8 @@ class _StubAIController:
         self.client = SimpleNamespace(settings=SimpleNamespace(debug_logging=False))
         self.updated_clients: list[Any] = []
         self.client = SimpleNamespace(settings=SimpleNamespace(debug_logging=False))
+        self.suggestion_calls: list[dict[str, Any]] = []
+        self.suggestion_responses: list[list[str]] = []
 
     async def run_chat(self, prompt: str, snapshot: dict, *, metadata=None, on_event=None) -> dict:
         self.prompts.append(prompt)
@@ -538,6 +609,13 @@ class _StubAIController:
 
     def cancel(self) -> None:
         self.cancelled = True
+
+    async def suggest_followups(self, history: Sequence[Mapping[str, str]], *, max_suggestions: int = 4) -> list[str]:
+        payload = {"history": list(history), "max": max_suggestions}
+        self.suggestion_calls.append(payload)
+        if self.suggestion_responses:
+            return self.suggestion_responses.pop(0)
+        return [f"Suggestion {len(self.suggestion_calls)}"]
 
     def register_tool(
         self,
