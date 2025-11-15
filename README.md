@@ -117,18 +117,20 @@ Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat m
 | `DiffBuilderTool` | `tinkerbell.ai.tools.diff_builder` | Generates unified diffs from before/after snippets so agents never have to handcraft patch formatting.
 | `SearchReplaceTool` | `tinkerbell.ai.tools.search_replace` | Provides regex/literal transforms with optional dry-run previews before edits are enqueued.
 | `ValidationTool` | `tinkerbell.ai.tools.validation` | Checks YAML/JSON snippets via `ruamel.yaml`/`jsonschema` prior to insertion.
+| `ListTabsTool` | `tinkerbell.ai.tools.list_tabs` | Enumerates open tabs (`tab_id`, title, path, dirty flag) so agents can target any document without stealing focus.
 | `Memory Buffers` | `tinkerbell.ai.memory.buffers` | Maintains conversation + document summaries so prompts stay concise without losing context.
 
 You can register custom tools at runtime via `AIController.register_tool`, and the LangGraph plan automatically picks them up.
 
 ### Tool parameter reference
 
-- **`document_snapshot`** — accepts `delta_only` (bool) to request only changed fields; the tool also appends the latest diff summary and document digest so agents can detect drift between turns.
-- **`document_edit`** — consumes either a native `EditDirective` or a JSON/mapping payload matching the schema exposed during registration. Prefer `action="patch"` plus a unified diff and `document_version`; legacy `insert`/`replace` actions remain available for small, cursor-relative tweaks.
-- **`document_apply_patch`** — requires `content` (replacement text) and optionally `target_range`, `document_version`, `rationale`, and `context_lines`. It snapshots the live document, builds a diff for the requested range, and immediately sends it through `document_edit` so diff construction + application happen in one step.
+- **`document_snapshot`** — accepts `delta_only` (bool) to request only changed fields, `tab_id` to target a non-active document, `source_tab_ids` to batch additional read-only snapshots, and `include_open_documents` to embed lightweight metadata for every tab. Each response still carries the latest diff summary and digest so agents can detect drift.
+- **`document_edit`** — consumes either a native `EditDirective` or a JSON/mapping payload matching the schema exposed during registration. Prefer `action="patch"` plus a unified diff and `document_version`; legacy `insert`/`replace` actions remain available for small, cursor-relative tweaks. Provide `tab_id` whenever the edit should be applied to a background tab.
+- **`document_apply_patch`** — requires `content` (replacement text) and optionally `target_range`, `document_version`, `rationale`, `context_lines`, and `tab_id`. It snapshots the targeted document, builds a diff for the requested range, and immediately sends it through `document_edit` so diff construction + application happen in one step.
 - **`diff_builder`** — accepts `original`, `updated`, optional `filename`, and optional `context` (default 3) to produce a ready-to-send unified diff string compatible with `document_edit` patch directives.
 - **`search_replace`** — parameters include `pattern`, `replacement`, `is_regex`, `scope` (`document` or `selection`), `dry_run`, `max_replacements`, `match_case`, and `whole_word`. With `dry_run=True`, the tool performs no edit and instead returns a preview plus match counts; otherwise it enqueues a single replace directive scoped to the resolved range and refreshes the document version.
 - **`validate_snippet`** — requires `text` and `fmt` (`yaml`, `yml`, or `json`) and responds with a `ValidationOutcome` describing the first issue along with a count of remaining problems so agents can deliver actionable feedback.
+- **`list_tabs`** — no parameters; returns `{tabs: [...], active_tab_id, total}` so the agent can map natural-language references ("roadmap tab") to actual `tab_id` values before issuing snapshot/edit requests.
 
 ## Safety, privacy, and reliability
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, Sequence, cast
+from typing import Any, Callable, Mapping, Protocol, Sequence, cast
 
 from ...chat.commands import ActionType, parse_agent_payload
 from ...chat.message_model import EditDirective
@@ -39,18 +39,19 @@ class DocumentEditTool:
     patch_only: bool = False
     diff_builder: DiffBuilderTool = field(default_factory=DiffBuilderTool)
 
-    def run(self, directive: DirectiveInput | None = None, **fields: Any) -> str:
+    def run(self, directive: DirectiveInput | None = None, *, tab_id: str | None = None, **fields: Any) -> str:
         payload = self._coerce_input(self._resolve_input(directive, fields))
+        tab_id = self._normalize_tab_id(tab_id, payload)
         payload = self._validate_payload(payload)
         action = self._resolve_action(payload)
         if self.patch_only and action in {ActionType.REPLACE.value, ActionType.INSERT.value}:
-            payload = self._auto_convert_to_patch(payload)
+            payload = self._auto_convert_to_patch(payload, tab_id=tab_id)
             action = ActionType.PATCH.value
         self._enforce_patch_mode(action)
-        self.bridge.queue_edit(payload)
+        self._queue_edit(payload, tab_id=tab_id)
 
-        diff = getattr(self.bridge, "last_diff_summary", None)
-        version = getattr(self.bridge, "last_snapshot_version", None)
+        diff = self._last_diff(tab_id)
+        version = self._last_version(tab_id)
         return self._format_status(action, diff, version)
 
     @staticmethod
@@ -151,13 +152,19 @@ class DocumentEditTool:
             return f"queued (version={version})"
         return "queued"
 
-    def _auto_convert_to_patch(self, payload: EditDirective | Mapping[str, Any]) -> Mapping[str, Any]:
+    def _auto_convert_to_patch(self, payload: EditDirective | Mapping[str, Any], *, tab_id: str | None) -> Mapping[str, Any]:
         snapshot_fn = getattr(self.bridge, "generate_snapshot", None)
         if not callable(snapshot_fn):
             raise ValueError(
                 "Patch-only mode requires unified diff directives; call document_apply_patch to convert content edits into patches."
             )
-        snapshot = dict(cast(Mapping[str, Any], snapshot_fn(delta_only=False)))
+        typed_snapshot_fn = cast(Callable[..., Mapping[str, Any]], snapshot_fn)
+        snapshot = dict(
+            cast(
+                Mapping[str, Any],
+                self._invoke_snapshot(typed_snapshot_fn, tab_id=tab_id),
+            )
+        )
         base_text = snapshot.get("text", "")
         if not isinstance(base_text, str):
             raise ValueError("Snapshot did not provide document text")
@@ -176,9 +183,7 @@ class DocumentEditTool:
         filename = str(snapshot.get("path") or self.diff_builder.default_filename)
         diff = self.diff_builder.run(base_text, updated_text, filename=filename)
 
-        version = self._extract_version_token(mapping_payload) or snapshot.get("version") or getattr(
-            self.bridge, "last_snapshot_version", None
-        )
+        version = self._extract_version_token(mapping_payload) or snapshot.get("version") or self._last_version(tab_id)
         if not version:
             raise ValueError("Document version is required; call document_snapshot before applying edits")
 
@@ -226,4 +231,57 @@ class DocumentEditTool:
         if end < start:
             start, end = end, start
         return start, end
+
+    def _normalize_tab_id(self, tab_id: str | None, payload: EditDirective | Mapping[str, Any]) -> str | None:
+        payload_tab: str | None = None
+        if isinstance(payload, Mapping):
+            payload_tab = payload.get("tab_id") or payload.get("document_id")
+            explicit = payload.get("metadata")
+        else:
+            explicit = getattr(payload, "metadata", None)
+        if isinstance(explicit, Mapping):
+            payload_tab = payload_tab or explicit.get("tab_id")
+        normalized = (tab_id or payload_tab or "").strip()
+        return normalized or None
+
+    def _queue_edit(self, payload: EditDirective | Mapping[str, Any], *, tab_id: str | None) -> None:
+        queue_edit = getattr(self.bridge, "queue_edit", None)
+        if not callable(queue_edit):  # pragma: no cover - defensive
+            raise ValueError("Bridge does not expose queue_edit")
+
+        if tab_id:
+            try:
+                queue_edit(payload, tab_id=tab_id)
+                return
+            except TypeError:
+                mapping = dict(self._payload_to_mapping(payload))
+                metadata = mapping.get("metadata")
+                if isinstance(metadata, Mapping):
+                    meta = dict(metadata)
+                else:
+                    meta = {}
+                meta.setdefault("tab_id", tab_id)
+                mapping["metadata"] = meta
+                mapping.setdefault("tab_id", tab_id)
+                payload = mapping
+
+        queue_edit(payload)
+
+    def _invoke_snapshot(self, snapshot_fn: Callable[..., Mapping[str, Any]], *, tab_id: str | None) -> Mapping[str, Any]:
+        try:
+            return snapshot_fn(delta_only=False, tab_id=tab_id)
+        except TypeError:
+            return snapshot_fn(delta_only=False)
+
+    def _last_diff(self, tab_id: str | None) -> str | None:
+        getter = getattr(self.bridge, "get_last_diff_summary", None)
+        if callable(getter):
+            return cast(str | None, getter(tab_id=tab_id))
+        return cast(str | None, getattr(self.bridge, "last_diff_summary", None))
+
+    def _last_version(self, tab_id: str | None) -> str | None:
+        getter = getattr(self.bridge, "get_last_snapshot_version", None)
+        if callable(getter):
+            return cast(str | None, getter(tab_id=tab_id))
+        return cast(str | None, getattr(self.bridge, "last_snapshot_version", None))
 

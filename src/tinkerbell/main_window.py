@@ -8,6 +8,7 @@ import json
 import logging
 import time
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING
@@ -16,8 +17,9 @@ from .chat.chat_panel import ChatPanel
 from .chat.commands import ActionType, DIRECTIVE_SCHEMA
 from .chat.message_model import ChatMessage, EditDirective, ToolTrace
 from .editor.document_model import DocumentMetadata, DocumentState, SelectionRange
-from .editor.editor_widget import EditorWidget
-from .services.bridge import DocumentBridge
+from .editor.workspace import DocumentTab
+from .editor.tabbed_editor import TabbedEditorWidget
+from .services.bridge_router import WorkspaceBridgeRouter
 from .services.settings import Settings, SettingsStore
 from .utils import file_io, logging as logging_utils
 from .widgets.status_bar import StatusBar
@@ -25,6 +27,7 @@ from .ai.tools.diff_builder import DiffBuilderTool
 from .ai.tools.document_snapshot import DocumentSnapshotTool
 from .ai.tools.document_edit import DocumentEditTool
 from .ai.tools.document_apply_patch import DocumentApplyPatchTool
+from .ai.tools.list_tabs import ListTabsTool
 from .ai.tools.search_replace import SearchReplaceTool
 from .ai.tools.validation import validate_snippet
 
@@ -170,9 +173,12 @@ class MainWindow(QMainWindow):
         self._context = context
         initial_settings = context.settings
         show_tool_panel = bool(getattr(initial_settings, "show_tool_activity_panel", False))
-        self._editor = EditorWidget()
+        self._editor = TabbedEditorWidget()
+        self._workspace = self._editor.workspace
         self._chat_panel = ChatPanel(show_tool_activity_panel=show_tool_panel)
-        self._bridge = DocumentBridge(editor=self._editor)
+        self._bridge = WorkspaceBridgeRouter(self._workspace)
+        self._editor.add_tab_created_listener(self._bridge.track_tab)
+        self._workspace.add_active_listener(self._handle_active_tab_changed)
         self._status_bar = StatusBar()
         self._splitter: Any = None
         self._actions: Dict[str, WindowAction] = {}
@@ -195,6 +201,7 @@ class MainWindow(QMainWindow):
         self._active_theme = (getattr(initial_settings, "theme", "") or "default").strip() or "default"
         self._auto_patch_tool: DocumentApplyPatchTool | None = None
         self._ai_client_signature: tuple[Any, ...] | None = self._ai_settings_signature(initial_settings)
+        self._restoring_workspace = False
         self._initialize_ui()
 
     # ------------------------------------------------------------------
@@ -271,6 +278,13 @@ class MainWindow(QMainWindow):
         """Instantiate all menu/toolbar actions defined in the plan."""
 
         return {
+            "file_new_tab": self._build_action(
+                name="file_new_tab",
+                text="New Tab",
+                shortcut="Ctrl+N",
+                status_tip="Create a new untitled tab",
+                callback=self._handle_new_tab_requested,
+            ),
             "file_open": self._build_action(
                 name="file_open",
                 text="Open…",
@@ -284,6 +298,13 @@ class MainWindow(QMainWindow):
                 shortcut="Ctrl+S",
                 status_tip="Save the current document",
                 callback=self._handle_save_requested,
+            ),
+            "file_close_tab": self._build_action(
+                name="file_close_tab",
+                text="Close Tab",
+                shortcut="Ctrl+W",
+                status_tip="Close the active tab",
+                callback=self._handle_close_tab_requested,
             ),
             "file_revert": self._build_action(
                 name="file_revert",
@@ -322,7 +343,7 @@ class MainWindow(QMainWindow):
             "file": MenuSpec(
                 name="file",
                 title="&File",
-                actions=("file_open", "file_save", "file_revert", "file_save_as"),
+                actions=("file_new_tab", "file_open", "file_save", "file_save_as", "file_close_tab", "file_revert"),
             ),
             "settings": MenuSpec(name="settings", title="&Settings", actions=("settings_open",)),
             "ai": MenuSpec(name="ai", title="&AI", actions=("ai_snapshot",)),
@@ -332,7 +353,7 @@ class MainWindow(QMainWindow):
         """Return declarative toolbar metadata used by future Qt wiring."""
 
         return {
-            "file": ToolbarSpec(name="file", actions=("file_open", "file_save")),
+            "file": ToolbarSpec(name="file", actions=("file_new_tab", "file_open", "file_save", "file_close_tab")),
             "ai": ToolbarSpec(name="ai", actions=("ai_snapshot",)),
         }
 
@@ -444,7 +465,20 @@ class MainWindow(QMainWindow):
                         "delta_only": {
                             "type": "boolean",
                             "description": "Return only fields that changed since the previous snapshot.",
-                        }
+                        },
+                        "tab_id": {
+                            "type": "string",
+                            "description": "Optional tab identifier; defaults to the active tab when omitted.",
+                        },
+                        "source_tab_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Collect additional snapshots for the provided tab IDs (read-only).",
+                        },
+                        "include_open_documents": {
+                            "type": "boolean",
+                            "description": "When true, include metadata for every open tab in the response.",
+                        },
                     },
                     "additionalProperties": False,
                 },
@@ -489,8 +523,24 @@ class MainWindow(QMainWindow):
                             "minimum": 0,
                             "description": "Override the number of context lines included in the generated diff.",
                         },
+                        "tab_id": {
+                            "type": "string",
+                            "description": "Optional tab identifier; defaults to the active tab when omitted.",
+                        },
                     },
                     "required": ["content"],
+                    "additionalProperties": False,
+                },
+            )
+
+            tab_listing_tool = ListTabsTool(provider=self._bridge)
+            register(
+                "list_tabs",
+                tab_listing_tool,
+                description="Enumerate the open tabs (tab_id, title, path, dirty) so agents can target specific documents.",
+                parameters={
+                    "type": "object",
+                    "properties": {},
                     "additionalProperties": False,
                 },
             )
@@ -601,7 +651,7 @@ class MainWindow(QMainWindow):
             )
 
             _LOGGER.debug(
-                "Default AI tools registered: document_snapshot, document_edit, document_apply_patch, diff_builder, search_replace, validate_snippet"
+                "Default AI tools registered: document_snapshot, document_edit, document_apply_patch, diff_builder, search_replace, validate_snippet, list_tabs"
             )
         except Exception as exc:  # pragma: no cover - defensive logging
             _LOGGER.warning("Failed to register default AI tools: %s", exc)
@@ -1098,6 +1148,17 @@ class MainWindow(QMainWindow):
 
         self._refresh_chat_suggestions(selection=selection)
 
+    def _handle_active_tab_changed(self, tab: DocumentTab | None) -> None:
+        if tab is None:
+            self._current_document_path = None
+            self._sync_settings_workspace_state()
+            return
+        document = tab.document()
+        self._current_document_path = document.metadata.path
+        self._refresh_window_title(document)
+        self._refresh_chat_suggestions(state=document)
+        self._sync_settings_workspace_state()
+
     def _refresh_chat_suggestions(
         self,
         *,
@@ -1179,6 +1240,31 @@ class MainWindow(QMainWindow):
             self.update_status(f"File not found: {path}")
             raise
 
+    def _handle_new_tab_requested(self) -> None:
+        with self._suspend_snapshot_persistence():
+            tab = self._editor.create_tab()
+        self._workspace.set_active_tab(tab.id)
+        self._current_document_path = None
+        self._sync_settings_workspace_state()
+        self.update_status("New tab created")
+
+    def _handle_close_tab_requested(self) -> None:
+        active_tab = self._workspace.active_tab
+        if active_tab is None:
+            self.update_status("No tab to close")
+            return
+        closed = self._editor.close_active_tab()
+        document = closed.document()
+        self._clear_unsaved_snapshot(path=document.metadata.path, tab_id=closed.id)
+        if self._workspace.tab_count() == 0:
+            self._handle_new_tab_requested()
+        else:
+            new_active = self._workspace.active_tab
+            if new_active is not None:
+                self._current_document_path = new_active.document().metadata.path
+        self._sync_settings_workspace_state()
+        self.update_status(f"Closed tab {closed.title}")
+
     def _handle_save_requested(self) -> None:
         """Save the current document, prompting for a path if required."""
 
@@ -1218,16 +1304,14 @@ class MainWindow(QMainWindow):
         document = DocumentState(text=text, metadata=metadata)
         document.dirty = False
 
-        self._snapshot_persistence_block += 1
-        try:
+        with self._suspend_snapshot_persistence():
             self._editor.load_document(document)
-        finally:
-            self._snapshot_persistence_block = max(0, self._snapshot_persistence_block - 1)
 
         self._current_document_path = path
         self._clear_unsaved_snapshot(path=path)
         self._refresh_window_title(document)
         self.update_status(f"Reverted {path.name}")
+        self._sync_settings_workspace_state()
 
     def _handle_settings_requested(self) -> None:
         """Show the settings dialog so users can configure integrations."""
@@ -1255,7 +1339,7 @@ class MainWindow(QMainWindow):
     # Public API
     # ------------------------------------------------------------------
     @property
-    def editor_widget(self) -> EditorWidget:
+    def editor_widget(self) -> TabbedEditorWidget:
         """Expose the editor widget for tests and auxiliary services."""
 
         return self._editor
@@ -1285,21 +1369,27 @@ class MainWindow(QMainWindow):
         if not target.exists():
             raise FileNotFoundError(target)
 
+        existing = self._workspace.find_tab_by_path(target)
+        if existing is not None:
+            self._workspace.set_active_tab(existing.id)
+            self.update_status(f"Focused {target.name}")
+            return
+
         text = file_io.read_text(target)
         metadata = DocumentMetadata(path=target, language=self._infer_language(target))
         document = DocumentState(text=text, metadata=metadata)
         document.dirty = False
 
-        self._snapshot_persistence_block += 1
-        try:
-            self._editor.load_document(document)
-        finally:
-            self._snapshot_persistence_block = max(0, self._snapshot_persistence_block - 1)
+        with self._suspend_snapshot_persistence():
+            tab = self._editor.create_tab(document=document, path=target, title=target.name, make_active=True)
+        self._workspace.set_active_tab(tab.id)
         self._current_document_path = target
         self._remember_recent_file(target)
         if self._apply_pending_snapshot_for_path(target):
+            self._sync_settings_workspace_state()
             return
         self.update_status(f"Loaded {target.name}")
+        self._sync_settings_workspace_state()
 
     def save_document(self, path: str | Path | None = None) -> Path:
         """Persist the current document to disk and return the saved path."""
@@ -1325,10 +1415,14 @@ class MainWindow(QMainWindow):
         self._current_document_path = target_path
         self._remember_recent_file(target_path)
         self._clear_unsaved_snapshot(path=target_path)
+        active_tab = self._workspace.active_tab
         if previous_path is None:
-            self._clear_unsaved_snapshot(path=None)
+            self._clear_unsaved_snapshot(path=None, tab_id=active_tab.id if active_tab else None)
+        if active_tab is not None:
+            self._editor.refresh_tab_title(active_tab.id)
         self.update_status(f"Saved {target_path.name}")
         self._refresh_window_title(document)
+        self._sync_settings_workspace_state()
         return target_path
 
     def update_status(self, message: str, *, timeout_ms: Optional[int] = None) -> None:
@@ -1436,10 +1530,19 @@ class MainWindow(QMainWindow):
         if settings is None:
             return
 
-        restored_file = self._try_restore_last_file(settings)
-        if restored_file:
-            return
-        self._restore_unsaved_snapshot(settings)
+        restored = False
+        if self._restore_workspace_tabs(settings):
+            restored = True
+        else:
+            next_index = getattr(settings, "next_untitled_index", None)
+            if isinstance(next_index, int):
+                self._workspace.set_next_untitled_index(next_index)
+            if self._try_restore_last_file(settings):
+                restored = True
+            else:
+                restored = self._restore_unsaved_snapshot(settings)
+
+        self._sync_settings_workspace_state(persist=False)
 
     def _try_restore_last_file(self, settings: Settings) -> bool:
         last_path = (settings.last_open_file or "").strip()
@@ -1461,21 +1564,97 @@ class MainWindow(QMainWindow):
             self.update_status("Failed to restore last session file")
         return False
 
-    def _restore_unsaved_snapshot(self, settings: Settings) -> None:
+    def _restore_unsaved_snapshot(self, settings: Settings) -> bool:
         snapshot = settings.unsaved_snapshot
         if not isinstance(snapshot, dict) or "text" not in snapshot:
-            return
+            return False
 
-        self._load_snapshot_document(snapshot, path=None)
+        tab = self._workspace.active_tab or self._workspace.ensure_tab()
+        self._load_snapshot_document(snapshot, path=None, tab_id=tab.id)
         self.update_status("Restored unsaved draft")
+        return True
 
-    def _apply_pending_snapshot_for_path(self, path: Path) -> bool:
-        restored = self._restore_unsaved_snapshot_for_path(path)
-        if restored:
-            self.update_status(f"Restored unsaved changes for {path.name}")
-        return restored
+    def _restore_workspace_tabs(self, settings: Settings) -> bool:
+        entries = [entry for entry in (settings.open_tabs or []) if isinstance(entry, dict)]
+        if not entries:
+            return False
 
-    def _restore_unsaved_snapshot_for_path(self, path: Path | str) -> bool:
+        self._restoring_workspace = True
+        try:
+            for tab_id in list(self._workspace.tab_ids()):
+                try:
+                    self._editor.close_tab(tab_id)
+                except KeyError:  # pragma: no cover - defensive guard
+                    continue
+
+            restored_ids: list[str] = []
+            for entry in entries:
+                tab = self._create_tab_from_settings_entry(entry)
+                if tab is not None:
+                    restored_ids.append(tab.id)
+
+            if not restored_ids:
+                return False
+
+            active_id = settings.active_tab_id or restored_ids[-1]
+            if active_id not in self._workspace.tab_ids():
+                active_id = restored_ids[-1]
+            self._workspace.set_active_tab(active_id)
+            next_index = getattr(settings, "next_untitled_index", None)
+            if isinstance(next_index, int):
+                self._workspace.set_next_untitled_index(next_index)
+            return True
+        finally:
+            self._restoring_workspace = False
+
+    def _create_tab_from_settings_entry(self, entry: Mapping[str, Any]) -> DocumentTab | None:
+        title = str(entry.get("title") or UNTITLED_DOCUMENT_NAME)
+        path_value = entry.get("path")
+        path = Path(path_value).expanduser() if path_value else None
+        language = str(entry.get("language") or (self._infer_language(path) if path else "markdown"))
+        document = DocumentState(text="", metadata=DocumentMetadata(path=path, language=language))
+        document.dirty = bool(entry.get("dirty", False))
+
+        if path is not None:
+            try:
+                document.text = file_io.read_text(path)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                _LOGGER.debug("Unable to restore %s from disk: %s", path, exc)
+                document.text = ""
+
+        raw_untitled_index = entry.get("untitled_index")
+        untitled_index_value: int | None = None
+        if raw_untitled_index is not None:
+            try:
+                untitled_index_value = int(raw_untitled_index)
+            except (TypeError, ValueError):
+                untitled_index_value = None
+
+        with self._suspend_snapshot_persistence():
+            tab = self._editor.create_tab(
+                document=document,
+                path=path,
+                title=title,
+                make_active=False,
+                tab_id=entry.get("tab_id"),
+                untitled_index=untitled_index_value,
+            )
+
+        if path is not None:
+            self._apply_pending_snapshot_for_path(path, tab_id=tab.id, silent=True)
+        else:
+            self._apply_untitled_snapshot(tab.id)
+
+        self._editor.refresh_tab_title(tab.id)
+        return tab
+
+    def _apply_pending_snapshot_for_path(
+        self,
+        path: Path | str,
+        *,
+        tab_id: str | None = None,
+        silent: bool = False,
+    ) -> bool:
         settings = self._context.settings
         if settings is None:
             return False
@@ -1486,10 +1665,27 @@ class MainWindow(QMainWindow):
             return False
 
         resolved_path = Path(normalized_key)
-        self._load_snapshot_document(snapshot, path=resolved_path)
+        self._load_snapshot_document(snapshot, path=resolved_path, tab_id=tab_id)
+        if not silent:
+            self.update_status(f"Restored unsaved changes for {resolved_path.name}")
         return True
 
-    def _load_snapshot_document(self, snapshot: dict[str, Any], *, path: Path | None) -> None:
+    def _apply_untitled_snapshot(self, tab_id: str) -> bool:
+        settings = self._context.settings
+        if settings is None:
+            return False
+
+        snapshot = None
+        if settings.untitled_snapshots:
+            snapshot = (settings.untitled_snapshots or {}).get(tab_id)
+        if snapshot is None:
+            snapshot = settings.unsaved_snapshot
+        if not isinstance(snapshot, dict) or "text" not in snapshot:
+            return False
+        self._load_snapshot_document(snapshot, path=None, tab_id=tab_id)
+        return True
+
+    def _load_snapshot_document(self, snapshot: dict[str, Any], *, path: Path | None, tab_id: str | None) -> None:
         text = str(snapshot.get("text", ""))
         language = str(
             snapshot.get("language")
@@ -1507,10 +1703,23 @@ class MainWindow(QMainWindow):
             selection=selection,
             dirty=True,
         )
-        self._editor.load_document(document)
-        self._current_document_path = path
-        digest_key = self._snapshot_key(path)
+        with self._suspend_snapshot_persistence():
+            self._editor.load_document(document, tab_id=tab_id)
+
+        if tab_id is None or self._workspace.active_tab_id == tab_id:
+            self._current_document_path = path
+        digest_key = self._snapshot_key(path, tab_id=tab_id)
         self._unsaved_snapshot_digests[digest_key] = file_io.compute_text_digest(text)
+        if tab_id is not None:
+            self._editor.refresh_tab_title(tab_id)
+
+    @contextmanager
+    def _suspend_snapshot_persistence(self) -> Any:
+        self._snapshot_persistence_block += 1
+        try:
+            yield
+        finally:
+            self._snapshot_persistence_block = max(0, self._snapshot_persistence_block - 1)
 
     def _handle_missing_last_file(self, settings: Settings) -> None:
         if settings.last_open_file:
@@ -1525,10 +1734,12 @@ class MainWindow(QMainWindow):
 
         document = state or self._editor.to_document()
         path = document.metadata.path or self._current_document_path
-        key = self._snapshot_key(path)
+        active_tab = self._workspace.active_tab
+        tab_id = active_tab.id if active_tab is not None else None
+        key = self._snapshot_key(path, tab_id=tab_id)
 
         if not document.dirty:
-            self._clear_unsaved_snapshot(settings=settings, path=path)
+            self._clear_unsaved_snapshot(settings=settings, path=path, tab_id=tab_id)
             return
 
         snapshot = {
@@ -1538,18 +1749,24 @@ class MainWindow(QMainWindow):
         }
         digest = file_io.compute_text_digest(snapshot["text"])
         if self._unsaved_snapshot_digests.get(key) == digest:
-            existing = self._get_snapshot_entry(settings, key)
+            existing = self._get_snapshot_entry(settings, path=path, tab_id=tab_id)
             if existing == snapshot:
                 return
 
-        if key == self._UNTITLED_SNAPSHOT_KEY:
-            settings.unsaved_snapshot = snapshot
+        if path is None:
+            if tab_id is not None:
+                snapshots = dict(settings.untitled_snapshots or {})
+                snapshots[tab_id] = snapshot
+                settings.untitled_snapshots = snapshots
+            else:
+                settings.unsaved_snapshot = snapshot
         else:
             snapshots = dict(settings.unsaved_snapshots or {})
             snapshots[key] = snapshot
             settings.unsaved_snapshots = snapshots
 
         self._unsaved_snapshot_digests[key] = digest
+        self._sync_settings_workspace_state(persist=False)
         self._persist_settings(settings)
 
     def _clear_unsaved_snapshot(
@@ -1557,14 +1774,20 @@ class MainWindow(QMainWindow):
         *,
         settings: Settings | None = None,
         path: Path | str | None = None,
+        tab_id: str | None = None,
         persist: bool = True,
     ) -> None:
-        key = self._snapshot_key(path)
+        key = self._snapshot_key(path, tab_id=tab_id)
         target_settings = settings or self._context.settings
         changed = False
 
         if target_settings is not None:
-            if key == self._UNTITLED_SNAPSHOT_KEY:
+            if path is None and tab_id is not None:
+                snapshots = dict(target_settings.untitled_snapshots or {})
+                if snapshots.pop(tab_id, None) is not None:
+                    target_settings.untitled_snapshots = snapshots
+                    changed = True
+            elif path is None and tab_id is None:
                 if target_settings.unsaved_snapshot is not None:
                     target_settings.unsaved_snapshot = None
                     changed = True
@@ -1578,13 +1801,24 @@ class MainWindow(QMainWindow):
         if changed and persist and target_settings is not None:
             self._persist_settings(target_settings)
 
-    def _get_snapshot_entry(self, settings: Settings, key: str) -> dict[str, Any] | None:
-        if key == self._UNTITLED_SNAPSHOT_KEY:
+    def _get_snapshot_entry(
+        self,
+        settings: Settings,
+        *,
+        path: Path | str | None,
+        tab_id: str | None,
+    ) -> dict[str, Any] | None:
+        if path is None:
+            if tab_id is not None:
+                return (settings.untitled_snapshots or {}).get(tab_id)
             return settings.unsaved_snapshot
+        key = self._snapshot_key(path)
         return (settings.unsaved_snapshots or {}).get(key)
 
-    def _snapshot_key(self, path: Path | str | None) -> str:
+    def _snapshot_key(self, path: Path | str | None, *, tab_id: str | None = None) -> str:
         if path is None:
+            if tab_id:
+                return f"{self._UNTITLED_SNAPSHOT_KEY}:{tab_id}"
             return self._UNTITLED_SNAPSHOT_KEY
         return str(Path(path).expanduser().resolve())
 
@@ -1616,6 +1850,22 @@ class MainWindow(QMainWindow):
             store.save(settings)
         except Exception as exc:  # pragma: no cover - disk write failures are rare
             _LOGGER.warning("Failed to persist settings: %s", exc)
+
+    def _sync_settings_workspace_state(self, *, persist: bool = True) -> None:
+        if self._restoring_workspace:
+            return
+        settings = self._context.settings
+        if settings is None:
+            return
+
+        state = self._workspace.serialize_state()
+        settings.open_tabs = state.get("open_tabs", [])
+        settings.active_tab_id = state.get("active_tab_id")
+        untitled_counter = state.get("untitled_counter")
+        if isinstance(untitled_counter, int):
+            settings.next_untitled_index = untitled_counter
+        if persist:
+            self._persist_settings(settings)
 
     def _apply_runtime_settings(self, settings: Settings) -> None:
         self._apply_chat_panel_settings(settings)

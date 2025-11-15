@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence, cast
 
 from .diff_builder import DiffBuilderTool
 from .document_edit import DocumentEditTool, Bridge as EditBridge
@@ -33,8 +33,9 @@ class DocumentApplyPatchTool:
         document_version: str | None = None,
         rationale: str | None = None,
         context_lines: int = 3,
+        tab_id: str | None = None,
     ) -> str:
-        snapshot = dict(self.bridge.generate_snapshot(delta_only=False))
+        snapshot = dict(self._generate_snapshot(tab_id=tab_id))
         base_text = snapshot.get("text", "")
         if not isinstance(base_text, str):
             raise ValueError("Snapshot did not provide document text")
@@ -53,7 +54,7 @@ class DocumentApplyPatchTool:
             filename=filename,
             context=max(0, int(context_lines)),
         )
-        version = self._resolve_version(snapshot, document_version)
+        version = self._resolve_version(snapshot, document_version, tab_id=tab_id)
         payload: dict[str, Any] = {
             "action": "patch",
             "diff": diff,
@@ -61,7 +62,7 @@ class DocumentApplyPatchTool:
         }
         if rationale is not None:
             payload["rationale"] = rationale
-        return self.edit_tool.run(**payload)
+        return self.edit_tool.run(tab_id=tab_id, **payload)
 
     def _resolve_range(
         self,
@@ -86,8 +87,8 @@ class DocumentApplyPatchTool:
             start, end = end, start
         return start, end
 
-    def _resolve_version(self, snapshot: Mapping[str, Any], explicit: str | None) -> str:
-        snapshot_version = snapshot.get("version") or getattr(self.bridge, "last_snapshot_version", None)
+    def _resolve_version(self, snapshot: Mapping[str, Any], explicit: str | None, *, tab_id: str | None) -> str:
+        snapshot_version = snapshot.get("version") or self._last_snapshot_version(tab_id)
         candidate = explicit or snapshot_version
         if not candidate:
             raise ValueError("Document version is required; call document_snapshot before applying edits")
@@ -97,6 +98,22 @@ class DocumentApplyPatchTool:
         if explicit and candidate_text != str(snapshot_version).strip():
             raise ValueError("Provided document_version does not match the latest snapshot; refresh first")
         return candidate_text
+
+    def _generate_snapshot(self, *, tab_id: str | None) -> Mapping[str, Any]:
+        snapshot_fn = getattr(self.bridge, "generate_snapshot", None)
+        if not callable(snapshot_fn):  # pragma: no cover - defensive
+            raise ValueError("Bridge does not expose generate_snapshot")
+        try:
+            result = snapshot_fn(delta_only=False, tab_id=tab_id)
+        except TypeError:
+            result = snapshot_fn(delta_only=False)
+        return cast(Mapping[str, Any], result)
+
+    def _last_snapshot_version(self, tab_id: str | None) -> str | None:
+        getter = getattr(self.bridge, "get_last_snapshot_version", None)
+        if callable(getter):
+            return cast(str | None, getter(tab_id=tab_id))
+        return cast(str | None, getattr(self.bridge, "last_snapshot_version", None))
 
 
 __all__ = ["DocumentApplyPatchTool"]

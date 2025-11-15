@@ -39,10 +39,12 @@ def test_main_window_registers_default_actions():
     window = _make_window()
     action_keys = set(window.actions.keys())
     assert {
+        "file_new_tab",
         "file_open",
         "file_save",
         "file_revert",
         "file_save_as",
+        "file_close_tab",
         "settings_open",
         "ai_snapshot",
     }.issubset(action_keys)
@@ -182,7 +184,14 @@ def test_menu_specs_expose_file_and_settings_actions():
     menus = {spec.name: spec for spec in window.menu_specs()}
 
     assert "file" in menus
-    assert menus["file"].actions == ("file_open", "file_save", "file_revert", "file_save_as")
+    assert menus["file"].actions == (
+        "file_new_tab",
+        "file_open",
+        "file_save",
+        "file_save_as",
+        "file_close_tab",
+        "file_revert",
+    )
 
     assert "settings" in menus
     assert menus["settings"].actions == ("settings_open",)
@@ -211,18 +220,23 @@ def test_open_document_records_last_open_file(tmp_path: Path):
 
     assert settings.last_open_file == str(target.resolve())
     assert settings.unsaved_snapshot is None
+    assert not settings.untitled_snapshots
 
 
 def test_unsaved_snapshot_persisted_for_untitled_document():
     settings = Settings()
     window = _make_window(settings=settings)
 
+    tab_id = window.editor_widget.active_tab_id()
+    assert tab_id is not None
+
     window.editor_widget.set_text("Scratch pad")
 
-    snapshot = settings.unsaved_snapshot
+    snapshot = (settings.untitled_snapshots or {}).get(tab_id)
     assert snapshot is not None
     assert snapshot["text"] == "Scratch pad"
     assert snapshot["language"] == window.editor_widget.to_document().metadata.language
+    assert settings.open_tabs[0]["tab_id"] == tab_id
 
 
 def test_window_title_reflects_active_document(tmp_path: Path):
@@ -324,6 +338,49 @@ def test_unsaved_snapshot_restores_when_available():
     assert window.last_status_message == "Restored unsaved draft"
 
 
+def test_workspace_tabs_restore_from_settings(tmp_path: Path) -> None:
+    doc_path = tmp_path / "notes.md"
+    doc_path.write_text("Disk text", encoding="utf-8")
+    normalized = str(doc_path.resolve())
+
+    settings = Settings(
+        open_tabs=[
+            {
+                "tab_id": "draft-1",
+                "title": "Draft",
+                "dirty": True,
+                "language": "markdown",
+                "untitled_index": 4,
+            },
+            {
+                "tab_id": "file-1",
+                "title": "notes.md",
+                "dirty": True,
+                "language": "markdown",
+                "path": str(doc_path),
+            },
+        ],
+        active_tab_id="file-1",
+        untitled_snapshots={"draft-1": {"text": "Draft", "language": "markdown", "selection": [0, 5]}},
+        unsaved_snapshots={normalized: {"text": "Edited", "language": "markdown", "selection": [0, 6]}},
+        next_untitled_index=5,
+    )
+
+    window = _make_window(settings=settings)
+    workspace = window.editor_widget.workspace
+
+    assert workspace.tab_count() == 2
+    assert workspace.active_tab_id == "file-1"
+
+    untitled_tab = workspace.get_tab("draft-1")
+    assert untitled_tab.document().text == "Draft"
+
+    file_tab = workspace.get_tab("file-1")
+    assert file_tab.document().text == "Edited"
+
+    assert settings.open_tabs[0]["tab_id"] == "draft-1"
+
+
 def test_unsaved_snapshot_clears_after_save(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     settings = Settings()
     window = _make_window(settings=settings)
@@ -334,7 +391,7 @@ def test_unsaved_snapshot_clears_after_save(tmp_path: Path, monkeypatch: pytest.
 
     window.save_document()
 
-    assert settings.unsaved_snapshot is None
+    assert not settings.untitled_snapshots
     assert target.read_text(encoding="utf-8") == "Unsaved draft"
 
 
@@ -875,9 +932,13 @@ def test_default_ai_tools_register_when_controller_available():
     del window  # window retains references to editor/bridge but is unused in assertions
 
     tool_names = set(controller.registered_tools)
-    assert {"document_snapshot", "document_edit", "document_apply_patch", "validate_snippet"}.issubset(
-        tool_names
-    )
+    assert {
+        "document_snapshot",
+        "document_edit",
+        "document_apply_patch",
+        "validate_snippet",
+        "list_tabs",
+    }.issubset(tool_names)
 
     assert controller.registered_tools["document_snapshot"]["strict"] is True
 
@@ -889,6 +950,10 @@ def test_default_ai_tools_register_when_controller_available():
     validator = controller.registered_tools["validate_snippet"]["impl"]
     outcome = validator("foo: bar", "yaml")
     assert hasattr(outcome, "ok")
+
+    tab_listing = controller.registered_tools["list_tabs"]["impl"].run()
+    assert isinstance(tab_listing, dict)
+    assert "tabs" in tab_listing and "active_tab_id" in tab_listing
 
 
 def test_close_event_cancels_background_tasks(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,0 +1,11 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.3, pytest-8.4.2, pluggy-1.6.0 -- C:\Users\etern\Desktop\ai_text_editor\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+PySide6 6.10.0 -- Qt runtime 6.10.0 -- Qt compiled 6.10.0
+rootdir: C:\Users\etern\Desktop\ai_text_editor
+configfile: pyproject.toml
+plugins: anyio-4.11.0, asyncio-0.23.8, qt-4.5.0
+asyncio: mode=Mode.STRICT
+collecting ... collected 5 items
+
+tests/test_workspace.py::test_workspace_creates_tabs_and_tracks_active QWidget: Must construct a QApplication before a QWidget

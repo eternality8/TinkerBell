@@ -57,6 +57,10 @@ class Settings:
     last_open_file: str | None = None
     unsaved_snapshot: dict[str, Any] | None = None
     unsaved_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
+    untitled_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
+    open_tabs: list[dict[str, Any]] = field(default_factory=list)
+    active_tab_id: str | None = None
+    next_untitled_index: int = 1
     font_family: str = "JetBrains Mono"
     font_size: int = 13
     window_geometry: str | None = None

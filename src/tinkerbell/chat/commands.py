@@ -68,6 +68,7 @@ DIRECTIVE_SCHEMA: Dict[str, Any] = {
         "version": {"type": "string"},
         "document_digest": {"type": "string"},
         "metadata": {"type": "object"},
+        "tab_id": {"type": "string", "minLength": 1},
         "selection_fingerprint": {"type": "string", "minLength": 1},
     },
     "additionalProperties": True,

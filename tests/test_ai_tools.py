@@ -21,13 +21,31 @@ class _EditBridgeStub:
         self.last_diff_summary: str | None = None
         self.last_snapshot_version: str | None = None
         self.snapshot = {"text": "", "selection": (0, 0), "version": "digest-base", "path": "doc.txt"}
+        self.queue_tab_ids: list[str | None] = []
+        self.snapshot_requests: list[dict[str, Any]] = []
 
-    def queue_edit(self, directive) -> None:  # type: ignore[override]
+    def queue_edit(self, directive, *, tab_id: str | None = None) -> None:  # type: ignore[override]
+        self.queue_tab_ids.append(tab_id)
         self.calls.append(directive)
 
-    def generate_snapshot(self, *, delta_only: bool = False):  # type: ignore[override]
+    def generate_snapshot(  # type: ignore[override]
+        self,
+        *,
+        delta_only: bool = False,
+        tab_id: str | None = None,
+        include_open_documents: bool = False,
+    ):
+        self.snapshot_requests.append(
+            {"delta_only": delta_only, "tab_id": tab_id, "include_open_documents": include_open_documents}
+        )
         assert delta_only is False
         return dict(self.snapshot)
+
+    def get_last_diff_summary(self, tab_id: str | None = None) -> str | None:  # noqa: ARG002 - unused
+        return self.last_diff_summary
+
+    def get_last_snapshot_version(self, tab_id: str | None = None) -> str | None:  # noqa: ARG002 - unused
+        return self.last_snapshot_version
 
 
 class _SnapshotProviderStub:
@@ -37,9 +55,21 @@ class _SnapshotProviderStub:
         self.last_diff_summary: str | None = "+1 char"
         self.last_snapshot_version: str | None = "digest-1"
 
-    def generate_snapshot(self, *, delta_only: bool = False):  # type: ignore[override]
+    def generate_snapshot(  # type: ignore[override]
+        self,
+        *,
+        delta_only: bool = False,
+        tab_id: str | None = None,
+        include_open_documents: bool = False,
+    ):
         self.delta_only_calls.append(delta_only)
         return dict(self.snapshot)
+
+    def get_last_diff_summary(self, tab_id: str | None = None) -> str | None:  # noqa: ARG002 - unused
+        return self.last_diff_summary
+
+    def get_last_snapshot_version(self, tab_id: str | None = None) -> str | None:  # noqa: ARG002 - unused
+        return self.last_snapshot_version
 
 
 class _SearchReplaceBridgeStub:
@@ -63,9 +93,11 @@ class _PatchBridgeStub(_EditBridgeStub):
         self.snapshot = {"text": text, "selection": selection, "version": version, "path": "doc.md"}
         self.last_snapshot_version = version
 
-    def generate_snapshot(self, *, delta_only: bool = False):  # type: ignore[override]
-        assert delta_only is False
-        return dict(self.snapshot)
+
+class _LegacyBridgeStub(_EditBridgeStub):
+    def queue_edit(self, directive) -> None:  # type: ignore[override]
+        # Legacy bridges do not accept tab_id keyword arguments
+        self.calls.append(directive)
 
 
 def test_document_edit_tool_accepts_json_payload_and_reports_status():
@@ -139,6 +171,28 @@ def test_document_edit_tool_handles_special_characters_in_sentence():
     assert recorded["content"].startswith("“smart quotes” & emojis 🎉")
     assert recorded["content"].endswith("Next line")
     assert recorded["target_range"] == [25, 52]
+
+
+def test_document_edit_tool_routes_to_specific_tab():
+    bridge = _EditBridgeStub()
+    tool = DocumentEditTool(bridge=bridge)
+
+    tool.run(action="insert", content="Hi", target_range=(0, 0), tab_id="tab-123")
+
+    assert bridge.queue_tab_ids[-1] == "tab-123"
+
+
+def test_document_edit_tool_embeds_tab_when_bridge_lacks_routing():
+    bridge = _LegacyBridgeStub()
+    tool = DocumentEditTool(bridge=bridge)
+
+    tool.run(action="insert", content="Hi", target_range=(0, 0), tab_id="tab-legacy")
+
+    payload = bridge.calls[-1]
+    assert isinstance(payload, dict)
+    assert payload["tab_id"] == "tab-legacy"
+    metadata = payload.get("metadata") or {}
+    assert metadata.get("tab_id") == "tab-legacy"
 
 
 def test_document_edit_tool_accepts_patch_payload():
@@ -215,6 +269,17 @@ def test_document_apply_patch_tool_builds_and_applies_diff():
     assert bridge.calls and bridge.calls[-1]["action"] == "patch"
     assert "digest-7" in status
     assert bridge.calls[-1]["document_version"] == "digest-7"
+
+
+def test_document_apply_patch_tool_targets_specific_tab():
+    bridge = _PatchBridgeStub(text="Alpha beta", selection=(0, 5), version="digest-8")
+    edit_tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+
+    tool.run(content="ALPHA", target_range=(0, 5), tab_id="tab-b")
+
+    assert bridge.queue_tab_ids[-1] == "tab-b"
+    assert bridge.snapshot_requests[-1]["tab_id"] == "tab-b"
 
 
 def test_document_apply_patch_tool_validates_snapshot_version():
