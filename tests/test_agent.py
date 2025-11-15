@@ -151,6 +151,27 @@ def test_ai_controller_executes_tool_and_continues(sample_snapshot):
     assert result["tool_calls"][0]["resolved_arguments"] == {"delta_only": True}
 
 
+def test_ai_controller_includes_history_before_latest_prompt(sample_snapshot):
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="ready")])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    history = [
+        {"role": "user", "content": "Earlier question"},
+        {"role": "assistant", "content": "Earlier reply"},
+    ]
+
+    async def run() -> dict:
+        return await controller.run_chat("New topic", sample_snapshot, history=history)
+
+    asyncio.run(run())
+
+    messages = stub_client.calls[0]["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[1:3] == history
+    assert messages[-1]["role"] == "user"
+    assert "New topic" in messages[-1]["content"]
+
+
 def test_ai_controller_suggest_followups_returns_parsed_json():
     stub_client = _StubClient(
         [

@@ -146,6 +146,7 @@ class ChatPanel(QWidgetBase):
         self._messages: List[ChatMessage] = []
         self._active_stream: Optional[ChatMessage] = None
         self._tool_traces: list[ToolTrace] = []
+        self._visible_tool_traces: list[ToolTrace] = []
         self._suggestions: list[str] = []
         self._composer_text: str = ""
         self._composer_context = ComposerContext()
@@ -332,6 +333,13 @@ class ChatPanel(QWidgetBase):
         self._refresh_tool_trace_widget()
         return trace
 
+    def update_tool_trace(self, trace: ToolTrace) -> None:
+        """Refresh the tool trace list when an existing trace mutates."""
+
+        if not any(existing is trace for existing in self._tool_traces):
+            return
+        self._refresh_tool_trace_widget()
+
     def load_transcript(self, messages: Iterable[ChatMessage]) -> None:
         """Replace the history with ``messages`` respecting the history limit."""
 
@@ -393,6 +401,20 @@ class ChatPanel(QWidgetBase):
         except Exception:  # pragma: no cover - clipboard write failure
             return False
         return True
+
+    def copy_tool_trace_details(
+        self,
+        trace: Optional[ToolTrace] = None,
+        *,
+        index: Optional[int] = None,
+    ) -> bool:
+        """Copy a formatted summary of a recorded tool trace."""
+
+        selected = trace or self._resolve_tool_trace(index)
+        if selected is None:
+            return False
+        details = self._format_tool_trace_details(selected)
+        return self.copy_text_to_clipboard(details)
 
     # ------------------------------------------------------------------
     # Prompt submission + listeners
@@ -591,6 +613,7 @@ class ChatPanel(QWidgetBase):
             layout.addWidget(trace_label)
             self._tool_trace_widget = QListWidget(self)
             self._tool_trace_widget.setObjectName("tb-chat-traces")
+            self._configure_tool_trace_widget()
             layout.addWidget(self._tool_trace_widget)
             self._sync_tool_trace_visibility()
 
@@ -773,10 +796,30 @@ class ChatPanel(QWidgetBase):
         try:
             widget.blockSignals(True)
             widget.clear()
-            for trace in self._tool_traces[-10:]:
-                widget.addItem(f"{trace.name}: {trace.output_summary}")
+            visible_traces = list(self._tool_traces[-10:])
+            self._visible_tool_traces = visible_traces
+            for trace in visible_traces:
+                item_text = f"{trace.name}: {trace.output_summary}"
+                if QListWidgetItem is not None:
+                    QListWidgetItem(item_text, widget)
+                else:
+                    widget.addItem(item_text)
         finally:
             widget.blockSignals(False)
+
+    def _configure_tool_trace_widget(self) -> None:
+        widget = self._tool_trace_widget
+        if widget is None or Qt is None or QMenu is None:
+            return
+        try:
+            widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            return
+
+        try:
+            widget.customContextMenuRequested.connect(self._handle_tool_trace_context_menu)  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
 
     def _sync_tool_trace_visibility(self) -> None:
         label = self._tool_trace_label
@@ -788,6 +831,92 @@ class ChatPanel(QWidgetBase):
                 target.setVisible(self._tool_activity_visible)
             except Exception:  # pragma: no cover - depends on Qt availability
                 pass
+
+    def _handle_tool_trace_context_menu(self, point: Any) -> None:
+        widget = self._tool_trace_widget
+        if widget is None or QMenu is None:
+            return
+        try:
+            item = widget.itemAt(point)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            item = None
+        if item is None:
+            return
+        try:
+            row = widget.row(item)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            row = -1
+        trace = self._visible_tool_traces[row] if 0 <= row < len(self._visible_tool_traces) else None
+        if trace is None:
+            return
+        details = self._format_tool_trace_details(trace)
+        try:
+            menu = QMenu(widget)
+            copy_action = menu.addAction("Copy tool call details")
+            global_pos = widget.mapToGlobal(point)
+            selected = menu.exec(global_pos)
+            if selected == copy_action:
+                self.copy_text_to_clipboard(details)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+
+    def _format_tool_trace_details(self, trace: ToolTrace) -> str:
+        def _normalize(value: Optional[str]) -> str:
+            text = (value or "").strip()
+            return text if text else "(empty)"
+
+        def _normalize_block(value: Optional[str]) -> str:
+            if value is None:
+                return "(empty)"
+            text = str(value)
+            return text if text.strip() else "(empty)"
+
+        metadata = getattr(trace, "metadata", None) or {}
+        raw_input = metadata.get("raw_input")
+        raw_output = metadata.get("raw_output")
+
+        def _format_input() -> str:
+            if raw_input is not None:
+                return _normalize_block(raw_input)
+            return _normalize(trace.input_summary)
+
+        def _format_output() -> str:
+            if raw_output is not None:
+                return _normalize_block(raw_output)
+            return _normalize(trace.output_summary)
+
+        lines = [
+            f"Tool: {trace.name or '(unknown)'}",
+            f"Input: {_format_input()}",
+            f"Output: {_format_output()}",
+            f"Duration: {trace.duration_ms} ms",
+        ]
+
+        before_text = metadata.get("text_before")
+        after_text = metadata.get("text_after")
+        if before_text is not None or after_text is not None:
+            lines.extend(
+                [
+                    "",
+                    "Replaced text:",
+                    _normalize_block(before_text),
+                    "",
+                    "New text:",
+                    _normalize_block(after_text),
+                ]
+            )
+
+        return "\n".join(lines)
+
+    def _resolve_tool_trace(self, index: Optional[int]) -> Optional[ToolTrace]:
+        if not self._tool_traces:
+            return None
+        if index is None:
+            return self._tool_traces[-1]
+        total = len(self._tool_traces)
+        if -total <= index < total:
+            return self._tool_traces[index]
+        return None
 
     def _render_message_text(self, message: ChatMessage) -> str:
         prefix = message.role.upper()

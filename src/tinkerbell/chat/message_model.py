@@ -23,6 +23,7 @@ class ToolTrace:
     input_summary: str
     output_summary: str
     duration_ms: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

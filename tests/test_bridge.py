@@ -109,3 +109,17 @@ def test_edit_listener_receives_diff_summary():
     assert events
     assert events[0][0] == "insert"
     assert events[0][1] == "+3 chars"
+
+
+def test_last_edit_context_tracks_replacement_segments():
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+
+    bridge.queue_edit(EditDirective(action="replace", target_range=(0, 5), content="hi"))
+
+    context = bridge.last_edit_context
+    assert context is not None
+    assert context.action == "replace"
+    assert context.target_range == (0, 5)
+    assert context.replaced_text == "hello"
+    assert context.content == "hi"

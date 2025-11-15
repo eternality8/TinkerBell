@@ -64,6 +64,65 @@ def test_document_edit_tool_accepts_json_payload_and_reports_status():
     assert "digest-123" in status
 
 
+def test_document_edit_tool_accepts_keyword_arguments():
+    bridge = _EditBridgeStub()
+    bridge.last_diff_summary = "Δ0"
+    tool = DocumentEditTool(bridge=bridge)
+
+    status = tool.run(action="replace", content="Hello", target_range=(0, 5))
+
+    assert bridge.calls and bridge.calls[0]["action"] == "replace"
+    assert status.startswith("applied") or status == "queued"
+
+
+def test_document_edit_tool_requires_payload():
+    bridge = _EditBridgeStub()
+    tool = DocumentEditTool(bridge=bridge)
+
+    with pytest.raises(ValueError):
+        tool.run()
+
+    with pytest.raises(ValueError):
+        tool.run('{"action":"insert","content":"Hi"}', action="insert")
+
+
+def test_document_edit_tool_replaces_paragraph_with_formatting():
+    bridge = _EditBridgeStub()
+    bridge.last_diff_summary = "+12 chars"
+    bridge.last_snapshot_version = "digest-abc"
+    tool = DocumentEditTool(bridge=bridge)
+
+    replacement = "New intro paragraph.\n\n- bullet α\n- bullet β ✨"
+    status = tool.run(
+        action="replace",
+        content=replacement,
+        target_range={"start": 10, "end": 64},
+        rationale="Refresh intro with bullets",
+    )
+
+    assert bridge.calls and bridge.calls[0]["content"] == replacement
+    assert bridge.calls[0]["target_range"] == {"start": 10, "end": 64}
+    assert "applied" in status and "digest-abc" in status
+
+
+def test_document_edit_tool_handles_special_characters_in_sentence():
+    bridge = _EditBridgeStub()
+    tool = DocumentEditTool(bridge=bridge)
+
+    payload = (
+        '{"action":"replace","target_range":[25,52],'
+        '"content":"“smart quotes” & emojis 🎉\\nNext line"}'
+    )
+
+    tool.run(payload)
+
+    assert bridge.calls
+    recorded = bridge.calls[-1]
+    assert recorded["content"].startswith("“smart quotes” & emojis 🎉")
+    assert recorded["content"].endswith("Next line")
+    assert recorded["target_range"] == [25, 52]
+
+
 def test_document_snapshot_tool_includes_diff_summary_and_version():
     provider = _SnapshotProviderStub()
     tool = DocumentSnapshotTool(provider=provider)

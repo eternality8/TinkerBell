@@ -1,8 +1,17 @@
 """Editor widget tests covering logical behaviors in headless mode."""
 
+import pytest
+
 from tinkerbell.chat.message_model import EditDirective
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.editor.editor_widget import EditorWidget
+
+
+@pytest.fixture(autouse=True)
+def _ensure_qapp(qapp):  # pragma: no cover - pytest-qt provides the fixture
+    """Guarantee a running QApplication when PySide6 is installed."""
+
+    return qapp
 
 
 def test_editor_widget_snapshot_roundtrip():

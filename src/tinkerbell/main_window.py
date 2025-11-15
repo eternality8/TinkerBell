@@ -6,8 +6,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING
 
@@ -143,6 +144,19 @@ class WindowContext:
     settings_store: Optional[SettingsStore] = None
 
 
+@dataclass(slots=True)
+class _PendingToolTrace:
+    """Bookkeeping for streaming tool call data before it is displayed."""
+
+    name: str
+    arguments_chunks: list[str] = field(default_factory=list)
+    raw_input: str | None = None
+    pending_output: str | None = None
+    pending_parsed: Any | None = None
+    trace: ToolTrace | None = None
+    started_at: float | None = None
+
+
 class MainWindow(QMainWindow):
     """Primary application window hosting the editor and chat splitter."""
 
@@ -168,6 +182,7 @@ class MainWindow(QMainWindow):
         self._current_document_path: Optional[Path] = None
         self._ai_task: asyncio.Task[Any] | None = None
         self._ai_stream_active = False
+        self._pending_tool_traces: Dict[str, _PendingToolTrace] = {}
         self._suggestion_task: asyncio.Task[Any] | None = None
         self._suggestion_request_id = 0
         self._suggestion_cache_key: str | None = None
@@ -246,6 +261,13 @@ class MainWindow(QMainWindow):
                 status_tip="Save the current document",
                 callback=self._handle_save_requested,
             ),
+            "file_revert": self._build_action(
+                name="file_revert",
+                text="Revert",
+                shortcut=None,
+                status_tip="Discard unsaved changes and reload the file from disk",
+                callback=self._handle_revert_requested,
+            ),
             "file_save_as": self._build_action(
                 name="file_save_as",
                 text="Save As…",
@@ -276,7 +298,7 @@ class MainWindow(QMainWindow):
             "file": MenuSpec(
                 name="file",
                 title="&File",
-                actions=("file_open", "file_save", "file_save_as"),
+                actions=("file_open", "file_save", "file_revert", "file_save_as"),
             ),
             "settings": MenuSpec(name="settings", title="&Settings", actions=("settings_open",)),
             "ai": MenuSpec(name="ai", title="&AI", actions=("ai_snapshot",)),
@@ -518,8 +540,13 @@ class MainWindow(QMainWindow):
             self.update_status("Previous AI request canceled")
 
         snapshot = self._bridge.generate_snapshot()
+        history_payload = self._serialize_chat_history(
+            self._chat_panel.history(),
+            limit=12,
+            exclude_latest=True,
+        )
         task = self._run_coroutine(
-            self._run_ai_turn(controller, prompt, snapshot, metadata or {})
+            self._run_ai_turn(controller, prompt, snapshot, metadata or {}, history_payload)
         )
         self._ai_task = task
 
@@ -529,6 +556,7 @@ class MainWindow(QMainWindow):
         prompt: str,
         snapshot: Mapping[str, Any],
         metadata: Mapping[str, Any],
+        history: Sequence[Mapping[str, str]] | None,
     ) -> None:
         self._ai_stream_active = False
         normalized_metadata = self._normalize_metadata(metadata)
@@ -539,6 +567,7 @@ class MainWindow(QMainWindow):
                 prompt,
                 snapshot,
                 metadata=normalized_metadata,
+                history=history,
                 on_event=self._handle_ai_stream_event,
             )
         except Exception as exc:  # pragma: no cover - runtime safety
@@ -578,16 +607,113 @@ class MainWindow(QMainWindow):
                 self._ai_stream_active = True
             return
 
-        if event_type.startswith("tool_calls") and getattr(event, "tool_name", None):
-            arguments = (getattr(event, "arguments_delta", None) or getattr(event, "tool_arguments", None) or "").strip()
-            if not arguments:
-                arguments = "(no arguments)"
-            trace = ToolTrace(
-                name=str(getattr(event, "tool_name", "tool")),
-                input_summary=arguments[:120],
-                output_summary=(getattr(event, "tool_arguments", None) or arguments)[:120],
-            )
-            self._chat_panel.show_tool_trace(trace)
+        if event_type == "tool_calls.function.arguments.delta":
+            self._record_tool_call_arguments_delta(event)
+            return
+
+        if event_type == "tool_calls.function.arguments.done":
+            self._finalize_tool_call_arguments(event)
+            return
+
+        if event_type == "tool_calls.result":
+            self._record_tool_call_result(event)
+            return
+
+    def _record_tool_call_arguments_delta(self, event: Any) -> None:
+        key = self._tool_call_key(event)
+        if not key:
+            return
+        state = self._pending_tool_traces.get(key)
+        if state is None:
+            state = _PendingToolTrace(name=self._normalize_tool_name(event))
+            self._pending_tool_traces[key] = state
+        delta = getattr(event, "arguments_delta", None) or getattr(event, "tool_arguments", None)
+        if delta:
+            state.arguments_chunks.append(str(delta))
+
+    def _finalize_tool_call_arguments(self, event: Any) -> None:
+        key = self._tool_call_key(event)
+        if not key:
+            return
+        state = self._pending_tool_traces.get(key)
+        if state is None:
+            state = _PendingToolTrace(name=self._normalize_tool_name(event))
+            self._pending_tool_traces[key] = state
+        arguments_text = getattr(event, "tool_arguments", None)
+        if not arguments_text:
+            arguments_text = "".join(state.arguments_chunks)
+        state.arguments_chunks.clear()
+        state.raw_input = str(arguments_text or "")
+        metadata: Dict[str, Any] = {"raw_input": state.raw_input}
+        trace = ToolTrace(
+            name=state.name,
+            input_summary=self._summarize_tool_io(state.raw_input),
+            output_summary="(running…)",
+            metadata=metadata,
+        )
+        state.trace = trace
+        state.started_at = time.perf_counter()
+        self._chat_panel.show_tool_trace(trace)
+        if state.pending_output is not None:
+            self._apply_tool_result_to_trace(key, state)
+
+    def _record_tool_call_result(self, event: Any) -> None:
+        key = self._tool_call_key(event)
+        if not key:
+            return
+        state = self._pending_tool_traces.get(key)
+        if state is None:
+            state = _PendingToolTrace(name=self._normalize_tool_name(event))
+            self._pending_tool_traces[key] = state
+        content = getattr(event, "content", None) or getattr(event, "tool_arguments", None) or ""
+        state.pending_output = str(content)
+        state.pending_parsed = getattr(event, "parsed", None)
+        self._apply_tool_result_to_trace(key, state)
+
+    def _apply_tool_result_to_trace(self, key: str, state: _PendingToolTrace) -> None:
+        trace = state.trace
+        if trace is None or state.pending_output is None:
+            return
+        trace.output_summary = self._summarize_tool_io(state.pending_output)
+        metadata = dict(trace.metadata)
+        if state.raw_input is not None:
+            metadata.setdefault("raw_input", state.raw_input)
+        metadata["raw_output"] = state.pending_output
+        if state.pending_parsed is not None:
+            metadata["parsed_output"] = state.pending_parsed
+        trace.metadata = metadata
+        if state.started_at is not None:
+            elapsed = max(0.0, time.perf_counter() - state.started_at)
+            trace.duration_ms = int(elapsed * 1000)
+        self._chat_panel.update_tool_trace(trace)
+        self._pending_tool_traces.pop(key, None)
+
+    def _tool_call_key(self, event: Any) -> str:
+        identifier = getattr(event, "tool_call_id", None) or getattr(event, "id", None)
+        if identifier:
+            return str(identifier)
+        index = getattr(event, "tool_index", None)
+        return f"{self._normalize_tool_name(event)}:{index if index is not None else 0}"
+
+    @staticmethod
+    def _normalize_tool_name(event: Any) -> str:
+        name = getattr(event, "tool_name", None) or "tool"
+        text = str(name).strip()
+        return text or "tool"
+
+    @staticmethod
+    def _summarize_tool_io(payload: Any, limit: int = 140) -> str:
+        if payload is None:
+            return "(empty)"
+        text = str(payload).strip()
+        if not text:
+            return "(empty)"
+        condensed = " ".join(text.split())
+        if not condensed:
+            return "(empty)"
+        if len(condensed) <= limit:
+            return condensed
+        return f"{condensed[: limit - 1].rstrip()}…"
 
     def _coerce_stream_text(self, payload: Any) -> str:
         if payload is None:
@@ -743,8 +869,17 @@ class MainWindow(QMainWindow):
         digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         return digest
 
-    def _serialize_chat_history(self, history: Sequence[ChatMessage], limit: int = 10) -> list[dict[str, str]]:
-        windowed = list(history)[-limit:]
+    def _serialize_chat_history(
+        self,
+        history: Sequence[ChatMessage],
+        limit: int = 10,
+        *,
+        exclude_latest: bool = False,
+    ) -> list[dict[str, str]]:
+        messages = list(history)
+        if exclude_latest and messages:
+            messages = messages[:-1]
+        windowed = messages[-limit:] if limit else messages
         serialized: list[dict[str, str]] = []
         for message in windowed:
             text = (message.content or "").strip()
@@ -806,10 +941,19 @@ class MainWindow(QMainWindow):
     def _handle_edit_applied(self, directive: EditDirective, _state: DocumentState, diff: str) -> None:
         summary = f"Applied {directive.action} ({diff})"
         self.update_status(summary)
+        metadata: Dict[str, Any] = {}
+        if directive.action == "replace":
+            context = getattr(self._bridge, "last_edit_context", None)
+            if context is not None and context.action == "replace":
+                metadata["text_before"] = context.replaced_text
+                metadata["text_after"] = context.content
+            else:
+                metadata["text_after"] = directive.content
         trace = ToolTrace(
             name=f"edit:{directive.action}",
             input_summary=f"range={directive.target_range}",
             output_summary=diff,
+            metadata=metadata,
         )
         self._chat_panel.show_tool_trace(trace)
 
@@ -936,6 +1080,35 @@ class MainWindow(QMainWindow):
             self.save_document(path)
         except RuntimeError:
             _LOGGER.debug("Save As aborted for path: %s", path)
+
+    def _handle_revert_requested(self) -> None:
+        """Reload the active document from disk, discarding unsaved edits."""
+
+        path = self._resolve_active_document_path()
+        if path is None:
+            self.update_status("No file to revert")
+            return
+
+        try:
+            text = file_io.read_text(path)
+        except FileNotFoundError:
+            self.update_status(f"File not found: {path}")
+            return
+
+        metadata = DocumentMetadata(path=path, language=self._infer_language(path))
+        document = DocumentState(text=text, metadata=metadata)
+        document.dirty = False
+
+        self._snapshot_persistence_block += 1
+        try:
+            self._editor.load_document(document)
+        finally:
+            self._snapshot_persistence_block = max(0, self._snapshot_persistence_block - 1)
+
+        self._current_document_path = path
+        self._clear_unsaved_snapshot(path=path)
+        self._refresh_window_title(document)
+        self.update_status(f"Reverted {path.name}")
 
     def _handle_settings_requested(self) -> None:
         """Show the settings dialog so users can configure integrations."""
@@ -1081,6 +1254,14 @@ class MainWindow(QMainWindow):
 
         parent = self._qt_parent_widget()
         return open_file_dialog(parent=parent, start_dir=start_dir)
+
+    def _resolve_active_document_path(self) -> Path | None:
+        document = self._editor.to_document()
+        if document.metadata.path is not None:
+            return Path(document.metadata.path)
+        if self._current_document_path is not None:
+            return Path(self._current_document_path)
+        return None
 
     def _prompt_for_save_path(self) -> Path | None:
         """Show the save-file dialog and return the chosen path."""

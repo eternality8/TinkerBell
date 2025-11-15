@@ -33,8 +33,8 @@ class DocumentEditTool:
 
     bridge: Bridge
 
-    def run(self, directive: DirectiveInput) -> str:
-        payload = self._coerce_input(directive)
+    def run(self, directive: DirectiveInput | None = None, **fields: Any) -> str:
+        payload = self._coerce_input(self._resolve_input(directive, fields))
         self.bridge.queue_edit(payload)
 
         diff = getattr(self.bridge, "last_diff_summary", None)
@@ -46,6 +46,16 @@ class DocumentEditTool:
         if version:
             return f"queued (version={version})"
         return "queued"
+
+    @staticmethod
+    def _resolve_input(directive: DirectiveInput | None, fields: Mapping[str, Any]) -> DirectiveInput:
+        if directive is not None and fields:
+            raise ValueError("Provide either a directive argument or keyword fields, not both.")
+        if directive is None:
+            if not fields:
+                raise ValueError("Directive payload is required.")
+            return dict(fields)
+        return directive
 
     @staticmethod
     def _coerce_input(directive: DirectiveInput) -> EditDirective | Mapping[str, Any]:

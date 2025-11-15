@@ -168,12 +168,13 @@ class AIController:
         doc_snapshot: Mapping[str, Any] | None,
         *,
         metadata: Mapping[str, str] | None = None,
+        history: Sequence[Mapping[str, str]] | None = None,
         on_event: ToolCallback | None = None,
     ) -> dict:
         """Execute a chat turn against the compiled agent graph."""
 
         snapshot = dict(doc_snapshot or {})
-        base_messages = self._build_messages(prompt, snapshot)
+        base_messages = self._build_messages(prompt, snapshot, history)
         merged_metadata = self._build_metadata(snapshot, metadata)
         tool_specs = [registration.as_openai_tool() for registration in self.tools.values()]
         max_iterations = self._graph.get("metadata", {}).get("max_iterations")
@@ -366,12 +367,38 @@ class AIController:
                 break
         return sanitized
 
-    def _build_messages(self, prompt: str, snapshot: Mapping[str, Any]) -> list[dict[str, str]]:
+    def _build_messages(
+        self,
+        prompt: str,
+        snapshot: Mapping[str, Any],
+        history: Sequence[Mapping[str, Any]] | None = None,
+    ) -> list[dict[str, str]]:
         user_prompt = prompts.format_user_prompt(prompt, dict(snapshot))
-        return [
+        messages: list[dict[str, str]] = [
             {"role": "system", "content": prompts.base_system_prompt()},
-            {"role": "user", "content": user_prompt},
         ]
+        if history:
+            messages.extend(self._sanitize_history(history))
+        messages.append({"role": "user", "content": user_prompt})
+        return messages
+
+    def _sanitize_history(
+        self,
+        history: Sequence[Mapping[str, Any]],
+        limit: int = 20,
+    ) -> list[dict[str, str]]:
+        allowed_roles = {"user", "assistant", "system", "tool"}
+        window = list(history)[-limit:]
+        sanitized: list[dict[str, str]] = []
+        for entry in window:
+            role = str(entry.get("role", "user")).lower()
+            if role not in allowed_roles:
+                continue
+            text = str(entry.get("content", "")).strip()
+            if not text:
+                continue
+            sanitized.append({"role": role, "content": text})
+        return sanitized
 
     def _build_metadata(
         self,

@@ -193,4 +193,16 @@ def _build_ai_controller(settings: Settings, *, debug_logging: bool = False) -> 
         _LOGGER.warning("AI controller unavailable: %s", exc)
         return None
 
-    return AIController(client=client)
+    limit = _resolve_max_tool_iterations(settings)
+    return AIController(client=client, max_tool_iterations=limit)
+
+
+def _resolve_max_tool_iterations(settings: Settings | None) -> int:
+    """Clamp the configured iteration limit into a safe operating range."""
+
+    raw_value = getattr(settings, "max_tool_iterations", 8) if settings else 8
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = 8
+    return max(1, min(value, 50))

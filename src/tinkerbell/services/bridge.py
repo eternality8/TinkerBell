@@ -43,6 +43,16 @@ class _QueuedEdit:
     payload: Optional[Mapping[str, Any]] = None
 
 
+@dataclass(slots=True)
+class EditContext:
+    """Details about the most recently applied directive."""
+
+    action: str
+    target_range: tuple[int, int]
+    replaced_text: str
+    content: str
+
+
 class DocumentBridge:
     """Orchestrates safe document snapshots, conflict detection, and queued edits."""
 
@@ -52,6 +62,7 @@ class DocumentBridge:
         self._draining = False
         self._last_diff: Optional[str] = None
         self._last_snapshot_token: Optional[str] = None
+        self._last_edit_context: Optional[EditContext] = None
         self._main_thread_executor = main_thread_executor
         self._edit_listeners: list[EditAppliedListener] = []
 
@@ -82,6 +93,12 @@ class DocumentBridge:
         """Expose the digest associated with the latest document snapshot."""
 
         return self._last_snapshot_token
+
+    @property
+    def last_edit_context(self) -> Optional[EditContext]:
+        """Expose metadata about the most recently applied edit."""
+
+        return self._last_edit_context
 
     def add_edit_listener(self, listener: EditAppliedListener) -> None:
         """Register a callback fired after each successful directive."""
@@ -134,6 +151,14 @@ class DocumentBridge:
             _LOGGER.exception("Failed to apply directive: action=%s", queued.directive.action)
             raise RuntimeError(f"Failed to apply directive: {queued.directive.action}") from exc
 
+        start, end = queued.directive.target_range
+        replaced_segment = before_text[start:end]
+        self._last_edit_context = EditContext(
+            action=queued.directive.action,
+            target_range=(start, end),
+            replaced_text=replaced_segment,
+            content=queued.directive.content,
+        )
         self._last_diff = self._summarize_diff(before_text, updated_state.text)
         self._last_snapshot_token = self._compute_document_token(updated_state)
         _LOGGER.debug(

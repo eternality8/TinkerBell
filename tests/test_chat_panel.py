@@ -94,6 +94,132 @@ def test_chat_panel_show_tool_trace_attaches_to_latest_message():
     assert msg.tool_traces[-1] is trace
 
 
+def test_copy_tool_trace_details_includes_all_fields(monkeypatch):
+    panel = _make_panel()
+    trace = ToolTrace(
+        name="search_api",
+        input_summary="query=hello",
+        output_summary="result=42",
+        duration_ms=87,
+    )
+    panel.show_tool_trace(trace)
+
+    class _Clipboard:
+        def __init__(self) -> None:
+            self.text = ""
+
+        def setText(self, text: str) -> None:
+            self.text = text
+
+    class _QtAppStub:
+        _clipboard = _Clipboard()
+
+        @staticmethod
+        def instance() -> object:
+            return object()
+
+        @staticmethod
+        def clipboard() -> _Clipboard:
+            return _QtAppStub._clipboard
+
+    monkeypatch.setattr(chat_panel, "QApplication", _QtAppStub)
+
+    copied = panel.copy_tool_trace_details(trace)
+
+    assert copied is True
+    text = panel.last_copied_text or ""
+    assert "Tool: search_api" in text
+    assert "Input: query=hello" in text
+    assert "Output: result=42" in text
+    assert "Duration: 87 ms" in text
+
+
+def test_copy_tool_trace_details_includes_replacement_text(monkeypatch):
+    panel = _make_panel()
+    trace = ToolTrace(
+        name="edit:replace",
+        input_summary="range=(0, 5)",
+        output_summary="Δ-2 chars",
+        metadata={"text_before": "old text", "text_after": "new text"},
+    )
+    panel.show_tool_trace(trace)
+
+    class _Clipboard:
+        def __init__(self) -> None:
+            self.text = ""
+
+        def setText(self, text: str) -> None:
+            self.text = text
+
+    class _QtAppStub:
+        _clipboard = _Clipboard()
+
+        @staticmethod
+        def instance() -> object:
+            return object()
+
+        @staticmethod
+        def clipboard() -> _Clipboard:
+            return _QtAppStub._clipboard
+
+    monkeypatch.setattr(chat_panel, "QApplication", _QtAppStub)
+
+    copied = panel.copy_tool_trace_details(trace)
+
+    assert copied is True
+    text = panel.last_copied_text or ""
+    assert "Replaced text:" in text
+    assert "old text" in text
+    assert "New text:" in text
+    assert "new text" in text
+
+
+def test_copy_tool_trace_details_prefers_raw_metadata(monkeypatch):
+    panel = _make_panel()
+    long_input = '{"action":"replace","content":"' + ("A" * 60) + '"}'
+    long_output = "Line 1\nLine 2 with details"
+    trace = ToolTrace(
+        name="edit:replace",
+        input_summary="short",
+        output_summary="summary",
+        metadata={"raw_input": long_input, "raw_output": long_output},
+    )
+    panel.show_tool_trace(trace)
+
+    class _Clipboard:
+        def __init__(self) -> None:
+            self.text = ""
+
+        def setText(self, text: str) -> None:
+            self.text = text
+
+    class _QtAppStub:
+        _clipboard = _Clipboard()
+
+        @staticmethod
+        def instance() -> object:
+            return object()
+
+        @staticmethod
+        def clipboard() -> _Clipboard:
+            return _QtAppStub._clipboard
+
+    monkeypatch.setattr(chat_panel, "QApplication", _QtAppStub)
+
+    copied = panel.copy_tool_trace_details(trace)
+
+    assert copied is True
+    text = panel.last_copied_text or ""
+    assert long_input in text
+    assert "Line 2 with details" in text
+
+
+def test_copy_tool_trace_details_without_traces_returns_false():
+    panel = _make_panel()
+
+    assert panel.copy_tool_trace_details() is False
+
+
 def test_chat_panel_suggestions_update_composer():
     panel = _make_panel()
     panel.set_suggestions(["Option A", "Option B"])

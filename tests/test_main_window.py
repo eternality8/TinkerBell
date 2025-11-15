@@ -38,7 +38,14 @@ def _make_window(controller: Any | None = None, settings: Settings | None = None
 def test_main_window_registers_default_actions():
     window = _make_window()
     action_keys = set(window.actions.keys())
-    assert {"file_open", "file_save", "file_save_as", "settings_open", "ai_snapshot"}.issubset(action_keys)
+    assert {
+        "file_open",
+        "file_save",
+        "file_revert",
+        "file_save_as",
+        "settings_open",
+        "ai_snapshot",
+    }.issubset(action_keys)
     assert window.last_status_message == "Ready"
 
 
@@ -167,7 +174,7 @@ def test_menu_specs_expose_file_and_settings_actions():
     menus = {spec.name: spec for spec in window.menu_specs()}
 
     assert "file" in menus
-    assert menus["file"].actions == ("file_open", "file_save", "file_save_as")
+    assert menus["file"].actions == ("file_open", "file_save", "file_revert", "file_save_as")
 
     assert "settings" in menus
     assert menus["settings"].actions == ("settings_open",)
@@ -365,6 +372,36 @@ def test_save_document_clears_file_snapshot(tmp_path: Path):
     window.save_document()
 
     assert str(target.resolve()) not in settings.unsaved_snapshots
+
+
+def test_revert_discards_unsaved_changes(tmp_path: Path):
+    target = tmp_path / "story.md"
+    target.write_text("Original text", encoding="utf-8")
+    settings = Settings()
+    window = _make_window(settings=settings)
+    window.open_document(target)
+    window.editor_widget.set_text("Edited text")
+
+    normalized = str(target.resolve())
+    assert settings.unsaved_snapshots is not None
+    assert settings.unsaved_snapshots[normalized]["text"] == "Edited text"
+
+    window._handle_revert_requested()
+
+    document = window.editor_widget.to_document()
+    assert document.text == "Original text"
+    assert document.dirty is False
+    assert normalized not in (settings.unsaved_snapshots or {})
+    assert window.last_status_message == f"Reverted {target.name}"
+
+
+def test_revert_without_path_updates_status():
+    window = _make_window()
+    window.editor_widget.set_text("Scratch")
+
+    window._handle_revert_requested()
+
+    assert window.last_status_message == "No file to revert"
 
 
 def test_startup_restores_file_snapshot(tmp_path: Path):
@@ -601,9 +638,19 @@ class _StubAIController:
         self.suggestion_responses: list[list[str]] = []
         self.stream_scripts: list[list[Any]] = []
         self.response_texts: list[str] = []
+        self.history_payloads: list[Sequence[Mapping[str, str]] | None] = []
 
-    async def run_chat(self, prompt: str, snapshot: dict, *, metadata=None, on_event=None) -> dict:
+    async def run_chat(
+        self,
+        prompt: str,
+        snapshot: dict,
+        *,
+        metadata=None,
+        history=None,
+        on_event=None,
+    ) -> dict:
         self.prompts.append(prompt)
+        self.history_payloads.append(history)
         if on_event is not None:
             script = self.stream_scripts.pop(0) if self.stream_scripts else None
             events = script or [
@@ -671,6 +718,24 @@ def test_chat_prompt_routes_to_ai_controller():
     assert history[-1].role == "assistant"
     assert "hello world" in history[-1].content.lower()
     assert controller.prompts == ["Summarize this"]
+    assert controller.history_payloads[-1] == []
+
+
+def test_chat_prompt_includes_prior_history_for_ai_requests():
+    controller = _StubAIController()
+    window = _make_window(controller)
+    panel = window.chat_panel
+    panel.append_user_message("Earlier question")
+    panel.append_ai_message(ChatMessage(role="assistant", content="Earlier reply"))
+
+    panel.set_composer_text("New request")
+    panel.send_prompt()
+
+    history_payload = controller.history_payloads[-1]
+    assert history_payload == [
+        {"role": "user", "content": "Earlier question"},
+        {"role": "assistant", "content": "Earlier reply"},
+    ]
 
 
 def test_stream_done_event_does_not_duplicate_text():
@@ -709,6 +774,56 @@ def test_stream_done_event_does_not_duplicate_text():
     final_text = assistant_messages[-1].content
     assert final_text.count("Ooh, I'd love to help you write a story!") == 1
     assert final_text.count("Ooh, I see we have a fresh, blank canvas") == 1
+
+
+def test_tool_call_stream_events_coalesce_into_single_trace():
+    controller = _StubAIController()
+    window = _make_window(controller)
+    call_id = "tool-123"
+    arguments_text = '{"action":"replace","content":"Better text"}'
+    result_text = "Applied edit"
+
+    events = [
+        SimpleNamespace(
+            type="tool_calls.function.arguments.delta",
+            tool_name="document_edit",
+            tool_index=0,
+            tool_call_id=call_id,
+            arguments_delta='{"action":"replace"',
+        ),
+        SimpleNamespace(
+            type="tool_calls.function.arguments.delta",
+            tool_name="document_edit",
+            tool_index=0,
+            tool_call_id=call_id,
+            arguments_delta=',"content":"Better text"}',
+        ),
+        SimpleNamespace(
+            type="tool_calls.function.arguments.done",
+            tool_name="document_edit",
+            tool_index=0,
+            tool_call_id=call_id,
+            tool_arguments=arguments_text,
+        ),
+        SimpleNamespace(
+            type="tool_calls.result",
+            tool_name="document_edit",
+            tool_index=0,
+            tool_call_id=call_id,
+            content=result_text,
+        ),
+    ]
+
+    for payload in events:
+        window._process_stream_event(payload)  # type: ignore[arg-type]
+
+    traces = getattr(window.chat_panel, "_tool_traces")
+    assert len(traces) == 1
+    trace = traces[0]
+    assert trace.metadata["raw_input"] == arguments_text
+    assert trace.metadata["raw_output"] == result_text
+    assert trace.output_summary == result_text
+    assert window._pending_tool_traces == {}
 
 
 def test_default_ai_tools_register_when_controller_available():

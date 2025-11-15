@@ -24,6 +24,7 @@ QPlainTextEdit: Any = None
 QStackedWidget: Any = None
 QVBoxLayout: Any = None
 QWidgetBase: Any = None
+QSizePolicy: Any = None
 
 try:  # pragma: no cover - PySide6 optional in CI
     from PySide6.QtCore import Qt as _QtCoreQt  # noqa: F401  (exported for future use)
@@ -32,6 +33,7 @@ try:  # pragma: no cover - PySide6 optional in CI
         QApplication as _QtApplication,
         QLabel as _QtLabel,
         QPlainTextEdit as _QtPlainTextEdit,
+        QSizePolicy as _QtSizePolicy,
         QStackedWidget as _QtStackedWidget,
         QVBoxLayout as _QtVBoxLayout,
         QWidget as _QtWidget,
@@ -45,6 +47,7 @@ try:  # pragma: no cover - PySide6 optional in CI
     QStackedWidget = _QtStackedWidget
     QVBoxLayout = _QtVBoxLayout
     QWidgetBase = _QtWidget
+    QSizePolicy = _QtSizePolicy
 except Exception:  # pragma: no cover - runtime fallback
 
     class _StubQWidget:  # type: ignore[too-many-ancestors]
@@ -134,6 +137,12 @@ class EditorWidget(QWidgetBase):
         self._preview_widget = QLabel(self)
         self._preview_widget.setObjectName("previewLabel")  # type: ignore[attr-defined]
         self._preview_widget.setWordWrap(True)  # type: ignore[attr-defined]
+        if QSizePolicy is not None:
+            try:
+                policy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                self._preview_widget.setSizePolicy(policy)
+            except Exception:  # pragma: no cover - defensive guard
+                pass
 
         self._stack = QStackedWidget(self)
         self._stack.addWidget(self._qt_editor)
@@ -365,14 +374,26 @@ class EditorWidget(QWidgetBase):
         self._redo_stack.clear()
 
     def _refresh_preview(self, *, if_enabled: bool) -> None:
-        if not self._preview_enabled and if_enabled:
+        should_render = self._preview_enabled or not if_enabled
+        if should_render:
+            self._preview_cache = render_preview(self._text_buffer, theme=self._theme)
+        self._sync_preview_widget()
+
+    def _sync_preview_widget(self) -> None:
+        if self._preview_widget is None:
             return
-        self._preview_cache = render_preview(self._text_buffer, theme=self._theme)
-        if self._preview_widget is not None and self._preview_cache is not None:
+        if not self._preview_enabled:
             try:
-                self._preview_widget.setText(self._preview_cache.html)
+                self._preview_widget.clear()
             except Exception:  # pragma: no cover - defensive guard
                 pass
+            return
+        if self._preview_cache is None:
+            return
+        try:
+            self._preview_widget.setText(self._preview_cache.html)
+        except Exception:  # pragma: no cover - defensive guard
+            pass
 
     def _emit_text_changed(self) -> None:
         for listener in list(self._text_listeners):
