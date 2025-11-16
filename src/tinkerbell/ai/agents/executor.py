@@ -16,8 +16,14 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, Mapping, MutableMap
 from openai.types.chat import ChatCompletionToolParam
 
 from .. import prompts
+from ..ai_types import AgentConfig
 from ..client import AIClient, AIStreamEvent
-from ..services.telemetry import ContextUsageEvent, InMemoryTelemetrySink, TelemetrySink
+from ..services.telemetry import (
+    ContextUsageEvent,
+    PersistentTelemetrySink,
+    TelemetrySink,
+    default_telemetry_path,
+)
 from .graph import build_agent_graph
 
 LOGGER = logging.getLogger(__name__)
@@ -114,8 +120,8 @@ class AIController:
     telemetry_enabled: bool = False
     telemetry_limit: int = 200
     telemetry_sink: TelemetrySink | None = None
+    agent_config: AgentConfig | None = None
     _graph: Dict[str, Any] = field(init=False, repr=False)
-    _max_tool_iterations: int = field(init=False, repr=False)
     _active_task: asyncio.Task[dict] | None = field(default=None, init=False, repr=False)
     _task_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _telemetry_sink: TelemetrySink | None = field(default=None, init=False, repr=False)
@@ -129,8 +135,10 @@ class AIController:
                 else:
                     normalized[name] = ToolRegistration(name=name, impl=value)
             self.tools = normalized
-        self._max_tool_iterations = self._normalize_iterations(self.max_tool_iterations)
-        self.max_tool_iterations = self._max_tool_iterations
+        config = self.agent_config or AgentConfig(max_iterations=self.max_tool_iterations)
+        config.max_iterations = self._normalize_iterations(config.max_iterations)
+        self.agent_config = config.clamp()
+        self.max_tool_iterations = self.agent_config.max_iterations
         self._rebuild_graph()
         self.configure_context_window(
             max_context_tokens=self.max_context_tokens,
@@ -170,9 +178,11 @@ class AIController:
         """Update the maximum allowed tool iterations and rebuild the graph if needed."""
 
         normalized = self._normalize_iterations(iterations)
-        if normalized == self._max_tool_iterations:
+        config = self.agent_config or AgentConfig(max_iterations=self.max_tool_iterations)
+        if normalized == config.max_iterations:
             return
-        self._max_tool_iterations = normalized
+        config.max_iterations = normalized
+        self.agent_config = config
         self.max_tool_iterations = normalized
         self._rebuild_graph()
 
@@ -417,9 +427,13 @@ class AIController:
                 await result
 
     def _rebuild_graph(self) -> None:
+        config = self.agent_config or AgentConfig(max_iterations=self.max_tool_iterations)
+        config.max_iterations = self._normalize_iterations(config.max_iterations)
+        self.agent_config = config.clamp()
+        self.max_tool_iterations = self.agent_config.max_iterations
         self._graph = build_agent_graph(
             tools={name: registration.impl for name, registration in self.tools.items()},
-            max_iterations=self._max_tool_iterations,
+            config=self.agent_config,
         )
 
     def _configure_telemetry_sink(self) -> None:
@@ -430,7 +444,7 @@ class AIController:
             limit = 200
         limit = max(20, min(limit, 10_000))
         if self.telemetry_sink is None:
-            self._telemetry_sink = InMemoryTelemetrySink(capacity=limit)
+            self._telemetry_sink = PersistentTelemetrySink(path=default_telemetry_path(), capacity=limit)
         else:
             self._telemetry_sink = self.telemetry_sink
 
@@ -554,7 +568,11 @@ class AIController:
             return False
         name = record.get("name") or ""
         failure_prefix = f"Tool '{name}' failed:"
-        return result.startswith(failure_prefix)
+        if result.startswith(failure_prefix):
+            return True
+        if result.startswith("Tool '") and result.endswith("is not registered."):
+            return True
+        return False
 
     def _pending_patch_prompt(self) -> str:
         return (
@@ -650,8 +668,9 @@ class AIController:
         snapshot: Mapping[str, Any],
         history: Sequence[Mapping[str, Any]] | None = None,
     ) -> _MessagePlan:
-        user_prompt = prompts.format_user_prompt(prompt, dict(snapshot))
-        system_message = {"role": "system", "content": prompts.base_system_prompt()}
+        model_name = getattr(getattr(self.client, "settings", None), "model", None)
+        user_prompt = prompts.format_user_prompt(prompt, dict(snapshot), model_name=model_name)
+        system_message = {"role": "system", "content": prompts.base_system_prompt(model_name=model_name)}
         user_message = {"role": "user", "content": user_prompt}
 
         context_limit = self.max_context_tokens
@@ -845,7 +864,13 @@ class AIController:
         records: list[dict[str, Any]] = []
         token_cost = 0
         for call in tool_calls:
-            content, record = await self._execute_tool_call(call, on_event)
+            started_at = time.time()
+            start_perf = time.perf_counter()
+            content, resolved_arguments, raw_result = await self._execute_tool_call(call, on_event)
+            duration_ms = max(0.0, (time.perf_counter() - start_perf) * 1000.0)
+            argument_tokens = self._estimate_text_tokens(call.arguments or "")
+            result_tokens = self._estimate_text_tokens(content)
+            call_token_cost = argument_tokens + result_tokens
             tool_message: dict[str, Any] = {
                 "role": "tool",
                 "tool_call_id": call.call_id,
@@ -854,22 +879,30 @@ class AIController:
             if call.name:
                 tool_message["name"] = call.name
             messages.append(tool_message)
+            record = self._build_tool_record(
+                call,
+                resolved_arguments,
+                content,
+                call_token_cost,
+                duration_ms,
+                raw_result,
+                started_at=started_at,
+            )
             records.append(record)
-            token_cost += self._estimate_text_tokens(call.arguments or "")
-            token_cost += self._estimate_text_tokens(content)
+            token_cost += call_token_cost
         return messages, records, token_cost
 
     async def _execute_tool_call(
         self,
         call: _ToolCallRequest,
         on_event: ToolCallback | None,
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[str, Any, Any]:
         registration = self.tools.get(call.name) if call.name else None
         resolved_arguments = self._coerce_tool_arguments(call.arguments, call.parsed)
         if registration is None:
             message = f"Tool '{call.name or 'unknown'}' is not registered."
             await self._emit_tool_result_event(call, message, None, on_event)
-            return message, self._build_tool_record(call, resolved_arguments, message)
+            return message, resolved_arguments, None
 
         try:
             result = await self._invoke_tool_impl(registration.impl, resolved_arguments)
@@ -879,7 +912,7 @@ class AIController:
 
         serialized = self._serialize_tool_result(result)
         await self._emit_tool_result_event(call, serialized, result, on_event)
-        return serialized, self._build_tool_record(call, resolved_arguments, serialized)
+        return serialized, resolved_arguments, result
 
     async def _emit_tool_result_event(
         self,
@@ -906,7 +939,14 @@ class AIController:
         call: _ToolCallRequest,
         resolved_arguments: Any,
         serialized_result: str,
+        tokens_used: int,
+        duration_ms: float,
+        raw_result: Any,
+        *,
+        started_at: float,
     ) -> dict[str, Any]:
+        diff_summary = self._summarize_tool_result(call.name, resolved_arguments, raw_result, serialized_result)
+        status = self._derive_tool_status(call.name, serialized_result)
         return {
             "id": call.call_id,
             "name": call.name,
@@ -915,7 +955,46 @@ class AIController:
             "parsed": call.parsed,
             "resolved_arguments": resolved_arguments,
             "result": serialized_result,
+            "status": status,
+            "tokens_used": tokens_used,
+            "duration_ms": round(duration_ms, 3),
+            "started_at": started_at,
+            "diff_summary": diff_summary,
         }
+
+    def _derive_tool_status(self, tool_name: str | None, serialized_result: str) -> str:
+        probe = {"name": tool_name, "result": serialized_result}
+        return "failed" if self._tool_call_failed(probe) else "ok"
+
+    def _summarize_tool_result(
+        self,
+        tool_name: str | None,
+        resolved_arguments: Any,
+        raw_result: Any,
+        serialized_result: str,
+    ) -> str | None:
+        diff_source: str | None = None
+        name = (tool_name or "").lower()
+        if name == "diff_builder":
+            if isinstance(raw_result, str) and raw_result.strip():
+                diff_source = raw_result
+            elif serialized_result.strip():
+                diff_source = serialized_result
+        elif name == "document_edit" and isinstance(resolved_arguments, Mapping):
+            diff_value = resolved_arguments.get("diff")
+            if isinstance(diff_value, str):
+                diff_source = diff_value
+        if not diff_source:
+            return None
+        return self._summarize_diff_text(diff_source)
+
+    @staticmethod
+    def _summarize_diff_text(diff_text: str) -> str:
+        lines = diff_text.splitlines()
+        additions = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++"))
+        deletions = sum(1 for line in lines if line.startswith("-") and not line.startswith("---"))
+        hunk_count = sum(1 for line in lines if line.startswith("@@")) or (1 if lines else 0)
+        return f"+{additions}/-{deletions} lines across {hunk_count} hunk(s)"
 
     def _coerce_tool_arguments(self, raw_arguments: str | None, parsed: Any | None) -> Any:
         if parsed is not None:

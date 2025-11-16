@@ -24,6 +24,7 @@ class ToolTrace:
     output_summary: str
     duration_ms: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
+    step_index: Optional[int] = None
 
 
 @dataclass(slots=True)

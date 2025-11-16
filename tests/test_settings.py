@@ -93,3 +93,37 @@ def test_debug_settings_roundtrip(tmp_path: Path) -> None:
 
     assert loaded.debug.token_logging_enabled is True
     assert loaded.debug.token_log_limit == 321
+
+
+def test_load_applies_cli_overrides(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    store = SettingsStore(path)
+    store.save(Settings(base_url="https://ui", request_timeout=45.0))
+
+    loaded = store.load(overrides={"base_url": "https://cli", "request_timeout": 30.5})
+
+    assert loaded.base_url == "https://cli"
+    assert loaded.request_timeout == pytest.approx(30.5)
+
+
+def test_env_overrides_take_priority_over_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    store = SettingsStore(path)
+    store.save(Settings(base_url="https://ui"))
+
+    monkeypatch.setenv("TINKERBELL_BASE_URL", "https://env")
+
+    loaded = store.load(overrides={"base_url": "https://cli"})
+
+    assert loaded.base_url == "https://env"
+
+
+def test_secret_vault_forced_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("tinkerbell.services.settings._dpapi_supported", lambda: False)
+    monkeypatch.setenv("TINKERBELL_SECRET_BACKEND", "dpapi")
+    vault = SecretVault(key_path=tmp_path / "settings.key")
+
+    assert vault.strategy == "fernet"
+    token = vault.encrypt("super-secret")
+    assert token.startswith("fernet:")
+    assert vault.decrypt(token) == "super-secret"

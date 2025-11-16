@@ -111,6 +111,17 @@ def test_chat_panel_show_tool_trace_attaches_to_latest_message():
     assert msg.tool_traces[-1] is trace
 
 
+def test_tool_traces_include_step_numbers_in_metadata():
+    panel = _make_panel()
+    first = panel.show_tool_trace(ToolTrace(name="snapshot", input_summary="all", output_summary="ok"))
+    second = panel.show_tool_trace(ToolTrace(name="diff", input_summary="delta", output_summary="ready"))
+
+    assert first.step_index == 1
+    assert second.step_index == 2
+    details = panel._format_tool_trace_details(second)
+    assert "Step: 2" in details
+
+
 def test_copy_tool_trace_details_includes_all_fields(monkeypatch):
     panel = _make_panel()
     trace = ToolTrace(

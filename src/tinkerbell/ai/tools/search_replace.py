@@ -1,7 +1,8 @@
-"""Search/replace helper tool with dry-run previews."""
+"""Search/replace helper tool with dry-run previews and diff summaries."""
 
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Protocol
@@ -32,6 +33,9 @@ class SearchReplaceResult:
     scope: Literal["document", "selection"]
     target_range: tuple[int, int]
     document_version: str | None = None
+    max_replacements: int | None = None
+    limited: bool = False
+    diff_preview: str | None = None
 
 
 @dataclass(slots=True)
@@ -40,6 +44,11 @@ class SearchReplaceTool:
 
     bridge: SearchReplaceBridge
     preview_chars: int = 240
+    default_max_replacements: int = 200
+
+    def __post_init__(self) -> None:
+        if self.default_max_replacements <= 0:
+            raise ValueError("default_max_replacements must be positive")
 
     def run(
         self,
@@ -72,15 +81,27 @@ class SearchReplaceTool:
         segment_text = text[segment_start:segment_end]
 
         regex = self._compile_pattern(pattern, is_regex=is_regex, match_case=match_case, whole_word=whole_word)
-        first_match = regex.search(segment_text)
         count_limit = self._normalize_replacement_limit(max_replacements)
-        updated_segment, replacements = regex.subn(replacement, segment_text, count=count_limit)
+        updated_segment, replacements, limited, first_match = self._apply_replacements(
+            regex,
+            segment_text,
+            replacement,
+            limit=count_limit,
+        )
 
-        updated_document = text[:segment_start] + updated_segment + text[segment_end:]
+        updated_document = text if replacements == 0 else text[:segment_start] + updated_segment + text[segment_end:]
         focus_index = self._compute_focus_index(first_match, segment_start if active_scope == "document" else 0)
 
         preview_source = updated_document if active_scope == "document" else updated_segment
         preview = self._build_preview(preview_source, focus_index)
+
+        diff_preview = None
+        if replacements:
+            diff_preview = self._build_diff_preview(
+                text if active_scope == "document" else segment_text,
+                updated_document if active_scope == "document" else updated_segment,
+                document_label=self._resolve_document_label(snapshot),
+            )
 
         directive_version = snapshot.get("version") or getattr(self.bridge, "last_snapshot_version", None)
         applied = False
@@ -90,6 +111,11 @@ class SearchReplaceTool:
                 "action": "replace",
                 "target_range": (segment_start, segment_end),
                 "content": updated_segment if active_scope == "selection" else updated_document,
+                "metadata": {
+                    "matches": replacements,
+                    "limited": limited,
+                    "max_replacements": count_limit,
+                },
             }
             if directive_version:
                 payload["document_version"] = directive_version
@@ -106,6 +132,9 @@ class SearchReplaceTool:
             scope=active_scope,
             target_range=(segment_start, segment_end),
             document_version=directive_version,
+            max_replacements=count_limit,
+            limited=limited,
+            diff_preview=diff_preview,
         )
 
     def _compile_pattern(
@@ -129,13 +158,79 @@ class SearchReplaceTool:
         except re.error as exc:  # pragma: no cover - invalid regex path is already guarded in tests
             raise ValueError(f"Invalid regex pattern: {exc}") from exc
 
-    @staticmethod
-    def _normalize_replacement_limit(max_replacements: int | None) -> int:
+    def _normalize_replacement_limit(self, max_replacements: int | None) -> int:
         if max_replacements is None:
-            return 0
+            return self.default_max_replacements
         if max_replacements <= 0:
             raise ValueError("max_replacements must be a positive integer")
         return int(max_replacements)
+
+    def _apply_replacements(
+        self,
+        regex: re.Pattern[str],
+        text: str,
+        replacement: str,
+        *,
+        limit: int,
+    ) -> tuple[str, int, bool, re.Match[str] | None]:
+        cursor = 0
+        chunks: list[str] = []
+        replacements = 0
+        limited = False
+        first_match: re.Match[str] | None = None
+
+        for match in regex.finditer(text):
+            if replacements >= limit:
+                limited = True
+                break
+
+            if first_match is None:
+                first_match = match
+
+            start, end = match.span()
+            chunks.append(text[cursor:start])
+            chunks.append(replacement)
+            cursor = end
+            replacements += 1
+
+        if replacements == 0:
+            return text, 0, False, None
+
+        chunks.append(text[cursor:])
+        return ("".join(chunks), replacements, limited, first_match)
+
+    def _build_diff_preview(
+        self,
+        original: str,
+        updated: str,
+        *,
+        document_label: str,
+        context_lines: int = 3,
+        max_lines: int = 200,
+    ) -> str:
+        diff_iter = difflib.unified_diff(
+            original.splitlines(),
+            updated.splitlines(),
+            fromfile=f"{document_label}:before",
+            tofile=f"{document_label}:after",
+            n=context_lines,
+            lineterm="",
+        )
+        lines: list[str] = []
+        for line in diff_iter:
+            lines.append(line)
+            if len(lines) >= max_lines:
+                lines.append("... (diff truncated)")
+                break
+        return "\n".join(lines)
+
+    @staticmethod
+    def _resolve_document_label(snapshot: Mapping[str, Any]) -> str:
+        path = snapshot.get("path")
+        if path:
+            return str(path)
+        document_id = snapshot.get("document_id") or "document"
+        return str(document_id)
 
     def _build_preview(self, text: str, focus_index: int | None) -> str:
         if not text:

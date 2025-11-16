@@ -329,6 +329,11 @@ class ChatPanel(QWidgetBase):
         """Attach a tool trace to the latest assistant message and cache it."""
 
         self._tool_traces.append(trace)
+        step_index = len(self._tool_traces)
+        trace.step_index = step_index
+        metadata = dict(getattr(trace, "metadata", None) or {})
+        metadata.setdefault("step_index", step_index)
+        trace.metadata = metadata
         target = None
         if self._messages and self._messages[-1].role == "assistant":
             target = self._messages[-1]
@@ -833,12 +838,18 @@ class ChatPanel(QWidgetBase):
         try:
             widget.blockSignals(True)
             widget.clear()
+            total_steps = len(self._tool_traces)
             visible_traces = list(self._tool_traces[-10:])
             self._visible_tool_traces = visible_traces
-            for trace in visible_traces:
+            start_index = max(0, total_steps - len(visible_traces))
+            self._update_tool_trace_header(total_steps=total_steps, start_index=start_index)
+            for offset, trace in enumerate(visible_traces, start=start_index + 1):
+                trace.step_index = trace.step_index or offset
                 name = trace.name or "tool"
                 badge = " [patch]" if str(name).endswith("patch") else ""
-                item_text = f"{name}{badge}: {trace.output_summary}"
+                duration = f" · {trace.duration_ms} ms" if getattr(trace, "duration_ms", 0) else ""
+                step_label = f"Step {trace.step_index or offset}"
+                item_text = f"{step_label} · {name}{badge}{duration}: {trace.output_summary}"
                 preview = (trace.metadata or {}).get("diff_preview") if trace.metadata else None
                 if isinstance(preview, str) and preview.strip():
                     first_line = preview.strip().splitlines()[0]
@@ -850,6 +861,25 @@ class ChatPanel(QWidgetBase):
                     widget.addItem(item_text)
         finally:
             widget.blockSignals(False)
+
+    def _update_tool_trace_header(self, *, total_steps: int, start_index: int) -> None:
+        label = self._tool_trace_label
+        if label is None:
+            return
+        if total_steps <= 0:
+            text = "Tool Activity"
+        elif total_steps == 1:
+            text = "Tool Activity – Step 1"
+        else:
+            first_visible = start_index + 1
+            if first_visible == total_steps:
+                text = f"Tool Activity – Step {total_steps}"
+            else:
+                text = f"Tool Activity – Steps {first_visible}–{total_steps}"
+        try:
+            label.setText(text)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
 
     def _refresh_composer_enablement(self) -> None:
         widget = self._composer_widget
@@ -995,6 +1025,10 @@ class ChatPanel(QWidgetBase):
             f"Output: {_format_output()}",
             f"Duration: {trace.duration_ms} ms",
         ]
+
+        step_index = trace.step_index or metadata.get("step_index")
+        if isinstance(step_index, int) and step_index > 0:
+            lines.insert(0, f"Step: {step_index}")
 
         before_text = metadata.get("text_before")
         after_text = metadata.get("text_after")

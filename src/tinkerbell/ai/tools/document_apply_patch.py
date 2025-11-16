@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, Sequence, cast
 
 from .diff_builder import DiffBuilderTool
 from .document_edit import DocumentEditTool, Bridge as EditBridge
 from .document_snapshot import SnapshotProvider
+from ...services.bridge import DocumentVersionMismatchError
 
 
 class PatchBridge(EditBridge, SnapshotProvider, Protocol):
@@ -24,6 +26,7 @@ class DocumentApplyPatchTool:
     edit_tool: DocumentEditTool
     diff_builder: DiffBuilderTool = field(default_factory=DiffBuilderTool)
     filename_fallback: str = "document.txt"
+    default_context_lines: int = 5
 
     def run(
         self,
@@ -32,7 +35,7 @@ class DocumentApplyPatchTool:
         target_range: Mapping[str, Any] | Sequence[int] | tuple[int, int] | None = None,
         document_version: str | None = None,
         rationale: str | None = None,
-        context_lines: int = 3,
+        context_lines: int | None = None,
         tab_id: str | None = None,
     ) -> str:
         snapshot = dict(self._generate_snapshot(tab_id=tab_id))
@@ -47,18 +50,20 @@ class DocumentApplyPatchTool:
             return "skipped: content already matches selection"
 
         updated_text = base_text[:start] + new_text + base_text[end:]
-        filename = str(snapshot.get("path") or self.filename_fallback)
+        filename = self._normalize_filename(snapshot)
         diff = self.diff_builder.run(
             base_text,
             updated_text,
             filename=filename,
-            context=max(0, int(context_lines)),
+            context=context_lines if context_lines is not None else self.default_context_lines,
         )
         version = self._resolve_version(snapshot, document_version, tab_id=tab_id)
+        content_hash = self._resolve_content_hash(snapshot, base_text)
         payload: dict[str, Any] = {
             "action": "patch",
             "diff": diff,
             "document_version": version,
+            "content_hash": content_hash,
         }
         if rationale is not None:
             payload["rationale"] = rationale
@@ -96,8 +101,17 @@ class DocumentApplyPatchTool:
         if not candidate_text:
             raise ValueError("Document version is required; call document_snapshot before applying edits")
         if explicit and candidate_text != str(snapshot_version).strip():
-            raise ValueError("Provided document_version does not match the latest snapshot; refresh first")
+            raise DocumentVersionMismatchError(
+                "Provided document_version does not match the latest snapshot; refresh document_snapshot and rebuild your diff."
+            )
         return candidate_text
+
+    @staticmethod
+    def _resolve_content_hash(snapshot: Mapping[str, Any], base_text: str) -> str:
+        token = snapshot.get("content_hash")
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+        return hashlib.sha1(base_text.encode("utf-8")).hexdigest()
 
     def _generate_snapshot(self, *, tab_id: str | None) -> Mapping[str, Any]:
         snapshot_fn = getattr(self.bridge, "generate_snapshot", None)
@@ -114,6 +128,13 @@ class DocumentApplyPatchTool:
         if callable(getter):
             return cast(str | None, getter(tab_id=tab_id))
         return cast(str | None, getattr(self.bridge, "last_snapshot_version", None))
+
+    def _normalize_filename(self, snapshot: Mapping[str, Any]) -> str:
+        path = snapshot.get("path")
+        if isinstance(path, str) and path.strip():
+            return path.strip()
+        document_id = snapshot.get("document_id") or "document"
+        return f"tab://{document_id}" if document_id else self.filename_fallback
 
 
 __all__ = ["DocumentApplyPatchTool"]

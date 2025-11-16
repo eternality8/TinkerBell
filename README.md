@@ -110,6 +110,23 @@ You can supply OpenAI-compatible credentials in three interchangeable ways:
 	 - `TINKERBELL_DEBUG_LOGGING` (set to `1`/`true` to force verbose logging and prompt dumps)
 	 - `TINKERBELL_REQUEST_TIMEOUT` (seconds before an AI request fails; defaults to `90`)
 3. **Programmatic injection** – Instantiate `Settings` or `ClientSettings` yourself if you embed TinkerBell in a larger Python workflow.
+4. **CLI overrides** – Pass `--set key=value` flags to the launcher to override persisted settings for a single session:
+
+```powershell
+uv run tinkerbell --set base_url=https://proxy.example.com --set max_tool_iterations=5
+```
+
+Add `--settings-path` when you want to point at a custom `settings.json` file.
+
+Precedence is deterministic: **environment variables override CLI flags, which in turn override the values saved via the UI**. This matches the debugging workflow where you might hardcode safe defaults, tweak them per-session with CLI overrides, and fall back to environment variables for quick emergency switches (e.g., rotating API keys).
+
+Need to confirm what the app sees? Use the built-in inspector to dump the fully merged configuration with secrets redacted:
+
+```powershell
+uv run tinkerbell --dump-settings --set base_url=https://proxy.example.com
+```
+
+The output includes the resolved settings path, the active secret backend (DPAPI or Fernet; override with `TINKERBELL_SECRET_BACKEND`), and whichever environment variables were applied.
 
 Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat message. Failures are surfaced in the chat panel and status bar, and logs are written to your platform-specific temp directory.
 
@@ -129,8 +146,8 @@ Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat m
 | `DocumentEditTool` | `tinkerbell.ai.tools.document_edit` | Applies validated insert/replace/annotate directives and patch diffs through the bridge with undo support and diff summaries.
 | `DocumentApplyPatchTool` | `tinkerbell.ai.tools.document_apply_patch` | Uses the live snapshot to build a diff for the requested range/content, then routes it through `DocumentEdit` so the agent never forgets to apply the edit.
 | `DiffBuilderTool` | `tinkerbell.ai.tools.diff_builder` | Generates unified diffs from before/after snippets so agents never have to handcraft patch formatting.
-| `SearchReplaceTool` | `tinkerbell.ai.tools.search_replace` | Provides regex/literal transforms with optional dry-run previews before edits are enqueued.
-| `ValidationTool` | `tinkerbell.ai.tools.validation` | Checks YAML/JSON snippets via `ruamel.yaml`/`jsonschema` prior to insertion.
+| `SearchReplaceTool` | `tinkerbell.ai.tools.search_replace` | Provides regex/literal transforms with capped replacements, diff previews, and optional dry-run summaries before edits are enqueued.
+| `ValidationTool` | `tinkerbell.ai.tools.validation` | Checks YAML/JSON snippets via `ruamel.yaml`/`jsonschema`, lint-stubs Markdown for heading/fence issues, and exposes hooks for custom validators.
 | `ListTabsTool` | `tinkerbell.ai.tools.list_tabs` | Enumerates open tabs (`tab_id`, title, path, dirty flag) so agents can target any document without stealing focus.
 | `Memory Buffers` | `tinkerbell.ai.memory.buffers` | Maintains conversation + document summaries so prompts stay concise without losing context.
 
@@ -142,8 +159,8 @@ You can register custom tools at runtime via `AIController.register_tool`, and t
 - **`document_edit`** — consumes either a native `EditDirective` or a JSON/mapping payload matching the schema exposed during registration. Prefer `action="patch"` plus a unified diff and `document_version`; legacy `insert`/`replace` actions remain available for small, cursor-relative tweaks. Provide `tab_id` whenever the edit should be applied to a background tab.
 - **`document_apply_patch`** — requires `content` (replacement text) and optionally `target_range`, `document_version`, `rationale`, `context_lines`, and `tab_id`. It snapshots the targeted document, builds a diff for the requested range, and immediately sends it through `document_edit` so diff construction + application happen in one step.
 - **`diff_builder`** — accepts `original`, `updated`, optional `filename`, and optional `context` (default 3) to produce a ready-to-send unified diff string compatible with `document_edit` patch directives.
-- **`search_replace`** — parameters include `pattern`, `replacement`, `is_regex`, `scope` (`document` or `selection`), `dry_run`, `max_replacements`, `match_case`, and `whole_word`. With `dry_run=True`, the tool performs no edit and instead returns a preview plus match counts; otherwise it enqueues a single replace directive scoped to the resolved range and refreshes the document version.
-- **`validate_snippet`** — requires `text` and `fmt` (`yaml`, `yml`, or `json`) and responds with a `ValidationOutcome` describing the first issue along with a count of remaining problems so agents can deliver actionable feedback.
+- **`search_replace`** — parameters include `pattern`, `replacement`, `is_regex`, `scope` (`document` or `selection`), `dry_run`, `max_replacements` (defaults to a guarded cap), `match_case`, and `whole_word`. Each call reports replacement counts, whether the cap was hit, and a unified diff preview; with `dry_run=True`, no edit occurs and only previews/diff metadata are returned.
+- **`validate_snippet`** — requires `text` and `fmt` (`yaml`, `yml`, `json`, `markdown`, or `md`) and responds with a `ValidationOutcome` describing the first issue plus a count of remaining problems. JSON calls optionally accept a schema, Markdown checks flag heading jumps/unclosed fences, and you can register additional formats at runtime via `tinkerbell.ai.tools.validation.register_snippet_validator`.
 - **`list_tabs`** — no parameters; returns `{tabs: [...], active_tab_id, total}` so the agent can map natural-language references ("roadmap tab") to actual `tab_id` values before issuing snapshot/edit requests.
 
 ## Phase 0 instrumentation & observability
@@ -163,6 +180,11 @@ You can register custom tools at runtime via `AIController.register_tool`, and t
 - `ContextUsageEvent` objects capture per-turn prompt tokens, tool tokens, response reserves, tool names, and timestamps.
 - Toggle **Settings → Debug → Token logging enabled** (or set `settings.debug.token_logging_enabled` programmatically) to surface live totals in the status bar and capture up to *N* events (default 200).
 - Retrieve the rolling buffer via `AIController.get_recent_context_events()` for assertions, diagnostics, or custom sinks.
+- Export recent events anytime with the CLI below (JSON or CSV) which reads the persisted buffer from `~/.tinkerbell/telemetry/context_usage.json`:
+	```powershell
+	uv run python -m tinkerbell.scripts.export_context_usage --format csv --limit 50 --output usage.csv
+	```
+	Use `--format json` (default) for structured blobs, `--source` to point at a custom buffer, and omit `--output` to stream directly to stdout for piping.
 
 ### Document version IDs
 

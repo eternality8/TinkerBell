@@ -51,14 +51,14 @@ def test_ai_controller_collects_streamed_response(sample_snapshot):
     assert result["response"] == "Hello world!"
 
     graph = result["graph"]
-    assert graph["entry"] == "ingest"
+    assert graph["entry"] == "plan"
     assert graph["metadata"]["max_iterations"] == 8
     assert [node["name"] for node in graph["nodes"][:5]] == [
-        "ingest",
-        "planner",
-        "tool_router",
-        "guard",
-        "respond",
+        "plan",
+        "select_tool",
+        "tool_executor",
+        "safety_validator",
+        "response_builder",
     ]
     assert graph["tools"] == []
     assert stub_client.calls[0]["metadata"] == {"tab": "notes"}
@@ -198,8 +198,14 @@ def test_ai_controller_executes_tool_and_continues(sample_snapshot):
 
     assert result["response"] == "All set"
     assert calls == [True]
-    assert result["tool_calls"][0]["name"] == "snapshot"
-    assert result["tool_calls"][0]["resolved_arguments"] == {"delta_only": True}
+    tool_trace = result["tool_calls"][0]
+    assert tool_trace["name"] == "snapshot"
+    assert tool_trace["resolved_arguments"] == {"delta_only": True}
+    assert tool_trace["status"] == "ok"
+    assert tool_trace["tokens_used"] >= 0
+    assert tool_trace["duration_ms"] >= 0
+    assert tool_trace["diff_summary"] is None
+    assert "started_at" in tool_trace
 
 
 def test_ai_controller_emits_result_events_with_fallback_ids(sample_snapshot):
@@ -340,6 +346,11 @@ def test_ai_controller_prompts_until_document_edit_runs(sample_snapshot):
     assert len(diff_calls) == 1
     assert len(edit_calls) == 1
     assert len(result["tool_calls"]) == 2
+    diff_trace, edit_trace = result["tool_calls"]
+    assert diff_trace["status"] == "ok"
+    assert diff_trace["diff_summary"] == "+1/-1 lines across 1 hunk(s)"
+    assert edit_trace["status"] == "ok"
+    assert edit_trace["diff_summary"] == "+0/-0 lines across 1 hunk(s)"
     assert len(stub_client.calls) == 4
     reminder_payload = stub_client.calls[2]
     assert reminder_payload["messages"][-1]["role"] == "system"

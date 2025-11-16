@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
 from tinkerbell import app
-from tinkerbell.services.settings import Settings
+from tinkerbell.services.settings import Settings, SettingsStore
 
 
 class _StubAIClient:
@@ -142,3 +145,38 @@ async def test_shutdown_ai_controller_ignores_missing_method() -> None:
     controller = _StubController()
 
     await app._shutdown_ai_controller(cast(app.AIController, controller))
+
+
+def test_coerce_cli_overrides_casts_types() -> None:
+    overrides = app._coerce_cli_overrides(
+        [
+            "base_url=https://cli",
+            "debug_logging=true",
+            "max_tool_iterations=12",
+            "request_timeout=42.25",
+        ]
+    )
+
+    assert overrides["base_url"] == "https://cli"
+    assert overrides["debug_logging"] is True
+    assert overrides["max_tool_iterations"] == 12
+    assert overrides["request_timeout"] == pytest.approx(42.25)
+
+
+def test_coerce_cli_overrides_rejects_unknown_field() -> None:
+    with pytest.raises(ValueError):
+        app._coerce_cli_overrides(["not_a_setting=value"])
+
+
+def test_dump_settings_redacts_api_key(tmp_path: Path) -> None:
+    settings = Settings(api_key="super-secret", base_url="https://example.com")
+    store = SettingsStore(tmp_path / "settings.json")
+    buffer = io.StringIO()
+
+    app._dump_settings(settings, store, overrides={"base_url": "https://cli"}, stream=buffer)
+
+    payload = json.loads(buffer.getvalue())
+    redacted = payload["settings"]["api_key"]
+    assert "super-secret" not in redacted
+    assert payload["meta"]["secret_backend"] == store.vault.strategy
+    assert "base_url" in payload["meta"]["cli_overrides"]

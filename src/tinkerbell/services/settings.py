@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 import base64
 import json
 import logging
@@ -18,6 +19,7 @@ __all__ = ["Settings", "SettingsStore", "SecretVault", "DebugSettings"]
 LOGGER = logging.getLogger(__name__)
 _SETTINGS_DIR = Path.home() / ".tinkerbell"
 _DEFAULT_SETTINGS_PATH = _SETTINGS_DIR / "settings.json"
+_SETTINGS_VERSION = 2
 _ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_API_KEY": "api_key",
     "TINKERBELL_BASE_URL": "base_url",
@@ -34,6 +36,7 @@ _FLOAT_ENV_OVERRIDES: Mapping[str, str] = {
 }
 _TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
 _API_KEY_FIELD = "api_key_ciphertext"
+_SECRET_BACKEND_ENV = "TINKERBELL_SECRET_BACKEND"
 
 
 @dataclass(slots=True)
@@ -79,6 +82,71 @@ class Settings:
     debug: DebugSettings = field(default_factory=DebugSettings)
 
 
+class SecretProvider(ABC):
+    """Interface for encrypting and decrypting sensitive strings."""
+
+    name: str = "unknown"
+
+    @abstractmethod
+    def encrypt(self, secret: str) -> str:
+        """Return an encoded representation of ``secret`` suitable for storage."""
+
+    @abstractmethod
+    def decrypt(self, token: str) -> str:
+        """Return the plaintext representation of ``token``."""
+
+
+class WindowsSecretProvider(SecretProvider):
+    """Secret provider backed by the Windows DPAPI interfaces."""
+
+    name = "dpapi"
+
+    def encrypt(self, secret: str) -> str:
+        raw = _dpapi_protect(secret.encode("utf-8"))
+        return base64.urlsafe_b64encode(raw).decode("ascii")
+
+    def decrypt(self, token: str) -> str:
+        payload = base64.urlsafe_b64decode(token.encode("ascii"))
+        return _dpapi_unprotect(payload).decode("utf-8")
+
+
+class FernetSecretProvider(SecretProvider):
+    """Secret provider that uses a symmetric Fernet key stored on disk."""
+
+    name = "fernet"
+
+    def __init__(self, key_path: Path | None = None) -> None:
+        self._key_path = key_path or (_SETTINGS_DIR / "settings.key")
+        self._fernet: Fernet | None = None
+
+    def encrypt(self, secret: str) -> str:
+        token = self._get_fernet().encrypt(secret.encode("utf-8"))
+        return token.decode("ascii")
+
+    def decrypt(self, token: str) -> str:
+        raw = self._get_fernet().decrypt(token.encode("ascii"))
+        return raw.decode("utf-8")
+
+    def _get_fernet(self) -> Fernet:
+        if self._fernet is None:
+            key = self._load_or_create_key()
+            self._fernet = Fernet(key)
+        return self._fernet
+
+    def _load_or_create_key(self) -> bytes:
+        path = self._key_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            return path.read_bytes().strip()
+        key = Fernet.generate_key()
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_bytes(key)
+        if os.name != "nt":  # pragma: no cover - depends on OS
+            os.chmod(tmp_path, 0o600)
+        tmp_path.replace(path)
+        return key
+
+
 class SettingsStore:
     """Persistence adapter for :class:`Settings`."""
 
@@ -87,16 +155,30 @@ class SettingsStore:
         key_path = self._path.with_suffix(".key")
         self._vault = vault or SecretVault(key_path=key_path)
 
-    def load(self) -> Settings:
-        """Load settings from disk, applying environment overrides when present."""
+    @property
+    def path(self) -> Path:
+        """Return the resolved path backing this store."""
+
+        return self._path
+
+    @property
+    def vault(self) -> SecretVault:
+        """Return the secret vault managing API key encryption."""
+
+        return self._vault
+
+    def load(self, *, overrides: Mapping[str, Any] | None = None) -> Settings:
+        """Load settings from disk, applying CLI/environment overrides when present."""
 
         payload = self._read_payload()
         settings = Settings()
+        needs_migration = False
 
         if payload:
-            plaintext_key = self._decrypt_api_key(
+            plaintext_key, migrated = self._decrypt_api_key(
                 payload.pop(_API_KEY_FIELD, None), payload.pop("api_key", None)
             )
+            needs_migration = migrated
             data = _filter_fields(payload)
             debug_payload = data.get("debug")
             if isinstance(debug_payload, Mapping):
@@ -111,6 +193,16 @@ class SettingsStore:
                 settings = Settings()
             if plaintext_key:
                 settings = replace(settings, api_key=plaintext_key)
+
+        version_mismatch = bool(payload) and payload.get("version") != _SETTINGS_VERSION
+        if needs_migration or version_mismatch:
+            try:
+                self.save(settings)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                LOGGER.warning("Failed to migrate settings payload: %s", exc)
+
+        if overrides:
+            settings = self._apply_overrides(settings, overrides, source="CLI")
 
         settings = self._apply_env_overrides(settings)
         return settings
@@ -132,7 +224,8 @@ class SettingsStore:
         ciphertext = self._encrypt_api_key(api_key)
         if ciphertext:
             data[_API_KEY_FIELD] = ciphertext
-        data["version"] = 1
+        data["version"] = _SETTINGS_VERSION
+        data["secret_backend"] = self._vault.strategy
         return data
 
     def _read_payload(self) -> Dict[str, Any]:
@@ -146,6 +239,26 @@ class SettingsStore:
         except json.JSONDecodeError as exc:
             LOGGER.warning("Settings file %s is not valid JSON: %s", self._path, exc)
             return {}
+
+    def _apply_overrides(
+        self,
+        settings: Settings,
+        overrides: Mapping[str, Any],
+        *,
+        source: str = "runtime",
+    ) -> Settings:
+        allowed = {field.name for field in fields(Settings)}
+        filtered: Dict[str, Any] = {}
+        for key, value in overrides.items():
+            if key not in allowed or value is None:
+                continue
+            filtered[key] = value
+        if filtered:
+            LOGGER.debug(
+                "Applying %s settings overrides: %s", source, sorted(filtered)
+            )
+            settings = replace(settings, **filtered)
+        return settings
 
     def _apply_env_overrides(self, settings: Settings) -> Settings:
         overrides: Dict[str, Any] = {}
@@ -168,79 +281,104 @@ class SettingsStore:
                     "Environment override %s=%s is not a valid float", env_name, value
                 )
         if overrides:
-            LOGGER.debug("Applying settings overrides from environment: %s", sorted(overrides))
-            settings = replace(settings, **overrides)
+            settings = self._apply_overrides(settings, overrides, source="environment")
         return settings
 
     def _encrypt_api_key(self, api_key: str) -> str | None:
         if not api_key:
             return None
         try:
-            return self._vault.encrypt(api_key)
+            token = self._vault.encrypt(api_key)
+            LOGGER.debug("API key encrypted via %s backend", self._vault.strategy)
+            return token
         except Exception as exc:  # pragma: no cover - extremely rare
             LOGGER.warning("Failed to encrypt API key: %s", exc)
             return None
 
-    def _decrypt_api_key(self, ciphertext: str | None, legacy_plaintext: str | None) -> str:
+    def _decrypt_api_key(
+        self, ciphertext: str | None, legacy_plaintext: str | None
+    ) -> tuple[str, bool]:
         if ciphertext:
             try:
-                return self._vault.decrypt(ciphertext)
+                return self._vault.decrypt(ciphertext), False
             except Exception as exc:  # pragma: no cover - defensive guard
                 LOGGER.warning("Unable to decrypt API key: %s", exc)
-                return ""
-        return legacy_plaintext or ""
+                return "", False
+        if legacy_plaintext:
+            LOGGER.info("Detected legacy plaintext API key; migrating to encrypted storage.")
+            return legacy_plaintext, True
+        return "", False
 
 
 class SecretVault:
     """Encrypts and decrypts sensitive strings for settings persistence."""
 
-    def __init__(self, *, key_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        key_path: Path | None = None,
+        provider: SecretProvider | None = None,
+    ) -> None:
         self._key_path = key_path or (_SETTINGS_DIR / "settings.key")
-        self._fernet: Fernet | None = None
+        self._fernet_provider = FernetSecretProvider(self._key_path)
+        self._windows_provider = WindowsSecretProvider() if _dpapi_supported() else None
+        self._provider = provider or self._auto_detect_provider()
+
+    @property
+    def strategy(self) -> str:
+        return self._provider.name
 
     def encrypt(self, secret: str) -> str:
         if not secret:
             return ""
-        if _dpapi_supported():
-            protected = _dpapi_protect(secret.encode("utf-8"))
-            encoded = base64.urlsafe_b64encode(protected).decode("ascii")
-            return f"dpapi:{encoded}"
-        token = self._get_fernet().encrypt(secret.encode("utf-8")).decode("ascii")
-        return f"fernet:{token}"
+        payload = self._provider.encrypt(secret)
+        return f"{self._provider.name}:{payload}"
 
     def decrypt(self, token: str | None) -> str:
         if not token:
             return ""
-        if token.startswith("dpapi:") and _dpapi_supported():
-            payload = token.split(":", 1)[1].encode("ascii")
-            raw = base64.urlsafe_b64decode(payload)
-            return _dpapi_unprotect(raw).decode("utf-8")
-        if token.startswith("fernet:"):
-            payload = token.split(":", 1)[1].encode("ascii")
-            try:
-                return self._get_fernet().decrypt(payload).decode("utf-8")
-            except InvalidToken as exc:  # pragma: no cover - indicates tampering
-                raise ValueError("Invalid Fernet token") from exc
-        return token
+        prefix, payload = self._split_token(token)
+        provider = self._provider_for_prefix(prefix)
+        if provider is None:
+            LOGGER.warning("Unknown secret token prefix %s; returning ciphertext.", prefix)
+            return token
+        try:
+            return provider.decrypt(payload)
+        except InvalidToken as exc:  # pragma: no cover - indicates tampering
+            raise ValueError("Invalid Fernet token") from exc
+        except Exception as exc:  # pragma: no cover - defensive guard
+            raise ValueError(f"Unable to decrypt secret via {provider.name}") from exc
 
-    def _get_fernet(self) -> Fernet:
-        if self._fernet is None:
-            key = self._load_or_create_key()
-            self._fernet = Fernet(key)
-        return self._fernet
+    def _provider_for_prefix(self, prefix: str | None) -> SecretProvider | None:
+        if prefix == WindowsSecretProvider.name and self._windows_provider is not None:
+            return self._windows_provider
+        if prefix == FernetSecretProvider.name:
+            return self._fernet_provider
+        if prefix is None:
+            return self._provider
+        return None
 
-    def _load_or_create_key(self) -> bytes:
-        path = self._key_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            return path.read_bytes().strip()
-        key = Fernet.generate_key()
-        tmp_path = path.with_suffix(".tmp")
-        tmp_path.write_bytes(key)
-        if os.name != "nt":
-            os.chmod(tmp_path, 0o600)
-        tmp_path.replace(path)
-        return key
+    def _auto_detect_provider(self) -> SecretProvider:
+        forced = os.environ.get(_SECRET_BACKEND_ENV, "").strip().lower()
+        if forced == WindowsSecretProvider.name and self._windows_provider is None:
+            LOGGER.warning(
+                "DPAPI secret backend requested but unavailable; falling back to Fernet."
+            )
+            forced = FernetSecretProvider.name
+        if forced == FernetSecretProvider.name:
+            return self._fernet_provider
+        if forced == WindowsSecretProvider.name and self._windows_provider is not None:
+            return self._windows_provider
+        if self._windows_provider is not None:
+            return self._windows_provider
+        return self._fernet_provider
+
+    @staticmethod
+    def _split_token(token: str) -> tuple[str | None, str]:
+        if ":" not in token:
+            return None, token
+        prefix, payload = token.split(":", 1)
+        return (prefix or None), payload
 
 
 def _filter_fields(payload: Mapping[str, Any]) -> Dict[str, Any]:

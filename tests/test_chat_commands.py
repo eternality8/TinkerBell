@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from tinkerbell.chat.commands import ActionType, parse_agent_payload, validate_directive
+from tinkerbell.chat.commands import ActionType, parse_agent_payload, resolve_tab_reference, validate_directive
+
+
+_TABS = [
+    {"tab_id": "tab-a", "title": "README.md", "path": "C:/repo/README.md"},
+    {"tab_id": "tab-b", "title": "Notes.md", "path": "C:/repo/docs/notes.md"},
+]
 
 
 def test_parse_accepts_json_string() -> None:
@@ -93,3 +99,14 @@ def test_validate_rejects_patch_without_version() -> None:
 
     assert result.ok is False
     assert "document_version" in result.message.lower()
+
+
+def test_resolve_tab_reference_matches_number() -> None:
+    assert resolve_tab_reference("Tab 2", _TABS) == "tab-b"
+    assert resolve_tab_reference("#1", _TABS) == "tab-a"
+
+
+def test_resolve_tab_reference_matches_titles_and_paths() -> None:
+    assert resolve_tab_reference("readme.md", _TABS) == "tab-a"
+    assert resolve_tab_reference("notes", _TABS) == "tab-b"
+    assert resolve_tab_reference("unknown", _TABS) is None

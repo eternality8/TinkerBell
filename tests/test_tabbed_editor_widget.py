@@ -70,3 +70,18 @@ def test_selection_listeners_fire_on_tab_switch() -> None:
     widget.focus_tab(second.id)
     assert observed
     assert isinstance(observed[-1], SelectionRange)
+
+
+def test_tabbed_editor_diff_overlay_is_routable() -> None:
+    widget = TabbedEditorWidget()
+    tab_id = widget.active_tab_id()
+    assert tab_id is not None
+
+    widget.show_diff_overlay("@@", spans=[(0, 1)], summary="Δ", source="tool", tab_id=tab_id)
+
+    tab = widget.workspace.get_tab(tab_id)
+    assert tab.editor.diff_overlay is not None
+
+    widget.clear_diff_overlay(tab_id=tab_id)
+
+    assert tab.editor.diff_overlay is None

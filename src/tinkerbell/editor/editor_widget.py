@@ -9,8 +9,9 @@ otherwise an in-memory buffer is used.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Optional, Protocol
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Optional, Protocol, Sequence
 
 from ..chat.message_model import EditDirective
 from .document_model import DocumentState, SelectionRange
@@ -22,10 +23,12 @@ QTextCursor: Any = None
 QApplication: Any = None
 QLabel: Any = None
 QPlainTextEdit: Any = None
+QTextEdit: Any = None
 QStackedWidget: Any = None
 QVBoxLayout: Any = None
 QWidgetBase: Any = None
 QSizePolicy: Any = None
+QColor: Any = None
 
 try:  # pragma: no cover - PySide6 optional in CI
     from PySide6.QtCore import Qt as _QtCoreQt  # noqa: F401  (exported for future use)
@@ -34,21 +37,25 @@ try:  # pragma: no cover - PySide6 optional in CI
         QApplication as _QtApplication,
         QLabel as _QtLabel,
         QPlainTextEdit as _QtPlainTextEdit,
+        QTextEdit as _QtTextEdit,
         QSizePolicy as _QtSizePolicy,
         QStackedWidget as _QtStackedWidget,
         QVBoxLayout as _QtVBoxLayout,
         QWidget as _QtWidget,
     )
+    from PySide6.QtGui import QColor as _QtColor
 
     Qt = _QtCoreQt
     QTextCursor = _QtTextCursor
     QApplication = _QtApplication
     QLabel = _QtLabel
     QPlainTextEdit = _QtPlainTextEdit
+    QTextEdit = _QtTextEdit
     QStackedWidget = _QtStackedWidget
     QVBoxLayout = _QtVBoxLayout
     QWidgetBase = _QtWidget
     QSizePolicy = _QtSizePolicy
+    QColor = _QtColor
 except Exception:  # pragma: no cover - runtime fallback
 
     class _StubQWidget:  # type: ignore[too-many-ancestors]
@@ -58,6 +65,8 @@ except Exception:  # pragma: no cover - runtime fallback
             del args, kwargs
 
     QWidgetBase = _StubQWidget
+    QTextEdit = None
+    QColor = None
 
 
 class SnapshotListener(Protocol):
@@ -89,6 +98,17 @@ class _UndoEntry:
     selection: SelectionRange
 
 
+@dataclass(slots=True)
+class DiffOverlayState:
+    """Metadata describing a temporary diff highlight inside the editor."""
+
+    diff: str
+    spans: tuple[tuple[int, int], ...] = ()
+    summary: str | None = None
+    source: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class EditorWidget(QWidgetBase):
     """High-level widget orchestrating the text editor component."""
 
@@ -109,6 +129,8 @@ class EditorWidget(QWidgetBase):
         self._selection_listeners: list[SelectionListener] = []
         self._undo_stack: list[_UndoEntry] = []
         self._redo_stack: list[_UndoEntry] = []
+        self._diff_overlay: DiffOverlayState | None = None
+        self._last_change_source: str = "init"
 
         self._build_ui()
 
@@ -162,6 +184,7 @@ class EditorWidget(QWidgetBase):
         self._text_buffer = document.text
         self._undo_stack.clear()
         self._redo_stack.clear()
+        self.clear_diff_overlay()
         if self._qt_editor is not None:
             self._qt_editor.blockSignals(True)
             self._qt_editor.setPlainText(document.text)
@@ -169,6 +192,7 @@ class EditorWidget(QWidgetBase):
         self._refresh_preview(if_enabled=False)
         self._emit_text_changed()
         self._emit_selection_changed()
+        self._mark_change_source("programmatic")
 
     def to_document(self) -> DocumentState:
         """Return the current document representation."""
@@ -209,6 +233,7 @@ class EditorWidget(QWidgetBase):
             self._qt_editor.blockSignals(False)
         self._refresh_preview(if_enabled=True)
         self._emit_text_changed()
+        self._mark_change_source("programmatic")
 
     def insert_text(self, text: str, position: Optional[int] = None) -> None:
         """Insert ``text`` at ``position`` or current selection start."""
@@ -243,6 +268,7 @@ class EditorWidget(QWidgetBase):
             self.insert_text(annotation, position=insert_at)
         else:
             raise ValueError(f"Unsupported directive action: {directive.action}")
+        self._mark_change_source("programmatic")
         return self.to_document()
 
     def apply_patch_result(self, result: PatchResult, selection_hint: tuple[int, int] | None = None) -> DocumentState:
@@ -271,6 +297,7 @@ class EditorWidget(QWidgetBase):
             start = end = len(result.text)
 
         self.apply_selection(SelectionRange(start, end))
+        self._mark_change_source("programmatic")
         return self.to_document()
 
     # ------------------------------------------------------------------
@@ -440,6 +467,7 @@ class EditorWidget(QWidgetBase):
         self._state.update_text(self._text_buffer)
         self._refresh_preview(if_enabled=True)
         self._emit_text_changed()
+        self._mark_change_source("user")
 
     def _handle_qt_selection_changed(self) -> None:
         if self._qt_editor is None or QTextCursor is None:
@@ -448,6 +476,95 @@ class EditorWidget(QWidgetBase):
         selection = SelectionRange(start=cursor.selectionStart(), end=cursor.selectionEnd())
         self._state.selection = selection
         self._emit_selection_changed()
+
+    # ------------------------------------------------------------------
+    # Diff overlay helpers
+    # ------------------------------------------------------------------
+    def show_diff_overlay(
+        self,
+        diff_text: str,
+        *,
+        spans: Sequence[tuple[int, int]] | None = None,
+        summary: str | None = None,
+        source: str | None = None,
+    ) -> DiffOverlayState:
+        normalized_spans = self._normalize_overlay_spans(spans)
+        state = DiffOverlayState(
+            diff=str(diff_text or ""),
+            spans=normalized_spans,
+            summary=summary,
+            source=source,
+        )
+        self._diff_overlay = state
+        self._apply_overlay_highlight()
+        return state
+
+    def clear_diff_overlay(self) -> None:
+        if self._diff_overlay is None:
+            return
+        self._diff_overlay = None
+        self._apply_overlay_highlight()
+
+    @property
+    def diff_overlay(self) -> DiffOverlayState | None:
+        return self._diff_overlay
+
+    @property
+    def last_change_source(self) -> str:
+        return self._last_change_source
+
+    # ------------------------------------------------------------------
+    # Overlay + change tracking internals
+    # ------------------------------------------------------------------
+    def _normalize_overlay_spans(self, spans: Sequence[tuple[int, int]] | None) -> tuple[tuple[int, int], ...]:
+        if not spans:
+            return ()
+        normalized: list[tuple[int, int]] = []
+        for start, end in spans:
+            begin, finish = self._clamp_range(start, end)
+            if begin == finish:
+                continue
+            normalized.append((begin, finish))
+        return tuple(normalized)
+
+    def _apply_overlay_highlight(self) -> None:
+        if self._qt_editor is None or QTextCursor is None or QTextEdit is None:
+            return
+        overlay = self._diff_overlay
+        selection_cls = getattr(QTextEdit, "ExtraSelection", None)
+        if selection_cls is None:
+            return
+        selections: list[Any] = []
+        if overlay and overlay.spans:
+            for start, end in overlay.spans:
+                cursor = self._qt_editor.textCursor()
+                cursor.setPosition(start)
+                cursor.setPosition(end, QTextCursor.KeepAnchor)
+                selection = selection_cls()
+                selection.cursor = cursor
+                format_obj = selection.format
+                color = self._overlay_color()
+                if color is not None:
+                    try:
+                        format_obj.setBackground(color)
+                    except Exception:
+                        pass
+                selections.append(selection)
+        try:
+            self._qt_editor.setExtraSelections(selections)
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+
+    def _overlay_color(self) -> Any | None:
+        if QColor is None:
+            return None
+        try:
+            return QColor(255, 243, 196)
+        except Exception:  # pragma: no cover - defensive guard
+            return None
+
+    def _mark_change_source(self, source: str) -> None:
+        self._last_change_source = source
 
 
 # Syntax package -----------------------------------------------------------------

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from json import JSONDecodeError
+from pathlib import Path
 from typing import Any, Dict
 
 from jsonschema import Draft7Validator, ValidationError
@@ -32,6 +34,20 @@ class ValidationResult:
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*(?P<body>.*)```$", re.IGNORECASE | re.DOTALL)
 _JSON_DECODER = json.JSONDecoder()
+_TAB_REFERENCE_KEYS = (
+    "tab",
+    "tab_reference",
+    "tab_label",
+    "tab_name",
+    "target_tab",
+    "document",
+    "document_title",
+    "document_name",
+    "file",
+    "file_name",
+)
+_UNTITLED_REFERENCE_RE = re.compile(r"^untitled\s*(?P<index>\d+)$", re.IGNORECASE)
+_TAB_NUMBER_RE = re.compile(r"^(?:tab\s*#?|#)(?P<number>\d+)$", re.IGNORECASE)
 
 DIRECTIVE_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -183,7 +199,67 @@ def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(target_range, tuple):
         normalized["target_range"] = list(target_range)
 
+    tab_reference = extract_tab_reference(normalized)
+    if tab_reference and not normalized.get("tab_reference"):
+        normalized["tab_reference"] = tab_reference
+
     return normalized
+
+
+def resolve_tab_reference(
+    reference: str,
+    tabs: Sequence[Mapping[str, Any]],
+    *,
+    active_tab_id: str | None = None,
+) -> str | None:
+    """Resolve ``reference`` to a concrete ``tab_id`` using ``tabs`` metadata."""
+
+    text = (reference or "").strip()
+    if not text:
+        return None
+    normalized = text.lower()
+    normalized_tabs = list(tabs or [])
+    if not normalized_tabs:
+        return text
+
+    resolved_tabs: list[tuple[int, str, Mapping[str, Any]]] = []
+    for idx, entry in enumerate(normalized_tabs, start=1):
+        tab_id = _coerce_tab_id(entry)
+        if not tab_id:
+            continue
+        resolved_tabs.append((idx, tab_id, entry))
+        if tab_id.lower() == normalized:
+            return tab_id
+
+    index_match = _TAB_NUMBER_RE.match(normalized)
+    if index_match:
+        number = int(index_match.group("number"))
+        for idx, tab_id, _ in resolved_tabs:
+            if idx == number:
+                return tab_id
+
+    untitled_match = _UNTITLED_REFERENCE_RE.match(normalized)
+    if untitled_match:
+        target = int(untitled_match.group("index"))
+        for _, tab_id, entry in resolved_tabs:
+            if int(entry.get("untitled_index") or -1) == target:
+                return tab_id
+
+    exact_matches = _match_tabs_by_fields(normalized, resolved_tabs, exact=True)
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        preferred = _pick_preferred_tab(exact_matches, active_tab_id)
+        if preferred:
+            return preferred
+
+    substring_matches = _match_tabs_by_fields(normalized, resolved_tabs, exact=False)
+    if substring_matches:
+        preferred = _pick_preferred_tab(substring_matches, active_tab_id)
+        if preferred:
+            return preferred
+
+    return None
 
 
 def _strip_code_fence(text: str) -> str:
@@ -223,4 +299,68 @@ def _extract_version_token(payload: Mapping[str, Any]) -> str | None:
         if token_str:
             return token_str
     return None
+
+
+def extract_tab_reference(payload: Mapping[str, Any]) -> str | None:
+    for key in _TAB_REFERENCE_KEYS:
+        candidate = payload.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+        if isinstance(candidate, (int, float)):
+            return f"Tab {int(candidate)}"
+    metadata = payload.get("metadata")
+    if isinstance(metadata, Mapping):
+        return extract_tab_reference(dict(metadata))
+    return None
+
+
+def _coerce_tab_id(entry: Mapping[str, Any]) -> str:
+    return str(entry.get("tab_id") or entry.get("id") or "").strip()
+
+
+def _match_tabs_by_fields(
+    normalized_reference: str,
+    tabs: Sequence[tuple[int, str, Mapping[str, Any]]],
+    *,
+    exact: bool,
+) -> list[str]:
+    matches: list[str] = []
+    for _, tab_id, entry in tabs:
+        for field in _iter_tab_fields(entry):
+            candidate = field.lower()
+            if not candidate:
+                continue
+            if exact and candidate == normalized_reference:
+                matches.append(tab_id)
+                break
+            if not exact and normalized_reference in candidate:
+                matches.append(tab_id)
+                break
+    return matches
+
+
+def _iter_tab_fields(entry: Mapping[str, Any]) -> list[str]:
+    fields: list[str] = []
+    title = entry.get("title")
+    if isinstance(title, str):
+        fields.append(title.strip())
+    path = entry.get("path")
+    if isinstance(path, str) and path.strip():
+        normalized_path = path.strip()
+        fields.append(normalized_path)
+        basename = os.path.basename(normalized_path) or Path(normalized_path).name
+        if basename:
+            fields.append(basename)
+    label = entry.get("label")
+    if isinstance(label, str):
+        fields.append(label.strip())
+    return [field for field in fields if field]
+
+
+def _pick_preferred_tab(candidates: list[str], active_tab_id: str | None) -> str | None:
+    if not candidates:
+        return None
+    if active_tab_id and active_tab_id in candidates:
+        return active_tab_id
+    return candidates[0]
 

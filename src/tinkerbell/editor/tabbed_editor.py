@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Sequence
 
 from .document_model import DocumentState, SelectionRange
 from .editor_widget import EditorWidget, SelectionListener, SnapshotListener, TextChangeListener, QWidgetBase
@@ -115,6 +115,22 @@ class TabbedEditorWidget(QWidgetBase):
     def apply_theme(self, theme_name: str) -> None:
         for tab in self._workspace.iter_tabs():
             tab.editor.apply_theme(theme_name)
+
+    def show_diff_overlay(
+        self,
+        diff_text: str,
+        *,
+        spans: Sequence[tuple[int, int]] | None = None,
+        summary: str | None = None,
+        source: str | None = None,
+        tab_id: str | None = None,
+    ) -> None:
+        tab = self._resolve_tab(tab_id)
+        tab.editor.show_diff_overlay(diff_text, spans=spans, summary=summary, source=source)
+
+    def clear_diff_overlay(self, *, tab_id: str | None = None) -> None:
+        tab = self._resolve_tab(tab_id)
+        tab.editor.clear_diff_overlay()
 
     # ------------------------------------------------------------------
     # Workspace helpers

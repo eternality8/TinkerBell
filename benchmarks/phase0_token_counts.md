@@ -31,6 +31,34 @@ All counts were generated with the built-in `ApproxByteCounter` (bytes ÷ 4) via
    ```
    > On Python 3.13 the command currently fails unless a Rust compiler is on `PATH`. Installing [rustup](https://rustup.rs/) and re-running the sync resolves the issue; alternatively, use Python 3.12 where official wheels are published.
 
+## Phase 1 diff latency (Nov 2025)
+
+Phase 1 adds editor diff overlays and stricter document safety checks, so we captured how long `DiffBuilderTool` takes to compute previews for our largest fixtures. Measurements were gathered on the same Windows 11 workstation using the helper script `benchmarks/measure_diff_latency.py` (see below) with the default context of 3 lines per hunk.
+
+| Document | Size (MB) | Tokens (approx) | Diff chars | Runtime (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| War and Peace | 3.14 | 823,404 | 844 | 64.50 |
+| Twenty Thousand Leagues | 0.60 | 156,438 | 939 | 7.29 |
+| 5 MB JSON fixture | 4.89 | 1,282,867 | 282 | 518.76 |
+
+*Notes:*
+
+- Token counts still rely on `ApproxByteCounter` (tiktoken wheels are not yet available for Python 3.13 on Windows without a Rust toolchain).
+- The JSON case allocates noticeably more time because the placeholder mutation duplicates several kilobytes near the top of the file, triggering longer diff spans.
+- These runs exercise the exact path the LangGraph agent uses before showing diff overlays in the editor; any runtime under ~700 ms leaves ample headroom for the UI watchdog budget set in Phase 1.
+
+### Reproducing the diff benchmark
+
+````powershell
+uv run python benchmarks/measure_diff_latency.py
+````
+
+Use `--case LABEL=PATH` to benchmark additional fixtures or `--json` for machine-readable output (handy for plotting CI trends). Example:
+
+````powershell
+uv run python benchmarks/measure_diff_latency.py --case Handbook=test_data/War and Peace.txt --json
+````
+
 ## Next steps
 
 - Re-run the table whenever you add a new default model or adjust `_DEFAULT_BYTES_PER_TOKEN` so regressions are caught quickly.

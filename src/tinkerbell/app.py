@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Dict, Mapping, Optional, Sequence, TextIO, cast, get_args, get_origin, get_type_hints
 
 from .ai.agents.executor import AIController
 from .ai.client import AIClient, ClientSettings
@@ -19,6 +21,7 @@ from .utils import logging as logging_utils
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
 _LOGGER = logging.getLogger(__name__)
+_FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
 
 
 @dataclass(slots=True)
@@ -38,12 +41,17 @@ def configure_logging(debug: bool = False, *, force: bool = False) -> None:
     _install_qt_message_handler()
 
 
-def load_settings(path: Optional[Path] = None, *, store: SettingsStore | None = None) -> Settings:
+def load_settings(
+    path: Optional[Path] = None,
+    *,
+    store: SettingsStore | None = None,
+    overrides: Mapping[str, Any] | None = None,
+) -> Settings:
     """Load persisted settings or fall back to defaults."""
 
     active_store = store or SettingsStore(path)
     try:
-        settings = active_store.load()
+        settings = active_store.load(overrides=overrides)
     except Exception as exc:  # pragma: no cover - defensive path
         store_path = getattr(active_store, "_path", path)
         _LOGGER.warning("Failed to load settings from %s: %s", store_path, exc)
@@ -88,16 +96,30 @@ def create_qapp(settings: Settings) -> QtRuntime:
     return QtRuntime(app=app, loop=loop)
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """Entry point invoked by the `tinkerbell` console script."""
+
+    args, passthrough = _parse_cli_args(argv)
+    _rewrite_sys_argv(passthrough)
 
     debug = _env_flag("TINKERBELL_DEBUG", default=False)
     configure_logging(debug)
 
-    settings_path = os.environ.get("TINKERBELL_SETTINGS_PATH")
+    settings_path = args.settings_path or os.environ.get("TINKERBELL_SETTINGS_PATH")
     resolved_path = Path(settings_path).expanduser() if settings_path else None
     settings_store = SettingsStore(resolved_path)
-    settings = load_settings(resolved_path, store=settings_store)
+    try:
+        cli_overrides = _coerce_cli_overrides(args.overrides or [])
+    except ValueError as exc:
+        print(f"Invalid --set override: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    overrides_mapping: Dict[str, Any] | None = cli_overrides or None
+    settings = load_settings(resolved_path, store=settings_store, overrides=overrides_mapping)
+
+    if args.dump_settings:
+        _dump_settings(settings, settings_store, overrides=cli_overrides)
+        return
 
     if settings.debug_logging and not debug:
         configure_logging(True, force=True)
@@ -280,3 +302,148 @@ def _resolve_max_tool_iterations(settings: Settings | None) -> int:
     except (TypeError, ValueError):
         value = 8
     return max(1, min(value, 50))
+
+
+def _parse_cli_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser(
+        prog="tinkerbell",
+        add_help=True,
+        description="Launch the TinkerBell desktop editor or inspect its configuration.",
+    )
+    parser.add_argument(
+        "--dump-settings",
+        action="store_true",
+        help="Print the effective settings payload (with secrets redacted) and exit.",
+    )
+    parser.add_argument(
+        "--settings-path",
+        metavar="PATH",
+        help="Override the default ~/.tinkerbell/settings.json path.",
+    )
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        metavar="KEY=VALUE",
+        action="append",
+        default=[],
+        help="Override persisted settings before launch (repeatable).",
+    )
+    return parser.parse_known_args(argv)
+
+
+def _rewrite_sys_argv(passthrough: Sequence[str]) -> None:
+    program = sys.argv[0] if sys.argv else "tinkerbell"
+    sys.argv = [program, *passthrough]
+
+
+def _coerce_cli_overrides(items: Sequence[str]) -> Dict[str, Any]:
+    overrides: Dict[str, Any] = {}
+    if not items:
+        return overrides
+
+    fields = Settings.__dataclass_fields__  # type: ignore[attr-defined]
+    type_hints = get_type_hints(Settings)
+    for entry in items:
+        if "=" not in entry:
+            raise ValueError(f"Override '{entry}' must use KEY=VALUE syntax.")
+        key, raw_value = entry.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError("Override is missing a field name.")
+        if key not in fields:
+            raise ValueError(f"Unknown setting '{key}'.")
+        annotation = type_hints.get(key, fields[key].type)
+        overrides[key] = _coerce_value(annotation, raw_value.strip())
+    return overrides
+
+
+def _coerce_value(annotation: Any, raw_value: str) -> Any:
+    target = _resolve_annotation(annotation)
+    normalized = raw_value.strip()
+
+    if target is str or target is Any:
+        return normalized
+    if target is bool:
+        return _parse_bool(normalized)
+    if target is int:
+        return int(normalized, 10)
+    if target is float:
+        return float(normalized)
+    if target is type(None) or normalized.lower() in {"none", "null"}:
+        return None
+    if is_dataclass(target):
+        try:
+            payload = json.loads(normalized or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("Dataclass overrides must be valid JSON") from exc
+        if isinstance(target, type):
+            return target(**payload)
+        raise ValueError("Dataclass override target is not instantiable")
+    if target is list:
+        try:
+            return json.loads(normalized or "[]")
+        except json.JSONDecodeError as exc:
+            raise ValueError("List overrides must be valid JSON arrays") from exc
+    if target is dict:
+        try:
+            return json.loads(normalized or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("Dict overrides must be valid JSON objects") from exc
+    return normalized
+
+
+def _resolve_annotation(annotation: Any) -> Any:
+    origin = get_origin(annotation)
+    if origin is None:
+        return annotation
+    if origin in {list, dict}:
+        return origin
+    args = [arg for arg in get_args(annotation) if arg is not type(None)]
+    if not args:
+        return origin
+    return args[0]
+
+
+def _parse_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in _TRUE_VALUES:
+        return True
+    if lowered in _FALSE_VALUES:
+        return False
+    raise ValueError(f"Cannot coerce '{value}' to a boolean.")
+
+
+def _dump_settings(
+    settings: Settings,
+    store: SettingsStore,
+    *,
+    overrides: Mapping[str, Any],
+    stream: TextIO | None = None,
+) -> None:
+    destination = stream or sys.stdout
+    payload = asdict(settings)
+    api_key = payload.get("api_key", "")
+    if isinstance(api_key, str):
+        payload["api_key"] = _redact_secret(api_key)
+    metadata = {
+        "path": str(store.path),
+        "secret_backend": getattr(store.vault, "strategy", "unknown"),
+        "cli_overrides": sorted(overrides.keys()),
+        "environment_variables": _active_env_overrides(),
+    }
+    output = {"settings": payload, "meta": metadata}
+    json.dump(output, destination, indent=2)
+    destination.write("\n")
+
+
+def _redact_secret(value: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        return ""
+    if len(stripped) <= 4:
+        return "*" * len(stripped)
+    return f"{stripped[:2]}{'*' * (len(stripped) - 4)}{stripped[-2:]}"
+
+
+def _active_env_overrides() -> list[str]:
+    return sorted(name for name in os.environ if name.startswith("TINKERBELL_"))

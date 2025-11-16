@@ -12,7 +12,8 @@ Deliver a second-generation AI editing loop that handles 100K+ token files witho
 
 ## Current status (Nov 2025)
 - ✅ **Phase 0 delivered:** Tokenizer registry + CLI, telemetry sinks/toggles, document versioning, cache bus, and supporting docs/benchmarks are merged with full pytest coverage.
-- 🔜 **Next focus – Phase 1:** Design windowed snapshots and chunk tooling on top of the new cache bus; chunk indexer scaffolding has not started yet.
+- ✅ **Phase 1 delivered:** LangGraph-driven editor affordances (diff overlays, autosave signal, improved dialogs), deterministic tool traces, telemetry/memory upgrades, and benchmarking artifacts are complete with tests/docs.
+- 🔜 **Next focus – Phase 2:** Token-aware gating + trace summarization using the new budget policy objects described below.
 
 ## Phase 0 – Telemetry & shared infrastructure ✅
 **Status:** Completed in November 2025. The token counter registry (`ai/client.py` + `scripts/inspect_tokens.py`), telemetry events + sinks (`ai/services/telemetry.py`, status bar hooks, settings toggles), document versioning (`editor/document_model.py`, `services/bridge.py`, optimistic patch enforcement), and the cache invalidation bus (`ai/memory/cache_bus.py`) are live with docs + benchmarks. These foundations now back every subsequent phase.
@@ -38,30 +39,22 @@ Deliver a second-generation AI editing loop that handles 100K+ token files witho
 - **Tokenizer packages unavailable offline:** ship a bundled fallback estimator.
 - **Telemetry flood:** gate verbose logs behind settings and truncate traces after N entries.
 
-## Phase 1 – Windowed snapshots + chunk system
-**Goal:** Reduce default tool payload size by returning only needed regions while enabling on-demand chunk retrieval.
+## Phase 1 – Desktop UX & workflow hardening ✅
+**Status:** Complete. This milestone focused on making the LangGraph assistant safe and ergonomic for large Markdown/YAML/JSON edits while wiring in deterministic telemetry.
 
-### Work items
-1. **Snapshot windowing API**
-   - Add `window`, `max_tokens`, `include_text`, and `delta_only` parameters to `DocumentSnapshotTool` with schema updates in `chat/commands.py`.
-   - Bridge implementation trims text based on selection +/- configurable context, returning metadata if `include_text` is false.
-2. **Chunk indexer**
-   - Create `DocumentChunkIndex` under `ai/tools` that slices documents into presets (`code`, `notes`, `prose`) using structural heuristics.
-   - Store chunk descriptors (start/end offsets, line span, hash, semantic tags) keyed by document + version ID.
-3. **`DocumentChunkTool`**
-   - New tool returns chunk text by ID or byte/line range, optionally expanding by overlap percentage.
-   - Integrate with chunk cache in `AIController` (per tab LRU with cap).
-4. **Prompt updates + migrations**
-   - Update `prompts.py` to describe slim snapshot defaults and chunk usage.
-   - Adjust integration tests (`tests/test_ai_tools.py`, `tests/test_bridge.py`) to cover new parameters.
+### Delivered scope
+1. **LangGraph + agent plumbing** – Updated planner/selector/tool loop contracts, structured tool traces, and prompt templates (`ai/agents`, `ai/prompts.py`) so every turn emits diff previews, selection metadata, and guardrail hints.
+2. **Document safety + telemetry** – Hardened `DocumentApplyPatchTool`, diff builder, validation/search tools, and cache bus consumers; added autosave + diff overlay events in `main_window.py`, `editor/*`, `services/telemetry.py`, and scripts (`export_context_usage`, `measure_diff_latency`).
+3. **UI polish tied to AI workflows** – Delivered chat panel tool timelines, status bar token/autosave indicators, tab-level diff overlays, and the new import/export dialogs with token budgets + sample loaders (`widgets/dialogs.py`, `widgets/status_bar.py`, `chat/*`).
+4. **Docs/tests/benchmarks** – Expanded pytest coverage across `tests/test_chat_panel.py`, `test_main_window.py`, `test_editor_widget.py`, etc., refreshed `docs/ai_v2.md`, and updated `benchmarks/phase0_token_counts.md` with diff-latency metrics produced by `benchmarks/measure_diff_latency.py`.
 
-### Validation
-- Benchmark large sample docs (add under `assets/sample_docs`) comparing old vs new snapshot token counts; capture in markdown artifact.
-- Unit tests for chunk boundary logic and cache invalidation on version mismatch.
+### Validation & acceptance
+- Full regression suites (`uv run pytest`, plus targeted dialog/main-window suites) run green; lint/mypy checks mirror CI.
+- Manual smoke logs captured for large Markdown/YAML/JSON files (using the new dialog sample dropdown) and archived alongside telemetry exports.
+- Architecture docs in `docs/ai_v2.md` + README reference the updated Phase 1 state; Phase 2 follow-ups live in `improvement_ideas.md`.
 
-### Risks & mitigations
-- **Stale chunk offsets after edits:** subscribe to cache bus to drop affected chunks whenever patches land.
-- **Memory pressure from caches:** expose settings for cache size and evict oldest chunks first.
+### Ready for Phase 2
+With observability, diff safety, and UI affordances in place, Phase 2 can concentrate on the token budget policy + summarization work outlined below without blocking issues from earlier phases.
 
 ## Phase 2 – Token-aware gating & trace summarization
 **Goal:** Prevent oversized tool outputs from exhausting budgets and provide safe summaries.
@@ -132,7 +125,7 @@ Deliver a second-generation AI editing loop that handles 100K+ token files witho
 ## Cross-cutting deliverables
 - **Docs:** Update `README.md` and add `docs/ai_v2.md` walkthrough after each major phase.
 - **Benchmarks:** Maintain a `benchmarks/large_doc_report.md` showing token usage, latency, and success criteria over time.
-- **Testing:** Expand `tests/test_ai_tools.py`, `test_bridge.py`, `test_app.py`, and controller tests for every new tool or policy.
+- **Testing:** Expand `tests/test_ai_tools.py`, `test_bridge.py`, `test_app.py`, and controller tests for every new tool or policy. Run the full regression suite with `uv run pytest` so results stay consistent with the shared environment.
 - **Samples:** Add representative large docs (code, prose, YAML) in `assets/sample_docs/` for regression tests.
 
 ## Milestone readiness checklist

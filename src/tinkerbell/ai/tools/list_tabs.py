@@ -23,20 +23,21 @@ class ListTabsTool:
     provider: TabListingProvider
 
     def run(self) -> dict[str, Any]:
-        tabs = [self._normalize(entry) for entry in self.provider.list_tabs()]
+        raw_tabs = self.provider.list_tabs()
+        tabs = [self._normalize(entry, index=idx) for idx, entry in enumerate(raw_tabs, start=1)]
         return {
             "tabs": tabs,
             "active_tab_id": self.provider.active_tab_id(),
             "total": len(tabs),
         }
 
-    def _normalize(self, entry: Mapping[str, Any]) -> dict[str, Any]:
+    def _normalize(self, entry: Mapping[str, Any], *, index: int | None = None) -> dict[str, Any]:
         tab_id = str(entry.get("tab_id") or entry.get("id") or "").strip()
         title = str(entry.get("title") or "Untitled").strip()
         path = entry.get("path")
         if path is not None:
             path = str(path)
-        return {
+        payload = {
             "tab_id": tab_id,
             "title": title,
             "path": path,
@@ -44,3 +45,7 @@ class ListTabsTool:
             "language": entry.get("language"),
             "untitled_index": entry.get("untitled_index"),
         }
+        if index is not None:
+            payload["tab_number"] = index
+            payload["label"] = f"Tab {index}: {title}"
+        return payload

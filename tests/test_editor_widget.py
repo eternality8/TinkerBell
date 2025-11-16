@@ -63,3 +63,17 @@ def test_editor_widget_selection_updates_document_state():
     widget.apply_selection(SelectionRange(1, 4))
     assert widget.to_document().selection.start == 1
     assert widget.to_document().selection.end == 4
+
+
+def test_editor_widget_diff_overlay_tracks_state():
+    widget = EditorWidget()
+    widget.load_document(DocumentState(text="overlay text"))
+
+    state = widget.show_diff_overlay("@@ diff @@", spans=[(0, 7)], summary="Δ", source="test")
+
+    assert state.summary == "Δ"
+    assert widget.diff_overlay is not None
+
+    widget.clear_diff_overlay()
+
+    assert widget.diff_overlay is None

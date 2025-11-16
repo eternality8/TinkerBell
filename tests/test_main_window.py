@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 import tinkerbell.main_window as main_window_module
-from tinkerbell.chat.message_model import ChatMessage
+from tinkerbell.chat.message_model import ChatMessage, ToolTrace
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.main_window import MainWindow, WindowContext
 from tinkerbell.services.importers import FileImporter, ImportResult, ImporterError
@@ -358,7 +358,7 @@ def test_save_document_prompts_for_path(tmp_path: Path, monkeypatch: pytest.Monk
     window.editor_widget.load_document(document)
     target = tmp_path / "draft.md"
 
-    monkeypatch.setattr(window, "_prompt_for_save_path", lambda: target)
+    monkeypatch.setattr(window, "_prompt_for_save_path", lambda **_: target)
 
     saved_path = window.save_document()
 
@@ -370,10 +370,43 @@ def test_save_document_cancelled(monkeypatch: pytest.MonkeyPatch):
     window = _make_window()
     window.editor_widget.load_document(DocumentState(text="content"))
 
-    monkeypatch.setattr(window, "_prompt_for_save_path", lambda: None)
+    monkeypatch.setattr(window, "_prompt_for_save_path", lambda **_: None)
 
     with pytest.raises(RuntimeError):
         window.save_document()
+
+
+def test_main_window_diff_overlay_helpers() -> None:
+    window = _make_window()
+    document = window.editor_widget.to_document()
+    trace = ToolTrace(name="edit:patch", input_summary="", output_summary="Δ", metadata={"spans": [(0, 1)], "diff_preview": "@@"})
+
+    window._apply_diff_overlay(trace, document=document, range_hint=(0, 1))
+
+    tab = window.editor_widget.workspace.active_tab
+    assert tab is not None
+    assert tab.editor.diff_overlay is not None
+
+    window._clear_diff_overlay()
+
+    assert tab.editor.diff_overlay is None
+
+
+def test_main_window_autosave_indicator_updates(tmp_path: Path) -> None:
+    window = _make_window()
+    status = window._status_bar
+
+    assert status.autosave_state[0] == "Saved"
+
+    window.editor_widget.set_text("changed content")
+
+    dirty_label = status.autosave_state[0]
+    assert "Autosaved" in dirty_label or dirty_label == "Unsaved changes"
+
+    target = tmp_path / "autosave.md"
+    window.save_document(target)
+
+    assert status.autosave_state[0] == "Saved"
 
 
 def test_last_session_file_restored_on_startup(tmp_path: Path):
@@ -460,7 +493,7 @@ def test_unsaved_snapshot_clears_after_save(tmp_path: Path, monkeypatch: pytest.
     window.editor_widget.set_text("Unsaved draft")
     target = tmp_path / "saved.md"
 
-    monkeypatch.setattr(window, "_prompt_for_save_path", lambda: target)
+    monkeypatch.setattr(window, "_prompt_for_save_path", lambda **_: target)
 
     window.save_document()
 

@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import time
+from datetime import datetime, timezone, timedelta
 from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from .chat.message_model import ChatMessage, EditDirective, ToolTrace
 from .editor.document_model import DocumentMetadata, DocumentState, SelectionRange
 from .editor.workspace import DocumentTab
 from .editor.tabbed_editor import TabbedEditorWidget
+from .services import telemetry as telemetry_service
 from .services.bridge_router import WorkspaceBridgeRouter
 from .services.importers import FileImporter, ImportResult, ImporterError
 from .services.settings import Settings, SettingsStore
@@ -215,6 +217,8 @@ class MainWindow(QMainWindow):
         self._auto_patch_tool: DocumentApplyPatchTool | None = None
         self._ai_client_signature: tuple[Any, ...] | None = self._ai_settings_signature(initial_settings)
         self._restoring_workspace = False
+        self._tabs_with_overlay: set[str] = set()
+        self._last_autosave_at: datetime | None = None
         self._initialize_ui()
 
     # ------------------------------------------------------------------
@@ -289,6 +293,7 @@ class MainWindow(QMainWindow):
 
         self.update_status("Ready")
         self._restore_last_session_document()
+        self._update_autosave_indicator(document=self._editor.to_document())
 
     def _build_splitter(self) -> Any:
         """Create the editor/chat splitter, falling back to a lightweight state."""
@@ -692,7 +697,7 @@ class MainWindow(QMainWindow):
                         "fmt": {
                             "type": "string",
                             "description": "Declared format of the snippet.",
-                            "enum": ["yaml", "yml", "json"],
+                            "enum": ["yaml", "yml", "json", "markdown", "md"],
                         },
                     },
                     "required": ["text", "fmt"],
@@ -864,14 +869,60 @@ class MainWindow(QMainWindow):
         debug_settings = getattr(settings, "debug", None)
         if not getattr(debug_settings, "token_logging_enabled", False):
             return
-        events = controller.get_recent_context_events(limit=1)
-        if not events:
+        limit = getattr(debug_settings, "token_log_limit", 1)
+        try:
+            limit_value = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit_value = 1
+        events = controller.get_recent_context_events(limit=limit_value)
+        dashboard = telemetry_service.build_usage_dashboard(events)
+        if dashboard is None:
             return
-        event = events[-1]
-        prompt = f"Prompt {event.prompt_tokens:,}"
-        tools = f"Tools {event.tool_tokens:,}"
-        usage_text = f"{prompt} · {tools}"
-        self._status_bar.set_memory_usage(usage_text)
+        self._status_bar.set_memory_usage(
+            dashboard.summary_text,
+            totals=dashboard.totals_text,
+            last_tool=dashboard.summary.last_tool,
+        )
+
+    def _update_autosave_indicator(
+        self,
+        *,
+        autosaved: bool = False,
+        document: DocumentState | None = None,
+    ) -> None:
+        doc = document or self._editor.to_document()
+        if autosaved:
+            self._last_autosave_at = datetime.now(timezone.utc)
+        status, detail = self._format_autosave_label(doc)
+        try:
+            self._status_bar.set_autosave_state(status, detail=detail)
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+
+    def _format_autosave_label(self, document: DocumentState) -> tuple[str, str]:
+        name = self._document_display_name(document)
+        if not document.dirty:
+            return ("Saved", name)
+        if self._last_autosave_at is None:
+            return ("Unsaved changes", name)
+        elapsed = datetime.now(timezone.utc) - self._last_autosave_at
+        return (f"Autosaved {self._format_elapsed(elapsed)}", name)
+
+    @staticmethod
+    def _format_elapsed(delta: timedelta) -> str:
+        seconds = max(0, int(delta.total_seconds()))
+        if seconds < 5:
+            return "just now"
+        if seconds < 60:
+            return f"{seconds}s ago"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes}m ago"
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours}h ago"
+        days = hours // 24
+        return f"{days}d ago"
 
     def _record_tool_call_result(self, event: Any) -> None:
         key = self._tool_call_key(event)
@@ -1184,6 +1235,8 @@ class MainWindow(QMainWindow):
             metadata=metadata,
         )
         self._chat_panel.show_tool_trace(trace)
+        self._apply_diff_overlay(trace, document=_state, range_hint=range_hint)
+        self._update_autosave_indicator(document=_state)
 
     def _handle_edit_failure(self, directive: EditDirective, message: str) -> None:
         action = (directive.action or "").strip().lower()
@@ -1193,6 +1246,89 @@ class MainWindow(QMainWindow):
             self._post_assistant_notice(f"Patch apply failed: {notice}. Please request a fresh snapshot.")
         else:
             self.update_status(f"Edit failed: {message or 'Unknown error'}")
+
+    def _apply_diff_overlay(self, trace: ToolTrace, *, document: DocumentState, range_hint: tuple[int, int]) -> None:
+        tab_id = self._find_tab_id_for_document(document)
+        if not tab_id:
+            return
+        metadata = trace.metadata if isinstance(trace.metadata, Mapping) else {}
+        spans = self._coerce_overlay_spans(metadata.get("spans"), fallback_range=range_hint)
+        diff_payload = metadata.get("diff_preview") if isinstance(metadata, Mapping) else None
+        label = str(diff_payload or trace.output_summary or trace.name)
+        try:
+            self._editor.show_diff_overlay(
+                label,
+                spans=spans,
+                summary=trace.output_summary,
+                source=trace.name,
+                tab_id=tab_id,
+            )
+        except Exception:  # pragma: no cover - defensive guard
+            return
+        self._tabs_with_overlay.add(tab_id)
+
+    def _coerce_overlay_spans(
+        self,
+        raw_spans: Any,
+        *,
+        fallback_range: tuple[int, int] | None,
+    ) -> tuple[tuple[int, int], ...]:
+        spans: list[tuple[int, int]] = []
+        if isinstance(raw_spans, Sequence):
+            for entry in raw_spans:
+                if not isinstance(entry, Sequence) or len(entry) != 2:
+                    continue
+                try:
+                    start = int(entry[0])
+                    end = int(entry[1])
+                except (TypeError, ValueError):
+                    continue
+                if start == end:
+                    continue
+                if end < start:
+                    start, end = end, start
+                spans.append((start, end))
+        if not spans and fallback_range is not None and fallback_range[0] != fallback_range[1]:
+            start, end = fallback_range
+            if end < start:
+                start, end = end, start
+            spans.append((start, end))
+        return tuple(spans)
+
+    def _maybe_clear_diff_overlay(self, state: DocumentState) -> None:
+        tab_id = self._find_tab_id_for_document(state)
+        if not tab_id or tab_id not in self._tabs_with_overlay:
+            return
+        try:
+            tab = self._workspace.get_tab(tab_id)
+        except KeyError:
+            self._tabs_with_overlay.discard(tab_id)
+            return
+        change_source = getattr(tab.editor, "last_change_source", "")
+        if change_source != "user":
+            return
+        self._clear_diff_overlay(tab_id=tab_id)
+
+    def _clear_diff_overlay(self, *, tab_id: str | None = None) -> None:
+        target_id = tab_id or self._workspace.active_tab_id
+        if not target_id or target_id not in self._tabs_with_overlay:
+            return
+        try:
+            self._editor.clear_diff_overlay(tab_id=target_id)
+        except KeyError:  # pragma: no cover - tab already gone
+            pass
+        self._tabs_with_overlay.discard(target_id)
+
+    def _find_tab_id_for_document(self, document: DocumentState) -> str | None:
+        document_id = getattr(document, "document_id", None)
+        for tab in self._workspace.iter_tabs():
+            try:
+                tab_document = tab.document()
+            except Exception:  # pragma: no cover - defensive guard
+                continue
+            if document_id and tab_document.document_id == document_id:
+                return tab.id
+        return self._workspace.active_tab_id
 
     # ------------------------------------------------------------------
     # Action callbacks
@@ -1208,8 +1344,12 @@ class MainWindow(QMainWindow):
         self._refresh_window_title(state)
         self._refresh_chat_suggestions(state=state)
         if self._snapshot_persistence_block > 0:
+            self._update_autosave_indicator(document=state)
+            self._maybe_clear_diff_overlay(state)
             return
         self._persist_unsaved_snapshot(state)
+        self._update_autosave_indicator(document=state)
+        self._maybe_clear_diff_overlay(state)
 
     def _handle_editor_selection_changed(self, selection: SelectionRange) -> None:
         """Refresh suggestions and composer context when the selection moves."""
@@ -1225,6 +1365,7 @@ class MainWindow(QMainWindow):
         self._current_document_path = document.metadata.path
         self._refresh_window_title(document)
         self._refresh_chat_suggestions(state=document)
+        self._update_autosave_indicator(document=document)
         self._sync_settings_workspace_state()
 
     def _refresh_chat_suggestions(
@@ -1339,6 +1480,7 @@ class MainWindow(QMainWindow):
         self._workspace.set_active_tab(tab.id)
         self._current_document_path = None
         self._sync_settings_workspace_state()
+        self._update_autosave_indicator(document=self._editor.to_document())
         self.update_status("New tab created")
 
     def _handle_close_tab_requested(self) -> None:
@@ -1349,6 +1491,7 @@ class MainWindow(QMainWindow):
         closed = self._editor.close_active_tab()
         document = closed.document()
         self._clear_unsaved_snapshot(path=document.metadata.path, tab_id=closed.id)
+        self._tabs_with_overlay.discard(closed.id)
         if self._workspace.tab_count() == 0:
             self._handle_new_tab_requested()
         else:
@@ -1356,6 +1499,7 @@ class MainWindow(QMainWindow):
             if new_active is not None:
                 self._current_document_path = new_active.document().metadata.path
         self._sync_settings_workspace_state()
+        self._update_autosave_indicator(document=self._editor.to_document())
         self.update_status(f"Closed tab {closed.title}")
 
     def _handle_save_requested(self) -> None:
@@ -1370,7 +1514,7 @@ class MainWindow(QMainWindow):
     def _handle_save_as_requested(self) -> None:
         """Trigger a Save As workflow backed by the standard dialog."""
 
-        path = self._prompt_for_save_path()
+        path = self._prompt_for_save_path(document=self._editor.to_document())
         if path is None:
             self.update_status("Save canceled")
             return
@@ -1405,6 +1549,7 @@ class MainWindow(QMainWindow):
         self._refresh_window_title(document)
         self.update_status(f"Reverted {path.name}")
         self._sync_settings_workspace_state()
+        self._update_autosave_indicator(document=document)
 
     def _handle_settings_requested(self) -> None:
         """Show the settings dialog so users can configure integrations."""
@@ -1480,9 +1625,11 @@ class MainWindow(QMainWindow):
         self._remember_recent_file(target)
         if self._apply_pending_snapshot_for_path(target):
             self._sync_settings_workspace_state()
+            self._update_autosave_indicator(document=self._editor.to_document())
             return
         self.update_status(f"Loaded {target.name}")
         self._sync_settings_workspace_state()
+        self._update_autosave_indicator(document=document)
 
     def save_document(self, path: str | Path | None = None) -> Path:
         """Persist the current document to disk and return the saved path."""
@@ -1496,7 +1643,7 @@ class MainWindow(QMainWindow):
             target_path = document.metadata.path or self._current_document_path
 
         if target_path is None:
-            target_path = self._prompt_for_save_path()
+            target_path = self._prompt_for_save_path(document=document)
             if target_path is None:
                 self.update_status("Save canceled")
                 raise RuntimeError("Save canceled")
@@ -1516,6 +1663,7 @@ class MainWindow(QMainWindow):
         self.update_status(f"Saved {target_path.name}")
         self._refresh_window_title(document)
         self._sync_settings_workspace_state()
+        self._update_autosave_indicator(document=document)
         return target_path
 
     def update_status(self, message: str, *, timeout_ms: Optional[int] = None) -> None:
@@ -1559,7 +1707,13 @@ class MainWindow(QMainWindow):
             ) from exc
 
         parent = self._qt_parent_widget()
-        return open_file_dialog(parent=parent, start_dir=start_dir)
+        token_budget = None
+        settings = self._context.settings
+        if settings is not None:
+            raw_budget = getattr(settings, "max_context_tokens", None)
+            if isinstance(raw_budget, int):
+                token_budget = raw_budget
+        return open_file_dialog(parent=parent, start_dir=start_dir, token_budget=token_budget)
 
     def _prompt_for_import_path(self) -> Path | None:
         """Display the import dialog constrained to supported file types."""
@@ -1574,11 +1728,19 @@ class MainWindow(QMainWindow):
 
         parent = self._qt_parent_widget()
         file_filter = self._file_importer.dialog_filter()
+        token_budget = None
+        settings = self._context.settings
+        if settings is not None:
+            raw_budget = getattr(settings, "max_context_tokens", None)
+            if isinstance(raw_budget, int):
+                token_budget = raw_budget
         return open_file_dialog(
             parent=parent,
             caption="Import File",
             start_dir=start_dir,
             file_filter=file_filter,
+            token_budget=token_budget,
+            enable_samples=False,
         )
 
     def _resolve_active_document_path(self) -> Path | None:
@@ -1589,7 +1751,7 @@ class MainWindow(QMainWindow):
             return Path(self._current_document_path)
         return None
 
-    def _prompt_for_save_path(self) -> Path | None:
+    def _prompt_for_save_path(self, *, document: DocumentState | None = None) -> Path | None:
         """Show the save-file dialog and return the chosen path."""
 
         start_dir = self._resolve_save_start_dir(self._context.settings)
@@ -1601,7 +1763,30 @@ class MainWindow(QMainWindow):
             ) from exc
 
         parent = self._qt_parent_widget()
-        return save_file_dialog(parent=parent, start_dir=start_dir)
+        token_budget = None
+        settings = self._context.settings
+        if settings is not None:
+            raw_budget = getattr(settings, "max_context_tokens", None)
+            if isinstance(raw_budget, int):
+                token_budget = raw_budget
+
+        document_text: str | None = None
+        selection_text: str | None = None
+        if document is not None:
+            document_text = document.text
+            selection = document.selection
+            if selection.end > selection.start:
+                text = document.text
+                start = max(0, min(len(text), selection.start))
+                end = max(start, min(len(text), selection.end))
+                selection_text = text[start:end]
+        return save_file_dialog(
+            parent=parent,
+            start_dir=start_dir,
+            document_text=document_text,
+            selection_text=selection_text,
+            token_budget=token_budget,
+        )
 
     def _open_import_result(self, result: ImportResult, *, source_path: Path) -> None:
         """Create a new tab populated with imported text."""
@@ -1618,6 +1803,7 @@ class MainWindow(QMainWindow):
         self._remember_recent_file(source_path)
         self._refresh_window_title(document)
         self._sync_settings_workspace_state()
+        self._update_autosave_indicator(document=document)
         status = f"Imported {source_path.name}"
         if result.notes:
             status = f"{status} – {result.notes}"
@@ -1714,6 +1900,7 @@ class MainWindow(QMainWindow):
             return False
 
         self._restoring_workspace = True
+        self._tabs_with_overlay.clear()
         try:
             for tab_id in list(self._workspace.tab_ids()):
                 try:
@@ -1846,6 +2033,7 @@ class MainWindow(QMainWindow):
         self._unsaved_snapshot_digests[digest_key] = file_io.compute_text_digest(text)
         if tab_id is not None:
             self._editor.refresh_tab_title(tab_id)
+        self._update_autosave_indicator(document=document)
 
     @contextmanager
     def _suspend_snapshot_persistence(self) -> Any:
@@ -1902,6 +2090,7 @@ class MainWindow(QMainWindow):
         self._unsaved_snapshot_digests[key] = digest
         self._sync_settings_workspace_state(persist=False)
         self._persist_settings(settings)
+        self._update_autosave_indicator(autosaved=True, document=document)
 
     def _clear_unsaved_snapshot(
         self,

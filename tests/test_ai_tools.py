@@ -13,6 +13,7 @@ from tinkerbell.ai.tools.document_snapshot import DocumentSnapshotTool
 from tinkerbell.ai.tools.search_replace import SearchReplaceTool
 from tinkerbell.ai.tools.validation import validate_snippet
 from tinkerbell.editor.syntax import yaml_json
+from tinkerbell.services.bridge import DocumentVersionMismatchError
 
 
 class _EditBridgeStub:
@@ -23,6 +24,11 @@ class _EditBridgeStub:
         self.snapshot = {"text": "", "selection": (0, 0), "version": "digest-base", "path": "doc.txt"}
         self.queue_tab_ids: list[str | None] = []
         self.snapshot_requests: list[dict[str, Any]] = []
+        self.tabs: list[dict[str, Any]] = [
+            {"tab_id": "tab-a", "title": "README.md", "path": "C:/repo/README.md", "dirty": False},
+            {"tab_id": "tab-b", "title": "Notes.md", "path": "C:/repo/notes.md", "dirty": True},
+        ]
+        self._active_tab_id = "tab-a"
 
     def queue_edit(self, directive, *, tab_id: str | None = None) -> None:  # type: ignore[override]
         self.queue_tab_ids.append(tab_id)
@@ -46,6 +52,12 @@ class _EditBridgeStub:
 
     def get_last_snapshot_version(self, tab_id: str | None = None) -> str | None:  # noqa: ARG002 - unused
         return self.last_snapshot_version
+
+    def list_tabs(self) -> list[dict[str, Any]]:
+        return list(self.tabs)
+
+    def active_tab_id(self) -> str | None:
+        return self._active_tab_id
 
 
 class _SnapshotProviderStub:
@@ -104,7 +116,7 @@ def test_document_edit_tool_accepts_json_payload_and_reports_status():
     bridge = _EditBridgeStub()
     bridge.last_diff_summary = "+2 chars"
     bridge.last_snapshot_version = "digest-123"
-    tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
 
     status = tool.run('{"action":"insert","content":"Hi","target_range":[0,0]}')
 
@@ -117,7 +129,7 @@ def test_document_edit_tool_accepts_json_payload_and_reports_status():
 def test_document_edit_tool_accepts_keyword_arguments():
     bridge = _EditBridgeStub()
     bridge.last_diff_summary = "Δ0"
-    tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
 
     status = tool.run(action="replace", content="Hello", target_range=(0, 5))
 
@@ -140,7 +152,7 @@ def test_document_edit_tool_replaces_paragraph_with_formatting():
     bridge = _EditBridgeStub()
     bridge.last_diff_summary = "+12 chars"
     bridge.last_snapshot_version = "digest-abc"
-    tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
 
     replacement = "New intro paragraph.\n\n- bullet α\n- bullet β ✨"
     status = tool.run(
@@ -157,7 +169,7 @@ def test_document_edit_tool_replaces_paragraph_with_formatting():
 
 def test_document_edit_tool_handles_special_characters_in_sentence():
     bridge = _EditBridgeStub()
-    tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
 
     payload = (
         '{"action":"replace","target_range":[25,52],'
@@ -175,16 +187,35 @@ def test_document_edit_tool_handles_special_characters_in_sentence():
 
 def test_document_edit_tool_routes_to_specific_tab():
     bridge = _EditBridgeStub()
-    tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
 
     tool.run(action="insert", content="Hi", target_range=(0, 0), tab_id="tab-123")
 
     assert bridge.queue_tab_ids[-1] == "tab-123"
 
 
+def test_document_edit_tool_resolves_tab_reference_in_argument():
+    bridge = _EditBridgeStub()
+    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
+
+    tool.run(action="insert", content="Hi", target_range=(0, 0), tab_id="Tab 2")
+
+    assert bridge.queue_tab_ids[-1] == "tab-b"
+
+
+def test_document_edit_tool_resolves_tab_reference_from_payload():
+    bridge = _EditBridgeStub()
+    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
+
+    payload = {"action": "insert", "content": "Hi", "target_range": [0, 0], "tab": "README.md"}
+    tool.run(payload)
+
+    assert bridge.queue_tab_ids[-1] == "tab-a"
+
+
 def test_document_edit_tool_embeds_tab_when_bridge_lacks_routing():
     bridge = _LegacyBridgeStub()
-    tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
 
     tool.run(action="insert", content="Hi", target_range=(0, 0), tab_id="tab-legacy")
 
@@ -208,7 +239,7 @@ def test_document_edit_tool_accepts_patch_payload():
 +new
 """
 
-    status = tool.run(action="patch", diff=diff, document_version="digest-xyz")
+    status = tool.run(action="patch", diff=diff, document_version="digest-xyz", content_hash="hash-xyz")
 
     assert bridge.calls[-1]["action"] == "patch"
     assert "patch" in status and "digest-xyz" in status
@@ -225,11 +256,11 @@ def test_document_edit_tool_rejects_patch_without_snapshot_version():
         tool.run(action="patch", diff=diff)
 
 
-def test_document_edit_tool_enforces_patch_only_mode_for_non_patch_actions():
+def test_document_edit_tool_rejects_inline_edits_when_not_allowed():
     bridge = _EditBridgeStub()
-    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+    tool = DocumentEditTool(bridge=bridge)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="diff-only"):
         tool.run(action="annotate", content="Note", target_range=(0, 0))
 
     assert bridge.calls == []
@@ -253,7 +284,7 @@ def test_document_edit_tool_allows_patches_when_patch_only_enabled():
     tool = DocumentEditTool(bridge=bridge, patch_only=True)
 
     diff = """--- a/doc.txt\n+++ b/doc.txt\n@@ -1 +1 @@\n-old\n+new\n"""
-    status = tool.run(action="patch", diff=diff, document_version="digest")
+    status = tool.run(action="patch", diff=diff, document_version="digest", content_hash="hash-digest")
 
     assert bridge.calls and bridge.calls[-1]["action"] == "patch"
     assert "patch" in status
@@ -287,7 +318,7 @@ def test_document_apply_patch_tool_validates_snapshot_version():
     edit_tool = DocumentEditTool(bridge=bridge)
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
-    with pytest.raises(ValueError, match="document_version"):
+    with pytest.raises(DocumentVersionMismatchError):
         tool.run(content="Hola", target_range=(0, 5), document_version="digest-old")
 
 
@@ -362,6 +393,12 @@ def test_search_replace_tool_updates_document_scope():
     assert "earth" in payload["content"]
     assert result.document_version == "updated"
     assert "earth" in result.preview
+    assert result.diff_preview and result.diff_preview.startswith("---")
+    assert result.max_replacements == tool.default_max_replacements
+    assert result.limited is False
+    metadata = payload["metadata"]
+    assert metadata["matches"] == 2
+    assert metadata["limited"] is False
 
 
 def test_search_replace_tool_respects_selection_scope_and_dry_run():
@@ -386,6 +423,27 @@ def test_search_replace_tool_respects_selection_scope_and_dry_run():
     assert bridge.queue_calls == []
     assert result.document_version == "digest-1"
     assert result.preview
+    assert result.diff_preview and result.diff_preview.startswith("---")
+    assert result.max_replacements == 1
+    assert result.limited is False
+
+
+def test_search_replace_tool_honors_replacement_cap_and_reports_limited():
+    bridge = _SearchReplaceBridgeStub(text="aaaaa", selection=(0, 0), version="digest-cap")
+    tool = SearchReplaceTool(bridge=bridge)
+
+    result = tool.run(pattern="a", replacement="b", max_replacements=2)
+
+    assert result.replacements == 2
+    assert result.limited is True
+    assert result.max_replacements == 2
+    assert result.diff_preview
+    assert bridge.queue_calls
+    payload = bridge.queue_calls[-1]
+    metadata = payload["metadata"]
+    assert metadata["limited"] is True
+    assert metadata["matches"] == 2
+    assert metadata["max_replacements"] == 2
 
 
 def test_search_replace_tool_validates_inputs():
@@ -435,3 +493,43 @@ def test_validate_snippet_success_path_can_be_stubbed(monkeypatch: pytest.Monkey
     outcome = validation_module.validate_snippet("foo: bar", "yaml")
 
     assert outcome.ok is True
+
+
+def test_validate_snippet_flags_markdown_heading_jumps():
+    markdown = """# Title\n### Skipped level"""
+
+    outcome = validate_snippet(markdown, "markdown")
+
+    assert outcome.ok is False
+    assert "Heading level" in outcome.message
+    assert "Line 2" in outcome.message
+
+
+def test_validate_snippet_detects_unclosed_markdown_fence():
+    markdown = """```python\ncode sample"""
+
+    outcome = validate_snippet(markdown, "md")
+
+    assert outcome.ok is False
+    assert "fenced code" in outcome.message.lower()
+
+
+def test_register_snippet_validator_supports_custom_formats(monkeypatch: pytest.MonkeyPatch):
+    from tinkerbell.ai.tools import validation as validation_module
+
+    registry_copy = dict(validation_module._FORMAT_VALIDATORS)
+    monkeypatch.setattr(validation_module, "_FORMAT_VALIDATORS", registry_copy)
+
+    def _fake_validator(text: str):
+        if "invalid" in text:
+            return [yaml_json.ValidationError(message="custom failure", line=3)]
+        return []
+
+    validation_module.register_snippet_validator("custom", _fake_validator)
+
+    failure = validation_module.validate_snippet("invalid", "custom")
+    assert failure.ok is False
+    assert "custom failure" in failure.message
+
+    success = validation_module.validate_snippet("valid", "custom")
+    assert success.ok is True

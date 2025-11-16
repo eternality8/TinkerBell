@@ -13,6 +13,59 @@ except Exception:  # pragma: no cover - PySide6 not available
     QStatusBar = None  # type: ignore[assignment]
 
 
+class ContextUsageWidget:
+    """Helper component that displays rolling telemetry details."""
+
+    def __init__(self) -> None:
+        self.summary_text: str = ""
+        self.totals_text: str = ""
+        self.last_tool: str = ""
+        self._summary_label: Any = None
+        self._details_label: Any = None
+
+    def install(self, status_bar: Any | None) -> None:
+        if status_bar is None or QLabel is None:
+            return
+        self._summary_label = QLabel(self.summary_text)
+        self._summary_label.setObjectName("tb-status-memory-summary")
+        self._summary_label.setContentsMargins(8, 0, 8, 0)
+        self._details_label = QLabel(self._details_text())
+        self._details_label.setObjectName("tb-status-memory-details")
+        self._details_label.setContentsMargins(0, 0, 8, 0)
+        try:
+            status_bar.addPermanentWidget(self._summary_label)
+            status_bar.addPermanentWidget(self._details_label)
+        except Exception:
+            self._summary_label = None
+            self._details_label = None
+
+    def update(self, summary: str, totals: str | None = None, last_tool: str | None = None) -> None:
+        self.summary_text = summary.strip()
+        self.totals_text = (totals or "").strip()
+        self.last_tool = (last_tool or "").strip()
+        self._refresh_labels()
+
+    def _refresh_labels(self) -> None:
+        if self._summary_label is not None:
+            try:
+                self._summary_label.setText(self.summary_text)
+            except Exception:
+                pass
+        if self._details_label is not None:
+            try:
+                self._details_label.setText(self._details_text())
+            except Exception:
+                pass
+
+    def _details_text(self) -> str:
+        parts: list[str] = []
+        if self.totals_text:
+            parts.append(self.totals_text)
+        if self.last_tool:
+            parts.append(f"Last tool {self.last_tool}")
+        return " · ".join(parts)
+
+
 class StatusBar:
     """Status bar that mirrors the plan.md contract yet stays test friendly."""
 
@@ -23,12 +76,15 @@ class StatusBar:
         self._document_format: str = "plain"
         self._ai_state: str = "Idle"
         self._memory_usage: str = ""
+        self._autosave_state: str = "Saved"
+        self._autosave_detail: str = ""
+        self._context_widget = ContextUsageWidget()
 
         self._qt_bar = self._build_qt_status_bar(parent)
         self._cursor_label: Any = None
         self._format_label: Any = None
         self._ai_label: Any = None
-        self._memory_label: Any = None
+        self._autosave_label: Any = None
 
         if self._qt_bar is not None:
             self._init_widgets()
@@ -77,11 +133,19 @@ class StatusBar:
         self._ai_state = self._coerce_state(state)
         self._update_label(self._ai_label, self._ai_state)
 
-    def set_memory_usage(self, usage: str) -> None:
+    def set_memory_usage(self, usage: str, *, totals: str | None = None, last_tool: str | None = None) -> None:
         """Display the latest memory usage summary (e.g., autosave + tokens)."""
 
         self._memory_usage = usage.strip()
-        self._update_label(self._memory_label, self._memory_usage)
+        self._context_widget.update(self._memory_usage, totals, last_tool)
+
+    def set_autosave_state(self, state: str, *, detail: str | None = None) -> None:
+        """Update the autosave indicator text."""
+
+        normalized = state.strip() if state else "Saved"
+        self._autosave_state = normalized or "Saved"
+        self._autosave_detail = (detail or "").strip()
+        self._update_label(self._autosave_label, self._format_autosave_text())
 
     def widget(self) -> Any | None:
         """Return the underlying :class:`QStatusBar` when available."""
@@ -111,6 +175,14 @@ class StatusBar:
     def memory_usage(self) -> str:
         return self._memory_usage
 
+    @property
+    def context_widget(self) -> ContextUsageWidget:
+        return self._context_widget
+
+    @property
+    def autosave_state(self) -> tuple[str, str]:
+        return (self._autosave_state, self._autosave_detail)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -124,15 +196,17 @@ class StatusBar:
         self._format_label.setObjectName("tb-status-format")
         self._ai_label = QLabel(self._ai_state)
         self._ai_label.setObjectName("tb-status-ai")
-        self._memory_label = QLabel(self._memory_usage)
-        self._memory_label.setObjectName("tb-status-memory")
+        self._autosave_label = QLabel(self._format_autosave_text())
+        self._autosave_label.setObjectName("tb-status-autosave")
 
-        for label in (self._cursor_label, self._format_label, self._ai_label, self._memory_label):
+        for label in (self._cursor_label, self._format_label, self._ai_label, self._autosave_label):
             label.setContentsMargins(8, 0, 8, 0)
             try:
                 self._qt_bar.addPermanentWidget(label)
             except Exception:
                 break
+
+        self._context_widget.install(self._qt_bar)
 
     def _update_label(self, label: Any, text: str) -> None:
         if label is None:
@@ -145,6 +219,11 @@ class StatusBar:
     def _format_cursor_text(self) -> str:
         line, column = self._cursor
         return f"Ln {line}, Col {column}"
+
+    def _format_autosave_text(self) -> str:
+        detail = self._autosave_detail
+        base = f"Autosave: {self._autosave_state}"
+        return f"{base} · {detail}" if detail else base
 
     @staticmethod
     def _coerce_state(state: str | Enum) -> str:
@@ -177,4 +256,7 @@ class StatusBar:
         except Exception:
             pass
         return bar
+
+
+__all__ = ["StatusBar", "ContextUsageWidget"]
 

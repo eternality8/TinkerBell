@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 import inspect
 from typing import Any, Iterable, Mapping, MutableMapping
 
+from ..ai_types import AgentConfig
+
 
 @dataclass(frozen=True, slots=True)
 class GraphNode:
@@ -94,63 +96,92 @@ class GraphSpec:
 class AgentGraphBuilder:
     """Builder translating registered tools into a LangGraph-style blueprint."""
 
-    BASE_NODES: tuple[GraphNode, ...] = (
-        GraphNode(
-            name="ingest",
-            kind="ingest",
-            description="Collect the user prompt, document snapshot, and seed LangChain memory.",
-            metadata={"contracts": ["prompt", "doc_snapshot", "memory.digest"]},
-        ),
-        GraphNode(
-            name="planner",
-            kind="planner",
-            description="Decide whether to answer directly or request tool assistance (ReAct style).",
-            metadata={"strategy": "react", "max_tokens": 256},
-        ),
-        GraphNode(
-            name="tool_router",
-            kind="tool",
-            description="Invoke editor-aware tools (snapshot/edit/search) and capture traces.",
-            metadata={"concurrency": 1, "timeout_s": 15},
-        ),
-        GraphNode(
-            name="guard",
-            kind="guard",
-            description="Validate structured directives, enforce safety rails, and decide on retries.",
-            metadata={"rules": ["requires_rationale", "diff_required_for_edits"]},
-        ),
-        GraphNode(
-            name="respond",
-            kind="respond",
-            description="Emit the final assistant message and structured directives for the UI bridge.",
-            metadata={"outputs": ["text", "edit_directive", "tool_trace"]},
-        ),
-    )
-
-    BASE_EDGES: tuple[GraphEdge, ...] = (
-        GraphEdge("ingest", "planner", "always"),
-        GraphEdge("planner", "tool_router", "tool_needed"),
-        GraphEdge("planner", "respond", "final_response"),
-        GraphEdge("tool_router", "guard", "tool_completed"),
-        GraphEdge("guard", "planner", "needs_follow_up"),
-        GraphEdge("guard", "respond", "validated"),
-    )
-
-    def __init__(self, tools: Mapping[str, Any], *, max_iterations: int = 8) -> None:
+    def __init__(self, tools: Mapping[str, Any], *, config: AgentConfig | None = None) -> None:
         self._tools = dict(tools)
-        self._max_iterations = max(1, max_iterations)
+        self._config = (config or AgentConfig()).clamp()
+
+    def _base_nodes(self) -> list[GraphNode]:
+        policy = self._config.retry_policy
+        return [
+            GraphNode(
+                name="plan",
+                kind="planner",
+                description="Summarize the request, inspect snapshot metadata, and decide the next step.",
+                metadata={
+                    "contracts": ["prompt", "doc_snapshot", "selection"],
+                    "strategy": "react",
+                    "max_tokens": 256,
+                    "max_retries": policy.planner_max_retries,
+                    "retry_backoff": [policy.backoff_min_seconds, policy.backoff_max_seconds],
+                },
+            ),
+            GraphNode(
+                name="select_tool",
+                kind="router",
+                description="Choose the next editor-aware tool or finish with a written response.",
+                metadata={
+                    "allow_parallel": self._config.allow_parallel_tools,
+                    "diff_required": self._config.diff_required_for_edits,
+                },
+            ),
+            GraphNode(
+                name="tool_executor",
+                kind="tool",
+                description="Invoke snapshot/diff/edit/search tools and capture structured telemetry.",
+                metadata={
+                    "timeout_s": policy.tool_timeout_seconds,
+                    "retry_limit": policy.tool_retry_limit,
+                },
+            ),
+            GraphNode(
+                name="safety_validator",
+                kind="guard",
+                description="Enforce document versioning, diff requirements, and validation hooks.",
+                metadata={
+                    "validation_retries": policy.validation_retry_limit,
+                    "enforce_version": True,
+                    "rules": ["requires_rationale", "diff_required_for_edits"],
+                },
+            ),
+            GraphNode(
+                name="response_builder",
+                kind="respond",
+                description="Compose the final assistant message plus any queued edit directives.",
+                metadata={"outputs": ["text", "edit_directive", "tool_trace"]},
+            ),
+        ]
+
+    @staticmethod
+    def _base_edges() -> list[GraphEdge]:
+        return [
+            GraphEdge("plan", "select_tool", "tool_needed"),
+            GraphEdge("plan", "response_builder", "final_response"),
+            GraphEdge("select_tool", "tool_executor", "dispatch"),
+            GraphEdge("tool_executor", "safety_validator", "tool_completed"),
+            GraphEdge("safety_validator", "plan", "needs_follow_up"),
+            GraphEdge("safety_validator", "response_builder", "validated"),
+        ]
 
     def build(self) -> GraphSpec:
         tool_descriptors = self._build_tool_descriptors()
-        nodes = list(self.BASE_NODES) + self._tool_nodes(tool_descriptors)
-        edges = list(self.BASE_EDGES) + self._tool_edges(tool_descriptors)
+        nodes = self._base_nodes() + self._tool_nodes(tool_descriptors)
+        edges = self._base_edges() + self._tool_edges(tool_descriptors)
         metadata: MutableMapping[str, Any] = {
-            "max_iterations": self._max_iterations,
-            "planner": {"strategy": "react", "allow_parallel_tools": False},
-            "tooling": {"registered": len(tool_descriptors)},
+            "max_iterations": self._config.max_iterations,
+            "planner": {
+                "strategy": "react",
+                "allow_parallel_tools": self._config.allow_parallel_tools,
+                "max_retries": self._config.retry_policy.planner_max_retries,
+            },
+            "tooling": {
+                "registered": len(tool_descriptors),
+                "timeout_s": self._config.retry_policy.tool_timeout_seconds,
+            },
+            "retry_policy": self._config.retry_policy.as_metadata(),
+            "diff_required": self._config.diff_required_for_edits,
         }
         return GraphSpec(
-            entry="ingest",
+            entry="plan",
             nodes=nodes,
             edges=edges,
             tools=tool_descriptors,
@@ -183,8 +214,8 @@ class AgentGraphBuilder:
         edges: list[GraphEdge] = []
         for descriptor in tools:
             node_name = f"tool:{descriptor.name}"
-            edges.append(GraphEdge("tool_router", node_name, "dispatch"))
-            edges.append(GraphEdge(node_name, "guard", "result"))
+            edges.append(GraphEdge("tool_executor", node_name, "dispatch"))
+            edges.append(GraphEdge(node_name, "safety_validator", "result"))
         return edges
 
 
@@ -215,7 +246,7 @@ def _tool_entry_point(tool: Any) -> str:
     return tool.__class__.__module__ + "." + tool.__class__.__qualname__
 
 
-def build_agent_graph(*, tools: Mapping[str, Any], max_iterations: int = 8) -> dict[str, Any]:
+def build_agent_graph(*, tools: Mapping[str, Any], config: AgentConfig | None = None) -> dict[str, Any]:
     """Return a declarative description of the LangGraph wiring.
 
     Parameters
@@ -228,6 +259,6 @@ def build_agent_graph(*, tools: Mapping[str, Any], max_iterations: int = 8) -> d
         tool invocation cycle before forcing a final response.
     """
 
-    builder = AgentGraphBuilder(tools=tools, max_iterations=max_iterations)
+    builder = AgentGraphBuilder(tools=tools, config=config)
     return builder.build().to_dict()
 

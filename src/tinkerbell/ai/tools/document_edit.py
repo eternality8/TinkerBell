@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Protocol, Sequence, cast
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence, cast
 
-from ...chat.commands import ActionType, parse_agent_payload
+from ...chat.commands import ActionType, extract_tab_reference, parse_agent_payload, resolve_tab_reference
 from ...chat.message_model import EditDirective
 from .diff_builder import DiffBuilderTool
 
@@ -37,14 +38,16 @@ class DocumentEditTool:
 
     bridge: Bridge
     patch_only: bool = False
+    allow_inline_edits: bool = False
     diff_builder: DiffBuilderTool = field(default_factory=DiffBuilderTool)
+    diff_context_lines: int = 5
 
     def run(self, directive: DirectiveInput | None = None, *, tab_id: str | None = None, **fields: Any) -> str:
         payload = self._coerce_input(self._resolve_input(directive, fields))
         tab_id = self._normalize_tab_id(tab_id, payload)
-        payload = self._validate_payload(payload)
         action = self._resolve_action(payload)
-        if self.patch_only and action in {ActionType.REPLACE.value, ActionType.INSERT.value}:
+        payload = self._validate_payload(payload, action)
+        if self.patch_only and action in {ActionType.REPLACE.value, ActionType.INSERT.value, ActionType.ANNOTATE.value}:
             payload = self._auto_convert_to_patch(payload, tab_id=tab_id)
             action = ActionType.PATCH.value
         self._enforce_patch_mode(action)
@@ -79,11 +82,14 @@ class DocumentEditTool:
         action = payload.get("action") if isinstance(payload, Mapping) else None
         return str(action).lower() if action else ""
 
-    def _validate_payload(self, payload: EditDirective | Mapping[str, Any]):
-        action = self._resolve_action(payload)
-        if action != ActionType.PATCH.value:
-            return payload
-        return self._prepare_patch_payload(payload)
+    def _validate_payload(self, payload: EditDirective | Mapping[str, Any], action: str):
+        if action == ActionType.PATCH.value:
+            return self._prepare_patch_payload(payload)
+        if not self.allow_inline_edits and not self.patch_only:
+            raise ValueError(
+                "DocumentEditTool is configured for diff-only edits; call document_apply_patch to convert inline content edits into patches."
+            )
+        return payload
 
     def _prepare_patch_payload(self, payload: EditDirective | Mapping[str, Any]) -> Mapping[str, Any]:
         if isinstance(payload, EditDirective):
@@ -116,6 +122,9 @@ class DocumentEditTool:
             raise ValueError(
                 "Patch directives must include the document_version from the snapshot that produced the diff; call document_snapshot again if needed."
             )
+        content_hash = self._extract_content_hash(mapping_payload)
+        if not content_hash:
+            raise ValueError("Patch directives must include the content_hash from the originating snapshot.")
 
         return mapping_payload
 
@@ -130,14 +139,23 @@ class DocumentEditTool:
                 return token_text
         return None
 
+    @staticmethod
+    def _extract_content_hash(payload: Mapping[str, Any]) -> str | None:
+        token = payload.get("content_hash")
+        if token is None:
+            return None
+        token_text = str(token).strip()
+        return token_text or None
+
     def _enforce_patch_mode(self, action: str) -> None:
-        if not self.patch_only:
-            return
-        if action == ActionType.PATCH.value:
-            return
-        raise ValueError(
-            "Patch-only mode requires unified diff directives; call document_apply_patch (or diff_builder + document_edit) to convert your content edits into a patch."
-        )
+        if self.patch_only and action != ActionType.PATCH.value:
+            raise ValueError(
+                "Patch-only mode requires unified diff directives; call document_apply_patch (or diff_builder + document_edit) to convert your content edits into a patch."
+            )
+        if action != ActionType.PATCH.value and not self.allow_inline_edits:
+            raise ValueError(
+                "DocumentEditTool is configured for diff-only edits; convert content edits into patches before calling document_edit."
+            )
 
     def _format_status(self, action: str, diff: str | None, version: str | None) -> str:
         if diff and version:
@@ -180,17 +198,26 @@ class DocumentEditTool:
         if updated_text == base_text:
             raise ValueError("Content already matches document; nothing to patch")
 
-        filename = str(snapshot.get("path") or self.diff_builder.default_filename)
-        diff = self.diff_builder.run(base_text, updated_text, filename=filename)
+        filename = self._normalize_diff_filename(snapshot)
+        diff = self.diff_builder.run(
+            base_text,
+            updated_text,
+            filename=filename,
+            context=self.diff_context_lines,
+        )
 
         version = self._extract_version_token(mapping_payload) or snapshot.get("version") or self._last_version(tab_id)
         if not version:
             raise ValueError("Document version is required; call document_snapshot before applying edits")
+        content_hash = self._extract_content_hash(mapping_payload) or snapshot.get("content_hash")
+        if not content_hash:
+            content_hash = self._hash_text(base_text)
 
         patch_payload: dict[str, Any] = {
             "action": ActionType.PATCH.value,
             "diff": diff,
             "document_version": str(version),
+            "content_hash": str(content_hash),
         }
         rationale = mapping_payload.get("rationale")
         if rationale is not None:
@@ -234,15 +261,80 @@ class DocumentEditTool:
 
     def _normalize_tab_id(self, tab_id: str | None, payload: EditDirective | Mapping[str, Any]) -> str | None:
         payload_tab: str | None = None
+        payload_metadata: Mapping[str, Any] | None = None
         if isinstance(payload, Mapping):
             payload_tab = payload.get("tab_id") or payload.get("document_id")
-            explicit = payload.get("metadata")
+            metadata = payload.get("metadata")
+            if isinstance(metadata, Mapping):
+                payload_metadata = metadata
         else:
-            explicit = getattr(payload, "metadata", None)
-        if isinstance(explicit, Mapping):
-            payload_tab = payload_tab or explicit.get("tab_id")
-        normalized = (tab_id or payload_tab or "").strip()
-        return normalized or None
+            payload_tab = getattr(payload, "tab_id", None)
+            payload_metadata = getattr(payload, "metadata", None)
+
+        tabs = self._list_tabs()
+        active_tab = self._active_tab_id()
+
+        candidate = (tab_id or payload_tab or "").strip()
+        resolved = self._resolve_tab_identifier(candidate, tabs, active_tab, allow_fallback=True)
+        if resolved:
+            return resolved
+
+        reference = None
+        mapping_payload = self._payload_to_mapping(payload)
+        reference = extract_tab_reference(mapping_payload)
+        if reference is None and isinstance(payload_metadata, Mapping):
+            reference = extract_tab_reference(dict(payload_metadata))
+        resolved = self._resolve_tab_identifier(reference or "", tabs, active_tab, allow_fallback=False)
+        return resolved or None
+
+    def _resolve_tab_identifier(
+        self,
+        candidate: str,
+        tabs: Sequence[Mapping[str, Any]],
+        active_tab_id: str | None,
+        *,
+        allow_fallback: bool,
+    ) -> str | None:
+        normalized = (candidate or "").strip()
+        if not normalized:
+            return None
+        if not tabs:
+            return normalized
+        for entry in tabs:
+            tab_id = str(entry.get("tab_id") or entry.get("id") or "").strip()
+            if tab_id and tab_id.lower() == normalized.lower():
+                return tab_id
+        resolved = resolve_tab_reference(normalized, tabs, active_tab_id=active_tab_id)
+        if resolved:
+            return resolved
+        return normalized if allow_fallback else None
+
+    def _list_tabs(self) -> Sequence[Mapping[str, Any]]:
+        provider = getattr(self.bridge, "list_tabs", None)
+        if not callable(provider):
+            return ()
+        try:
+            tabs = provider()
+        except Exception:  # pragma: no cover - defensive guard
+            return ()
+        if isinstance(tabs, Sequence):
+            return tabs
+        if isinstance(tabs, Iterable):
+            return list(tabs)
+        return ()
+
+    def _active_tab_id(self) -> str | None:
+        getter = getattr(self.bridge, "active_tab_id", None)
+        if callable(getter):
+            try:
+                value = getter()
+            except Exception:  # pragma: no cover - defensive guard
+                return None
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
+        return None
 
     def _queue_edit(self, payload: EditDirective | Mapping[str, Any], *, tab_id: str | None) -> None:
         queue_edit = getattr(self.bridge, "queue_edit", None)
@@ -284,4 +376,16 @@ class DocumentEditTool:
         if callable(getter):
             return cast(str | None, getter(tab_id=tab_id))
         return cast(str | None, getattr(self.bridge, "last_snapshot_version", None))
+
+    @staticmethod
+    def _normalize_diff_filename(snapshot: Mapping[str, Any]) -> str:
+        path = snapshot.get("path")
+        if isinstance(path, str) and path.strip():
+            return path.strip()
+        document_id = snapshot.get("document_id") or "document"
+        return f"tab://{document_id}"
+
+    @staticmethod
+    def _hash_text(text: str) -> str:
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
