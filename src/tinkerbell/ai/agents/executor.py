@@ -18,6 +18,10 @@ from openai.types.chat import ChatCompletionToolParam
 from .. import prompts
 from ..ai_types import AgentConfig
 from ..client import AIClient, AIStreamEvent
+from ..services import ToolPayload, build_pointer, summarize_tool_content, telemetry as telemetry_service
+from ..services.trace_compactor import TraceCompactor
+from ...chat.message_model import ToolPointerMessage
+from ..services.context_policy import BudgetDecision, ContextBudgetPolicy
 from ..services.telemetry import (
     ContextUsageEvent,
     PersistentTelemetrySink,
@@ -28,6 +32,7 @@ from .graph import build_agent_graph
 
 LOGGER = logging.getLogger(__name__)
 _PROMPT_HEADROOM = 4_096
+_POINTER_SUMMARY_TOKENS = 512
 _SUGGESTION_SYSTEM_PROMPT = (
     "You are a proactive writing assistant that proposes the next helpful user prompts after reviewing the prior "
     "conversation. Respond ONLY with a JSON array of concise suggestion strings (each under 120 characters). "
@@ -66,6 +71,14 @@ class _MessagePlan:
     prompt_tokens: int
 
 
+class ContextBudgetExceeded(RuntimeError):
+    """Raised when the context budget policy rejects a prompt."""
+
+    def __init__(self, decision: BudgetDecision):
+        super().__init__(f"Context budget exceeded: {decision.reason}")
+        self.decision = decision
+
+
 @dataclass(slots=True)
 class ToolRegistration:
     """Metadata stored for each registered tool."""
@@ -75,6 +88,7 @@ class ToolRegistration:
     description: str | None = None
     parameters: Mapping[str, Any] | None = None
     strict: bool = True
+    summarizable: bool = True
 
     def as_openai_tool(self) -> ChatCompletionToolParam:
         """Return an OpenAI-compatible tool spec for the AI client."""
@@ -121,10 +135,13 @@ class AIController:
     telemetry_limit: int = 200
     telemetry_sink: TelemetrySink | None = None
     agent_config: AgentConfig | None = None
+    budget_policy: ContextBudgetPolicy | None = None
     _graph: Dict[str, Any] = field(init=False, repr=False)
     _active_task: asyncio.Task[dict] | None = field(default=None, init=False, repr=False)
     _task_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _telemetry_sink: TelemetrySink | None = field(default=None, init=False, repr=False)
+    _last_budget_decision: BudgetDecision | None = field(default=None, init=False, repr=False)
+    _trace_compactor: TraceCompactor | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.tools:
@@ -145,6 +162,11 @@ class AIController:
             response_token_reserve=self.response_token_reserve,
         )
         self._configure_telemetry_sink()
+        self.configure_budget_policy(self.budget_policy)
+        self._trace_compactor = TraceCompactor(
+            pointer_builder=self._build_tool_pointer,
+            estimate_message_tokens=self._estimate_message_tokens,
+        )
 
     @property
     def graph(self) -> Dict[str, Any]:
@@ -160,15 +182,22 @@ class AIController:
         description: str | None = None,
         parameters: Mapping[str, Any] | None = None,
         strict: bool | None = None,
+        summarizable: bool | None = None,
     ) -> None:
         """Register (or replace) a tool available to the agent."""
 
+        if summarizable is None:
+            attr_flag = getattr(tool, "summarizable", None)
+            summarizable_flag = True if attr_flag is None else bool(attr_flag)
+        else:
+            summarizable_flag = bool(summarizable)
         registration = ToolRegistration(
             name=name,
             impl=tool,
             description=description,
             parameters=parameters,
             strict=True if strict is None else bool(strict),
+            summarizable=summarizable_flag,
         )
         self.tools[name] = registration
         LOGGER.debug("Registered tool: %s", name)
@@ -202,6 +231,17 @@ class AIController:
             self.response_token_reserve = self._normalize_response_reserve(response_token_reserve)
         else:
             self.response_token_reserve = self._normalize_response_reserve(self.response_token_reserve)
+
+    def configure_budget_policy(self, policy: ContextBudgetPolicy | None) -> None:
+        """Update (or initialize) the active budget policy."""
+
+        model_name = getattr(getattr(self.client, "settings", None), "model", None)
+        if policy is None:
+            policy = ContextBudgetPolicy.disabled(
+                model_name=model_name,
+                max_context_tokens=self.max_context_tokens,
+            )
+        self.budget_policy = policy
 
     def unregister_tool(self, name: str) -> None:
         """Remove a tool and rebuild the agent graph."""
@@ -243,8 +283,17 @@ class AIController:
             list(self.tools.keys()),
         )
 
+        self._evaluate_budget(
+            prompt_tokens=message_plan.prompt_tokens,
+            response_reserve=completion_budget,
+            snapshot=snapshot,
+        )
+
         async def _runner() -> dict:
+            if self._trace_compactor is not None:
+                self._trace_compactor.reset()
             conversation: list[dict[str, Any]] = list(base_messages)
+            conversation_tokens = message_plan.prompt_tokens
             response_text = ""
             turn_count = 0
             tool_iterations = 0
@@ -269,13 +318,16 @@ class AIController:
                     max_completion_tokens=completion_budget,
                 )
                 conversation.append(turn.assistant_message)
+                conversation_tokens += self._estimate_message_tokens(turn.assistant_message)
                 response_text = turn.response_text
 
                 if not turn.tool_calls:
                     if pending_patch_application and patch_reminders_sent < self.max_pending_patch_reminders:
                         reminder = self._pending_patch_prompt()
                         LOGGER.debug("Injected patch reminder (pending diff)")
-                        conversation.append({"role": "system", "content": reminder})
+                        reminder_message = {"role": "system", "content": reminder}
+                        conversation.append(reminder_message)
+                        conversation_tokens += self._estimate_message_tokens(reminder_message)
                         patch_reminders_sent += 1
                         continue
                     break
@@ -293,6 +345,13 @@ class AIController:
                     on_event,
                 )
                 executed_tool_calls.extend(tool_records)
+                tool_messages, conversation_tokens = self._compact_tool_messages(
+                    tool_messages,
+                    tool_records,
+                    conversation_tokens=conversation_tokens,
+                    response_reserve=completion_budget,
+                    snapshot=snapshot,
+                )
                 conversation.extend(tool_messages)
                 turn_metrics["tool_tokens"] += tool_token_cost
                 turn_metrics["conversation_length"] = len(conversation)
@@ -319,7 +378,9 @@ class AIController:
                     LOGGER.debug(
                         "Injected diff_builder consolidation reminder (count=%s)", diff_builders_since_edit
                     )
-                    conversation.append({"role": "system", "content": reminder_text})
+                    reminder_message = {"role": "system", "content": reminder_text}
+                    conversation.append(reminder_message)
+                    conversation_tokens += self._estimate_message_tokens(reminder_message)
                     diff_builders_since_edit = 0
                     continue
 
@@ -331,12 +392,26 @@ class AIController:
                 len(response_text),
                 len(executed_tool_calls),
             )
+            compaction_stats = None
+            if self._trace_compactor is not None:
+                trace_stats = self._trace_compactor.stats_snapshot().as_dict()
+                compaction_stats = trace_stats
+                if trace_stats.get("total_compactions") or trace_stats.get("tokens_saved"):
+                    telemetry_service.emit(
+                        "trace_compaction",
+                        {
+                            "run_id": turn_metrics.get("run_id"),
+                            "document_id": turn_metrics.get("document_id"),
+                            **trace_stats,
+                        },
+                    )
             return {
                 "prompt": prompt,
                 "response": response_text,
                 "doc_snapshot": snapshot,
                 "tool_calls": executed_tool_calls,
                 "graph": self.graph,
+                "trace_compaction": compaction_stats,
             }
 
         async with self._task_lock:
@@ -409,6 +484,13 @@ class AIController:
             except TypeError:
                 return list(tail())  # type: ignore[misc]
         return []
+
+    def get_budget_status(self) -> dict[str, object] | None:
+        """Expose the most recent context budget policy decision."""
+
+        if self.budget_policy is None:
+            return None
+        return self.budget_policy.status_snapshot()
 
     async def aclose(self) -> None:
         """Cancel any active work and close the underlying AI client."""
@@ -596,7 +678,7 @@ class AIController:
     ) -> dict[str, Any]:
         document_id = self._resolve_document_id(snapshot)
         model_name = getattr(getattr(self.client, "settings", None), "model", None) or "unknown"
-        return {
+        context = {
             "document_id": document_id,
             "model": model_name,
             "prompt_tokens": int(prompt_tokens),
@@ -607,6 +689,12 @@ class AIController:
             "tool_names": set(),
             "run_id": uuid.uuid4().hex,
         }
+        self._record_budget_usage(
+            run_id=context["run_id"],
+            prompt_tokens=int(prompt_tokens),
+            response_reserve=response_reserve,
+        )
+        return context
 
     def _record_tool_names(self, context: dict[str, Any], records: Sequence[Mapping[str, Any]]) -> None:
         names = context.get("tool_names")
@@ -616,6 +704,48 @@ class AIController:
             name = str(record.get("name") or "").strip()
             if name:
                 names.add(name)
+
+    def _evaluate_budget(
+        self,
+        *,
+        prompt_tokens: int,
+        response_reserve: int | None,
+        snapshot: Mapping[str, Any],
+        pending_tool_tokens: int = 0,
+        suppress_telemetry: bool = False,
+    ) -> BudgetDecision | None:
+        policy = self.budget_policy
+        if policy is None:
+            return None
+        decision = policy.tokens_available(
+            prompt_tokens=prompt_tokens,
+            response_reserve=response_reserve,
+            pending_tool_tokens=pending_tool_tokens,
+            document_id=self._resolve_document_id(snapshot),
+        )
+        self._last_budget_decision = decision
+        emitter = getattr(telemetry_service, "emit", None)
+        if not suppress_telemetry and callable(emitter):
+            emitter("context_budget_decision", decision.as_payload())
+        if decision.verdict == "reject" and not decision.dry_run:
+            raise ContextBudgetExceeded(decision)
+        return decision
+
+    def _record_budget_usage(
+        self,
+        *,
+        run_id: str,
+        prompt_tokens: int,
+        response_reserve: int | None,
+    ) -> None:
+        policy = self.budget_policy
+        if policy is None:
+            return
+        policy.record_usage(
+            run_id,
+            prompt_tokens=prompt_tokens,
+            response_reserve=response_reserve,
+        )
 
     def _emit_context_usage(self, context: dict[str, Any]) -> None:
         if not self.telemetry_enabled or self._telemetry_sink is None:
@@ -864,9 +994,11 @@ class AIController:
         records: list[dict[str, Any]] = []
         token_cost = 0
         for call in tool_calls:
+            registration = self.tools.get(call.name) if call.name else None
+            summarizable = getattr(registration, "summarizable", True) if registration is not None else True
             started_at = time.time()
             start_perf = time.perf_counter()
-            content, resolved_arguments, raw_result = await self._execute_tool_call(call, on_event)
+            content, resolved_arguments, raw_result = await self._execute_tool_call(call, registration, on_event)
             duration_ms = max(0.0, (time.perf_counter() - start_perf) * 1000.0)
             argument_tokens = self._estimate_text_tokens(call.arguments or "")
             result_tokens = self._estimate_text_tokens(content)
@@ -886,18 +1018,124 @@ class AIController:
                 call_token_cost,
                 duration_ms,
                 raw_result,
+                summarizable=summarizable,
                 started_at=started_at,
             )
             records.append(record)
             token_cost += call_token_cost
         return messages, records, token_cost
 
+    def _compact_tool_messages(
+        self,
+        messages: list[dict[str, Any]],
+        records: list[dict[str, Any]],
+        *,
+        conversation_tokens: int,
+        response_reserve: int | None,
+        snapshot: Mapping[str, Any],
+    ) -> tuple[list[dict[str, Any]], int]:
+        if not messages:
+            return messages, conversation_tokens
+        updated_tokens = conversation_tokens
+        compacted: list[dict[str, Any]] = []
+        compactor = self._trace_compactor
+
+        def _evaluate(prompt_tokens: int, pending_tokens: int) -> BudgetDecision | None:
+            return self._evaluate_budget(
+                prompt_tokens=prompt_tokens,
+                response_reserve=response_reserve,
+                snapshot=snapshot,
+                pending_tool_tokens=pending_tokens,
+                suppress_telemetry=True,
+            )
+
+        for idx, message in enumerate(messages):
+            record = records[idx] if idx < len(records) else {}
+            if not isinstance(record, dict):
+                record = dict(record)
+                if idx < len(records):
+                    records[idx] = record
+            summarizable = bool(record.get("summarizable", True))
+            content_text = str(message.get("content") or "")
+            entry = None
+            if compactor is not None:
+                entry = compactor.new_entry(
+                    message,
+                    record,
+                    raw_content=content_text,
+                    summarizable=summarizable,
+                )
+            pending_tokens = self._estimate_text_tokens(content_text)
+            decision = _evaluate(updated_tokens, pending_tokens)
+            if compactor is not None and decision is not None and decision.verdict == "needs_summary":
+                updated_tokens, decision = compactor.compact_history(
+                    evaluate=_evaluate,
+                    conversation_tokens=updated_tokens,
+                    pending_tokens=pending_tokens,
+                )
+            if (
+                decision is not None
+                and decision.verdict == "needs_summary"
+                and summarizable
+                and content_text
+            ):
+                if compactor is not None and entry is not None:
+                    compactor.compact_entry(entry)
+                else:
+                    pointer = self._build_tool_pointer(record, content_text)
+                    message["content"] = pointer.as_chat_content()
+                    record["pointer"] = pointer.as_dict()
+                pending_tokens = self._estimate_text_tokens(message.get("content") or "")
+                decision = _evaluate(updated_tokens, pending_tokens)
+            if decision is not None and decision.verdict == "reject" and not decision.dry_run:
+                raise ContextBudgetExceeded(decision)
+            message_tokens = self._estimate_message_tokens(message)
+            updated_tokens += message_tokens
+            if compactor is not None and entry is not None:
+                compactor.commit_entry(entry, current_tokens=message_tokens)
+            compacted.append(message)
+        return compacted, updated_tokens
+
+    def _build_tool_pointer(self, record: Mapping[str, Any], content_text: str) -> ToolPointerMessage:
+        tool_name = str(record.get("name") or "tool")
+        arguments = record.get("resolved_arguments")
+        if not isinstance(arguments, Mapping):
+            arguments = None
+        payload = ToolPayload(
+            name=tool_name,
+            content=content_text,
+            arguments=arguments,
+            metadata={
+                "tool_call_id": record.get("id"),
+                "status": record.get("status"),
+            },
+        )
+        summary = summarize_tool_content(payload, budget_tokens=_POINTER_SUMMARY_TOKENS)
+        instructions = self._pointer_rehydrate_instructions(tool_name, arguments)
+        pointer = build_pointer(summary, tool_name=tool_name, rehydrate_instructions=instructions)
+        pointer.metadata.setdefault("source", "context_budget")
+        return pointer
+
+    @staticmethod
+    def _pointer_rehydrate_instructions(tool_name: str, arguments: Mapping[str, Any] | None) -> str:
+        if arguments:
+            try:
+                encoded = json.dumps(arguments, ensure_ascii=False)
+            except (TypeError, ValueError):
+                encoded = str(arguments)
+            if len(encoded) > 180:
+                encoded = f"{encoded[:177].rstrip()}…"
+            return (
+                f"Re-run {tool_name} with arguments similar to {encoded} to recover the full payload pointed to above."
+            )
+        return f"Re-run {tool_name} to recover the full payload referenced by this pointer."
+
     async def _execute_tool_call(
         self,
         call: _ToolCallRequest,
+        registration: ToolRegistration | None,
         on_event: ToolCallback | None,
     ) -> tuple[str, Any, Any]:
-        registration = self.tools.get(call.name) if call.name else None
         resolved_arguments = self._coerce_tool_arguments(call.arguments, call.parsed)
         if registration is None:
             message = f"Tool '{call.name or 'unknown'}' is not registered."
@@ -944,6 +1182,7 @@ class AIController:
         raw_result: Any,
         *,
         started_at: float,
+        summarizable: bool,
     ) -> dict[str, Any]:
         diff_summary = self._summarize_tool_result(call.name, resolved_arguments, raw_result, serialized_result)
         status = self._derive_tool_status(call.name, serialized_result)
@@ -960,6 +1199,7 @@ class AIController:
             "duration_ms": round(duration_ms, 3),
             "started_at": started_at,
             "diff_summary": diff_summary,
+            "summarizable": summarizable,
         }
 
     def _derive_tool_status(self, tool_name: str | None, serialized_result: str) -> str:

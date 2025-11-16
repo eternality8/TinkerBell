@@ -238,6 +238,28 @@ def test_copy_tool_trace_details_includes_diff_preview(monkeypatch):
     assert "Diff preview:" in (panel.last_copied_text or "")
 
 
+def test_tool_trace_details_include_pointer_metadata():
+    panel = _make_panel()
+    pointer = {
+        "pointer_id": "ptr-123",
+        "display_text": "summarized output",
+        "rehydrate_instructions": "rerun search",
+    }
+    trace = ToolTrace(
+        name="search",
+        input_summary="term",
+        output_summary="original output",
+        metadata={"pointer": pointer, "pointer_instructions": "rerun search"},
+    )
+    panel.show_tool_trace(trace)
+
+    details = panel._format_tool_trace_details(trace)
+
+    assert "Compacted pointer: ptr-123" in details
+    assert "Pointer summary:" in details
+    assert "Rehydrate instructions:" in details
+
+
 def test_copy_tool_trace_details_prefers_raw_metadata(monkeypatch):
     panel = _make_panel()
     long_input = '{"action":"replace","content":"' + ("A" * 60) + '"}'

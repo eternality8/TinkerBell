@@ -174,6 +174,7 @@ class _PendingToolTrace:
     pending_parsed: Any | None = None
     trace: ToolTrace | None = None
     started_at: float | None = None
+    tool_call_id: str | None = None
 
 
 class MainWindow(QMainWindow):
@@ -206,6 +207,8 @@ class MainWindow(QMainWindow):
         self._ai_task: asyncio.Task[Any] | None = None
         self._ai_stream_active = False
         self._pending_tool_traces: Dict[str, _PendingToolTrace] = {}
+        self._tool_trace_index: Dict[str, ToolTrace] = {}
+        self._last_compaction_stats: dict[str, int] | None = None
         self._suggestion_task: asyncio.Task[Any] | None = None
         self._suggestion_request_id = 0
         self._suggestion_cache_key: str | None = None
@@ -777,7 +780,11 @@ class MainWindow(QMainWindow):
             self._handle_ai_failure(exc)
             return
 
-        response_text = (result or {}).get("response", "").strip()
+        payload = result or {}
+        tool_records = payload.get("tool_calls")
+        self._annotate_tool_traces_with_compaction(tool_records)
+        self._last_compaction_stats = payload.get("trace_compaction")
+        response_text = payload.get("response", "").strip()
         if not response_text:
             response_text = "The AI did not return any content."
         self._finalize_ai_response(response_text)
@@ -831,6 +838,7 @@ class MainWindow(QMainWindow):
         if state is None:
             state = _PendingToolTrace(name=self._normalize_tool_name(event))
             self._pending_tool_traces[key] = state
+        state.tool_call_id = key
         delta = getattr(event, "arguments_delta", None) or getattr(event, "tool_arguments", None)
         if delta:
             state.arguments_chunks.append(str(delta))
@@ -843,12 +851,14 @@ class MainWindow(QMainWindow):
         if state is None:
             state = _PendingToolTrace(name=self._normalize_tool_name(event))
             self._pending_tool_traces[key] = state
+        state.tool_call_id = key
         arguments_text = getattr(event, "tool_arguments", None)
         if not arguments_text:
             arguments_text = "".join(state.arguments_chunks)
         state.arguments_chunks.clear()
         state.raw_input = str(arguments_text or "")
         metadata: Dict[str, Any] = {"raw_input": state.raw_input}
+        metadata["tool_call_id"] = state.tool_call_id or key
         trace = ToolTrace(
             name=state.name,
             input_summary=self._summarize_tool_io(state.raw_input),
@@ -878,8 +888,26 @@ class MainWindow(QMainWindow):
         dashboard = telemetry_service.build_usage_dashboard(events)
         if dashboard is None:
             return
+        summary_text = dashboard.summary_text
+        compaction_stats = self._last_compaction_stats
+        if isinstance(compaction_stats, Mapping):
+            compactions = int(compaction_stats.get("total_compactions", 0))
+            tokens_saved = int(compaction_stats.get("tokens_saved", 0))
+            if compactions or tokens_saved:
+                stats_bits = f"Compactions {compactions}"
+                if tokens_saved:
+                    stats_bits = f"{stats_bits} (saved {tokens_saved:,})"
+                summary_text = f"{summary_text} · {stats_bits}" if summary_text else stats_bits
+        budget_snapshot = None
+        getter = getattr(controller, "get_budget_status", None)
+        if callable(getter):
+            budget_snapshot = getter()
+        if isinstance(budget_snapshot, Mapping):
+            budget_text = str(budget_snapshot.get("summary_text") or "").strip()
+            if budget_text:
+                summary_text = f"{summary_text} · {budget_text}"
         self._status_bar.set_memory_usage(
-            dashboard.summary_text,
+            summary_text,
             totals=dashboard.totals_text,
             last_tool=dashboard.summary.last_tool,
         )
@@ -932,6 +960,7 @@ class MainWindow(QMainWindow):
         if state is None:
             state = _PendingToolTrace(name=self._normalize_tool_name(event))
             self._pending_tool_traces[key] = state
+        state.tool_call_id = key
         content = getattr(event, "content", None) or getattr(event, "tool_arguments", None) or ""
         state.pending_output = str(content)
         state.pending_parsed = getattr(event, "parsed", None)
@@ -949,11 +978,42 @@ class MainWindow(QMainWindow):
         if state.pending_parsed is not None:
             metadata["parsed_output"] = state.pending_parsed
         trace.metadata = metadata
+        tool_call_id = metadata.get("tool_call_id")
+        if isinstance(tool_call_id, str):
+            self._tool_trace_index[tool_call_id] = trace
         if state.started_at is not None:
             elapsed = max(0.0, time.perf_counter() - state.started_at)
             trace.duration_ms = int(elapsed * 1000)
         self._chat_panel.update_tool_trace(trace)
         self._pending_tool_traces.pop(key, None)
+
+    def _annotate_tool_traces_with_compaction(self, records: Sequence[Mapping[str, Any]] | None) -> None:
+        if not records:
+            return
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            pointer = record.get("pointer")
+            if not pointer:
+                continue
+            call_id = record.get("id") or record.get("tool_call_id")
+            if not call_id:
+                continue
+            trace = self._tool_trace_index.get(str(call_id))
+            if trace is None:
+                continue
+            metadata = dict(trace.metadata or {})
+            metadata["compacted"] = True
+            metadata["pointer"] = pointer
+            instructions = pointer.get("rehydrate_instructions") if isinstance(pointer, Mapping) else None
+            if instructions:
+                metadata["pointer_instructions"] = instructions
+            summary = pointer.get("display_text") if isinstance(pointer, Mapping) else None
+            if summary:
+                metadata["pointer_summary"] = summary
+                trace.output_summary = summary
+            trace.metadata = metadata
+            self._chat_panel.update_tool_trace(trace)
 
     def _tool_call_key(self, event: Any) -> str:
         identifier = getattr(event, "tool_call_id", None) or getattr(event, "id", None)
@@ -1060,6 +1120,8 @@ class MainWindow(QMainWindow):
         self._cancel_active_ai_turn()
         self._cancel_dynamic_suggestions()
         self._clear_suggestion_cache()
+        self._tool_trace_index.clear()
+        self._last_compaction_stats = None
         self._refresh_chat_suggestions()
         self.update_status("Chat reset")
 
@@ -2247,6 +2309,37 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # pragma: no cover - defensive guard
             _LOGGER.debug("Unable to update context window settings: %s", exc)
 
+    def _apply_context_policy_settings(self, controller: Any, settings: Settings) -> None:
+        builder = getattr(self, "_build_context_budget_policy", None)
+        if not callable(builder):
+            return
+        policy = builder(settings)
+        configurator = getattr(controller, "configure_budget_policy", None)
+        if not callable(configurator):
+            return
+        try:
+            configurator(policy)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to update context budget policy: %s", exc)
+
+    def _build_context_budget_policy(self, settings: Settings):
+        try:
+            from .ai.services.context_policy import ContextBudgetPolicy
+        except Exception as exc:  # pragma: no cover - dependency guard
+            _LOGGER.debug("Context budget policy unavailable: %s", exc)
+            return None
+
+        policy_settings = getattr(settings, "context_policy", None)
+        max_context = getattr(settings, "max_context_tokens", 128_000)
+        reserve = getattr(settings, "response_token_reserve", 16_000)
+        model_name = getattr(settings, "model", None)
+        return ContextBudgetPolicy.from_settings(
+            policy_settings,
+            model_name=model_name,
+            max_context_tokens=max_context,
+            response_token_reserve=reserve,
+        )
+
     @staticmethod
     def _resolve_max_tool_iterations(settings: Settings | None) -> int:
         raw = getattr(settings, "max_tool_iterations", 8) if settings else 8
@@ -2335,6 +2428,7 @@ class MainWindow(QMainWindow):
         if controller is not None:
             self._apply_max_tool_iterations(controller, iteration_limit)
             self._apply_context_window_settings(controller, settings)
+            self._apply_context_policy_settings(controller, settings)
 
         self._update_ai_debug_logging(bool(getattr(settings, "debug_logging", False)))
 
@@ -2397,11 +2491,13 @@ class MainWindow(QMainWindow):
 
         try:
             limit = self._resolve_max_tool_iterations(settings)
+            policy = self._build_context_budget_policy(settings)
             return AIController(
                 client=client,
                 max_tool_iterations=limit,
                 max_context_tokens=getattr(settings, "max_context_tokens", 128_000),
                 response_token_reserve=getattr(settings, "response_token_reserve", 16_000),
+                budget_policy=policy,
             )
         except Exception as exc:
             _LOGGER.warning("Failed to initialize AI controller: %s", exc)

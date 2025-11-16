@@ -15,6 +15,7 @@ from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.main_window import MainWindow, WindowContext
 from tinkerbell.services.importers import FileImporter, ImportResult, ImporterError
 from tinkerbell.services.settings import Settings, SettingsStore
+from tinkerbell.services.telemetry import ContextUsageEvent
 
 
 def _ensure_qapp() -> None:
@@ -96,6 +97,31 @@ def test_document_edit_tool_runs_in_patch_only_mode():
     edit_tool = controller.registered_tools["document_edit"]["impl"]
 
     assert getattr(edit_tool, "patch_only", None) is True
+
+
+def test_tool_traces_capture_compaction_metadata():
+    window = _make_window()
+    trace = ToolTrace(
+        name="search",
+        input_summary="term",
+        output_summary="full output",
+        metadata={"tool_call_id": "call-xyz"},
+    )
+    window.chat_panel.show_tool_trace(trace)
+    window._tool_trace_index["call-xyz"] = trace
+    pointer = {
+        "pointer_id": "ptr-99",
+        "display_text": "summary",
+        "rehydrate_instructions": "run search",
+    }
+
+    window._annotate_tool_traces_with_compaction([{"id": "call-xyz", "pointer": pointer}])
+
+    assert trace.metadata.get("compacted") is True
+    assert trace.output_summary == "summary"
+    details = window.chat_panel._format_tool_trace_details(trace)
+    assert "Compacted pointer: ptr-99" in details
+    assert "Rehydrate instructions:" in details
 
 
 def test_settings_dialog_toggle_updates_tool_panel(monkeypatch: pytest.MonkeyPatch):
@@ -185,6 +211,33 @@ def test_suggestion_panel_reuses_cached_results_for_same_history():
 
     assert window.chat_panel.suggestions() == ("Idea A",)
     assert len(controller.suggestion_calls) == 1
+
+
+def test_context_usage_status_includes_compaction_stats():
+    controller = SimpleNamespace(
+        get_recent_context_events=lambda limit=None: [
+            ContextUsageEvent(
+                document_id="doc",
+                model="gpt",
+                prompt_tokens=100,
+                tool_tokens=50,
+                response_reserve=1_000,
+                timestamp=0.0,
+                conversation_length=2,
+                tool_names=("search",),
+                run_id="run-1",
+            )
+        ],
+        get_budget_status=lambda: None,
+    )
+    settings = Settings()
+    settings.debug.token_logging_enabled = True
+    window = _make_window(controller=controller, settings=settings)
+    window._last_compaction_stats = {"total_compactions": 2, "tokens_saved": 500}
+
+    window._update_context_usage_status()
+
+    assert "Compactions 2" in window._status_bar.memory_usage
 
 
 def test_suggestion_cache_invalidated_when_history_changes():

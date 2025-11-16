@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence, cast
+from typing import Any, Callable, ClassVar, Iterable, Mapping, Protocol, Sequence, cast
 
 from ...chat.commands import ActionType, extract_tab_reference, parse_agent_payload, resolve_tab_reference
 from ...chat.message_model import EditDirective
@@ -41,6 +41,7 @@ class DocumentEditTool:
     allow_inline_edits: bool = False
     diff_builder: DiffBuilderTool = field(default_factory=DiffBuilderTool)
     diff_context_lines: int = 5
+    summarizable: ClassVar[bool] = False
 
     def run(self, directive: DirectiveInput | None = None, *, tab_id: str | None = None, **fields: Any) -> str:
         payload = self._coerce_input(self._resolve_input(directive, fields))

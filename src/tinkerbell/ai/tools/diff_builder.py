@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import difflib
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 
 @dataclass(slots=True)
@@ -13,6 +13,7 @@ class DiffBuilderTool:
 
     default_filename: str = "document.txt"
     default_context_lines: int = 5
+    summarizable: ClassVar[bool] = True
 
     def run(self, original: str, updated: str, *, filename: str | None = None, context: int | None = None) -> str:
         if original is None or updated is None:

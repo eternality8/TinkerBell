@@ -23,6 +23,7 @@ TinkerBell pairs a PySide6 editor with a full LangChain/LangGraph tool stack so 
 - **Diff-based edits by default** – Agents fetch snapshots, build unified diffs, and submit `action="patch"` directives so every change is reproducible and undo-friendly.
 - **Structured safety rails** – All AI edits flow through `DocumentBridge` where schema validation, document-version checks, and diff summaries prevent stale or destructive operations.
 - **Deterministic token budgets** – A shared `TokenCounterRegistry` normalizes counts per model, falls back to a byte-length estimator when `tiktoken` is unavailable, and ships with `scripts/inspect_tokens.py` for quick sanity checks.
+- **Context budget policy + trace compactor** – Budget checks now run (and enforce) by default, compacting oversized tool payloads into pointer summaries while keeping the original trace available for auditing. Settings still expose dry-run/override switches when you need to experiment.
 - **Turn-level telemetry** – The status bar and debug settings can stream per-turn prompt/tool budgets via `ContextUsageEvent` objects so regressions are visible before shipping.
 - **Versioned document bus** – Every snapshot now includes `{document_id, version_id, content_hash}` and `DocumentCacheBus` broadcasts `DocumentChanged`/`DocumentClosed` events so downstream caches can stay coherent.
 - **Markdown-first editor** – `EditorWidget` wraps `QPlainTextEdit`/`QsciScintilla` with headless fallbacks, Markdown preview, undo/redo, selection tracking, and theme hooks.
@@ -101,7 +102,7 @@ uv sync --extra ai_tokenizers
 
 You can supply OpenAI-compatible credentials in three interchangeable ways:
 
-1. **Settings dialog** – Press `Ctrl+,` or use **Settings → Preferences…** to enter a base URL, API key, model name, and retry/backoff settings. Keys are stored with DPAPI (Windows) or Fernet (cross-platform) via `SettingsStore`. The dialog also exposes **Max Context Tokens** and **Response Token Reserve** so you can cap how much history is sent while guaranteeing ~16k tokens of headroom for replies.
+1. **Settings dialog** – Press `Ctrl+,` or use **Settings → Preferences…** to enter a base URL, API key, model name, and retry/backoff settings. Keys are stored with DPAPI (Windows) or Fernet (cross-platform) via `SettingsStore`. The dialog also exposes **Max Context Tokens**, **Response Token Reserve**, and the **Context Budget Policy** toggles (enforce vs. dry-run plus optional prompt/reserve overrides) so you can dial in budgets even though enforcement is now on by default.
 2. **Environment variables** – Set any subset of the following before launching the app:
 	 - `TINKERBELL_API_KEY`
 	 - `TINKERBELL_BASE_URL` (e.g., `https://api.openai.com/v1` or your proxy)
@@ -129,6 +130,12 @@ uv run tinkerbell --dump-settings --set base_url=https://proxy.example.com
 The output includes the resolved settings path, the active secret backend (DPAPI or Fernet; override with `TINKERBELL_SECRET_BACKEND`), and whichever environment variables were applied.
 
 Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat message. Failures are surfaced in the chat panel and status bar, and logs are written to your platform-specific temp directory.
+
+## Context budgets & trace compaction
+
+- **Enforced budget policy (opt-out available)** – Context budgets ship enabled with `dry_run=False`, so every new session automatically enforces prompt/reserve math. Toggle **Settings → Context budget policy → Dry run only** if you want to inspect decisions without blocking, or disable the policy entirely for legacy debugging.
+- **Automatic tool pointerization** – When the policy reports `needs_summary`, oversized tool payloads (snapshots, diffs, search results) are compacted into `[pointer:…]` summaries before they’re handed back to the model. Each pointer carries human-readable text plus rehydrate instructions so LangGraph nodes (and future tools) can call the originating tool again with a narrower scope whenever the raw payload is required. Validators and other critical outputs opt out via the `summarizable=False` flag on their registrations.
+- **UI + telemetry hooks** – Chat tool traces now show “Compacted” badges, the status bar publishes `tokens_saved` / `total_compactions`, and telemetry gains a `trace_compaction` event alongside `context_budget_decision`. Exported benchmarks (`benchmarks/measure_diff_latency.py`) demonstrate savings like “War and Peace diff: 88K tokens → 247 pointer tokens” to keep regression budgets honest.
 
 ## Everyday workflow
 

@@ -58,3 +58,58 @@ Phase 0 introduces the shared infrastructure that every subsequent AI milestone 
 
 - **Token + diff baselines** – `benchmarks/phase0_token_counts.md` now tracks both the original tokenizer sanity checks and the new Phase 1 diff latency table. Run `uv run python benchmarks/measure_diff_latency.py` to reproduce the War and Peace / Large JSON runtimes cited there.
 - **Automation hook** – The benchmark helper accepts `--case LABEL=PATH` (and `--json`) so CI jobs or future profiling scripts can extend the dataset without editing the file.
+- **Pointer impact follow-up** – Sprint 3 enables pointer-driven compaction by default, and the benchmark harness now prints `diff_tokens`, `pointer_tokens`, and `tokens_saved` for every oversized tool payload. War and Peace’s 88K-token diff collapses to ~250 tokens, so the controller stays comfortably below the watchdog ceiling.
+
+## 9. Sprint 2 – Summaries & pointers
+
+Phase 2 Sprint 2 builds on the dry-run budget policy by actually compacting oversized tool payloads. During this sprint the feature stayed behind the existing `context_policy.enabled` flag (defaulted to dry-run); Sprint 3 later flipped the default on for GA. Sprint 2 hinges on three pillars:
+
+1. **Deterministic summarizer module** (`tinkerbell.ai.services.summarizer`)
+  - Handles plaintext + diff payloads with conservative heuristics (line clamps, per-hunk stats, bullet synthesis) so results are reproducible in tests.
+  - Emits `SummaryResult` records that report both estimated token savings and the pointer metadata needed downstream.
+  - Tools can opt out by setting `summarizable = False` on their callable or dataclass; validators do this so lint findings never shrink.
+
+2. **Pointer-aware chat schema** (`tinkerbell.chat.message_model.ToolPointerMessage`)
+  - When `ContextBudgetPolicy.tokens_available()` returns `needs_summary`, the controller swaps the original tool response for a lightweight pointer message.
+  - Pointer text explains why the payload shrank, includes key metadata (tool name, document/version IDs, diff stats), and always ends with explicit rehydration instructions for LangGraph agents.
+  - Raw payloads are still preserved inside `executed_tool_calls` for UI expansion, export scripts, and audits.
+
+3. **Controller + prompt integration** (`tinkerbell.ai.agents.executor.AIController` & `ai/prompts.py`)
+  - `_handle_tool_calls` records per-tool `summarizable` flags, feeds payloads to the summarizer, and caches pointer instructions alongside tool traces.
+  - `_compact_tool_messages` retries the budget calculation after each summarization while suppressing duplicate telemetry so dashboards stay readable.
+  - Prompt templates now brief the agent on pointer semantics (“If you see a pointer message, rerun the referenced tool with the provided parameters to fetch the full data”).
+
+### Usage notes
+
+- **Settings & telemetry** – No new toggles were added; reuse `context_policy.enabled` and the response reserve fields from Phase 1. Telemetry gains `summary_count` + `tokens_saved` deltas per turn, visible in the status bar debug counters.
+- **Tests** – `tests/test_ai_tools.py` and `tests/test_agent.py` contain regression coverage for summarizer budgets, pointer serialization, and non-summarizable tools. Run `uv run pytest -k pointer` for a focused sweep.
+- **Manual validation** – Load `test_data/War and Peace.txt`, ask the Workspace Agent for a snapshot, and confirm the tool entry shows a pointer badge. Clicking it in the chat panel or invoking “Show full payload” should rehydrate the original diff.
+
+Sprint 3 completes the experience with a dedicated trace compactor service and UI badges everywhere pointers appear (see §10).
+
+## 10. Sprint 3 – Trace compactor GA
+
+Sprint 3 flips the context policy + trace compactor stack to General Availability. Oversized tool responses are now pointerized automatically, the UI surfaces compaction badges, and telemetry/status widgets expose savings without requiring debug flags.
+
+1. **TraceCompactor service** (`tinkerbell.ai.services.trace_compactor`)
+  - Maintains a rolling ledger of tool outputs, tracks token savings, and swaps entries for pointer summaries whenever the budget policy reports `needs_summary`.
+  - Integrates with `AIController` so compaction happens off the main thread while raw payloads continue to flow to transcripts/export scripts.
+2. **UI + transcript affordances** (`chat.chat_panel`, `main_window`, `services.bridge_router`)
+  - Tool traces show “Compacted” badges plus pointer metadata, and the transcript/export paths retain the original payload for auditing.
+  - Status bar text now appends `tokens_saved` / `total_compactions` counters so long-running sessions have immediate feedback.
+3. **Telemetry + benchmarks** (`services.telemetry`, `benchmarks/measure_diff_latency.py`)
+  - `trace_compaction` events capture `entries_tracked`, `total_compactions`, and `tokens_saved` for every turn. Tests assert the payloads so dashboards stay consistent.
+  - The benchmark helper injects a massive diff per document, showing savings like “War and Peace: 88K diff tokens → 247 pointer tokens (88K saved) in 66 ms” to validate both latency and GA savings.
+4. **Defaults flipped** (`services/settings.ContextPolicySettings`)
+  - `context_policy.enabled` now defaults to `True` with `dry_run=False`, so fresh installs enforce the policy immediately. Users can still opt out or revert to dry-run via settings or environment overrides.
+
+### Usage notes
+
+- The Settings dialog highlights the active policy + compaction stats, and toggling “Dry run only” is now an explicit opt-in.
+- Status bar and chat panel badges require no extra flags; pointer text always includes rehydrate instructions so LangGraph agents can fetch the raw data on demand.
+- Telemetry exports (`scripts/export_context_usage.py`) include the latest `trace_compaction` snapshot alongside `context_budget_decision` events for auditors.
+
+### Validation
+
+- New tests `tests/test_trace_compactor.py`, `tests/test_chat_panel.py`, and `tests/test_main_window.py` cover ledger math, pointer metadata propagation, and status-bar stats.
+- Full regression suites (`uv run pytest`) run green, and the refreshed benchmark numbers in `benchmarks/phase0_token_counts.md` document the <50 ms overhead requirement despite compaction.

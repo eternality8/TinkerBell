@@ -5,7 +5,7 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Protocol
+from typing import Any, ClassVar, Literal, Mapping, Protocol
 
 
 class SearchReplaceBridge(Protocol):
@@ -45,6 +45,7 @@ class SearchReplaceTool:
     bridge: SearchReplaceBridge
     preview_chars: int = 240
     default_max_replacements: int = 200
+    summarizable: ClassVar[bool] = False
 
     def __post_init__(self) -> None:
         if self.default_max_replacements <= 0:

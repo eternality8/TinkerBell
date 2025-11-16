@@ -14,7 +14,7 @@ from typing import Any, Dict, Mapping
 
 from cryptography.fernet import Fernet, InvalidToken
 
-__all__ = ["Settings", "SettingsStore", "SecretVault", "DebugSettings"]
+__all__ = ["Settings", "SettingsStore", "SecretVault", "DebugSettings", "ContextPolicySettings"]
 
 LOGGER = logging.getLogger(__name__)
 _SETTINGS_DIR = Path.home() / ".tinkerbell"
@@ -45,6 +45,17 @@ class DebugSettings:
 
     token_logging_enabled: bool = False
     token_log_limit: int = 200
+
+
+@dataclass(slots=True)
+class ContextPolicySettings:
+    """Context budget policy configuration surfaced in the settings UI."""
+
+    enabled: bool = True
+    dry_run: bool = False
+    prompt_budget_override: int | None = None
+    response_reserve_override: int | None = None
+    emergency_buffer: int = 2_000
 
 
 @dataclass(slots=True)
@@ -80,6 +91,7 @@ class Settings:
     debug_logging: bool = False
     show_tool_activity_panel: bool = False
     debug: DebugSettings = field(default_factory=DebugSettings)
+    context_policy: ContextPolicySettings = field(default_factory=ContextPolicySettings)
 
 
 class SecretProvider(ABC):
@@ -186,6 +198,12 @@ class SettingsStore:
                     data["debug"] = DebugSettings(**debug_payload)
                 except TypeError:
                     data["debug"] = DebugSettings()
+            policy_payload = data.get("context_policy")
+            if isinstance(policy_payload, Mapping):
+                try:
+                    data["context_policy"] = ContextPolicySettings(**policy_payload)
+                except TypeError:
+                    data["context_policy"] = ContextPolicySettings()
             try:
                 settings = Settings(**data)
             except TypeError as exc:

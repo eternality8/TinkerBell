@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Any, Iterable, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
+LOGGER = logging.getLogger(__name__)
+
+_EVENT_LISTENERS: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
+
 
 from ..ai import client as ai_client
 from ..ai.ai_types import TokenCounterProtocol
@@ -247,6 +252,33 @@ def build_usage_dashboard(events: Sequence[ContextUsageEvent] | Iterable[Context
     return UsageDashboard(summary=summary, totals=totals)
 
 
+def register_event_listener(event_name: str, callback: Callable[[dict[str, Any]], None]) -> None:
+    """Register a callback invoked whenever :func:`emit` fires *event_name*."""
+
+    if not event_name or callback is None:
+        return
+    listeners = _EVENT_LISTENERS.setdefault(event_name, [])
+    if callback not in listeners:
+        listeners.append(callback)
+
+
+def emit(event_name: str, payload: Mapping[str, Any] | None = None) -> None:
+    """Broadcast a structured telemetry event to in-process listeners."""
+
+    if not event_name:
+        return
+    event_payload = {"event": event_name}
+    if payload:
+        event_payload.update(payload)
+    listeners = list(_EVENT_LISTENERS.get(event_name, ()))
+    for callback in listeners:
+        try:
+            callback(dict(event_payload))
+        except Exception:  # pragma: no cover - listeners must not break emitters
+            LOGGER.debug("Telemetry listener %s failed", callback, exc_info=True)
+    LOGGER.debug("Telemetry emit %s: %s", event_name, event_payload)
+
+
 def default_telemetry_path() -> Path:
     """Return the default on-disk telemetry buffer location."""
 
@@ -364,4 +396,6 @@ __all__ = [
     "summarize_usage_events",
     "summarize_usage_totals",
     "token_counter_status",
+    "emit",
+    "register_event_listener",
 ]

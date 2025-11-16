@@ -24,6 +24,8 @@ summarize_usage_events = _telemetry.summarize_usage_events
 summarize_usage_totals = _telemetry.summarize_usage_totals
 token_counter_status = _telemetry.token_counter_status
 snapshot_events = _telemetry.snapshot_events
+emit = _telemetry.emit
+register_event_listener = _telemetry.register_event_listener
 
 __all__ = (
 	"ContextUsageEvent",
@@ -46,4 +48,6 @@ __all__ = (
 	"summarize_usage_totals",
 	"token_counter_status",
 	"snapshot_events",
+	"emit",
+	"register_event_listener",
 )

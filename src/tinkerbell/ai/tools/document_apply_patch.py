@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, Sequence, cast
+from typing import Any, ClassVar, Mapping, Protocol, Sequence, cast
 
 from .diff_builder import DiffBuilderTool
 from .document_edit import DocumentEditTool, Bridge as EditBridge
@@ -27,6 +27,7 @@ class DocumentApplyPatchTool:
     diff_builder: DiffBuilderTool = field(default_factory=DiffBuilderTool)
     filename_fallback: str = "document.txt"
     default_context_lines: int = 5
+    summarizable: ClassVar[bool] = False
 
     def run(
         self,

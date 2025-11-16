@@ -846,11 +846,17 @@ class ChatPanel(QWidgetBase):
             for offset, trace in enumerate(visible_traces, start=start_index + 1):
                 trace.step_index = trace.step_index or offset
                 name = trace.name or "tool"
-                badge = " [patch]" if str(name).endswith("patch") else ""
+                metadata = trace.metadata or {}
+                badges: list[str] = []
+                if str(name).endswith("patch"):
+                    badges.append("patch")
+                if metadata.get("compacted"):
+                    badges.append("compacted")
+                badge = f" [{', '.join(badges)}]" if badges else ""
                 duration = f" · {trace.duration_ms} ms" if getattr(trace, "duration_ms", 0) else ""
                 step_label = f"Step {trace.step_index or offset}"
                 item_text = f"{step_label} · {name}{badge}{duration}: {trace.output_summary}"
-                preview = (trace.metadata or {}).get("diff_preview") if trace.metadata else None
+                preview = metadata.get("diff_preview") if metadata else None
                 if isinstance(preview, str) and preview.strip():
                     first_line = preview.strip().splitlines()[0]
                     snippet = first_line[:80]
@@ -1047,6 +1053,18 @@ class ChatPanel(QWidgetBase):
         diff_preview = metadata.get("diff_preview")
         if diff_preview:
             lines.extend(["", "Diff preview:", _normalize_block(str(diff_preview))])
+
+        pointer = metadata.get("pointer")
+        instructions = metadata.get("pointer_instructions")
+        if isinstance(pointer, dict):
+            pointer_id = pointer.get("pointer_id") or "(unknown)"
+            lines.extend(["", f"Compacted pointer: {pointer_id}"])
+            summary_text = pointer.get("display_text")
+            if summary_text:
+                lines.extend(["", "Pointer summary:", _normalize_block(str(summary_text))])
+            instructions = instructions or pointer.get("rehydrate_instructions")
+        if instructions:
+            lines.extend(["", "Rehydrate instructions:", _normalize_block(str(instructions))])
 
         return "\n".join(lines)
 

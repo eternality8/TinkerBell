@@ -8,8 +8,11 @@ from typing import Any, AsyncIterator, Iterable, List, cast
 
 import pytest
 
+import tinkerbell.ai.agents.executor as agent_executor
 from tinkerbell.ai.agents.executor import AIController
 from tinkerbell.ai.client import AIClient, AIStreamEvent
+from tinkerbell.ai.services.context_policy import BudgetDecision, ContextBudgetPolicy
+from tinkerbell.services.settings import ContextPolicySettings
 
 
 class _StubClient:
@@ -31,6 +34,52 @@ class _StubClient:
         batch_index = min(len(self.calls) - 1, len(self._batches) - 1)
         for event in self._batches[batch_index]:
             yield event
+
+
+class _StubBudgetPolicy:
+    def __init__(self, verdicts: Iterable[str]):
+        self.verdicts = list(verdicts)
+        self.enabled = True
+        self.dry_run = False
+        self.prompt_budget = 1_000
+        self.response_reserve = 0
+        self.emergency_buffer = 0
+        self.model_name = "stub"
+        self._last: BudgetDecision | None = None
+        self.history: list[str] = []
+
+    def tokens_available(
+        self,
+        *,
+        prompt_tokens: int,
+        response_reserve: int | None = None,
+        pending_tool_tokens: int = 0,
+        document_id: str | None = None,
+        **_kwargs: Any,
+    ) -> BudgetDecision:
+        verdict = self.verdicts.pop(0) if self.verdicts else "ok"
+        decision = BudgetDecision(
+            verdict=verdict,  # type: ignore[arg-type]
+            reason="forced" if verdict != "ok" else "within-budget",
+            prompt_tokens=prompt_tokens + pending_tool_tokens,
+            prompt_budget=self.prompt_budget,
+            response_reserve=response_reserve or self.response_reserve,
+            pending_tool_tokens=pending_tool_tokens,
+            deficit=0,
+            dry_run=False,
+            model=self.model_name,
+            document_id=document_id,
+        )
+        self._last = decision
+        self.history.append(decision.verdict)
+        return decision
+
+    def record_usage(self, *_args, **_kwargs) -> None:  # pragma: no cover - no-op
+        return
+
+    def status_snapshot(self) -> dict[str, object]:  # pragma: no cover - simple helper
+        verdict = self._last.verdict if self._last else None
+        return {"verdict": verdict}
 
 
 def test_ai_controller_collects_streamed_response(sample_snapshot):
@@ -252,6 +301,33 @@ def test_ai_controller_emits_result_events_with_fallback_ids(sample_snapshot):
     assert result_event.tool_index == 0
 
 
+def test_ai_controller_emits_budget_decision(monkeypatch, sample_snapshot):
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="ready")])
+    policy = ContextBudgetPolicy.from_settings(
+        ContextPolicySettings(enabled=True, dry_run=True, prompt_budget_override=1_000),
+        model_name="stub",
+        max_context_tokens=2_000,
+        response_token_reserve=200,
+    )
+    captured: list[tuple[str, dict[str, object] | None]] = []
+
+    def _emit(name: str, payload: dict[str, object] | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(agent_executor.telemetry_service, "emit", _emit)
+
+    controller = AIController(client=cast(AIClient, stub_client), budget_policy=policy)
+
+    async def run() -> None:
+        await controller.run_chat("hello", sample_snapshot)
+
+    asyncio.run(run())
+    assert captured
+    name, payload = captured[-1]
+    assert name == "context_budget_decision"
+    assert payload and payload.get("verdict") == "ok"
+
+
 def test_ai_controller_includes_history_before_latest_prompt(sample_snapshot):
     stub_client = _StubClient([AIStreamEvent(type="content.done", content="ready")])
     controller = AIController(client=cast(AIClient, stub_client))
@@ -355,6 +431,72 @@ def test_ai_controller_prompts_until_document_edit_runs(sample_snapshot):
     reminder_payload = stub_client.calls[2]
     assert reminder_payload["messages"][-1]["role"] == "system"
     assert "document_edit" in reminder_payload["messages"][-1]["content"]
+
+
+def test_ai_controller_compacts_tool_output_with_pointer(sample_snapshot):
+    first_turn = [
+        AIStreamEvent(
+            type="tool_calls.function.arguments.done",
+            tool_name="snapshot",
+            tool_index=0,
+            tool_arguments="{}",
+            parsed={},
+        )
+    ]
+    final_turn = [AIStreamEvent(type="content.done", content="complete")]
+    stub_client = _StubClient([first_turn, final_turn])
+    policy = _StubBudgetPolicy(["ok", "needs_summary", "needs_summary", "ok"])
+    controller = AIController(client=cast(AIClient, stub_client), budget_policy=cast(ContextBudgetPolicy, policy))
+
+    class _VerboseTool:
+        def run(self) -> str:
+            return "\n".join(f"line {idx}: lorem ipsum" for idx in range(200))
+
+    controller.register_tool("snapshot", _VerboseTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("use tool", sample_snapshot)
+
+    result = asyncio.run(run())
+    tool_record = result["tool_calls"][0]
+    pointer = tool_record.get("pointer")
+    assert pointer is not None, policy.history
+    assert pointer["metadata"]["tool_name"] == "snapshot"
+    assert pointer["display_text"]
+    assert pointer["rehydrate_instructions"].startswith("Re-run snapshot")
+    assert tool_record["result"].startswith("line 0")
+
+
+def test_ai_controller_respects_non_summarizable_tool(sample_snapshot):
+    first_turn = [
+        AIStreamEvent(
+            type="tool_calls.function.arguments.done",
+            tool_name="critical_tool",
+            tool_index=0,
+            tool_arguments="{}",
+            parsed={},
+        )
+    ]
+    final_turn = [AIStreamEvent(type="content.done", content="complete")]
+    stub_client = _StubClient([first_turn, final_turn])
+    policy = _StubBudgetPolicy(["ok", "needs_summary"])
+    controller = AIController(client=cast(AIClient, stub_client), budget_policy=cast(ContextBudgetPolicy, policy))
+
+    class _CriticalTool:
+        summarizable = False
+
+        def run(self) -> str:
+            return "critical status: applied patch"
+
+    controller.register_tool("critical_tool", _CriticalTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("use tool", sample_snapshot)
+
+    result = asyncio.run(run())
+    tool_record = result["tool_calls"][0]
+    assert "pointer" not in tool_record
+    assert tool_record["result"].startswith("critical status")
 
 
 @pytest.mark.asyncio

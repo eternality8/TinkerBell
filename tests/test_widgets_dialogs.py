@@ -53,6 +53,12 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     timeout_input = dialog.findChild(QDoubleSpinBox, "request_timeout_input")
     context_input = dialog.findChild(QSpinBox, "max_context_tokens_input")
     reserve_input = dialog.findChild(QSpinBox, "response_token_reserve_input")
+    policy_enable = dialog.findChild(QCheckBox, "context_policy_enabled_checkbox")
+    policy_dry_run = dialog.findChild(QCheckBox, "context_policy_dry_run_checkbox")
+    prompt_toggle = dialog.findChild(QCheckBox, "context_policy_prompt_override_toggle")
+    prompt_input = dialog.findChild(QSpinBox, "context_policy_prompt_override_input")
+    reserve_toggle = dialog.findChild(QCheckBox, "context_policy_reserve_override_toggle")
+    reserve_override_input = dialog.findChild(QSpinBox, "context_policy_reserve_override_input")
 
     assert base_input is not None
     assert api_input is not None
@@ -63,6 +69,12 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert timeout_input is not None
     assert context_input is not None
     assert reserve_input is not None
+    assert policy_enable is not None
+    assert policy_dry_run is not None
+    assert prompt_toggle is not None
+    assert prompt_input is not None
+    assert reserve_toggle is not None
+    assert reserve_override_input is not None
 
     base_input.setText("https://example.com/v2")
     api_input.setText("new-key")
@@ -73,6 +85,12 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     timeout_input.setValue(42.5)
     context_input.setValue(256_000)
     reserve_input.setValue(20_000)
+    policy_enable.setChecked(True)
+    policy_dry_run.setChecked(False)
+    prompt_toggle.setChecked(True)
+    prompt_input.setValue(100_000)
+    reserve_toggle.setChecked(True)
+    reserve_override_input.setValue(12_000)
 
     updated = dialog.gather_settings()
 
@@ -85,6 +103,10 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert updated.request_timeout == pytest.approx(42.5)
     assert updated.max_context_tokens == 256_000
     assert updated.response_token_reserve == 20_000
+    assert updated.context_policy.enabled is True
+    assert updated.context_policy.dry_run is False
+    assert updated.context_policy.prompt_budget_override == 100_000
+    assert updated.context_policy.response_reserve_override == 12_000
 
 
 def test_settings_dialog_validation_uses_validator(qtbot, dialog_settings: Settings) -> None:

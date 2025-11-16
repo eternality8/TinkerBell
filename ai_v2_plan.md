@@ -13,7 +13,8 @@ Deliver a second-generation AI editing loop that handles 100K+ token files witho
 ## Current status (Nov 2025)
 - ✅ **Phase 0 delivered:** Tokenizer registry + CLI, telemetry sinks/toggles, document versioning, cache bus, and supporting docs/benchmarks are merged with full pytest coverage.
 - ✅ **Phase 1 delivered:** LangGraph-driven editor affordances (diff overlays, autosave signal, improved dialogs), deterministic tool traces, telemetry/memory upgrades, and benchmarking artifacts are complete with tests/docs.
-- 🔜 **Next focus – Phase 2:** Token-aware gating + trace summarization using the new budget policy objects described below.
+- ✅ **Phase 2 delivered:** Context-budget enforcement, pointer summaries, TraceCompactor GA, refreshed docs/benchmarks, and opt-out controls now live on the AI v2 branch.
+- 🔜 **Next focus – Phase 3:** Outline, retrieval, and chunk-aware tooling layered on top of the enforced policy described below.
 
 ## Phase 0 – Telemetry & shared infrastructure ✅
 **Status:** Completed in November 2025. The token counter registry (`ai/client.py` + `scripts/inspect_tokens.py`), telemetry events + sinks (`ai/services/telemetry.py`, status bar hooks, settings toggles), document versioning (`editor/document_model.py`, `services/bridge.py`, optimistic patch enforcement), and the cache invalidation bus (`ai/memory/cache_bus.py`) are live with docs + benchmarks. These foundations now back every subsequent phase.
@@ -56,7 +57,8 @@ Deliver a second-generation AI editing loop that handles 100K+ token files witho
 ### Ready for Phase 2
 With observability, diff safety, and UI affordances in place, Phase 2 can concentrate on the token budget policy + summarization work outlined below without blocking issues from earlier phases.
 
-## Phase 2 – Token-aware gating & trace summarization
+## Phase 2 – Token-aware gating & trace summarization ✅
+**Status:** Completed (Nov 2025 GA rollout for the context policy + trace compactor stack).
 **Goal:** Prevent oversized tool outputs from exhausting budgets and provide safe summaries.
 
 ### Work items

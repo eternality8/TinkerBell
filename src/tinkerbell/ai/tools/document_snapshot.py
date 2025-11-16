@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Protocol, cast
+from typing import Any, ClassVar, Iterable, Mapping, Protocol, cast
 
 
 class SnapshotProvider(Protocol):
@@ -31,6 +31,7 @@ class DocumentSnapshotTool:
     """Simple synchronous tool returning document snapshots."""
 
     provider: SnapshotProvider
+    summarizable: ClassVar[bool] = True
 
     def run(
         self,

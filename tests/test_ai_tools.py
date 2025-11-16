@@ -10,6 +10,7 @@ from tinkerbell.ai.tools.diff_builder import DiffBuilderTool
 from tinkerbell.ai.tools.document_apply_patch import DocumentApplyPatchTool
 from tinkerbell.ai.tools.document_edit import DocumentEditTool
 from tinkerbell.ai.tools.document_snapshot import DocumentSnapshotTool
+from tinkerbell.ai.tools.list_tabs import ListTabsTool
 from tinkerbell.ai.tools.search_replace import SearchReplaceTool
 from tinkerbell.ai.tools.validation import validate_snippet
 from tinkerbell.editor.syntax import yaml_json
@@ -399,6 +400,24 @@ def test_search_replace_tool_updates_document_scope():
     metadata = payload["metadata"]
     assert metadata["matches"] == 2
     assert metadata["limited"] is False
+
+
+def test_tools_expose_expected_summarizable_flags():
+    bridge = _EditBridgeStub()
+    edit_tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
+    snapshot_tool = DocumentSnapshotTool(provider=_SnapshotProviderStub())
+    patch_tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+    list_tool = ListTabsTool(provider=bridge)
+    search_tool = SearchReplaceTool(bridge=_SearchReplaceBridgeStub(text="text"))
+    diff_tool = DiffBuilderTool()
+
+    assert snapshot_tool.summarizable is True
+    assert list_tool.summarizable is True
+    assert diff_tool.summarizable is True
+    assert edit_tool.summarizable is False
+    assert patch_tool.summarizable is False
+    assert search_tool.summarizable is False
+    assert getattr(validate_snippet, "summarizable", None) is False
 
 
 def test_search_replace_tool_respects_selection_scope_and_dry_run():

@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..services.settings import Settings
+from ..services.settings import ContextPolicySettings, Settings
 from ..services.telemetry import count_text_tokens
 
 __all__ = [
@@ -766,6 +766,45 @@ class SettingsDialog(QDialog):
         self._timeout_hint.setObjectName("request_timeout_hint")
         self._prepare_hint_label(self._timeout_hint)
         self._request_timeout_input.valueChanged.connect(self._update_timeout_hint)
+        policy_original = getattr(self._original, "context_policy", ContextPolicySettings())
+        self._context_policy_enabled = QCheckBox("Enable context budget policy")
+        self._context_policy_enabled.setObjectName("context_policy_enabled_checkbox")
+        self._context_policy_enabled.setChecked(bool(getattr(policy_original, "enabled", False)))
+        self._context_policy_dry_run = QCheckBox("Dry run only (log decisions, do not block)")
+        self._context_policy_dry_run.setObjectName("context_policy_dry_run_checkbox")
+        self._context_policy_dry_run.setChecked(bool(getattr(policy_original, "dry_run", True)))
+        self._context_prompt_override_toggle = QCheckBox("Custom prompt budget")
+        self._context_prompt_override_toggle.setObjectName("context_policy_prompt_override_toggle")
+        has_prompt_override = getattr(policy_original, "prompt_budget_override", None)
+        self._context_prompt_override_toggle.setChecked(has_prompt_override is not None)
+        self._context_prompt_override_input = QSpinBox()
+        self._context_prompt_override_input.setObjectName("context_policy_prompt_override_input")
+        self._context_prompt_override_input.setRange(32_000, 512_000)
+        self._context_prompt_override_input.setSingleStep(1_000)
+        self._context_prompt_override_input.setSuffix(" tokens")
+        self._context_prompt_override_input.setValue(
+            int(has_prompt_override or getattr(self._original, "max_context_tokens", 128_000))
+        )
+        self._context_prompt_override_input.setEnabled(has_prompt_override is not None)
+        self._context_reserve_override_toggle = QCheckBox("Custom response reserve")
+        self._context_reserve_override_toggle.setObjectName("context_policy_reserve_override_toggle")
+        has_reserve_override = getattr(policy_original, "response_reserve_override", None)
+        self._context_reserve_override_toggle.setChecked(has_reserve_override is not None)
+        self._context_reserve_override_input = QSpinBox()
+        self._context_reserve_override_input.setObjectName("context_policy_reserve_override_input")
+        self._context_reserve_override_input.setRange(2_000, 64_000)
+        self._context_reserve_override_input.setSingleStep(500)
+        self._context_reserve_override_input.setSuffix(" tokens")
+        reserve_seed = has_reserve_override or getattr(self._original, "response_token_reserve", 16_000)
+        self._context_reserve_override_input.setValue(int(reserve_seed))
+        self._context_reserve_override_input.setEnabled(has_reserve_override is not None)
+        self._context_policy_hint = QLabel("Context policy runs budgeting checks before calling the model.")
+        self._context_policy_hint.setObjectName("context_policy_hint_label")
+        self._prepare_hint_label(self._context_policy_hint)
+        self._context_policy_enabled.toggled.connect(self._update_context_policy_hint)
+        self._context_policy_dry_run.toggled.connect(self._update_context_policy_hint)
+        self._context_prompt_override_toggle.toggled.connect(self._toggle_context_prompt_override)
+        self._context_reserve_override_toggle.toggled.connect(self._toggle_context_reserve_override)
 
         form_layout = QFormLayout()
         base_url_container = QWidget()
@@ -808,6 +847,22 @@ class SettingsDialog(QDialog):
         timeout_layout.addWidget(self._request_timeout_input)
         timeout_layout.addWidget(self._timeout_hint)
         form_layout.addRow("AI Timeout", timeout_container)
+        policy_container = QWidget()
+        policy_layout = QVBoxLayout(policy_container)
+        policy_layout.setContentsMargins(0, 0, 0, 0)
+        policy_layout.setSpacing(4)
+        policy_layout.addWidget(self._context_policy_enabled)
+        policy_layout.addWidget(self._context_policy_dry_run)
+        prompt_row = QHBoxLayout()
+        prompt_row.addWidget(self._context_prompt_override_toggle)
+        prompt_row.addWidget(self._context_prompt_override_input)
+        policy_layout.addLayout(prompt_row)
+        reserve_row = QHBoxLayout()
+        reserve_row.addWidget(self._context_reserve_override_toggle)
+        reserve_row.addWidget(self._context_reserve_override_input)
+        policy_layout.addLayout(reserve_row)
+        policy_layout.addWidget(self._context_policy_hint)
+        form_layout.addRow("Context Budget Policy", policy_container)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form_layout)
@@ -846,6 +901,7 @@ class SettingsDialog(QDialog):
         self._update_base_url_hint()
         self._update_reserve_hint()
         self._update_timeout_hint()
+        self._update_context_policy_hint()
         self._update_buttons_state()
 
     # ------------------------------------------------------------------
@@ -894,6 +950,7 @@ class SettingsDialog(QDialog):
         max_context_tokens = int(self._max_context_tokens_input.value())
         response_token_reserve = int(self._response_token_reserve_input.value())
         request_timeout = float(self._request_timeout_input.value())
+        context_policy = self._gather_context_policy_settings()
         return replace(
             self._original,
             base_url=base_url,
@@ -907,6 +964,7 @@ class SettingsDialog(QDialog):
             max_context_tokens=max_context_tokens,
             response_token_reserve=response_token_reserve,
             request_timeout=request_timeout,
+            context_policy=context_policy,
         )
 
     # ------------------------------------------------------------------
@@ -1003,6 +1061,46 @@ class SettingsDialog(QDialog):
             message = "Large (>300s) timeouts can stall the UI if the API hangs."
         self._set_hint(self._timeout_hint, message, level)
         self._set_field_error("timeout", message if level == "error" else None)
+
+    def _update_context_policy_hint(self) -> None:
+        enabled = self._context_policy_enabled.isChecked()
+        dry_run = self._context_policy_dry_run.isChecked()
+        if not enabled:
+            level = "info"
+            message = "Disabled – controller uses legacy prompt budgeting."
+        elif dry_run:
+            level = "warning"
+            message = "Dry run logs decisions without blocking oversized prompts."
+        else:
+            level = "success"
+            message = "Enabled – controller will block requests exceeding the policy."
+        self._set_hint(self._context_policy_hint, message, level)
+
+    def _toggle_context_prompt_override(self, checked: bool) -> None:
+        self._context_prompt_override_input.setEnabled(checked)
+
+    def _toggle_context_reserve_override(self, checked: bool) -> None:
+        self._context_reserve_override_input.setEnabled(checked)
+
+    def _gather_context_policy_settings(self) -> ContextPolicySettings:
+        original = getattr(self._original, "context_policy", ContextPolicySettings())
+        prompt_override = (
+            int(self._context_prompt_override_input.value())
+            if self._context_prompt_override_toggle.isChecked()
+            else None
+        )
+        reserve_override = (
+            int(self._context_reserve_override_input.value())
+            if self._context_reserve_override_toggle.isChecked()
+            else None
+        )
+        return replace(
+            original,
+            enabled=self._context_policy_enabled.isChecked(),
+            dry_run=self._context_policy_dry_run.isChecked(),
+            prompt_budget_override=prompt_override,
+            response_reserve_override=reserve_override,
+        )
 
     def _prepare_hint_label(self, label: QLabel) -> None:
         label.setWordWrap(True)

@@ -16,6 +16,41 @@ ChatRole = Literal["user", "assistant", "system", "tool"]
 
 
 @dataclass(slots=True)
+class ToolPointerMessage:
+    """Lightweight pointer descriptor used to compact oversized tool output."""
+
+    pointer_id: str
+    kind: str
+    display_text: str
+    rehydrate_instructions: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def as_chat_content(self) -> str:
+        """Render the pointer as plain-text content for chat history."""
+
+        header = f"[pointer:{self.pointer_id} kind={self.kind}]"
+        body = self.display_text.strip() or "(no summary available)"
+        footer = self.rehydrate_instructions.strip()
+        blocks = [header, body]
+        if footer:
+            blocks.append(f"Rehydrate instructions: {footer}")
+        return "\n".join(blocks)
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Serialize the pointer for telemetry/UI traces."""
+
+        payload: Dict[str, Any] = {
+            "pointer_id": self.pointer_id,
+            "kind": self.kind,
+            "display_text": self.display_text,
+            "rehydrate_instructions": self.rehydrate_instructions,
+        }
+        if self.metadata:
+            payload["metadata"] = dict(self.metadata)
+        return payload
+
+
+@dataclass(slots=True)
 class ToolTrace:
     """Trace output for a single tool invocation."""
 

@@ -132,3 +132,22 @@ def test_load_persistent_events_respects_limit(tmp_path: Path) -> None:
 
     events = telemetry_service.load_persistent_events(path, limit=2)
     assert [event.run_id for event in events] == ["run-2", "run-3"]
+
+
+def test_register_event_listener_receives_payload() -> None:
+    received: list[dict[str, object]] = []
+    event_name = "test-budget-event"
+
+    def _listener(payload: dict[str, object]) -> None:
+        received.append(payload)
+
+    telemetry_service.register_event_listener(event_name, _listener)
+    telemetry_service.emit(event_name, {"verdict": "ok", "deficit": 0})
+
+    assert received
+    assert received[-1]["verdict"] == "ok"
+
+
+def test_emit_handles_missing_listeners() -> None:
+    # Should not raise even when no listeners are registered.
+    telemetry_service.emit("nonexistent-event", {"value": 1})

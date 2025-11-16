@@ -31,29 +31,29 @@ All counts were generated with the built-in `ApproxByteCounter` (bytes ÷ 4) via
    ```
    > On Python 3.13 the command currently fails unless a Rust compiler is on `PATH`. Installing [rustup](https://rustup.rs/) and re-running the sync resolves the issue; alternatively, use Python 3.12 where official wheels are published.
 
-## Phase 1 diff latency (Nov 2025)
+## Phase 1+3 diff latency & compaction (Nov 2025)
 
-Phase 1 adds editor diff overlays and stricter document safety checks, so we captured how long `DiffBuilderTool` takes to compute previews for our largest fixtures. Measurements were gathered on the same Windows 11 workstation using the helper script `benchmarks/measure_diff_latency.py` (see below) with the default context of 3 lines per hunk.
+Phase 1 added diff overlays; Sprint 3 layers on the trace compactor GA rollout, so the benchmark now reports both latency and pointer savings for oversized tool output. Measurements were captured on the same Windows 11 workstation using `benchmarks/measure_diff_latency.py` (default context of 3 lines per hunk). The script now injects a large duplicated block into each document to mimic pathological tool payloads and then computes how many tokens the pointer summary saves.
 
-| Document | Size (MB) | Tokens (approx) | Diff chars | Runtime (ms) |
-| --- | ---: | ---: | ---: | ---: |
-| War and Peace | 3.14 | 823,404 | 844 | 64.50 |
-| Twenty Thousand Leagues | 0.60 | 156,438 | 939 | 7.29 |
-| 5 MB JSON fixture | 4.89 | 1,282,867 | 282 | 518.76 |
+| Document | Size (MB) | Tokens (approx) | Diff chars | Diff tokens | Pointer tokens | Tokens saved | Runtime (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| War and Peace | 3.14 | 823,404 | 345,287 | 88,343 | 247 | 88,096 | 66.45 |
+| Twenty Thousand Leagues | 0.60 | 156,438 | 66,679 | 16,855 | 259 | 16,596 | 7.53 |
+| 5 MB JSON fixture | 4.89 | 1,282,867 | 535,213 | 133,920 | 237 | 133,683 | 657.61 |
 
 *Notes:*
 
 - Token counts still rely on `ApproxByteCounter` (tiktoken wheels are not yet available for Python 3.13 on Windows without a Rust toolchain).
-- The JSON case allocates noticeably more time because the placeholder mutation duplicates several kilobytes near the top of the file, triggering longer diff spans.
-- These runs exercise the exact path the LangGraph agent uses before showing diff overlays in the editor; any runtime under ~700 ms leaves ample headroom for the UI watchdog budget set in Phase 1.
+- Pointer summaries clamp at ~250 tokens because the `TraceCompactor` reuses the controller’s 512-token pointer budget; even the 130K-token JSON diff collapses to a few hundred tokens before returning to the model.
+- The JSON case still takes the longest due to the 5 MB baseline, but compaction saves ~134K tokens, keeping the controller under its prompt budget without extra retries.
 
-### Reproducing the diff benchmark
+### Reproducing the diff & compaction benchmark
 
 ````powershell
 uv run python benchmarks/measure_diff_latency.py
 ````
 
-Use `--case LABEL=PATH` to benchmark additional fixtures or `--json` for machine-readable output (handy for plotting CI trends). Example:
+Use `--case LABEL=PATH` to benchmark additional fixtures or `--json` for machine-readable output (the JSON payload now includes `diff_tokens`, `pointer_tokens`, and `tokens_saved` for plotting CI trends). Example:
 
 ````powershell
 uv run python benchmarks/measure_diff_latency.py --case Handbook=test_data/War and Peace.txt --json

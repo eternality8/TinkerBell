@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, ClassVar, Mapping, Protocol, Sequence
 
 
 class TabListingProvider(Protocol):
@@ -21,6 +21,7 @@ class ListTabsTool:
     """Return sanitized metadata for every open editor tab."""
 
     provider: TabListingProvider
+    summarizable: ClassVar[bool] = True
 
     def run(self) -> dict[str, Any]:
         raw_tabs = self.provider.list_tabs()

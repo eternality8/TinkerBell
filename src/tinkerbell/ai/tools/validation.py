@@ -128,5 +128,8 @@ def _outcome_from_errors(errors: List[yaml_json.ValidationError]) -> ValidationO
     return ValidationOutcome(ok=False, message=message)
 
 
+validate_snippet.summarizable = False
+
+
 __all__ = ["ValidationOutcome", "validate_snippet", "register_snippet_validator"]
 
