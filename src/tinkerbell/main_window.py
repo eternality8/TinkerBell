@@ -776,6 +776,7 @@ class MainWindow(QMainWindow):
         if not response_text:
             response_text = "The AI did not return any content."
         self._finalize_ai_response(response_text)
+        self._update_context_usage_status()
         self.update_status("AI response ready")
 
     async def _handle_ai_stream_event(self, event: "AIStreamEvent") -> None:
@@ -854,6 +855,23 @@ class MainWindow(QMainWindow):
         self._chat_panel.show_tool_trace(trace)
         if state.pending_output is not None:
             self._apply_tool_result_to_trace(key, state)
+
+    def _update_context_usage_status(self) -> None:
+        controller = self._context.ai_controller
+        settings = self._context.settings
+        if controller is None or settings is None:
+            return
+        debug_settings = getattr(settings, "debug", None)
+        if not getattr(debug_settings, "token_logging_enabled", False):
+            return
+        events = controller.get_recent_context_events(limit=1)
+        if not events:
+            return
+        event = events[-1]
+        prompt = f"Prompt {event.prompt_tokens:,}"
+        tools = f"Tools {event.tool_tokens:,}"
+        usage_text = f"{prompt} · {tools}"
+        self._status_bar.set_memory_usage(usage_text)
 
     def _record_tool_call_result(self, event: Any) -> None:
         key = self._tool_call_key(event)

@@ -10,26 +10,29 @@ Deliver a second-generation AI editing loop that handles 100K+ token files witho
 - **Prompt/backwards compatibility:** New tool schemas land behind optional parameters and prompt toggles so existing tests and user flows keep working during rollout.
 - **Data locality:** Keep heavy processing (chunking, embeddings, NER) off the UI thread and avoid duplicating entire documents in memory when operating on large files.
 
-## Phase 0 – Telemetry & shared infrastructure
-**Goal:** Establish observability and core utilities required by later phases.
+## Current status (Nov 2025)
+- ✅ **Phase 0 delivered:** Tokenizer registry + CLI, telemetry sinks/toggles, document versioning, cache bus, and supporting docs/benchmarks are merged with full pytest coverage.
+- 🔜 **Next focus – Phase 1:** Design windowed snapshots and chunk tooling on top of the new cache bus; chunk indexer scaffolding has not started yet.
 
-### Work items
+## Phase 0 – Telemetry & shared infrastructure ✅
+**Status:** Completed in November 2025. The token counter registry (`ai/client.py` + `scripts/inspect_tokens.py`), telemetry events + sinks (`ai/services/telemetry.py`, status bar hooks, settings toggles), document versioning (`editor/document_model.py`, `services/bridge.py`, optimistic patch enforcement), and the cache invalidation bus (`ai/memory/cache_bus.py`) are live with docs + benchmarks. These foundations now back every subsequent phase.
+
+### Delivered scope
 1. **Tokenizer parity layer**
-   - Add a tokenizer registry in `ai/client.py` that maps model names to callable tokenizers (OpenAI tiktoken or local fallback).
-   - Expose `_estimate_text_tokens` → `_count_tokens(model, text)` and update callers.
+   - Added a tokenizer registry in `ai/client.py` that maps model names to callable tokenizers (OpenAI tiktoken or local fallback).
+   - Replaced `_estimate_text_tokens` usages with `_count_tokens(model, text)` and updated all callers; exposed via `scripts/inspect_tokens.py` for manual checks.
 2. **Context usage instrumentation**
-   - In `AIController`, log per-turn context size (prompt, history, tool payloads) and emit structured telemetry events.
-   - Add toggle in `services/settings.py` to enable verbose token logging for debugging.
+   - `AIController` now logs per-turn context size (prompt, history, tool payloads) and emits structured telemetry events.
+   - Verbose token logging is gated behind new settings + status-bar toggles (`services/settings.py`, `widgets/status_bar.py`).
 3. **Document version IDs**
-   - Extend `DocumentBridge.generate_snapshot` to include `version_id` (monotonic counter or content hash).
-   - Ensure `DocumentApplyPatchTool` bumps the version ID after successful edits.
+   - `DocumentBridge.generate_snapshot` returns a monotonic `version_id` + content hash.
+   - `DocumentApplyPatchTool` enforces optimistic concurrency and bumps version IDs after edits; cache bus consumers invalidate on mismatch.
 4. **Cache registry + invalidation bus**
-   - Introduce a lightweight pub/sub (e.g., `DocumentCacheBus`) under `ai/memory` so modules subscribe to `DocumentChanged(version_id, spans)` events.
+   - Introduced `DocumentCacheBus` under `ai/memory` so modules subscribe to `DocumentChanged(version_id, spans)` events and drop stale artifacts automatically.
 
 ### Validation
-- New unit tests in `tests/test_ai_client.py` for tokenizer selection.
-- Controller tests verifying telemetry records context usage per turn.
-- Snapshot tests ensuring version IDs increment on edits.
+- `tests/test_ai_client.py`, `test_ai_tools.py`, `test_bridge.py`, `test_memory_buffers.py`, and `test_workspace.py` cover tokenizer routing, cache bus fan-out, and versioned snapshots; the full suite (`uv run pytest`) passes (217 tests).
+- `scripts/inspect_tokens.py` exercises the tiktoken-backed counter against large fixture docs; telemetry toggles verified through widget tests.
 
 ### Risks & mitigations
 - **Tokenizer packages unavailable offline:** ship a bundled fallback estimator.

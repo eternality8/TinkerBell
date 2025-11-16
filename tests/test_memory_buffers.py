@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import gc
+import weakref
+
 from tinkerbell.ai.memory import buffers
+from tinkerbell.ai.memory.cache_bus import (
+    ChunkCacheSubscriber,
+    DocumentCacheBus,
+    DocumentCacheEvent,
+    DocumentChangedEvent,
+    DocumentClosedEvent,
+)
 
 
 def test_conversation_memory_trims_messages_and_tokens() -> None:
@@ -63,3 +73,68 @@ def test_memory_store_roundtrip(tmp_path: Path) -> None:
     assert record is not None
     assert record.summary == "Short summary"
     assert record.highlights == ["Intro", "Conclusion"]
+
+
+def test_document_cache_bus_notifies_subscribers_in_order() -> None:
+    bus = DocumentCacheBus()
+    received: list[tuple[str, str]] = []
+
+    def on_changed(event: DocumentCacheEvent) -> None:
+        assert isinstance(event, DocumentChangedEvent)
+        received.append(("changed", event.document_id))
+
+    def on_closed(event: DocumentCacheEvent) -> None:
+        assert isinstance(event, DocumentClosedEvent)
+        received.append(("closed", event.document_id))
+
+    bus.subscribe(DocumentChangedEvent, on_changed)
+    bus.subscribe(DocumentClosedEvent, on_closed)
+
+    bus.publish(
+        DocumentChangedEvent(document_id="doc-1", version_id=2, content_hash="abc", edited_ranges=((0, 5),)),
+    )
+    bus.publish(DocumentClosedEvent(document_id="doc-1", version_id=2, content_hash="abc"))
+
+    assert received == [("changed", "doc-1"), ("closed", "doc-1")]
+
+    bus.unsubscribe(DocumentChangedEvent, on_changed)
+    bus.publish(
+        DocumentChangedEvent(document_id="doc-1", version_id=3, content_hash="def", edited_ranges=((0, 1),)),
+    )
+    assert received == [("changed", "doc-1"), ("closed", "doc-1")]
+
+
+def test_document_cache_bus_supports_weak_subscribers() -> None:
+    bus = DocumentCacheBus()
+    events: list[str] = []
+
+    class Observer:
+        def handle(self, event: DocumentCacheEvent) -> None:
+            assert isinstance(event, DocumentChangedEvent)
+            events.append(event.document_id)
+
+    observer = Observer()
+    bus.subscribe(DocumentChangedEvent, observer.handle, weak=True)
+    bus.publish(DocumentChangedEvent(document_id="doc-weak", version_id=1, content_hash="x"))
+
+    assert events == ["doc-weak"]
+
+    observer_ref = weakref.ref(observer)
+    del observer
+    gc.collect()
+
+    bus.publish(DocumentChangedEvent(document_id="doc-weak-2", version_id=2, content_hash="y"))
+
+    assert observer_ref() is None
+    assert events == ["doc-weak"]
+
+
+def test_cache_stub_subscribers_record_events() -> None:
+    bus = DocumentCacheBus()
+    chunk = ChunkCacheSubscriber(bus=bus)
+
+    bus.publish(DocumentChangedEvent(document_id="doc-stub", version_id=9, content_hash="zzz"))
+    bus.publish(DocumentClosedEvent(document_id="doc-stub", version_id=9, content_hash="zzz"))
+
+    assert len(chunk.events) == 2
+    assert isinstance(chunk.events[0], DocumentChangedEvent)

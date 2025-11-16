@@ -13,7 +13,7 @@ from typing import Any, Dict, Mapping
 
 from cryptography.fernet import Fernet, InvalidToken
 
-__all__ = ["Settings", "SettingsStore", "SecretVault"]
+__all__ = ["Settings", "SettingsStore", "SecretVault", "DebugSettings"]
 
 LOGGER = logging.getLogger(__name__)
 _SETTINGS_DIR = Path.home() / ".tinkerbell"
@@ -34,6 +34,14 @@ _FLOAT_ENV_OVERRIDES: Mapping[str, str] = {
 }
 _TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
 _API_KEY_FIELD = "api_key_ciphertext"
+
+
+@dataclass(slots=True)
+class DebugSettings:
+    """Debug/diagnostic toggles grouped to match the AI v2 plan."""
+
+    token_logging_enabled: bool = False
+    token_log_limit: int = 200
 
 
 @dataclass(slots=True)
@@ -68,6 +76,7 @@ class Settings:
     window_geometry: str | None = None
     debug_logging: bool = False
     show_tool_activity_panel: bool = False
+    debug: DebugSettings = field(default_factory=DebugSettings)
 
 
 class SettingsStore:
@@ -89,6 +98,12 @@ class SettingsStore:
                 payload.pop(_API_KEY_FIELD, None), payload.pop("api_key", None)
             )
             data = _filter_fields(payload)
+            debug_payload = data.get("debug")
+            if isinstance(debug_payload, Mapping):
+                try:
+                    data["debug"] = DebugSettings(**debug_payload)
+                except TypeError:
+                    data["debug"] = DebugSettings()
             try:
                 settings = Settings(**data)
             except TypeError as exc:

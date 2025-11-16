@@ -254,11 +254,20 @@ def _build_ai_controller(settings: Settings, *, debug_logging: bool = False) -> 
     limit = _resolve_max_tool_iterations(settings)
     context_tokens = getattr(settings, "max_context_tokens", 128_000)
     response_reserve = getattr(settings, "response_token_reserve", 16_000)
+    debug_settings = getattr(settings, "debug", None)
+    telemetry_enabled = bool(getattr(debug_settings, "token_logging_enabled", False))
+    telemetry_limit = getattr(debug_settings, "token_log_limit", 200)
+    try:
+        telemetry_limit = int(telemetry_limit)
+    except (TypeError, ValueError):
+        telemetry_limit = 200
     return AIController(
         client=client,
         max_tool_iterations=limit,
         max_context_tokens=context_tokens,
         response_token_reserve=response_reserve,
+        telemetry_enabled=telemetry_enabled,
+        telemetry_limit=telemetry_limit,
     )
 
 

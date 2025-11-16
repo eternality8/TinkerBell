@@ -26,6 +26,11 @@ dependencies = [
 [project.scripts]
 tinkerbell = "tinkerbell.app:main"
 
+[project.optional-dependencies]
+ai_tokenizers = [
+  "tiktoken>=0.12,<0.13"
+]
+
 [dependency-groups]
 dev = [
   "black>=24.3,<25.0",

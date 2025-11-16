@@ -8,18 +8,16 @@ import inspect
 import json
 import logging
 import math
+import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, cast
-
-try:  # pragma: no cover - optional dependency used when available
-    import tiktoken  # type: ignore
-except Exception:  # pragma: no cover - tiktoken is optional in dev/test envs
-    tiktoken = None
 
 from openai.types.chat import ChatCompletionToolParam
 
 from .. import prompts
 from ..client import AIClient, AIStreamEvent
+from ..services.telemetry import ContextUsageEvent, InMemoryTelemetrySink, TelemetrySink
 from .graph import build_agent_graph
 
 LOGGER = logging.getLogger(__name__)
@@ -51,6 +49,15 @@ class _ModelTurnResult:
     assistant_message: Dict[str, Any]
     response_text: str
     tool_calls: list[_ToolCallRequest]
+
+
+@dataclass(slots=True)
+class _MessagePlan:
+    """Normalized plan for the prompt and completion budgeting."""
+
+    messages: list[dict[str, str]]
+    completion_budget: int | None
+    prompt_tokens: int
 
 
 @dataclass(slots=True)
@@ -104,11 +111,14 @@ class AIController:
     max_pending_patch_reminders: int = 2
     max_context_tokens: int = 128_000
     response_token_reserve: int = 16_000
+    telemetry_enabled: bool = False
+    telemetry_limit: int = 200
+    telemetry_sink: TelemetrySink | None = None
     _graph: Dict[str, Any] = field(init=False, repr=False)
     _max_tool_iterations: int = field(init=False, repr=False)
     _active_task: asyncio.Task[dict] | None = field(default=None, init=False, repr=False)
     _task_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
-    _token_encoder: Any | None = field(default=None, init=False, repr=False)
+    _telemetry_sink: TelemetrySink | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.tools:
@@ -126,6 +136,7 @@ class AIController:
             max_context_tokens=self.max_context_tokens,
             response_token_reserve=self.response_token_reserve,
         )
+        self._configure_telemetry_sink()
 
     @property
     def graph(self) -> Dict[str, Any]:
@@ -194,7 +205,6 @@ class AIController:
         """Swap the underlying AI client (e.g., when settings change)."""
 
         self.client = client
-        self._token_encoder = None
 
     async def run_chat(
         self,
@@ -208,7 +218,9 @@ class AIController:
         """Execute a chat turn against the compiled agent graph."""
 
         snapshot = dict(doc_snapshot or {})
-        base_messages, completion_budget = self._build_messages(prompt, snapshot, history)
+        message_plan = self._build_messages(prompt, snapshot, history)
+        base_messages = list(message_plan.messages)
+        completion_budget = message_plan.completion_budget
         merged_metadata = self._build_metadata(snapshot, metadata)
         tool_specs = [registration.as_openai_tool() for registration in self.tools.values()]
         max_iterations = self._graph.get("metadata", {}).get("max_iterations")
@@ -231,6 +243,12 @@ class AIController:
             diff_builders_since_edit = 0
             patch_reminders_sent = 0
 
+            turn_metrics = self._new_turn_context(
+                snapshot=snapshot,
+                prompt_tokens=message_plan.prompt_tokens,
+                conversation_length=len(base_messages),
+                response_reserve=completion_budget,
+            )
             while True:
                 turn_count += 1
                 turn = await self._invoke_model_turn(
@@ -260,9 +278,15 @@ class AIController:
                     )
                     break
 
-                tool_messages, tool_records = await self._handle_tool_calls(turn.tool_calls, on_event)
+                tool_messages, tool_records, tool_token_cost = await self._handle_tool_calls(
+                    turn.tool_calls,
+                    on_event,
+                )
                 executed_tool_calls.extend(tool_records)
                 conversation.extend(tool_messages)
+                turn_metrics["tool_tokens"] += tool_token_cost
+                turn_metrics["conversation_length"] = len(conversation)
+                self._record_tool_names(turn_metrics, tool_records)
 
                 for record in tool_records:
                     name = str(record.get("name") or "").lower()
@@ -289,7 +313,9 @@ class AIController:
                     diff_builders_since_edit = 0
                     continue
 
+            turn_metrics["conversation_length"] = len(conversation)
             self._log_response_text(response_text)
+            self._emit_context_usage(turn_metrics)
             LOGGER.debug(
                 "Chat turn complete (chars=%s, tool calls=%s)",
                 len(response_text),
@@ -340,6 +366,40 @@ class AIController:
 
         return tuple(self.tools.keys())
 
+    def configure_telemetry(
+        self,
+        *,
+        enabled: bool | None = None,
+        sink: TelemetrySink | None = None,
+        limit: int | None = None,
+    ) -> None:
+        """Update telemetry settings without reconstructing the controller."""
+
+        if enabled is not None:
+            self.telemetry_enabled = bool(enabled)
+        if limit is not None:
+            try:
+                self.telemetry_limit = max(20, min(int(limit), 10_000))
+            except (TypeError, ValueError):
+                pass
+        if sink is not None:
+            self.telemetry_sink = sink
+        self._configure_telemetry_sink()
+
+    def get_recent_context_events(self, limit: int | None = None) -> list[ContextUsageEvent]:
+        """Return the most recent context usage events from the active sink."""
+
+        sink = self._telemetry_sink
+        if sink is None:
+            return []
+        if hasattr(sink, "tail"):
+            tail = getattr(sink, "tail")
+            try:
+                return list(tail(limit))  # type: ignore[misc]
+            except TypeError:
+                return list(tail())  # type: ignore[misc]
+        return []
+
     async def aclose(self) -> None:
         """Cancel any active work and close the underlying AI client."""
 
@@ -361,6 +421,18 @@ class AIController:
             tools={name: registration.impl for name, registration in self.tools.items()},
             max_iterations=self._max_tool_iterations,
         )
+
+    def _configure_telemetry_sink(self) -> None:
+        limit = self.telemetry_limit
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 200
+        limit = max(20, min(limit, 10_000))
+        if self.telemetry_sink is None:
+            self._telemetry_sink = InMemoryTelemetrySink(capacity=limit)
+        else:
+            self._telemetry_sink = self.telemetry_sink
 
     def _build_suggestion_messages(
         self,
@@ -496,12 +568,88 @@ class AIController:
             "Consolidate the change into a single diff and immediately call document_edit (action=\"patch\")."
         )
 
+    def _new_turn_context(
+        self,
+        *,
+        snapshot: Mapping[str, Any],
+        prompt_tokens: int,
+        conversation_length: int,
+        response_reserve: int | None,
+    ) -> dict[str, Any]:
+        document_id = self._resolve_document_id(snapshot)
+        model_name = getattr(getattr(self.client, "settings", None), "model", None) or "unknown"
+        return {
+            "document_id": document_id,
+            "model": model_name,
+            "prompt_tokens": int(prompt_tokens),
+            "tool_tokens": 0,
+            "response_reserve": response_reserve,
+            "timestamp": time.time(),
+            "conversation_length": conversation_length,
+            "tool_names": set(),
+            "run_id": uuid.uuid4().hex,
+        }
+
+    def _record_tool_names(self, context: dict[str, Any], records: Sequence[Mapping[str, Any]]) -> None:
+        names = context.get("tool_names")
+        if not isinstance(names, set):
+            return
+        for record in records:
+            name = str(record.get("name") or "").strip()
+            if name:
+                names.add(name)
+
+    def _emit_context_usage(self, context: dict[str, Any]) -> None:
+        if not self.telemetry_enabled or self._telemetry_sink is None:
+            return
+        tool_names = context.get("tool_names")
+        if isinstance(tool_names, set):
+            tool_names_tuple = tuple(sorted(tool_names))
+        else:
+            tool_names_tuple = ()
+        event = ContextUsageEvent(
+            document_id=context.get("document_id"),
+            model=str(context.get("model") or "unknown"),
+            prompt_tokens=int(context.get("prompt_tokens", 0)),
+            tool_tokens=int(context.get("tool_tokens", 0)),
+            response_reserve=context.get("response_reserve"),
+            timestamp=float(context.get("timestamp", time.time())),
+            conversation_length=int(context.get("conversation_length", 0)),
+            tool_names=tool_names_tuple,
+            run_id=str(context.get("run_id") or uuid.uuid4().hex),
+        )
+        try:
+            self._telemetry_sink.record(event)
+        except Exception:  # pragma: no cover - sink errors should not break chat
+            LOGGER.debug("Telemetry sink rejected event", exc_info=True)
+        else:
+            LOGGER.debug(
+                "Telemetry event recorded (document=%s, prompt=%s tokens, tools=%s tokens)",
+                event.document_id,
+                event.prompt_tokens,
+                event.tool_tokens,
+            )
+
+    @staticmethod
+    def _resolve_document_id(snapshot: Mapping[str, Any]) -> str | None:
+        for key in ("document_id", "tab_id", "id"):
+            value = snapshot.get(key)
+            if value:
+                return str(value)
+        path = snapshot.get("path")
+        if path:
+            return str(path)
+        version = snapshot.get("version")
+        if version:
+            return str(version)
+        return None
+
     def _build_messages(
         self,
         prompt: str,
         snapshot: Mapping[str, Any],
         history: Sequence[Mapping[str, Any]] | None = None,
-    ) -> tuple[list[dict[str, str]], int | None]:
+    ) -> _MessagePlan:
         user_prompt = prompts.format_user_prompt(prompt, dict(snapshot))
         system_message = {"role": "system", "content": prompts.base_system_prompt()}
         user_message = {"role": "user", "content": user_prompt}
@@ -530,7 +678,8 @@ class AIController:
         messages.append(user_message)
 
         completion_budget = reserve if reserve > 0 else None
-        return messages, completion_budget
+        prompt_tokens = sum(self._estimate_message_tokens(message) for message in messages)
+        return _MessagePlan(messages=messages, completion_budget=completion_budget, prompt_tokens=prompt_tokens)
 
     def _sanitize_history(
         self,
@@ -581,36 +730,15 @@ class AIController:
     def _estimate_text_tokens(self, text: str) -> int:
         if not text:
             return 0
-        encoder = self._get_token_encoder()
-        if encoder is not None:
+        counter_fn = getattr(self.client, "count_tokens", None)
+        if callable(counter_fn):
             try:
-                return len(encoder.encode(text))
-            except Exception:  # pragma: no cover - defensive when encoder misbehaves
-                self._token_encoder = None
-        return max(1, math.ceil(len(text) / 4))
-
-    def _get_token_encoder(self) -> Any | None:
-        if tiktoken is None:
-            return None
-        if self._token_encoder is not None:
-            return self._token_encoder
-        model_name: str | None = None
-        client_settings = getattr(self.client, "settings", None)
-        if client_settings is not None:
-            model_name = getattr(client_settings, "model", None)
-        try:
-            encoding = (
-                tiktoken.encoding_for_model(model_name)
-                if model_name
-                else tiktoken.get_encoding("cl100k_base")
-            )
-        except Exception:  # pragma: no cover - fall back to default encoding
-            try:
-                encoding = tiktoken.get_encoding("cl100k_base")
-            except Exception:
-                encoding = None
-        self._token_encoder = encoding
-        return encoding
+                value: Any = counter_fn(text)
+                return int(value)
+            except Exception:  # pragma: no cover - defensive fallback
+                LOGGER.debug("AI client token counter failed; using heuristic", exc_info=True)
+        byte_length = len(text.encode("utf-8", errors="ignore"))
+        return max(1, math.ceil(byte_length / 4))
 
     def _build_metadata(
         self,
@@ -712,9 +840,10 @@ class AIController:
         self,
         tool_calls: Sequence[_ToolCallRequest],
         on_event: ToolCallback | None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
         messages: list[dict[str, Any]] = []
         records: list[dict[str, Any]] = []
+        token_cost = 0
         for call in tool_calls:
             content, record = await self._execute_tool_call(call, on_event)
             tool_message: dict[str, Any] = {
@@ -726,7 +855,9 @@ class AIController:
                 tool_message["name"] = call.name
             messages.append(tool_message)
             records.append(record)
-        return messages, records
+            token_cost += self._estimate_text_tokens(call.arguments or "")
+            token_cost += self._estimate_text_tokens(content)
+        return messages, records, token_cost
 
     async def _execute_tool_call(
         self,

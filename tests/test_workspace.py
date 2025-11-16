@@ -6,8 +6,10 @@ from pathlib import Path
 
 import pytest
 
+from tinkerbell.ai.memory.cache_bus import DocumentCacheBus, DocumentCacheEvent, DocumentClosedEvent
 from tinkerbell.editor.document_model import DocumentMetadata, DocumentState
 from tinkerbell.editor.workspace import DocumentWorkspace
+from tinkerbell.services.bridge import DocumentBridge
 
 
 class _StubEditor:
@@ -167,3 +169,25 @@ def test_workspace_errors_when_switching_to_unknown_tab() -> None:
     workspace.create_tab()
     with pytest.raises(KeyError):
         workspace.set_active_tab("missing")
+
+
+def test_workspace_close_tab_publishes_closed_event() -> None:
+    bus = DocumentCacheBus()
+    closed_events: list[DocumentClosedEvent] = []
+
+    def on_closed(event: DocumentCacheEvent) -> None:
+        assert isinstance(event, DocumentClosedEvent)
+        closed_events.append(event)
+
+    bus.subscribe(DocumentClosedEvent, on_closed)
+
+    workspace = DocumentWorkspace(
+        editor_factory=lambda: _StubEditor(),  # type: ignore[arg-type]
+        bridge_factory=lambda editor: DocumentBridge(editor=editor, cache_bus=bus),
+    )
+
+    tab = workspace.create_tab()
+    workspace.close_tab(tab.id)
+
+    assert closed_events
+    assert closed_events[-1].document_id == tab.document().document_id

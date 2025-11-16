@@ -6,10 +6,16 @@ import difflib
 
 import pytest
 
+from tinkerbell.ai.memory.cache_bus import (
+    DocumentCacheBus,
+    DocumentCacheEvent,
+    DocumentChangedEvent,
+    DocumentClosedEvent,
+)
 from tinkerbell.chat.message_model import EditDirective
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.editor.patches import PatchResult
-from tinkerbell.services.bridge import DocumentBridge
+from tinkerbell.services.bridge import DocumentBridge, DocumentVersionMismatchError
 
 
 class RecordingEditor:
@@ -65,6 +71,8 @@ def test_generate_snapshot():
     snapshot = bridge.generate_snapshot()
     assert snapshot["language"] == "markdown"
     assert "version" in snapshot
+    assert snapshot["version_id"] >= 1
+    assert snapshot["document_id"]
     assert snapshot["length"] == len(editor.state.text)
     assert snapshot["selection_text"] == editor.state.text[:5]
 
@@ -104,7 +112,7 @@ def test_queue_edit_rejects_stale_snapshot_version():
 
     editor.state.update_text("something else")
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(DocumentVersionMismatchError):
         bridge.queue_edit(
             {
                 "action": "replace",
@@ -225,3 +233,40 @@ def test_queue_edit_patch_handles_snippet_line_numbers():
 
     assert "BETA" in editor.state.text
     assert bridge.patch_metrics.total == 1
+
+
+def test_bridge_publishes_document_changed_events() -> None:
+    editor = RecordingEditor()
+    bus = DocumentCacheBus()
+    events: list[DocumentCacheEvent] = []
+    bus.subscribe(DocumentChangedEvent, lambda event: events.append(event))
+
+    bridge = DocumentBridge(editor=editor, cache_bus=bus)
+    bridge.queue_edit(EditDirective(action="insert", target_range=(5, 5), content="!!!"))
+
+    assert events
+    changed = events[-1]
+    assert isinstance(changed, DocumentChangedEvent)
+    assert changed.document_id == editor.state.document_id
+    assert changed.version_id == editor.state.version_id
+    assert changed.edited_ranges[0] == (5, 5)
+
+
+def test_bridge_notifies_document_closed() -> None:
+    editor = RecordingEditor()
+    bus = DocumentCacheBus()
+    closed_events: list[DocumentClosedEvent] = []
+
+    def on_closed(event: DocumentCacheEvent) -> None:
+        assert isinstance(event, DocumentClosedEvent)
+        closed_events.append(event)
+
+    bus.subscribe(DocumentClosedEvent, on_closed)
+
+    bridge = DocumentBridge(editor=editor, cache_bus=bus)
+    bridge.notify_document_closed(reason="tab-closed")
+
+    assert closed_events
+    event = closed_events[-1]
+    assert event.document_id == editor.state.document_id
+    assert event.reason == "tab-closed"

@@ -157,6 +157,9 @@ class DocumentWorkspace:
             else:
                 self._active_tab_id = None
             self._notify_active_listeners()
+        notify_closed = getattr(tab.bridge, "notify_document_closed", None)
+        if callable(notify_closed):
+            notify_closed(reason="tab-closed")
         return tab
 
     def ensure_tab(self) -> DocumentTab:

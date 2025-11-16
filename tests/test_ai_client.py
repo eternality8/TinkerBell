@@ -10,7 +10,13 @@ import pytest
 
 from openai import AsyncOpenAI
 
-from tinkerbell.ai.client import AIClient, AIStreamEvent, ClientSettings
+from tinkerbell.ai.client import (
+    AIClient,
+    AIStreamEvent,
+    ClientSettings,
+    ApproxByteCounter,
+    TokenCounterRegistry,
+)
 
 
 @dataclass
@@ -210,3 +216,50 @@ async def test_aclose_closes_underlying_client() -> None:
     await client.aclose()
 
     assert stub.closed is True
+
+
+class _FakeCounter:
+    def __init__(self, multiplier: int = 1, *, model_name: str = "fake-model") -> None:
+        self.multiplier = multiplier
+        self.model_name: str | None = model_name
+
+    def count(self, text: str) -> int:
+        return len(text) * self.multiplier
+
+    def estimate(self, text: str) -> int:
+        return len(text)
+
+
+def test_token_counter_registry_handles_missing_models() -> None:
+    registry = TokenCounterRegistry(fallback=ApproxByteCounter())
+    registry.register("fake", _FakeCounter(multiplier=2, model_name="fake"))
+
+    precise = registry.count("fake", "abc")
+    approximate = registry.count("missing", "abc")
+
+    assert precise == 6
+    assert approximate == registry.estimate("abc")
+
+
+@pytest.mark.asyncio
+async def test_ai_client_count_tokens_falls_back_when_counter_breaks() -> None:
+    class _BrokenCounter:
+        def __init__(self) -> None:
+            self.model_name: str | None = "stub"
+
+        def count(self, text: str) -> int:
+            raise RuntimeError("boom")
+
+        def estimate(self, text: str) -> int:
+            return len(text) + 5
+
+    registry = TokenCounterRegistry(fallback=ApproxByteCounter())
+    registry.register("stub-model", _BrokenCounter())
+
+    client = AIClient(
+        ClientSettings(base_url="http://local", api_key="test", model="stub-model"),
+        client=cast(AsyncOpenAI, _make_client([])),
+        token_registry=registry,
+    )
+
+    assert client.count_tokens("hello") == len("hello") + 5

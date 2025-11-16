@@ -9,9 +9,15 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Mapping, Optional, Protocol, Sequence, TypeVar
 
+from ..ai.memory.cache_bus import (
+    DocumentCacheBus,
+    DocumentChangedEvent,
+    DocumentClosedEvent,
+    get_document_cache_bus,
+)
 from ..chat.commands import ActionType, parse_agent_payload, validate_directive
 from ..chat.message_model import EditDirective
-from ..editor.document_model import DocumentState
+from ..editor.document_model import DocumentState, DocumentVersion
 from ..editor.patches import PatchApplyError, PatchResult, apply_unified_diff
 
 
@@ -81,20 +87,32 @@ class PatchMetrics:
         self.conflicts += 1
 
 
+class DocumentVersionMismatchError(RuntimeError):
+    """Raised when an edit references a stale document version."""
+
+
 class DocumentBridge:
     """Orchestrates safe document snapshots, conflict detection, and queued edits."""
 
-    def __init__(self, *, editor: EditorAdapter, main_thread_executor: Optional[Executor] = None) -> None:
+    def __init__(
+        self,
+        *,
+        editor: EditorAdapter,
+        main_thread_executor: Optional[Executor] = None,
+        cache_bus: DocumentCacheBus | None = None,
+    ) -> None:
         self.editor = editor
         self._pending_edits: Deque[_QueuedEdit] = deque()
         self._draining = False
         self._last_diff: Optional[str] = None
         self._last_snapshot_token: Optional[str] = None
+        self._last_document_version: Optional[DocumentVersion] = None
         self._last_edit_context: Optional[EditContext] = None
         self._main_thread_executor = main_thread_executor
         self._edit_listeners: list[EditAppliedListener] = []
         self._failure_listeners: list[Callable[[EditDirective, str], None]] = []
         self._patch_metrics = PatchMetrics()
+        self._cache_bus = cache_bus or get_document_cache_bus()
 
     # ------------------------------------------------------------------
     # Public API
@@ -110,9 +128,14 @@ class DocumentBridge:
         snapshot["line_offsets"] = self._compute_line_offsets(document.text)
         if snapshot["selection_text"]:
             snapshot["selection_hash"] = self._hash_text(snapshot["selection_text"])
-        token = self._compute_document_token(document)
+        version = document.version_info()
+        snapshot.setdefault("document_id", version.document_id)
+        snapshot.setdefault("version_id", version.version_id)
+        snapshot.setdefault("content_hash", version.content_hash)
+        token = self._format_version_token(version)
         snapshot["version"] = token
         self._last_snapshot_token = token
+        self._last_document_version = version
         return snapshot
 
     @property
@@ -126,6 +149,12 @@ class DocumentBridge:
         """Expose the digest associated with the latest document snapshot."""
 
         return self._last_snapshot_token
+
+    @property
+    def last_document_version(self) -> Optional[DocumentVersion]:
+        """Expose the most recent :class:`DocumentVersion`."""
+
+        return self._last_document_version
 
     @property
     def last_edit_context(self) -> Optional[EditContext]:
@@ -198,7 +227,7 @@ class DocumentBridge:
             if queued.directive.action == ActionType.PATCH.value:
                 self._patch_metrics.record_conflict()
             self._record_failure(queued.directive, message)
-            raise RuntimeError(message)
+            raise DocumentVersionMismatchError(message)
 
         if queued.directive.action == ActionType.PATCH.value:
             self._apply_patch_directive(queued, document_before)
@@ -221,7 +250,9 @@ class DocumentBridge:
             content=queued.directive.content,
         )
         self._last_diff = self._summarize_diff(before_text, updated_state.text)
-        self._last_snapshot_token = self._compute_document_token(updated_state)
+        version = updated_state.version_info()
+        self._last_snapshot_token = self._format_version_token(version)
+        self._last_document_version = version
         _LOGGER.debug(
             "Applied directive action=%s range=%s diff=%s",
             queued.directive.action,
@@ -229,6 +260,11 @@ class DocumentBridge:
             self._last_diff,
         )
         self._notify_listeners(queued.directive, updated_state)
+        self._publish_document_changed(
+            version,
+            spans=(queued.directive.target_range,),
+            source=queued.directive.action,
+        )
 
     def _execute_on_main_thread(self, func: Callable[[], DocumentState]) -> DocumentState:
         if self._main_thread_executor is not None:
@@ -277,12 +313,35 @@ class DocumentBridge:
             spans=patch_result.spans,
         )
         self._last_diff = patch_result.summary
-        self._last_snapshot_token = self._compute_document_token(updated_state)
+        version = updated_state.version_info(edited_ranges=patch_result.spans)
+        self._last_snapshot_token = self._format_version_token(version)
+        self._last_document_version = version
         elapsed = time.perf_counter() - start_time
         self._patch_metrics.record_success(elapsed)
 
         _LOGGER.debug("Applied patch directive diff=%s spans=%s", patch_result.summary, patch_result.spans)
         self._notify_listeners(queued.directive, updated_state)
+        self._publish_document_changed(
+            version,
+            spans=patch_result.spans,
+            source=queued.directive.action,
+        )
+
+    def notify_document_closed(self, *, reason: str | None = None) -> None:
+        document = self.editor.to_document()
+        version = document.version_info()
+        self._last_document_version = version
+        self._last_snapshot_token = self._format_version_token(version)
+        if self._cache_bus is None:
+            return
+        event = DocumentClosedEvent(
+            document_id=version.document_id,
+            version_id=version.version_id,
+            content_hash=version.content_hash,
+            reason=reason,
+            source="document-bridge",
+        )
+        self._cache_bus.publish(event)
 
     @staticmethod
     def _derive_patch_range(spans: Sequence[tuple[int, int]], length: int) -> tuple[int, int]:
@@ -381,8 +440,8 @@ class DocumentBridge:
         return None
 
     @staticmethod
-    def _compute_document_token(document: DocumentState) -> str:
-        return hashlib.sha1(document.text.encode("utf-8")).hexdigest()
+    def _format_version_token(version: DocumentVersion) -> str:
+        return f"{version.document_id}:{version.version_id}:{version.content_hash}"
 
     @staticmethod
     def _hash_text(text: str) -> str:
@@ -390,7 +449,7 @@ class DocumentBridge:
 
     @staticmethod
     def _is_version_current(document: DocumentState, expected: str) -> bool:
-        return DocumentBridge._compute_document_token(document) == expected
+        return document.version_signature() == expected
 
     @staticmethod
     def _clamp_range(start: int, end: int, length: int) -> tuple[int, int]:
@@ -418,4 +477,23 @@ class DocumentBridge:
             cursor += len(segment)
             offsets.append(cursor)
         return offsets
+
+    def _publish_document_changed(
+        self,
+        version: DocumentVersion,
+        *,
+        spans: Sequence[tuple[int, int]] | tuple[tuple[int, int], ...] | None,
+        source: str,
+    ) -> None:
+        if self._cache_bus is None:
+            return
+        edited = tuple(spans or version.edited_ranges)
+        event = DocumentChangedEvent(
+            document_id=version.document_id,
+            version_id=version.version_id,
+            content_hash=version.content_hash,
+            edited_ranges=edited,
+            source=source,
+        )
+        self._cache_bus.publish(event)
 

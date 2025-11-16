@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tinkerbell.services.settings import SecretVault, Settings, SettingsStore
+from tinkerbell.services.settings import DebugSettings, SecretVault, Settings, SettingsStore
 
 
 def test_load_returns_defaults_when_file_missing(tmp_path: Path) -> None:
@@ -81,3 +81,15 @@ def test_bool_env_overrides_enable_debug_logging(monkeypatch: pytest.MonkeyPatch
     overridden = SettingsStore(path).load()
 
     assert overridden.debug_logging is True
+
+
+def test_debug_settings_roundtrip(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    store = SettingsStore(path)
+    original = Settings(debug=DebugSettings(token_logging_enabled=True, token_log_limit=321))
+
+    store.save(original)
+    loaded = store.load()
+
+    assert loaded.debug.token_logging_enabled is True
+    assert loaded.debug.token_log_limit == 321

@@ -145,6 +145,24 @@ def test_ai_controller_logs_response_when_debug_enabled(sample_snapshot, caplog)
     assert any("AI response text" in record.message and "final answer" in record.message for record in caplog.records)
 
 
+def test_ai_controller_records_context_usage_events(sample_snapshot):
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="ok")])
+    stub_client.settings.model = "fake-model"
+    controller = AIController(client=cast(AIClient, stub_client), telemetry_enabled=True, telemetry_limit=10)
+
+    async def run() -> dict:
+        return await controller.run_chat("track", sample_snapshot)
+
+    result = asyncio.run(run())
+    assert result["response"] == "ok"
+
+    events = controller.get_recent_context_events(limit=1)
+    assert len(events) == 1
+    event = events[0]
+    assert event.model == "fake-model"
+    assert event.prompt_tokens > 0
+
+
 def test_ai_controller_executes_tool_and_continues(sample_snapshot):
     first_turn = [
         AIStreamEvent(type="content.delta", content="Working"),
