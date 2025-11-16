@@ -210,6 +210,28 @@ class SettingsDialog(QDialog):
         self._max_tool_iterations_input.setToolTip(
             "Maximum times the agent may invoke tools before returning a response."
         )
+        self._max_context_tokens_input = QSpinBox()
+        self._max_context_tokens_input.setObjectName("max_context_tokens_input")
+        self._max_context_tokens_input.setRange(32_000, 512_000)
+        self._max_context_tokens_input.setSingleStep(1_000)
+        context_default = int(getattr(self._original, "max_context_tokens", 128_000) or 128_000)
+        context_default = max(32_000, min(context_default, 512_000))
+        self._max_context_tokens_input.setValue(context_default)
+        self._max_context_tokens_input.setSuffix(" tokens")
+        self._max_context_tokens_input.setToolTip(
+            "Total prompt tokens (system + history + user) allowed before reserving response space."
+        )
+        self._response_token_reserve_input = QSpinBox()
+        self._response_token_reserve_input.setObjectName("response_token_reserve_input")
+        self._response_token_reserve_input.setRange(4_000, 64_000)
+        self._response_token_reserve_input.setSingleStep(500)
+        reserve_default = int(getattr(self._original, "response_token_reserve", 16_000) or 16_000)
+        reserve_default = max(4_000, min(reserve_default, 64_000))
+        self._response_token_reserve_input.setValue(reserve_default)
+        self._response_token_reserve_input.setSuffix(" tokens")
+        self._response_token_reserve_input.setToolTip(
+            "Tokens held back for the assistant's reply so streaming never truncates early."
+        )
         self._request_timeout_input = QDoubleSpinBox()
         self._request_timeout_input.setObjectName("request_timeout_input")
         self._request_timeout_input.setRange(5.0, 600.0)
@@ -241,6 +263,8 @@ class SettingsDialog(QDialog):
         form_layout.addRow("Debug", self._debug_checkbox)
         form_layout.addRow("Tool Traces", self._tool_panel_checkbox)
         form_layout.addRow("Max Tool Iterations", self._max_tool_iterations_input)
+        form_layout.addRow("Max Context Tokens", self._max_context_tokens_input)
+        form_layout.addRow("Response Token Reserve", self._response_token_reserve_input)
         form_layout.addRow("AI Timeout", self._request_timeout_input)
 
         layout = QVBoxLayout(self)
@@ -319,6 +343,8 @@ class SettingsDialog(QDialog):
         debug_logging = self._debug_checkbox.isChecked()
         show_tool_activity_panel = self._tool_panel_checkbox.isChecked()
         max_tool_iterations = int(self._max_tool_iterations_input.value())
+        max_context_tokens = int(self._max_context_tokens_input.value())
+        response_token_reserve = int(self._response_token_reserve_input.value())
         request_timeout = float(self._request_timeout_input.value())
         return replace(
             self._original,
@@ -330,6 +356,8 @@ class SettingsDialog(QDialog):
             debug_logging=debug_logging,
             show_tool_activity_panel=show_tool_activity_panel,
             max_tool_iterations=max_tool_iterations,
+            max_context_tokens=max_context_tokens,
+            response_token_reserve=response_token_reserve,
             request_timeout=request_timeout,
         )
 

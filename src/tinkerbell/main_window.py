@@ -20,6 +20,7 @@ from .editor.document_model import DocumentMetadata, DocumentState, SelectionRan
 from .editor.workspace import DocumentTab
 from .editor.tabbed_editor import TabbedEditorWidget
 from .services.bridge_router import WorkspaceBridgeRouter
+from .services.importers import FileImporter, ImportResult, ImporterError
 from .services.settings import Settings, SettingsStore
 from .utils import file_io, logging as logging_utils
 from .widgets.status_bar import StatusBar
@@ -36,13 +37,15 @@ if TYPE_CHECKING:  # pragma: no cover - import only for static analysis
     from .ai.client import AIStreamEvent
     from .widgets.dialogs import SettingsDialogResult
 
+QApplication: Any
 QMainWindow: Any
 QWidget: Any
 
 try:  # pragma: no cover - PySide6 optional in CI
-    from PySide6.QtWidgets import QMainWindow as _QtQMainWindow, QWidget as _QtQWidget
+    from PySide6.QtWidgets import QApplication as _QtQApplication, QMainWindow as _QtQMainWindow, QWidget as _QtQWidget
     QMainWindow = _QtQMainWindow
     QWidget = _QtQWidget
+    QApplication = _QtQApplication
 except Exception:  # pragma: no cover - runtime stubs keep tests headless
 
     class _StubQMainWindow:  # type: ignore
@@ -86,6 +89,15 @@ except Exception:  # pragma: no cover - runtime stubs keep tests headless
 
     QMainWindow = _StubQMainWindow
     QWidget = _StubQWidget
+    
+    class _StubQApplication:  # type: ignore
+        """Minimal QApplication placeholder for headless tests."""
+
+        @staticmethod
+        def instance() -> Any:
+            return None
+
+    QApplication = _StubQApplication
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -175,6 +187,7 @@ class MainWindow(QMainWindow):
         show_tool_panel = bool(getattr(initial_settings, "show_tool_activity_panel", False))
         self._editor = TabbedEditorWidget()
         self._workspace = self._editor.workspace
+        self._file_importer = FileImporter()
         self._chat_panel = ChatPanel(show_tool_activity_panel=show_tool_panel)
         self._bridge = WorkspaceBridgeRouter(self._workspace)
         self._editor.add_tab_created_listener(self._bridge.track_tab)
@@ -213,6 +226,7 @@ class MainWindow(QMainWindow):
         self._cancel_active_ai_turn()
         self._cancel_dynamic_suggestions()
         self._clear_suggestion_cache()
+        self._request_app_shutdown()
 
         super_close = getattr(super(), "closeEvent", None)
         if callable(super_close):  # pragma: no branch - defensive wiring
@@ -224,6 +238,35 @@ class MainWindow(QMainWindow):
         accept = getattr(event, "accept", None)
         if callable(accept):
             accept()
+
+    def _request_app_shutdown(self) -> None:
+        """Ask the QApplication to terminate so the qasync loop can stop."""
+
+        qt_instance = None
+        try:
+            qt_instance_getter = getattr(QApplication, "instance", None)
+            if callable(qt_instance_getter):
+                qt_instance = qt_instance_getter()
+        except Exception:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Failed to access QApplication instance", exc_info=True)
+            return
+
+        if not qt_instance:
+            return
+
+        closing_down = getattr(qt_instance, "closingDown", None)
+        try:
+            if callable(closing_down) and closing_down():
+                return
+        except Exception:  # pragma: no cover - defensive guard
+            _LOGGER.debug("QApplication closingDown() check failed", exc_info=True)
+
+        quit_fn = getattr(qt_instance, "quit", None)
+        if callable(quit_fn):
+            try:
+                quit_fn()
+            except Exception:  # pragma: no cover - defensive guard
+                _LOGGER.debug("QApplication.quit() raised", exc_info=True)
 
     # ------------------------------------------------------------------
     # UI setup helpers
@@ -292,6 +335,13 @@ class MainWindow(QMainWindow):
                 status_tip="Open a document from disk",
                 callback=self._handle_open_requested,
             ),
+            "file_import": self._build_action(
+                name="file_import",
+                text="Import…",
+                shortcut="Ctrl+Shift+I",
+                status_tip="Convert PDFs and other formats into editable text",
+                callback=self._handle_import_requested,
+            ),
             "file_save": self._build_action(
                 name="file_save",
                 text="Save",
@@ -343,7 +393,7 @@ class MainWindow(QMainWindow):
             "file": MenuSpec(
                 name="file",
                 title="&File",
-                actions=("file_new_tab", "file_open", "file_save", "file_save_as", "file_close_tab", "file_revert"),
+                actions=("file_new_tab", "file_open", "file_import", "file_save", "file_save_as", "file_close_tab", "file_revert"),
             ),
             "settings": MenuSpec(name="settings", title="&Settings", actions=("settings_open",)),
             "ai": MenuSpec(name="ai", title="&AI", actions=("ai_snapshot",)),
@@ -687,7 +737,7 @@ class MainWindow(QMainWindow):
         snapshot = self._bridge.generate_snapshot()
         history_payload = self._serialize_chat_history(
             self._chat_panel.history(),
-            limit=12,
+            limit=0,
             exclude_latest=True,
         )
         self._chat_panel.set_ai_running(True)
@@ -1240,6 +1290,31 @@ class MainWindow(QMainWindow):
             self.update_status(f"File not found: {path}")
             raise
 
+    def _handle_import_requested(self) -> None:
+        """Import a non-native file format by converting it to plain text."""
+
+        try:
+            path = self._prompt_for_import_path()
+        except RuntimeError:
+            self.update_status("Import dialog unavailable")
+            return
+
+        if path is None:
+            self.update_status("Import canceled")
+            return
+
+        try:
+            result = self._file_importer.import_file(path)
+        except FileNotFoundError:
+            self.update_status(f"File not found: {path}")
+            return
+        except ImporterError as exc:
+            message = str(exc).strip() or f"Unable to import {path.name}"
+            self.update_status(message)
+            return
+
+        self._open_import_result(result, source_path=path)
+
     def _handle_new_tab_requested(self) -> None:
         with self._suspend_snapshot_persistence():
             tab = self._editor.create_tab()
@@ -1468,6 +1543,26 @@ class MainWindow(QMainWindow):
         parent = self._qt_parent_widget()
         return open_file_dialog(parent=parent, start_dir=start_dir)
 
+    def _prompt_for_import_path(self) -> Path | None:
+        """Display the import dialog constrained to supported file types."""
+
+        start_dir = self._resolve_open_start_dir(self._context.settings)
+        try:
+            from .widgets.dialogs import open_file_dialog
+        except Exception as exc:  # pragma: no cover - depends on Qt availability
+            raise RuntimeError(
+                "File dialogs require the optional PySide6 dependency."
+            ) from exc
+
+        parent = self._qt_parent_widget()
+        file_filter = self._file_importer.dialog_filter()
+        return open_file_dialog(
+            parent=parent,
+            caption="Import File",
+            start_dir=start_dir,
+            file_filter=file_filter,
+        )
+
     def _resolve_active_document_path(self) -> Path | None:
         document = self._editor.to_document()
         if document.metadata.path is not None:
@@ -1489,6 +1584,26 @@ class MainWindow(QMainWindow):
 
         parent = self._qt_parent_widget()
         return save_file_dialog(parent=parent, start_dir=start_dir)
+
+    def _open_import_result(self, result: ImportResult, *, source_path: Path) -> None:
+        """Create a new tab populated with imported text."""
+
+        language = (result.language or "text").strip() or "text"
+        document = DocumentState(text=result.text, metadata=DocumentMetadata(language=language))
+        document.dirty = True
+        title = (result.title or source_path.stem or "Imported Document").strip() or "Imported Document"
+
+        with self._suspend_snapshot_persistence():
+            tab = self._editor.create_tab(document=document, title=title, make_active=True)
+        self._workspace.set_active_tab(tab.id)
+        self._current_document_path = None
+        self._remember_recent_file(source_path)
+        self._refresh_window_title(document)
+        self._sync_settings_workspace_state()
+        status = f"Imported {source_path.name}"
+        if result.notes:
+            status = f"{status} – {result.notes}"
+        self.update_status(status)
 
     def _resolve_open_start_dir(self, settings: Optional[Settings]) -> Path | None:
         if self._current_document_path is not None:
@@ -1530,18 +1645,19 @@ class MainWindow(QMainWindow):
         if settings is None:
             return
 
-        restored = False
         if self._restore_workspace_tabs(settings):
-            restored = True
-        else:
-            next_index = getattr(settings, "next_untitled_index", None)
-            if isinstance(next_index, int):
-                self._workspace.set_next_untitled_index(next_index)
-            if self._try_restore_last_file(settings):
-                restored = True
-            else:
-                restored = self._restore_unsaved_snapshot(settings)
+            self._sync_settings_workspace_state(persist=False)
+            return
 
+        next_index = getattr(settings, "next_untitled_index", None)
+        if isinstance(next_index, int):
+            self._workspace.set_next_untitled_index(next_index)
+
+        if self._try_restore_last_file(settings):
+            self._sync_settings_workspace_state(persist=False)
+            return
+
+        self._restore_unsaved_snapshot(settings)
         self._sync_settings_workspace_state(persist=False)
 
     def _try_restore_last_file(self, settings: Settings) -> bool:
@@ -1912,6 +2028,18 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # pragma: no cover - defensive guard
             _LOGGER.debug("Unable to update max tool iterations: %s", exc)
 
+    def _apply_context_window_settings(self, controller: Any, settings: Settings) -> None:
+        configurator = getattr(controller, "configure_context_window", None)
+        if not callable(configurator):
+            return
+        try:
+            configurator(
+                max_context_tokens=getattr(settings, "max_context_tokens", 128_000),
+                response_token_reserve=getattr(settings, "response_token_reserve", 16_000),
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to update context window settings: %s", exc)
+
     @staticmethod
     def _resolve_max_tool_iterations(settings: Settings | None) -> int:
         raw = getattr(settings, "max_tool_iterations", 8) if settings else 8
@@ -1999,6 +2127,7 @@ class MainWindow(QMainWindow):
 
         if controller is not None:
             self._apply_max_tool_iterations(controller, iteration_limit)
+            self._apply_context_window_settings(controller, settings)
 
         self._update_ai_debug_logging(bool(getattr(settings, "debug_logging", False)))
 
@@ -2064,6 +2193,8 @@ class MainWindow(QMainWindow):
             return AIController(
                 client=client,
                 max_tool_iterations=limit,
+                max_context_tokens=getattr(settings, "max_context_tokens", 128_000),
+                response_token_reserve=getattr(settings, "response_token_reserve", 16_000),
             )
         except Exception as exc:
             _LOGGER.warning("Failed to initialize AI controller: %s", exc)

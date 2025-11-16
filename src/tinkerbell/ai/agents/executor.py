@@ -7,8 +7,14 @@ import contextlib
 import inspect
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, cast
+
+try:  # pragma: no cover - optional dependency used when available
+    import tiktoken  # type: ignore
+except Exception:  # pragma: no cover - tiktoken is optional in dev/test envs
+    tiktoken = None
 
 from openai.types.chat import ChatCompletionToolParam
 
@@ -17,6 +23,7 @@ from ..client import AIClient, AIStreamEvent
 from .graph import build_agent_graph
 
 LOGGER = logging.getLogger(__name__)
+_PROMPT_HEADROOM = 4_096
 _SUGGESTION_SYSTEM_PROMPT = (
     "You are a proactive writing assistant that proposes the next helpful user prompts after reviewing the prior "
     "conversation. Respond ONLY with a JSON array of concise suggestion strings (each under 120 characters). "
@@ -95,10 +102,13 @@ class AIController:
     max_tool_iterations: int = 8
     diff_builder_reminder_threshold: int = 3
     max_pending_patch_reminders: int = 2
+    max_context_tokens: int = 128_000
+    response_token_reserve: int = 16_000
     _graph: Dict[str, Any] = field(init=False, repr=False)
     _max_tool_iterations: int = field(init=False, repr=False)
     _active_task: asyncio.Task[dict] | None = field(default=None, init=False, repr=False)
     _task_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _token_encoder: Any | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.tools:
@@ -112,6 +122,10 @@ class AIController:
         self._max_tool_iterations = self._normalize_iterations(self.max_tool_iterations)
         self.max_tool_iterations = self._max_tool_iterations
         self._rebuild_graph()
+        self.configure_context_window(
+            max_context_tokens=self.max_context_tokens,
+            response_token_reserve=self.response_token_reserve,
+        )
 
     @property
     def graph(self) -> Dict[str, Any]:
@@ -151,6 +165,23 @@ class AIController:
         self.max_tool_iterations = normalized
         self._rebuild_graph()
 
+    def configure_context_window(
+        self,
+        *,
+        max_context_tokens: int | None = None,
+        response_token_reserve: int | None = None,
+    ) -> None:
+        """Normalize and apply context window constraints for prompt planning."""
+
+        if max_context_tokens is not None:
+            self.max_context_tokens = self._normalize_context_tokens(max_context_tokens)
+        else:
+            self.max_context_tokens = self._normalize_context_tokens(self.max_context_tokens)
+        if response_token_reserve is not None:
+            self.response_token_reserve = self._normalize_response_reserve(response_token_reserve)
+        else:
+            self.response_token_reserve = self._normalize_response_reserve(self.response_token_reserve)
+
     def unregister_tool(self, name: str) -> None:
         """Remove a tool and rebuild the agent graph."""
 
@@ -163,6 +194,7 @@ class AIController:
         """Swap the underlying AI client (e.g., when settings change)."""
 
         self.client = client
+        self._token_encoder = None
 
     async def run_chat(
         self,
@@ -176,7 +208,7 @@ class AIController:
         """Execute a chat turn against the compiled agent graph."""
 
         snapshot = dict(doc_snapshot or {})
-        base_messages = self._build_messages(prompt, snapshot, history)
+        base_messages, completion_budget = self._build_messages(prompt, snapshot, history)
         merged_metadata = self._build_metadata(snapshot, metadata)
         tool_specs = [registration.as_openai_tool() for registration in self.tools.values()]
         max_iterations = self._graph.get("metadata", {}).get("max_iterations")
@@ -206,6 +238,7 @@ class AIController:
                     tool_specs=tool_specs if tool_specs else None,
                     metadata=merged_metadata,
                     on_event=on_event,
+                    max_completion_tokens=completion_budget,
                 )
                 conversation.append(turn.assistant_message)
                 response_text = turn.response_text
@@ -405,6 +438,29 @@ class AIController:
             candidate = 8
         return max(1, min(candidate, 50))
 
+    @staticmethod
+    def _normalize_context_tokens(value: int | None) -> int:
+        default = 128_000
+        try:
+            candidate = int(value) if value is not None else default
+        except (TypeError, ValueError):
+            candidate = default
+        return max(32_000, min(candidate, 512_000))
+
+    @staticmethod
+    def _normalize_response_reserve(value: int | None) -> int:
+        default = 16_000
+        try:
+            candidate = int(value) if value is not None else default
+        except (TypeError, ValueError):
+            candidate = default
+        return max(4_000, min(candidate, 64_000))
+
+    def _effective_response_reserve(self, context_limit: int) -> int:
+        limit = max(0, int(context_limit))
+        max_reserve = max(0, limit - _PROMPT_HEADROOM)
+        return max(0, min(self.response_token_reserve, max_reserve))
+
     def _sanitize_suggestions(self, raw_items: Iterable[Any], max_suggestions: int) -> list[str]:
         sanitized: list[str] = []
         seen: set[str] = set()
@@ -445,24 +501,46 @@ class AIController:
         prompt: str,
         snapshot: Mapping[str, Any],
         history: Sequence[Mapping[str, Any]] | None = None,
-    ) -> list[dict[str, str]]:
+    ) -> tuple[list[dict[str, str]], int | None]:
         user_prompt = prompts.format_user_prompt(prompt, dict(snapshot))
-        system_text = prompts.base_system_prompt()
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": system_text},
-        ]
+        system_message = {"role": "system", "content": prompts.base_system_prompt()}
+        user_message = {"role": "user", "content": user_prompt}
+
+        context_limit = self.max_context_tokens
+        reserve = self._effective_response_reserve(context_limit)
+        prompt_budget = max(0, context_limit - reserve)
+
+        system_tokens = self._estimate_message_tokens(system_message)
+        user_tokens = self._estimate_message_tokens(user_message)
+        required_prompt_tokens = system_tokens + user_tokens
+
+        if prompt_budget < required_prompt_tokens and reserve > 0:
+            shortfall = required_prompt_tokens - prompt_budget
+            reclaimed = min(reserve, shortfall)
+            reserve -= reclaimed
+            prompt_budget += reclaimed
+
+        history_budget = max(0, prompt_budget - required_prompt_tokens)
+        trimmed_history: list[dict[str, str]] = []
         if history:
-            messages.extend(self._sanitize_history(history))
-        messages.append({"role": "user", "content": user_prompt})
-        return messages
+            trimmed_history = self._sanitize_history(history, limit=60, token_budget=history_budget)
+
+        messages: list[dict[str, str]] = [system_message]
+        messages.extend(trimmed_history)
+        messages.append(user_message)
+
+        completion_budget = reserve if reserve > 0 else None
+        return messages, completion_budget
 
     def _sanitize_history(
         self,
         history: Sequence[Mapping[str, Any]],
         limit: int = 20,
+        *,
+        token_budget: int | None = None,
     ) -> list[dict[str, str]]:
         allowed_roles = {"user", "assistant", "system", "tool"}
-        window = list(history)[-limit:]
+        window = list(history)[-limit:] if limit else list(history)
         sanitized: list[dict[str, str]] = []
         for entry in window:
             role = str(entry.get("role", "user")).lower()
@@ -472,7 +550,67 @@ class AIController:
             if not text:
                 continue
             sanitized.append({"role": role, "content": text})
-        return sanitized
+        if token_budget is None:
+            return sanitized
+        budget = max(0, token_budget)
+        if budget == 0 or not sanitized:
+            return []
+        trimmed: list[dict[str, str]] = []
+        remaining = budget
+        for entry in reversed(sanitized):
+            tokens = self._estimate_message_tokens(entry)
+            if trimmed and tokens > remaining:
+                break
+            if not trimmed and tokens > remaining:
+                trimmed.append(entry)
+                break
+            trimmed.append(entry)
+            remaining -= tokens
+            if remaining <= 0:
+                break
+        trimmed.reverse()
+        return trimmed
+
+    def _estimate_message_tokens(self, message: Mapping[str, Any]) -> int:
+        content = str(message.get("content", "") or "")
+        tokens = self._estimate_text_tokens(content)
+        if message.get("role"):
+            tokens += 4  # allowance for role + message boundary tokens
+        return tokens
+
+    def _estimate_text_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        encoder = self._get_token_encoder()
+        if encoder is not None:
+            try:
+                return len(encoder.encode(text))
+            except Exception:  # pragma: no cover - defensive when encoder misbehaves
+                self._token_encoder = None
+        return max(1, math.ceil(len(text) / 4))
+
+    def _get_token_encoder(self) -> Any | None:
+        if tiktoken is None:
+            return None
+        if self._token_encoder is not None:
+            return self._token_encoder
+        model_name: str | None = None
+        client_settings = getattr(self.client, "settings", None)
+        if client_settings is not None:
+            model_name = getattr(client_settings, "model", None)
+        try:
+            encoding = (
+                tiktoken.encoding_for_model(model_name)
+                if model_name
+                else tiktoken.get_encoding("cl100k_base")
+            )
+        except Exception:  # pragma: no cover - fall back to default encoding
+            try:
+                encoding = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                encoding = None
+        self._token_encoder = encoding
+        return encoding
 
     def _build_metadata(
         self,
@@ -517,15 +655,20 @@ class AIController:
         tool_specs: Sequence[ChatCompletionToolParam] | None,
         metadata: Mapping[str, str] | None,
         on_event: ToolCallback | None,
+        max_completion_tokens: int | None = None,
     ) -> _ModelTurnResult:
         deltas: list[str] = []
         final_chunk: str | None = None
         tool_calls: list[_ToolCallRequest] = []
-        async for event in self.client.stream_chat(
-            messages=list(conversation),
-            tools=list(tool_specs) if tool_specs else None,
-            metadata=metadata,
-        ):
+        stream_kwargs: Dict[str, Any] = {
+            "messages": list(conversation),
+            "tools": list(tool_specs) if tool_specs else None,
+            "metadata": metadata,
+        }
+        if max_completion_tokens is not None:
+            stream_kwargs["max_completion_tokens"] = max_completion_tokens
+
+        async for event in self.client.stream_chat(**stream_kwargs):
             await self._dispatch_event(event, on_event)
             if event.type == "content.delta" and event.content:
                 deltas.append(event.content)

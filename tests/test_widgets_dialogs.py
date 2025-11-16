@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QLineEdit, QPushButton
+from PySide6.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QLineEdit, QPushButton, QSpinBox
 
 from tinkerbell.services.settings import Settings
 from tinkerbell.widgets import dialogs
@@ -36,6 +36,8 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     theme_input = dialog.findChild(QLineEdit, "theme_input")
     tool_checkbox = dialog.findChild(QCheckBox, "tool_activity_checkbox")
     timeout_input = dialog.findChild(QDoubleSpinBox, "request_timeout_input")
+    context_input = dialog.findChild(QSpinBox, "max_context_tokens_input")
+    reserve_input = dialog.findChild(QSpinBox, "response_token_reserve_input")
 
     assert base_input is not None
     assert api_input is not None
@@ -44,6 +46,8 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert theme_input is not None
     assert tool_checkbox is not None
     assert timeout_input is not None
+    assert context_input is not None
+    assert reserve_input is not None
 
     base_input.setText("https://example.com/v2")
     api_input.setText("new-key")
@@ -52,6 +56,8 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     theme_input.setText("dracula")
     tool_checkbox.setChecked(True)
     timeout_input.setValue(42.5)
+    context_input.setValue(256_000)
+    reserve_input.setValue(20_000)
 
     updated = dialog.gather_settings()
 
@@ -62,6 +68,8 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert updated.theme == "dracula"
     assert updated.show_tool_activity_panel is True
     assert updated.request_timeout == pytest.approx(42.5)
+    assert updated.max_context_tokens == 256_000
+    assert updated.response_token_reserve == 20_000
 
 
 def test_settings_dialog_validation_uses_validator(qtbot, dialog_settings: Settings) -> None:

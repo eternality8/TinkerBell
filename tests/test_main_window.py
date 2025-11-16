@@ -9,9 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 
+import tinkerbell.main_window as main_window_module
 from tinkerbell.chat.message_model import ChatMessage
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.main_window import MainWindow, WindowContext
+from tinkerbell.services.importers import FileImporter, ImportResult, ImporterError
 from tinkerbell.services.settings import Settings, SettingsStore
 
 
@@ -41,6 +43,7 @@ def test_main_window_registers_default_actions():
     assert {
         "file_new_tab",
         "file_open",
+        "file_import",
         "file_save",
         "file_revert",
         "file_save_as",
@@ -49,6 +52,30 @@ def test_main_window_registers_default_actions():
         "ai_snapshot",
     }.issubset(action_keys)
     assert window.last_status_message == "Ready"
+
+
+def test_close_event_requests_application_quit(monkeypatch: pytest.MonkeyPatch):
+    window = _make_window()
+    quit_calls = {"count": 0}
+
+    class _FakeApp:
+        def closingDown(self) -> bool:
+            return False
+
+        def quit(self) -> None:
+            quit_calls["count"] += 1
+
+    fake_app = _FakeApp()
+    monkeypatch.setattr(
+        main_window_module,
+        "QApplication",
+        SimpleNamespace(instance=lambda: fake_app),
+    )
+
+    event = SimpleNamespace(accept=lambda: None)
+    window.closeEvent(event)
+
+    assert quit_calls["count"] == 1
 
 
 def test_chat_suggestions_initialized_on_startup():
@@ -187,6 +214,7 @@ def test_menu_specs_expose_file_and_settings_actions():
     assert menus["file"].actions == (
         "file_new_tab",
         "file_open",
+        "file_import",
         "file_save",
         "file_save_as",
         "file_close_tab",
@@ -208,6 +236,51 @@ def test_open_document_loads_editor_state(tmp_path: Path):
     assert document.text == "Hello world"
     assert document.metadata.path == target
     assert not document.dirty
+
+
+def test_import_action_creates_new_tab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    window = _make_window()
+    source = tmp_path / "sample.pdf"
+    source.write_text("binary", encoding="utf-8")
+    result = ImportResult(text="Converted PDF", title="Sample (imported)", language="markdown")
+    stub_importer = FileImporter(handlers=())
+
+    def _import(path: Path) -> ImportResult:
+        assert path == source
+        return result
+
+    stub_importer.import_file = _import  # type: ignore[assignment]
+    stub_importer.dialog_filter = lambda: "PDF (*.pdf)"  # type: ignore[assignment]
+    window._file_importer = stub_importer
+    monkeypatch.setattr(window, "_prompt_for_import_path", lambda: source)
+
+    window._handle_import_requested()
+
+    document = window.editor_widget.to_document()
+    assert document.text == "Converted PDF"
+    assert document.metadata.path is None
+    assert document.metadata.language == "markdown"
+    assert window.last_status_message.startswith("Imported sample.pdf")
+
+
+def test_import_action_handles_handler_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    window = _make_window()
+    source = tmp_path / "broken.pdf"
+    source.write_text("binary", encoding="utf-8")
+
+    failing_importer = FileImporter(handlers=())
+
+    def _fail(_: Path) -> ImportResult:
+        raise ImporterError("Cannot import")
+
+    failing_importer.import_file = _fail  # type: ignore[assignment]
+    failing_importer.dialog_filter = lambda: "PDF (*.pdf)"  # type: ignore[assignment]
+    window._file_importer = failing_importer
+    monkeypatch.setattr(window, "_prompt_for_import_path", lambda: source)
+
+    window._handle_import_requested()
+
+    assert window.last_status_message == "Cannot import"
 
 
 def test_open_document_records_last_open_file(tmp_path: Path):

@@ -50,6 +50,8 @@ class Settings:
     retry_min_seconds: float = 0.5
     retry_max_seconds: float = 6.0
     max_tool_iterations: int = 8
+    max_context_tokens: int = 128_000
+    response_token_reserve: int = 16_000
     autosave_interval: float = 60.0
     default_headers: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, str] = field(default_factory=dict)

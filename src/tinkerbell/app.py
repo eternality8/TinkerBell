@@ -252,9 +252,13 @@ def _build_ai_controller(settings: Settings, *, debug_logging: bool = False) -> 
         return None
 
     limit = _resolve_max_tool_iterations(settings)
+    context_tokens = getattr(settings, "max_context_tokens", 128_000)
+    response_reserve = getattr(settings, "response_token_reserve", 16_000)
     return AIController(
         client=client,
         max_tool_iterations=limit,
+        max_context_tokens=context_tokens,
+        response_token_reserve=response_reserve,
     )
 
 

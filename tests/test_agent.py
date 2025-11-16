@@ -94,6 +94,37 @@ def test_ai_controller_tracks_registered_tools(sample_snapshot):
     assert result["tool_calls"] == []
 
 
+def test_ai_controller_limits_history_and_reserves_completion_tokens(sample_snapshot):
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="ok")])
+    controller = AIController(
+        client=cast(AIClient, stub_client),
+        max_context_tokens=40_000,
+        response_token_reserve=16_000,
+    )
+
+    long_history = [
+        {
+            "role": "user" if idx % 2 == 0 else "assistant",
+            "content": f"message-{idx} " + ("#" * 2000),
+        }
+        for idx in range(80)
+    ]
+
+    async def run() -> None:
+        await controller.run_chat("Trim please", sample_snapshot, history=long_history)
+
+    asyncio.run(run())
+
+    payload = stub_client.calls[0]
+    assert payload.get("max_completion_tokens") == 16_000
+    sent_messages = payload["messages"]
+    history_sent = sent_messages[1:-1]
+    assert history_sent  # history should not be empty
+    assert len(history_sent) < len(long_history)
+    assert len(history_sent) < 60  # token budget trims further than the window limit
+    assert history_sent[-1]["content"].startswith("message-79")
+
+
 def test_ai_controller_logs_response_when_debug_enabled(sample_snapshot, caplog):
     stub_client = _StubClient(
         [

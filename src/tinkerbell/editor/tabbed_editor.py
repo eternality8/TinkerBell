@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict
 
 from .document_model import DocumentState, SelectionRange
 from .editor_widget import EditorWidget, SelectionListener, SnapshotListener, TextChangeListener, QWidgetBase

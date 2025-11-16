@@ -23,6 +23,7 @@ TinkerBell pairs a PySide6 editor with a full LangChain/LangGraph tool stack so 
 - **Diff-based edits by default** – Agents fetch snapshots, build unified diffs, and submit `action="patch"` directives so every change is reproducible and undo-friendly.
 - **Structured safety rails** – All AI edits flow through `DocumentBridge` where schema validation, document-version checks, and diff summaries prevent stale or destructive operations.
 - **Markdown-first editor** – `EditorWidget` wraps `QPlainTextEdit`/`QsciScintilla` with headless fallbacks, Markdown preview, undo/redo, selection tracking, and theme hooks.
+- **One-click imports** – `File → Import…` converts PDFs (and future formats via pluggable handlers) into fresh, editable tabs so you can work with research papers or specs that aren’t plain text.
 - **Async everywhere** – LangGraph-powered agents run on asyncio while `qasync` ensures Qt stays responsive during streaming conversations.
 - **Windows-friendly secrets** – API keys are encrypted with DPAPI when available (fallback to Fernet) so dropping your laptop does not leak credentials.
 - **Tested components** – `pytest` + `pytest-qt` suites cover agents, bridge logic, widgets, syntax helpers, dialogs, and service layers.
@@ -87,7 +88,7 @@ The console script calls `tinkerbell.app:main`, which boots the qasync-enabled Q
 
 You can supply OpenAI-compatible credentials in three interchangeable ways:
 
-1. **Settings dialog** – Press `Ctrl+,` or use **Settings → Preferences…** to enter a base URL, API key, model name, and retry/backoff settings. Keys are stored with DPAPI (Windows) or Fernet (cross-platform) via `SettingsStore`.
+1. **Settings dialog** – Press `Ctrl+,` or use **Settings → Preferences…** to enter a base URL, API key, model name, and retry/backoff settings. Keys are stored with DPAPI (Windows) or Fernet (cross-platform) via `SettingsStore`. The dialog also exposes **Max Context Tokens** and **Response Token Reserve** so you can cap how much history is sent while guaranteeing ~16k tokens of headroom for replies.
 2. **Environment variables** – Set any subset of the following before launching the app:
 	 - `TINKERBELL_API_KEY`
 	 - `TINKERBELL_BASE_URL` (e.g., `https://api.openai.com/v1` or your proxy)
@@ -101,7 +102,7 @@ Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat m
 
 ## Everyday workflow
 
-1. **Open or create a document** – Markdown, YAML, JSON, or plain text files are supported out of the box. Syntax detection drives highlighting and validation helpers.
+1. **Open, create, or import a document** – Markdown, YAML, JSON, or plain text files are supported out of the box, and PDFs can be converted to text via **File → Import…**. Syntax detection drives highlighting and validation helpers.
 2. **Compose a prompt** – Select the text you want help with, describe the task (“Rewrite the introduction in an encouraging tone”), and hit **Send**. The selection summary and a fresh document snapshot are automatically attached.
 3. **Watch the agent work** – Streaming responses land in the chat history. Enable the Tool Activity panel from **Settings → Show tool activity panel** whenever you need to inspect each LangChain tool invocation (snapshot, diff builder, edits, etc.).
 4. **Apply or rollback edits** – Structured payloads go through the bridge, which enforces document-version checks and emits diff summaries (e.g., `+128 chars`). Undo/redo is still available because edits use the regular editor APIs.
