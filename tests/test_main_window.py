@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import logging
 import sys
 from pathlib import Path
@@ -11,7 +12,8 @@ from types import SimpleNamespace
 import pytest
 
 import tinkerbell.main_window as main_window_module
-from tinkerbell.chat.message_model import ChatMessage, ToolTrace
+from tinkerbell.chat.chat_panel import ChatTurnSnapshot
+from tinkerbell.chat.message_model import ChatMessage, EditDirective, ToolTrace
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.main_window import MainWindow, WindowContext
 from tinkerbell.services.importers import FileImporter, ImportResult, ImporterError
@@ -985,6 +987,136 @@ def test_new_chat_session_cancels_active_ai_request():
     assert window.last_status_message == "Chat reset"
 
 
+def test_accept_ai_changes_clears_overlays_and_drops_turn():
+    window = _make_window()
+    tab = window._workspace.active_tab
+    assert tab is not None
+    tab.editor.set_text("Original text")
+
+    _begin_test_review(window)
+    _apply_fake_ai_edit(window, tab, "AI updated text", diff_label="Δ1")
+    window._finalize_pending_turn_review(success=True)
+
+    assert tab.id in window._tabs_with_overlay
+
+    window._handle_accept_ai_changes()
+
+    assert window._pending_turn_review is None
+    assert not window._tabs_with_overlay
+    assert window._status_bar.review_controls_visible is False
+    assert "Accepted" in window.last_status_message
+
+
+def test_reject_ai_changes_restores_documents_and_chat():
+    window = _make_window()
+    primary = window._workspace.active_tab
+    assert primary is not None
+    primary.editor.set_text("Base primary text")
+    window._handle_new_tab_requested()
+    secondary = window._workspace.active_tab
+    assert secondary is not None
+    secondary.editor.set_text("Base secondary text")
+    window._workspace.set_active_tab(primary.id)
+
+    prompt = "Rewrite both documents"
+    _begin_test_review(window, prompt=prompt)
+    window.chat_panel.set_composer_text("")
+
+    base_primary = primary.document().text
+    base_secondary = secondary.document().text
+
+    _apply_fake_ai_edit(window, primary, "AI primary", diff_label="ΔP")
+    _apply_fake_ai_edit(window, secondary, "AI secondary", diff_label="ΔS")
+    window._finalize_pending_turn_review(success=True)
+    window.chat_panel.set_composer_text("post-AI")
+
+    window._handle_reject_ai_changes()
+
+    assert primary.document().text == base_primary
+    assert secondary.document().text == base_secondary
+    assert window.chat_panel.composer_text == prompt
+    assert window._pending_turn_review is None
+    assert not window._tabs_with_overlay
+    assert "Rejected" in window.last_status_message
+
+
+def test_manual_edit_during_pending_review_aborts_envelope():
+    window = _make_window()
+    tab = window._workspace.active_tab
+    assert tab is not None
+    tab.editor.set_text("Draft copy")
+
+    _begin_test_review(window)
+    _apply_fake_ai_edit(window, tab, "AI variant", diff_label="Δdraft")
+    window._finalize_pending_turn_review(success=True)
+
+    tab.editor._mark_change_source("user")
+    window._maybe_clear_diff_overlay(tab.document())
+
+    assert window._pending_turn_review is None
+    assert not window._tabs_with_overlay
+    assert "discarded" in window.last_status_message.lower()
+
+
+def test_closed_tab_marked_orphaned_and_skipped_on_accept():
+    window = _make_window()
+    tab = window._workspace.active_tab
+    assert tab is not None
+    tab.editor.set_text("Old text")
+
+    _begin_test_review(window)
+    _apply_fake_ai_edit(window, tab, "AI version", diff_label="Δold")
+    window._finalize_pending_turn_review(success=True)
+    pending = window._pending_turn_review
+    assert pending is not None
+
+    window._handle_close_tab_requested()
+
+    session = pending.tab_sessions.get(tab.id)
+    assert session is not None and session.orphaned is True
+
+    window._handle_accept_ai_changes()
+
+    assert window._pending_turn_review is None
+    assert "skipped 1 closed tab" in window.last_status_message
+
+
+def test_cancel_active_ai_turn_restores_composer_and_drops_review():
+    controller = _StubAIController()
+    window = _make_window(controller)
+    tab = window._workspace.active_tab
+    assert tab is not None
+    tab.editor.set_text("Original content")
+
+    prompt = "Original prompt"
+    _begin_test_review(window, prompt=prompt)
+    _apply_fake_ai_edit(window, tab, "AI change", diff_label="Δcancel")
+    window.chat_panel.set_composer_text("")
+
+    class _FakeTask:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    task = _FakeTask()
+    window._ai_task = task  # type: ignore[assignment]
+
+    window._cancel_active_ai_turn()
+
+    assert controller.cancelled is True
+    assert task.cancelled is True
+    assert window._ai_task is None
+    assert window._pending_turn_review is None
+    assert window.chat_panel.composer_text == prompt
+    assert not window._tabs_with_overlay
+    assert "Canceled AI request" in window.last_status_message
+
+
 class _StubAIController:
     def __init__(self) -> None:
         self.prompts: list[str] = []
@@ -1056,6 +1188,25 @@ class _StubAIController:
         self.updated_clients.append(client)
 
 
+def _begin_test_review(window: MainWindow, prompt: str = "Revise the document") -> None:
+    window.chat_panel.set_composer_text(prompt)
+    snapshot = window.chat_panel.capture_state()
+    window._begin_pending_turn_review(prompt=prompt, prompt_metadata={}, chat_snapshot=snapshot)
+
+
+def _apply_fake_ai_edit(
+    window: MainWindow,
+    tab: Any,
+    new_text: str,
+    *,
+    diff_label: str,
+) -> None:
+    before_state = deepcopy(tab.document())
+    directive = EditDirective(action="replace", target_range=(0, len(before_state.text)), content=new_text)
+    tab.editor.set_text(new_text)
+    window._handle_edit_applied(directive, before_state, diff_label)
+
+
 def test_chat_prompt_without_controller_emits_notice():
     window = _make_window()
     panel = window.chat_panel
@@ -1078,6 +1229,54 @@ def test_chat_prompt_routes_to_ai_controller():
     assert "hello world" in history[-1].content.lower()
     assert controller.prompts == ["Summarize this"]
     assert controller.history_payloads[-1] == []
+
+
+def test_handle_chat_request_uses_existing_chat_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = _StubAIController()
+    window = _make_window(controller)
+    sentinel = window.chat_panel.capture_state()
+
+    calls = {"consumed": 0}
+
+    def _consume() -> ChatTurnSnapshot:
+        calls["consumed"] += 1
+        return sentinel
+
+    def _fail_capture() -> ChatTurnSnapshot:
+        raise AssertionError("capture_state should not be called when snapshot exists")
+
+    monkeypatch.setattr(window._chat_panel, "consume_turn_snapshot", _consume)
+    monkeypatch.setattr(window._chat_panel, "capture_state", _fail_capture)
+
+    window._handle_chat_request("Summarize the document", {})
+
+    assert calls["consumed"] == 1
+    assert window._pending_turn_snapshot is sentinel
+
+
+def test_handle_chat_request_captures_snapshot_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = _StubAIController()
+    window = _make_window(controller)
+    sentinel = window.chat_panel.capture_state()
+
+    records = {"consumed": 0, "captured": 0}
+
+    def _consume() -> ChatTurnSnapshot | None:
+        records["consumed"] += 1
+        return None
+
+    def _capture() -> ChatTurnSnapshot:
+        records["captured"] += 1
+        return sentinel
+
+    monkeypatch.setattr(window._chat_panel, "consume_turn_snapshot", _consume)
+    monkeypatch.setattr(window._chat_panel, "capture_state", _capture)
+
+    window._handle_chat_request("Summarize the document", {})
+
+    assert records["consumed"] == 1
+    assert records["captured"] == 1
+    assert window._pending_turn_snapshot is sentinel
 
 
 def test_manual_outline_command_uses_outline_tool():

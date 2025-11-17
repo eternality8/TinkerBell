@@ -6,7 +6,7 @@ import types
 import pytest
 
 import tinkerbell.chat.chat_panel as chat_panel
-from tinkerbell.chat.chat_panel import ChatPanel, ComposerContext
+from tinkerbell.chat.chat_panel import ChatPanel, ComposerContext, ChatTurnSnapshot
 from tinkerbell.chat.message_model import ChatMessage, ToolTrace
 
 
@@ -369,6 +369,55 @@ def test_chat_panel_send_prompt_rejects_empty_text():
     panel = _make_panel()
     with pytest.raises(ValueError):
         panel.send_prompt("")
+
+
+def test_chat_panel_capture_and_restore_state_round_trip():
+    panel = _make_panel()
+    panel.append_user_message("Hi there")
+    panel.append_ai_message(ChatMessage(role="assistant", content="Welcome back"))
+    panel.show_tool_trace(ToolTrace(name="snapshot", input_summary="all", output_summary="ok"))
+    panel.set_suggestions(["Rewrite intro", "Summarize section"])
+    panel._toggle_suggestion_panel()
+    composer_context = ComposerContext("Intro", extras={"cursor": "top"})
+    panel.set_composer_text("Draft reply", context=composer_context)
+    panel.set_ai_running(True)
+
+    snapshot = panel.capture_state()
+
+    panel.clear_history()
+    panel._tool_traces.clear()
+    panel.set_suggestions([])
+    panel._suggestion_panel_open = False
+    panel.set_composer_text("Changed")
+    panel.set_ai_running(False)
+
+    panel.restore_state(snapshot)
+
+    history = panel.history()
+    assert len(history) == 2
+    assert history[0].content == "Hi there"
+    assert history[1].content == "Welcome back"
+    assert panel._tool_traces and panel._tool_traces[0].name == "snapshot"
+    assert panel.suggestions() == ("Rewrite intro", "Summarize section")
+    assert panel._suggestion_panel_open is True
+    assert panel.composer_text == "Draft reply"
+    assert panel._composer_context.selection_summary == "Intro"
+    assert panel._composer_context.extras == {"cursor": "top"}
+    assert panel._ai_running is True
+    assert panel._pending_turn_snapshot is None
+
+
+def test_chat_panel_consume_turn_snapshot_returns_once():
+    panel = _make_panel()
+    panel.set_composer_text("Capture me", context=ComposerContext("Summary"))
+    panel.send_prompt()
+
+    snapshot = panel.consume_turn_snapshot()
+
+    assert isinstance(snapshot, ChatTurnSnapshot)
+    assert snapshot.composer_text == "Capture me"
+    assert len(snapshot.messages) == 0
+    assert panel.consume_turn_snapshot() is None
 
 
 def test_chat_panel_start_new_chat_notifies_listeners():

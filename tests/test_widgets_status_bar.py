@@ -68,3 +68,36 @@ def test_status_bar_subagent_status_tracks_tooltip() -> None:
     bar.set_subagent_status(None, detail=None)
 
     assert bar.subagent_state == ("", "")
+
+
+def test_status_bar_review_controls_toggle_visibility() -> None:
+    bar = StatusBar()
+
+    assert bar.review_summary == ""
+    assert bar.review_controls_visible is False
+
+    bar.set_review_state("3 edits across 2 tabs")
+
+    assert bar.review_summary == "3 edits across 2 tabs"
+    assert bar.review_controls_visible is True
+
+    bar.clear_review_state()
+
+    assert bar.review_summary == ""
+    assert bar.review_controls_visible is False
+
+
+def test_status_bar_review_control_callbacks_fire() -> None:
+    bar = StatusBar()
+    calls: list[str] = []
+
+    bar.set_review_state(
+        "1 edit",
+        accept_callback=lambda: calls.append("accept"),
+        reject_callback=lambda: calls.append("reject"),
+    )
+
+    bar._review_controls.trigger_accept()
+    bar._review_controls.trigger_reject()
+
+    assert calls == ["accept", "reject"]

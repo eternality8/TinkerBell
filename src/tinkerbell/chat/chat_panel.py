@@ -18,6 +18,7 @@ the headless tests simple while remaining Qt-friendly for the full app.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, List, Optional, Protocol, Sequence, cast
 
@@ -125,6 +126,19 @@ class ComposerContext:
         return metadata
 
 
+@dataclass(slots=True)
+class ChatTurnSnapshot:
+    """Captures the chat panel state before an AI turn mutates it."""
+
+    messages: list[ChatMessage]
+    tool_traces: list[ToolTrace]
+    composer_text: str
+    composer_context: ComposerContext
+    suggestions: tuple[str, ...]
+    suggestion_panel_open: bool
+    ai_running: bool
+
+
 class ChatPanel(QWidgetBase):
     """Pane showing chat history, composer controls, and tool traces."""
 
@@ -168,6 +182,7 @@ class ChatPanel(QWidgetBase):
         self._last_copied_text: Optional[str] = None
         self._stop_ai_callback: Optional[Callable[[], None]] = None
         self._ai_running = False
+        self._pending_turn_snapshot: Optional[ChatTurnSnapshot] = None
         self._send_button_idle_text = "Send"
         self._send_button_idle_tooltip = "Send message"
         self._action_button_busy_text = "■"
@@ -182,6 +197,45 @@ class ChatPanel(QWidgetBase):
         """Return a copy of the recorded chat history."""
 
         return list(self._messages)
+
+    # ------------------------------------------------------------------
+    # Snapshot helpers
+    # ------------------------------------------------------------------
+    def capture_state(self) -> ChatTurnSnapshot:
+        """Create a deep copy snapshot of the chat state."""
+
+        return ChatTurnSnapshot(
+            messages=deepcopy(self._messages),
+            tool_traces=deepcopy(self._tool_traces),
+            composer_text=self.composer_text,
+            composer_context=deepcopy(self._composer_context),
+            suggestions=tuple(self._suggestions),
+            suggestion_panel_open=bool(self._suggestion_panel_open),
+            ai_running=self._ai_running,
+        )
+
+    def restore_state(self, snapshot: ChatTurnSnapshot) -> None:
+        """Restore the chat UI to a previously captured snapshot."""
+
+        self._messages = deepcopy(snapshot.messages)
+        self._active_stream = None
+        self._tool_traces = deepcopy(snapshot.tool_traces)
+        composer_context = deepcopy(snapshot.composer_context)
+        self.set_composer_text(snapshot.composer_text, context=composer_context)
+        self._suggestions = list(snapshot.suggestions)
+        self._suggestion_panel_open = bool(snapshot.suggestion_panel_open and self._suggestions)
+        self.set_ai_running(snapshot.ai_running)
+        self._pending_turn_snapshot = None
+        self._refresh_history_widget()
+        self._refresh_tool_trace_widget()
+        self._refresh_suggestion_widget()
+
+    def consume_turn_snapshot(self) -> Optional[ChatTurnSnapshot]:
+        """Return the pending turn snapshot once, clearing it afterwards."""
+
+        snapshot = self._pending_turn_snapshot
+        self._pending_turn_snapshot = None
+        return snapshot
 
     @property
     def tool_activity_visible(self) -> bool:
@@ -248,6 +302,7 @@ class ChatPanel(QWidgetBase):
 
         self.clear_history()
         self.clear_composer()
+        self._pending_turn_snapshot = None
         self._emit_session_reset()
 
     def set_selection_summary(
@@ -505,6 +560,7 @@ class ChatPanel(QWidgetBase):
         text = prompt if prompt is not None else self.composer_text.strip()
         if not text:
             raise ValueError("Prompt cannot be empty")
+        self._pending_turn_snapshot = self.capture_state()
         if record_history:
             self.append_user_message(text, self._composer_context.selection_summary)
         combined_metadata = self._composer_context.to_metadata()

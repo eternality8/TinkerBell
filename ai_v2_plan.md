@@ -125,6 +125,47 @@ With observability, diff safety, and UI affordances in place, Phase 2 can concen
 - **Cost blowup from subagents:** enforce a hard per-run token cap and surface warnings in telemetry.
 - **Complexity creep:** keep subagent feature flagged until earlier phases prove stable.
 
+## Phase 5 – Chunk-first editing & concordance automation (planned)
+**Goal:** Ship the remaining large-document deliverables from `improvement_ideas.md`: windowed snapshots, dedicated chunk tooling, streaming diff safety, prompt guardrails, character/storyline orchestration, and the preflight analysis layer that guides tool selection.
+
+### Work items
+1. **Chunk-aware `DocumentSnapshot` (Idea #1)**
+   - Extend `DocumentBridge.generate_snapshot` and `DocumentSnapshotTool` with `window`, `max_tokens`, `include_text`, and `delta_only` options.
+   - Return selection-scoped text plus chunk descriptors (offsets, hashes) so the agent knows what portion it holds.
+   - Update prompt contracts (`prompts.py`, controller metadata) so slim snapshots become the default while keeping full snapshots available via opt-in flag.
+2. **`DocumentChunkTool` + hashed segment cache (Idea #2)**
+   - Maintain a rolling chunk index (structure-aware boundaries, overlap, lineage metadata) per document version.
+   - Implement a chunk-fetch tool that serves single slices or iterator handles under 2K tokens, backed by a cache in `AIController` to reuse recent pulls.
+   - Surface chunk profiles (code/notes/prose presets) in settings and telemetry for observability.
+3. **Streaming diff builder for mega-edits (Idea #7)**
+   - Introduce range-based diff helpers that operate on chunk streams instead of the entire buffer to cut memory usage.
+   - Allow `DocumentApplyPatchTool` to accept multiple disjoint ranges, merging them server-side before applying patches.
+   - Add regression tests that edit large fixtures without duplicating the full document in memory.
+4. **Prompt + telemetry guardrails for selective reads (Idea #8)**
+   - Refresh system prompts to instruct agents to start with delta-only snapshots, then chunk/outline fetches.
+   - Emit telemetry warnings when a tool payload exceeds thresholds and surface UI hints nudging chunk-based retries.
+   - Document the new usage guidelines in README + docs so users understand the slimmer default flows.
+5. **Character/entity concordance toolchain (Idea #10)**
+   - Finish the entity index pipeline with alias tracking, concordance browsing, and a `CharacterMapTool` returning chunk IDs + exemplar quotes.
+   - Pair with a `CharacterEditPlanner` helper (powered by the subagent sandbox) that iterates affected chunks and records completion state in `DocumentPlotStateStore`.
+6. **Storyline consistency orchestration (Idea #11)**
+   - Promote the plot state scaffolding into a `PlotStateMemory` module with beat/timeline graphs and dependency tracking.
+   - Add tools for fetching/updating plot beats (`PlotOutlineTool`, `PlotStateUpdateTool`) and enforce a loop in controller prompts: read plot state → edit chunk → update state.
+7. **Preflight analysis & tool recommendations (Idea #12)**
+   - Build an `AnalysisAgent` or rule-based analyzer under `ai/analysis` that inspects doc metadata and suggests tool plans (chunk profile, retrieval/concordance usage, caution flags).
+   - Inject analyzer output into the system prompt metadata and expose it via UI so users see why certain tools were chosen.
+   - Provide a `ToolUsageAdvisorTool` so the main agent can re-evaluate mid-run when document conditions shift.
+
+### Validation
+- Expand pytest coverage for the new snapshot/chunk APIs, streaming diff builder, concordance + plot-state tools, and analysis layer integration points (`tests/test_ai_tools.py`, `test_agent.py`, `test_document_chunk_tool.py`, `test_plot_state.py`, etc.).
+- Add large-fixture regression scripts that measure token savings vs. full snapshots (`benchmarks/measure_chunk_latency.py`) and publish results alongside existing benchmark docs.
+- Run guardrail/prompt smoke tests to ensure the agent prefers chunked flows and respects analyzer recommendations before promoting the feature flag.
+
+### Risks & mitigations
+- **Chunk boundary accuracy:** invest in semantic boundary detection and allow requesters to expand/overlap chunks; provide quick fallback to byte-based slicing if structure heuristics fail.
+- **Entity/plot extraction noise:** gate concordance + storyline tooling behind validation telemetry, surface confidence scores, and allow manual overrides or refreshes from the UI.
+- **Analyzer overhead:** cap preflight cost via caching per document version and allow users to disable the layer if latency is critical, while still logging recommendations for diagnostics.
+
 ## Cross-cutting deliverables
 - **Docs:** Update `README.md` and add `docs/ai_v2.md` walkthrough after each major phase.
 - **Benchmarks:** Maintain a `benchmarks/large_doc_report.md` showing token usage, latency, and success criteria over time.

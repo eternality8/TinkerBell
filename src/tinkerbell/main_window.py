@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING, cast
 
-from .chat.chat_panel import ChatPanel
+from .chat.chat_panel import ChatPanel, ChatTurnSnapshot
 from .chat.commands import (
     ActionType,
     DIRECTIVE_SCHEMA,
@@ -27,6 +27,7 @@ from .chat.commands import (
 )
 from .chat.message_model import ChatMessage, EditDirective, ToolTrace
 from .editor.document_model import DocumentMetadata, DocumentState, SelectionRange
+from .editor.editor_widget import DiffOverlayState
 from .editor.workspace import DocumentTab
 from .editor.tabbed_editor import TabbedEditorWidget
 from .services import telemetry as telemetry_service
@@ -196,6 +197,52 @@ class _PendingToolTrace:
     tool_call_id: str | None = None
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+@dataclass(slots=True)
+class EditSummary:
+    """Tracks a single edit applied during an AI turn."""
+
+    directive: EditDirective
+    diff: str
+    spans: tuple[tuple[int, int], ...]
+    range_hint: tuple[int, int]
+    created_at: datetime = field(default_factory=_utcnow)
+
+
+@dataclass(slots=True)
+class PendingReviewSession:
+    """Per-tab session data for a pending AI turn review."""
+
+    tab_id: str
+    document_id: str
+    document_snapshot: DocumentState
+    previous_overlay: DiffOverlayState | None = None
+    applied_edits: list[EditSummary] = field(default_factory=list)
+    merged_spans: tuple[tuple[int, int], ...] = ()
+    last_overlay_label: str | None = None
+    orphaned: bool = False
+    latest_version_signature: str | None = None
+
+
+@dataclass(slots=True)
+class PendingTurnReview:
+    """Envelope capturing chat + document state for an AI turn."""
+
+    turn_id: str
+    prompt: str
+    prompt_metadata: dict[str, Any]
+    chat_snapshot: ChatTurnSnapshot
+    created_at: datetime = field(default_factory=_utcnow)
+    tab_sessions: dict[str, PendingReviewSession] = field(default_factory=dict)
+    total_edit_count: int = 0
+    total_tabs_affected: int = 0
+    ready_for_review: bool = False
+    completed: bool = False
+
+
 @dataclass(slots=True)
 class OutlineStatusInfo:
     """Tracks outline freshness/latency metadata per document."""
@@ -349,6 +396,10 @@ class MainWindow(QMainWindow):
         self._current_document_path: Optional[Path] = None
         self._ai_task: asyncio.Task[Any] | None = None
         self._ai_stream_active = False
+        self._pending_turn_review: PendingTurnReview | None = None
+        self._pending_reviews_by_tab: dict[str, PendingReviewSession] = {}
+        self._turn_sequence = 0
+        self._pending_turn_snapshot: ChatTurnSnapshot | None = None
         self._pending_tool_traces: Dict[str, _PendingToolTrace] = {}
         self._tool_trace_index: Dict[str, ToolTrace] = {}
         self._last_compaction_stats: dict[str, int] | None = None
@@ -368,6 +419,8 @@ class MainWindow(QMainWindow):
         self._restoring_workspace = False
         self._tabs_with_overlay: set[str] = set()
         self._last_autosave_at: datetime | None = None
+        self._last_review_summary: str | None = None
+        self._suppress_cancel_abort = False
         self._outline_worker: OutlineBuilderWorker | None = None
         self._outline_tool: DocumentOutlineTool | None = None
         self._find_sections_tool: DocumentFindSectionsTool | None = None
@@ -659,6 +712,20 @@ class MainWindow(QMainWindow):
                 status_tip="Capture the latest editor snapshot for the AI agent",
                 callback=self._handle_snapshot_requested,
             ),
+            "ai_accept_changes": self._build_action(
+                name="ai_accept_changes",
+                text="Accept AI Changes",
+                shortcut="Ctrl+Shift+Enter",
+                status_tip="Accept all pending AI edits across tabs",
+                callback=self._handle_accept_ai_changes,
+            ),
+            "ai_reject_changes": self._build_action(
+                name="ai_reject_changes",
+                text="Reject AI Changes",
+                shortcut="Ctrl+Shift+Backspace",
+                status_tip="Reject the pending AI turn and restore prior state",
+                callback=self._handle_reject_ai_changes,
+            ),
             "settings_open": self._build_action(
                 name="settings_open",
                 text="Preferences…",
@@ -678,7 +745,11 @@ class MainWindow(QMainWindow):
                 actions=("file_new_tab", "file_open", "file_import", "file_save", "file_save_as", "file_close_tab", "file_revert"),
             ),
             "settings": MenuSpec(name="settings", title="&Settings", actions=("settings_open",)),
-            "ai": MenuSpec(name="ai", title="&AI", actions=("ai_snapshot",)),
+            "ai": MenuSpec(
+                name="ai",
+                title="&AI",
+                actions=("ai_snapshot", "ai_accept_changes", "ai_reject_changes"),
+            ),
         }
 
     def _create_toolbars(self) -> Dict[str, ToolbarSpec]:
@@ -1263,6 +1334,185 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # AI coordination
     # ------------------------------------------------------------------
+    def _drop_pending_turn_review(self, *, reason: str | None = None) -> None:
+        if self._pending_turn_review is None:
+            return
+        turn_id = self._pending_turn_review.turn_id
+        self._pending_turn_review = None
+        self._pending_reviews_by_tab = {}
+        self._clear_review_controls()
+        if reason:
+            _LOGGER.debug("Dropped pending turn review turn_id=%s reason=%s", turn_id, reason)
+        else:
+            _LOGGER.debug("Dropped pending turn review turn_id=%s", turn_id)
+
+    def _restore_composer_prompt(self, turn: PendingTurnReview) -> None:
+        snapshot = turn.chat_snapshot
+        composer_text = turn.prompt
+        composer_context = None
+        if snapshot is not None:
+            composer_text = snapshot.composer_text or composer_text
+            composer_context = snapshot.composer_context
+        context_copy = deepcopy(composer_context) if composer_context is not None else None
+        try:
+            self._chat_panel.set_composer_text(composer_text or "", context=context_copy)
+        except Exception:
+            _LOGGER.debug("Unable to restore composer prompt", exc_info=True)
+
+    def _clear_pending_review_overlays(self, turn: PendingTurnReview) -> None:
+        for session in turn.tab_sessions.values():
+            tab_id = session.tab_id
+            if not tab_id:
+                continue
+            try:
+                self._workspace.get_tab(tab_id)
+            except KeyError:
+                continue
+            self._clear_diff_overlay(tab_id=tab_id)
+
+    def _mark_pending_session_orphaned(self, tab_id: str, *, reason: str) -> None:
+        if not tab_id:
+            return
+        session = self._pending_reviews_by_tab.get(tab_id)
+        if session is None:
+            return
+        if session.orphaned:
+            return
+        session.orphaned = True
+        _LOGGER.debug("Marked tab %s orphaned during pending review (%s)", tab_id, reason)
+
+    def _abort_pending_review(
+        self,
+        *,
+        reason: str,
+        status: str | None = None,
+        notice: str | None = None,
+        restore_composer: bool = False,
+        clear_overlays: bool = False,
+    ) -> None:
+        turn = self._pending_turn_review
+        if turn is None:
+            return
+        if clear_overlays:
+            self._clear_pending_review_overlays(turn)
+        if restore_composer:
+            self._restore_composer_prompt(turn)
+        self._drop_pending_turn_review(reason=reason)
+        if status:
+            self.update_status(status)
+        if notice:
+            self._post_assistant_notice(notice)
+
+    def _auto_accept_pending_review(self, *, reason: str = "new-turn") -> None:
+        if not self._pending_turn_review:
+            return
+        _LOGGER.debug(
+            "Auto-accepting pending review turn_id=%s reason=%s",
+            self._pending_turn_review.turn_id,
+            reason,
+        )
+        self._drop_pending_turn_review(reason=reason)
+
+    def _begin_pending_turn_review(
+        self,
+        *,
+        prompt: str,
+        prompt_metadata: Mapping[str, Any] | None,
+        chat_snapshot: ChatTurnSnapshot,
+    ) -> PendingTurnReview:
+        self._turn_sequence += 1
+        turn_id = f"turn-{self._turn_sequence}"
+        metadata_copy: dict[str, Any] = {}
+        if prompt_metadata:
+            metadata_copy = dict(prompt_metadata)
+        envelope = PendingTurnReview(
+            turn_id=turn_id,
+            prompt=prompt,
+            prompt_metadata=metadata_copy,
+            chat_snapshot=chat_snapshot,
+        )
+        self._pending_turn_review = envelope
+        self._pending_reviews_by_tab = envelope.tab_sessions
+        self._clear_review_controls()
+        return envelope
+
+    def _ensure_pending_review_session(
+        self,
+        *,
+        tab_id: str,
+        document_snapshot: DocumentState,
+        tab: DocumentTab | None = None,
+    ) -> PendingReviewSession | None:
+        turn = self._pending_turn_review
+        if turn is None:
+            return None
+        session = self._pending_reviews_by_tab.get(tab_id)
+        if session is not None:
+            return session
+        actual_tab = tab
+        if actual_tab is None:
+            try:
+                actual_tab = self._workspace.get_tab(tab_id)
+            except KeyError:
+                _LOGGER.debug("Unable to create review session; tab %s missing", tab_id)
+                return None
+        snapshot_copy = deepcopy(document_snapshot)
+        existing_overlay = actual_tab.editor.diff_overlay
+        prior_overlay = deepcopy(existing_overlay) if existing_overlay is not None else None
+        session = PendingReviewSession(
+            tab_id=tab_id,
+            document_id=document_snapshot.document_id,
+            document_snapshot=snapshot_copy,
+            previous_overlay=prior_overlay,
+        )
+        self._pending_reviews_by_tab[tab_id] = session
+        turn.total_tabs_affected = len(self._pending_reviews_by_tab)
+        return session
+
+    def _finalize_pending_turn_review(self, *, success: bool) -> None:
+        turn = self._pending_turn_review
+        if turn is None:
+            return
+        turn.completed = True
+        if not success:
+            self._drop_pending_turn_review(reason="turn-failed")
+            return
+        if turn.total_edit_count <= 0:
+            self._drop_pending_turn_review(reason="no-edits")
+            return
+        turn.ready_for_review = True
+        self._show_review_controls()
+
+    def _format_review_summary(self, turn: PendingTurnReview) -> str:
+        edits = max(int(turn.total_edit_count), 0)
+        tabs = max(int(turn.total_tabs_affected), 1)
+        edit_label = "edit" if edits == 1 else "edits"
+        tab_label = "tab" if tabs == 1 else "tabs"
+        return f"{edits} {edit_label} across {tabs} {tab_label}"
+
+    def _show_review_controls(self) -> None:
+        turn = self._pending_turn_review
+        if turn is None or not turn.ready_for_review:
+            self._clear_review_controls()
+            return
+        summary = self._format_review_summary(turn)
+        self._last_review_summary = summary
+        try:
+            self._status_bar.set_review_state(
+                summary,
+                accept_callback=self._handle_accept_ai_changes,
+                reject_callback=self._handle_reject_ai_changes,
+            )
+        except Exception:
+            _LOGGER.debug("Unable to display review controls", exc_info=True)
+
+    def _clear_review_controls(self) -> None:
+        self._last_review_summary = None
+        try:
+            self._status_bar.clear_review_state()
+        except Exception:
+            pass
+
     def _handle_chat_request(self, prompt: str, metadata: dict[str, Any]) -> None:
         try:
             manual_request = parse_manual_command(prompt)
@@ -1274,6 +1524,11 @@ class MainWindow(QMainWindow):
             self._handle_manual_command(manual_request)
             return
 
+        snapshot = self._chat_panel.consume_turn_snapshot()
+        if snapshot is None:
+            snapshot = self._chat_panel.capture_state()
+        self._pending_turn_snapshot = snapshot
+
         controller = self._context.ai_controller
         if controller is None:
             self._post_assistant_notice(
@@ -1283,8 +1538,19 @@ class MainWindow(QMainWindow):
             self._chat_panel.set_ai_running(False)
             return
 
+        self._auto_accept_pending_review(reason="new-turn")
+        self._begin_pending_turn_review(
+            prompt=prompt,
+            prompt_metadata=metadata,
+            chat_snapshot=snapshot,
+        )
+
         if self._ai_task and not self._ai_task.done():
-            self._cancel_active_ai_turn()
+            self._suppress_cancel_abort = True
+            try:
+                self._cancel_active_ai_turn()
+            finally:
+                self._suppress_cancel_abort = False
             self.update_status("Previous AI request canceled")
 
         snapshot = self._bridge.generate_snapshot()
@@ -1660,6 +1926,7 @@ class MainWindow(QMainWindow):
                 on_event=self._handle_ai_stream_event,
             )
         except Exception as exc:  # pragma: no cover - runtime safety
+            self._finalize_pending_turn_review(success=False)
             self._handle_ai_failure(exc)
             return
 
@@ -1673,6 +1940,7 @@ class MainWindow(QMainWindow):
         self._finalize_ai_response(response_text)
         self._update_context_usage_status()
         self.update_status("AI response ready")
+        self._finalize_pending_turn_review(success=True)
 
     async def _handle_ai_stream_event(self, event: "AIStreamEvent") -> None:
         self._process_stream_event(event)
@@ -2115,8 +2383,13 @@ class MainWindow(QMainWindow):
         _LOGGER.error("AI request failed: %s", exc)
         self._ai_stream_active = False
         self._post_assistant_notice(f"AI request failed: {exc}")
-        self.update_status("AI error")
+        self.update_status("AI error – pending edits discarded")
         self._chat_panel.set_ai_running(False)
+        self._abort_pending_review(
+            reason="ai-failure",
+            restore_composer=True,
+            clear_overlays=True,
+        )
 
     def _post_assistant_notice(self, message: str) -> None:
         message = message.strip()
@@ -2153,6 +2426,14 @@ class MainWindow(QMainWindow):
         self._ai_task = None
         self._ai_stream_active = False
         self._chat_panel.set_ai_running(False)
+        if self._suppress_cancel_abort:
+            return
+        self._abort_pending_review(
+            reason="ai-canceled",
+            status="Canceled AI request; pending edits discarded",
+            restore_composer=True,
+            clear_overlays=True,
+        )
 
     def _handle_chat_session_reset(self) -> None:
         self._cancel_active_ai_turn()
@@ -2334,9 +2615,54 @@ class MainWindow(QMainWindow):
             output_summary=diff,
             metadata=metadata,
         )
+        spans = self._coerce_overlay_spans(metadata.get("spans"), fallback_range=range_hint)
+        diff_preview = metadata.get("diff_preview")
+        overlay_label = str(diff_preview or trace.output_summary or trace.name)
+        tab_id = self._find_tab_id_for_document(_state)
+        tab: DocumentTab | None = None
+        if tab_id:
+            try:
+                tab = self._workspace.get_tab(tab_id)
+            except KeyError:
+                tab = None
+        current_document = tab.document() if tab is not None else None
+
+        turn = self._pending_turn_review
+        if turn is not None and tab_id:
+            session = self._ensure_pending_review_session(
+                tab_id=tab_id,
+                document_snapshot=_state,
+                tab=tab,
+            )
+            if session is not None:
+                edit_summary = EditSummary(
+                    directive=directive,
+                    diff=diff,
+                    spans=spans,
+                    range_hint=range_hint,
+                )
+                session.applied_edits.append(edit_summary)
+                turn.total_edit_count += 1
+                if spans:
+                    session.merged_spans = (
+                        self._merge_overlay_spans(session.merged_spans, spans)
+                        if session.merged_spans
+                        else spans
+                    )
+                session.last_overlay_label = overlay_label
+                if current_document is not None:
+                    session.latest_version_signature = current_document.version_signature()
+
         self._chat_panel.show_tool_trace(trace)
-        self._apply_diff_overlay(trace, document=_state, range_hint=range_hint)
-        self._update_autosave_indicator(document=_state)
+        self._apply_diff_overlay(
+            trace,
+            document=_state,
+            range_hint=range_hint,
+            tab_id=tab_id,
+            spans_override=spans,
+            label_override=overlay_label,
+        )
+        self._update_autosave_indicator(document=current_document or _state)
 
     def _handle_edit_failure(self, directive: EditDirective, message: str) -> None:
         action = (directive.action or "").strip().lower()
@@ -2347,25 +2673,37 @@ class MainWindow(QMainWindow):
         else:
             self.update_status(f"Edit failed: {message or 'Unknown error'}")
 
-    def _apply_diff_overlay(self, trace: ToolTrace, *, document: DocumentState, range_hint: tuple[int, int]) -> None:
-        tab_id = self._find_tab_id_for_document(document)
-        if not tab_id:
+    def _apply_diff_overlay(
+        self,
+        trace: ToolTrace,
+        *,
+        document: DocumentState,
+        range_hint: tuple[int, int],
+        tab_id: str | None = None,
+        spans_override: tuple[tuple[int, int], ...] | None = None,
+        label_override: str | None = None,
+    ) -> None:
+        target_id = tab_id or self._find_tab_id_for_document(document)
+        if not target_id:
             return
         metadata = trace.metadata if isinstance(trace.metadata, Mapping) else {}
-        spans = self._coerce_overlay_spans(metadata.get("spans"), fallback_range=range_hint)
+        spans = spans_override if spans_override is not None else self._coerce_overlay_spans(
+            metadata.get("spans"),
+            fallback_range=range_hint,
+        )
         diff_payload = metadata.get("diff_preview") if isinstance(metadata, Mapping) else None
-        label = str(diff_payload or trace.output_summary or trace.name)
+        label = label_override or str(diff_payload or trace.output_summary or trace.name)
         try:
             self._editor.show_diff_overlay(
                 label,
                 spans=spans,
                 summary=trace.output_summary,
                 source=trace.name,
-                tab_id=tab_id,
+                tab_id=target_id,
             )
         except Exception:  # pragma: no cover - defensive guard
             return
-        self._tabs_with_overlay.add(tab_id)
+        self._tabs_with_overlay.add(target_id)
 
     def _coerce_overlay_spans(
         self,
@@ -2395,6 +2733,24 @@ class MainWindow(QMainWindow):
             spans.append((start, end))
         return tuple(spans)
 
+    def _merge_overlay_spans(
+        self,
+        existing: tuple[tuple[int, int], ...],
+        new_spans: tuple[tuple[int, int], ...],
+    ) -> tuple[tuple[int, int], ...]:
+        if not existing:
+            return new_spans
+        if not new_spans:
+            return existing
+        ordered = sorted(existing + new_spans, key=lambda span: span[0])
+        merged: list[list[int]] = []
+        for start, end in ordered:
+            if not merged or start > merged[-1][1]:
+                merged.append([start, end])
+                continue
+            merged[-1][1] = max(merged[-1][1], end)
+        return tuple((start, end) for start, end in merged)
+
     def _maybe_clear_diff_overlay(self, state: DocumentState) -> None:
         tab_id = self._find_tab_id_for_document(state)
         if not tab_id or tab_id not in self._tabs_with_overlay:
@@ -2407,6 +2763,13 @@ class MainWindow(QMainWindow):
         change_source = getattr(tab.editor, "last_change_source", "")
         if change_source != "user":
             return
+        if self._pending_turn_review is not None:
+            self._abort_pending_review(
+                reason="manual-edit",
+                status="AI edits discarded after manual edit",
+                notice="Pending AI edits were cleared because you modified the document.",
+                clear_overlays=True,
+            )
         self._clear_diff_overlay(tab_id=tab_id)
 
     def _clear_diff_overlay(self, *, tab_id: str | None = None) -> None:
@@ -2479,6 +2842,8 @@ class MainWindow(QMainWindow):
         self._refresh_chat_suggestions(state=document)
         self._update_autosave_indicator(document=document)
         self._sync_settings_workspace_state()
+        if self._pending_turn_review and self._pending_turn_review.ready_for_review:
+            self._show_review_controls()
 
     def _refresh_chat_suggestions(
         self,
@@ -2568,6 +2933,142 @@ class MainWindow(QMainWindow):
         _LOGGER.debug("Snapshot refreshed: chars=%s", len(snapshot.get("text", "")))
         self.update_status("Snapshot refreshed")
 
+    def _handle_accept_ai_changes(self) -> None:
+        turn = self._pending_turn_review
+        if turn is None:
+            self.update_status("No AI edits pending review")
+            return
+        if not turn.ready_for_review:
+            self.update_status("AI turn still running – review not ready")
+            return
+
+        skipped_tabs: list[str] = []
+        for session in list(turn.tab_sessions.values()):
+            tab_id = session.tab_id
+            if not tab_id:
+                continue
+            if session.orphaned:
+                skipped_tabs.append(tab_id)
+                continue
+            try:
+                self._workspace.get_tab(tab_id)
+            except KeyError:
+                session.orphaned = True
+                skipped_tabs.append(tab_id)
+                continue
+            self._clear_diff_overlay(tab_id=tab_id)
+
+        if skipped_tabs:
+            _LOGGER.debug(
+                "Skipped clearing overlays for %s tab(s) during accept: %s",
+                len(skipped_tabs),
+                ", ".join(skipped_tabs),
+            )
+
+        summary = self._format_review_summary(turn)
+        notice = f"Accepted {summary}"
+        if skipped_tabs:
+            suffix = "tab" if len(skipped_tabs) == 1 else "tabs"
+            notice = f"{notice} (skipped {len(skipped_tabs)} closed {suffix})"
+        self._drop_pending_turn_review(reason="accepted")
+        self.update_status(notice)
+        self._post_assistant_notice(notice)
+
+    def _handle_reject_ai_changes(self) -> None:
+        turn = self._pending_turn_review
+        if not turn or not turn.ready_for_review:
+            self.update_status("No AI edits pending review")
+            return
+        sessions = list(turn.tab_sessions.values())
+        if not sessions:
+            self.update_status("No AI edits pending review")
+            self._drop_pending_turn_review(reason="empty-review")
+            return
+
+        skipped_tabs: list[str] = []
+        blocked_tabs: list[str] = []
+        tabs_to_restore: list[tuple[DocumentTab, PendingReviewSession]] = []
+        for session in sessions:
+            if session.orphaned:
+                skipped_tabs.append(session.tab_id)
+                continue
+            try:
+                tab = self._workspace.get_tab(session.tab_id)
+            except KeyError:
+                session.orphaned = True
+                skipped_tabs.append(session.tab_id)
+                continue
+
+            document = tab.document()
+            display_name = tab.title or session.tab_id
+            if document.document_id != session.document_id:
+                blocked_tabs.append(f"{display_name} now points to a different document")
+                continue
+            if session.latest_version_signature:
+                current_signature = document.version_signature()
+                if current_signature != session.latest_version_signature:
+                    blocked_tabs.append(f"{display_name} changed since the AI turn finished")
+                    continue
+            tabs_to_restore.append((tab, session))
+
+        if blocked_tabs:
+            detail = "; ".join(blocked_tabs)
+            self._post_assistant_notice(
+                "Reject canceled because some tabs changed after the AI edits: " + detail
+            )
+            self.update_status("Reject canceled; documents changed after AI edits")
+            return
+
+        for tab, session in tabs_to_restore:
+            snapshot_copy = deepcopy(session.document_snapshot)
+            tab.editor.load_document(snapshot_copy)
+            tab.update_title()
+            self._tabs_with_overlay.discard(tab.id)
+            prior_overlay = session.previous_overlay
+            if prior_overlay is not None:
+                try:
+                    tab.editor.show_diff_overlay(
+                        prior_overlay.diff,
+                        spans=prior_overlay.spans,
+                        summary=prior_overlay.summary,
+                        source=prior_overlay.source,
+                    )
+                    self._tabs_with_overlay.add(tab.id)
+                except Exception:
+                    _LOGGER.debug("Unable to restore previous overlay for tab %s", tab.id, exc_info=True)
+            document = tab.document()
+            if self._workspace.active_tab_id == tab.id:
+                self._refresh_window_title(document)
+            self._update_autosave_indicator(document=document)
+            try:
+                tab.bridge.generate_snapshot(delta_only=True)
+            except Exception:
+                _LOGGER.debug("Unable to refresh bridge snapshot for tab %s", tab.id, exc_info=True)
+
+        if skipped_tabs:
+            _LOGGER.debug(
+                "Skipped rolling back %s tab(s) during reject: %s",
+                len(skipped_tabs),
+                ", ".join(skipped_tabs),
+            )
+
+        snapshot = turn.chat_snapshot
+        if snapshot is not None:
+            try:
+                self._chat_panel.restore_state(snapshot)
+            except Exception:
+                _LOGGER.debug("Unable to restore chat snapshot during reject", exc_info=True)
+
+        self._sync_settings_workspace_state()
+        summary = self._format_review_summary(turn)
+        notice = f"Rejected {summary}"
+        if skipped_tabs:
+            suffix = "tab" if len(skipped_tabs) == 1 else "tabs"
+            notice = f"{notice} (skipped {len(skipped_tabs)} closed {suffix})"
+        self._drop_pending_turn_review(reason="rejected")
+        self.update_status(notice)
+        self._post_assistant_notice(notice)
+
     def _handle_open_requested(self) -> None:
         """Prompt the user for a document path and load it into the editor."""
 
@@ -2622,6 +3123,7 @@ class MainWindow(QMainWindow):
             self.update_status("No tab to close")
             return
         closed = self._editor.close_active_tab()
+        self._mark_pending_session_orphaned(closed.id, reason="tab-closed")
         document = closed.document()
         self._clear_unsaved_snapshot(path=document.metadata.path, tab_id=closed.id)
         self._tabs_with_overlay.discard(closed.id)
@@ -3035,7 +3537,13 @@ class MainWindow(QMainWindow):
         self._restoring_workspace = True
         self._tabs_with_overlay.clear()
         try:
+            self._abort_pending_review(
+                reason="workspace-restore",
+                status="AI edits discarded while restoring workspace",
+                clear_overlays=True,
+            )
             for tab_id in list(self._workspace.tab_ids()):
+                self._mark_pending_session_orphaned(tab_id, reason="workspace-restore")
                 try:
                     self._editor.close_tab(tab_id)
                 except KeyError:  # pragma: no cover - defensive guard

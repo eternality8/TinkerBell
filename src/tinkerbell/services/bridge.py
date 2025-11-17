@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from copy import deepcopy
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Mapping, Optional, Protocol, Sequence, TypeVar
@@ -222,6 +223,7 @@ class DocumentBridge:
 
     def _apply_edit(self, queued: _QueuedEdit) -> None:
         document_before = self.editor.to_document()
+        pre_edit_snapshot = deepcopy(document_before)
         if queued.context_version and not self._is_version_current(document_before, queued.context_version):
             message = "Directive is stale relative to the current document state"
             if queued.directive.action == ActionType.PATCH.value:
@@ -259,7 +261,7 @@ class DocumentBridge:
             queued.directive.target_range,
             self._last_diff,
         )
-        self._notify_listeners(queued.directive, updated_state)
+        self._notify_listeners(queued.directive, pre_edit_snapshot)
         self._publish_document_changed(
             version,
             spans=(queued.directive.target_range,),
@@ -293,6 +295,7 @@ class DocumentBridge:
             raise RuntimeError("Patch directive missing diff payload")
 
         start_time = time.perf_counter()
+        pre_edit_snapshot = deepcopy(document_before)
         try:
             patch_result = apply_unified_diff(document_before.text, diff_text)
         except PatchApplyError as exc:
@@ -320,7 +323,7 @@ class DocumentBridge:
         self._patch_metrics.record_success(elapsed)
 
         _LOGGER.debug("Applied patch directive diff=%s spans=%s", patch_result.summary, patch_result.spans)
-        self._notify_listeners(queued.directive, updated_state)
+        self._notify_listeners(queued.directive, pre_edit_snapshot)
         self._publish_document_changed(
             version,
             spans=patch_result.spans,

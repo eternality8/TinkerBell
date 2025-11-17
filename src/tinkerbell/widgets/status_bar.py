@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 try:  # pragma: no cover - Qt imports are optional during tests
     from PySide6.QtWidgets import QApplication, QLabel, QStatusBar
+    from PySide6.QtWidgets import QHBoxLayout, QPushButton, QWidget
 except Exception:  # pragma: no cover - PySide6 not available
     QApplication = None  # type: ignore[assignment]
     QLabel = None  # type: ignore[assignment]
+    QWidget = None  # type: ignore[assignment]
+    QPushButton = None  # type: ignore[assignment]
+    QHBoxLayout = None  # type: ignore[assignment]
     QStatusBar = None  # type: ignore[assignment]
 
 
@@ -66,6 +70,117 @@ class ContextUsageWidget:
         return " · ".join(parts)
 
 
+class DiffReviewControls:
+    """Inline accept/reject controls rendered inside the status bar."""
+
+    def __init__(self) -> None:
+        self.summary_text: str = ""
+        self.accept_callback: Callable[[], None] | None = None
+        self.reject_callback: Callable[[], None] | None = None
+        self._status_bar: Any | None = None
+        self._container: Any | None = None
+        self._summary_label: Any | None = None
+        self._accept_button: Any | None = None
+        self._reject_button: Any | None = None
+        self._visible = False
+
+    def install(self, status_bar: Any | None) -> None:
+        self._status_bar = status_bar
+        if (
+            status_bar is None
+            or QWidget is None
+            or QLabel is None
+            or QPushButton is None
+            or QHBoxLayout is None
+        ):
+            return
+        if self._container is not None:
+            return
+        try:
+            container = QWidget(status_bar)
+            layout = QHBoxLayout(container)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(4)
+            summary_label = QLabel(self.summary_text or "")
+            summary_label.setObjectName("tb-status-review-summary")
+            summary_label.setContentsMargins(8, 0, 4, 0)
+            accept_button = QPushButton("Accept")
+            accept_button.setObjectName("tb-status-review-accept")
+            reject_button = QPushButton("Reject")
+            reject_button.setObjectName("tb-status-review-reject")
+            layout.addWidget(summary_label)
+            layout.addWidget(accept_button)
+            layout.addWidget(reject_button)
+            try:
+                accept_button.clicked.connect(self.trigger_accept)  # type: ignore[attr-defined]
+                reject_button.clicked.connect(self.trigger_reject)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            status_bar.addPermanentWidget(container)
+            container.setVisible(False)
+        except Exception:
+            return
+
+        self._container = container
+        self._summary_label = summary_label
+        self._accept_button = accept_button
+        self._reject_button = reject_button
+        self._update_summary_label()
+        self._set_visible(self._visible)
+
+    def set_state(
+        self,
+        summary: str | None,
+        *,
+        accept_callback: Callable[[], None] | None = None,
+        reject_callback: Callable[[], None] | None = None,
+    ) -> None:
+        normalized = (summary or "").strip()
+        self.summary_text = normalized
+        self.accept_callback = accept_callback
+        self.reject_callback = reject_callback
+        self._update_summary_label()
+        self._set_visible(bool(normalized))
+
+    def clear(self) -> None:
+        self.set_state(None)
+
+    def trigger_accept(self) -> None:
+        if self.accept_callback is not None:
+            try:
+                self.accept_callback()
+            except Exception:
+                pass
+
+    def trigger_reject(self) -> None:
+        if self.reject_callback is not None:
+            try:
+                self.reject_callback()
+            except Exception:
+                pass
+
+    def _update_summary_label(self) -> None:
+        if self._summary_label is None:
+            return
+        try:
+            self._summary_label.setText(self.summary_text)
+        except Exception:
+            pass
+
+    def _set_visible(self, visible: bool) -> None:
+        self._visible = visible
+        if self._container is None:
+            return
+        try:
+            self._container.setVisible(visible)
+        except Exception:
+            pass
+
+    @property
+    def visible(self) -> bool:
+        return self._visible
+
+
 class StatusBar:
     """Status bar that mirrors the plan.md contract yet stays test friendly."""
 
@@ -82,6 +197,7 @@ class StatusBar:
         self._outline_detail: str = ""
         self._embedding_status: str = ""
         self._embedding_detail: str = ""
+        self._review_controls = DiffReviewControls()
         self._subagent_status: str = ""
         self._subagent_detail: str = ""
         self._context_widget = ContextUsageWidget()
@@ -192,6 +308,24 @@ class StatusBar:
             except Exception:
                 pass
 
+    def set_review_state(
+        self,
+        summary: str | None,
+        *,
+        accept_callback: Callable[[], None] | None = None,
+        reject_callback: Callable[[], None] | None = None,
+    ) -> None:
+        """Show inline diff review summary and optional callbacks."""
+
+        self._review_controls.set_state(
+            summary,
+            accept_callback=accept_callback,
+            reject_callback=reject_callback,
+        )
+
+    def clear_review_state(self) -> None:
+        self._review_controls.clear()
+
     def widget(self) -> Any | None:
         """Return the underlying :class:`QStatusBar` when available."""
 
@@ -240,6 +374,14 @@ class StatusBar:
     def subagent_state(self) -> tuple[str, str]:
         return (self._subagent_status, self._subagent_detail)
 
+    @property
+    def review_summary(self) -> str:
+        return self._review_controls.summary_text
+
+    @property
+    def review_controls_visible(self) -> bool:
+        return self._review_controls.visible
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -277,6 +419,7 @@ class StatusBar:
             except Exception:
                 break
 
+        self._review_controls.install(self._qt_bar)
         self._context_widget.install(self._qt_bar)
 
     def _update_label(self, label: Any, text: str) -> None:
@@ -311,6 +454,12 @@ class StatusBar:
             return str(getattr(state, "value", state.name))
         return str(state).strip() or "Idle"
 
+    def trigger_accept_review(self) -> None:
+        self._review_controls.trigger_accept()
+
+    def trigger_reject_review(self) -> None:
+        self._review_controls.trigger_reject()
+
     def _handle_qt_message_changed(self, text: str) -> None:
         self._message = text
         if not text:
@@ -338,5 +487,5 @@ class StatusBar:
         return bar
 
 
-__all__ = ["StatusBar", "ContextUsageWidget"]
+__all__ = ["StatusBar", "ContextUsageWidget", "DiffReviewControls"]
 
