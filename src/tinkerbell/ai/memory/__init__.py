@@ -23,6 +23,8 @@ from .embeddings import (
 	LocalEmbeddingProvider,
 	OpenAIEmbeddingProvider,
 )
+from .plot_state import DocumentPlotState, DocumentPlotStateStore, PlotArc, PlotBeat, PlotEntity
+from .result_cache import SubagentResultCache
 
 __all__ = [
 	"ConversationMemory",
@@ -30,6 +32,12 @@ __all__ = [
 	"MemoryStore",
 	"OutlineCacheStore",
 	"OutlineNode",
+	"DocumentPlotState",
+	"DocumentPlotStateStore",
+	"PlotArc",
+	"PlotBeat",
+	"PlotEntity",
+	"SubagentResultCache",
 	"ChunkEmbeddingRecord",
 	"DocumentEmbeddingIndex",
 	"EmbeddingProvider",

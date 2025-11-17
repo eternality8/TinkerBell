@@ -331,6 +331,50 @@ def test_context_usage_status_includes_compaction_stats():
     assert "Compactions 2" in window._status_bar.memory_usage
 
 
+def test_subagent_indicator_off_when_feature_disabled() -> None:
+    window = _make_window(settings=Settings(enable_subagents=False))
+
+    status, detail = window._status_bar.subagent_state
+    assert status == "Off"
+    assert "subagents" in detail.lower()
+
+
+def test_subagent_indicator_updates_from_telemetry_events() -> None:
+    window = _make_window(settings=Settings(enable_subagents=True))
+
+    # Initial state should be idle with a helpful tooltip message
+    status, detail = window._status_bar.subagent_state
+    assert status == "Idle"
+    assert "telemetry" in detail.lower()
+
+    window._handle_subagent_telemetry(
+        {
+            "event": "subagent.job_started",
+            "job_id": "job-1",
+            "chunk_id": "chunk-xyz",
+            "token_estimate": 512,
+        }
+    )
+
+    status, detail = window._status_bar.subagent_state
+    assert status == "Running (1)"
+    assert "job-1" in detail
+
+    window._handle_subagent_telemetry(
+        {
+            "event": "subagent.job_completed",
+            "job_id": "job-1",
+            "chunk_id": "chunk-xyz",
+            "tokens_used": 128,
+            "latency_ms": 25,
+        }
+    )
+
+    status, detail = window._status_bar.subagent_state
+    assert status == "Idle"
+    assert "Done 1" in detail
+
+
 def test_suggestion_cache_invalidated_when_history_changes():
     controller = _StubAIController()
     controller.suggestion_responses.append(["Idea A"])

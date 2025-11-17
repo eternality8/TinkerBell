@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, cast
+from typing import Any, Dict, Iterable, List, Mapping, cast
 
 from .models import ColorTuple, Theme
 

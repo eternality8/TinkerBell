@@ -57,16 +57,19 @@ Current agent flows rely on `DocumentSnapshotTool` returning the entire buffer p
 - **Key touches:** `prompts.py`, new controller telemetry hook, and UI messaging so users understand why the assistant may request multiple chunk pulls instead of one monolithic snapshot.
 
 ### 9. Manager + subagents for long-form tasks
+**Status:** ✅ Delivered in Phase 4 (flagged for opt-in). `AIController` now coordinates scoped helper jobs via `SubagentManager`, caches summaries with `SubagentResultCache`, and emits `subagent.turn_summary` telemetry plus trace-compacted scouting reports.
 - **Problem:** Even with chunk-aware tools, a single agent still has to ingest every chunk sequentially, and the conversation history accumulates summaries plus raw snippets, bloating the context window on multi-chapter documents.
 - **Proposal:** Introduce a coordination pattern where the main agent delegates work to short-lived "subagents"—each subagent receives a specific chunk (via `DocumentChunkTool`), performs a focused task (summarize, extract entities, validate), and returns a compact report. The manager agent then synthesizes these partial results, keeping only the compressed summaries in its context. Cache per-chunk outputs keyed by version hash so repeated prompts can reuse prior work.
 - **Key touches:** Extend `AIController` to spawn scoped worker instances (potentially with cheaper models) that have access only to chunk tools and validation. Define a `SubagentJobTool` contract for queueing chunk tasks and collecting results, store artifacts in `DocumentSummaryMemory`, and add safeguards so the manager re-runs subagents whenever a chunk's version hash changes.
 
 ### 10. Character/entity concordance toolchain
+**Status:** 🟡 Partial Phase 4 delivery. Plot scaffolding + `DocumentPlotStateTool` expose cached entities/metadata, but alias tracking, concordance browsing, and edit planners remain future work.
 - **Problem:** Creative-writing edits often target a specific character (e.g., "make Talia more sarcastic") which requires finding every chunk where the character appears and applying consistent tweaks. Manual regex search doesn’t capture aliases, pronouns, or indirect mentions.
 - **Proposal:** Build a `CharacterMapTool` that maintains an entity index per document: names, aliases, pronouns, first/last appearances, and exemplar quotes. When invoked, it returns chunk ids plus context snippets where the entity shows up. Pair it with a `CharacterEditPlanner` subagent that walks the list, proposes edits, and tracks which chunks have been updated to guarantee coverage.
 - **Key touches:** Extend the bridge/indexer to run a lightweight NER pipeline (spaCy or transformer-based) whenever the doc hash changes, storing results alongside chunk metadata. Add UI affordances to pick entities, and teach the agent prompt to call the concordance tool before making character-wide edits so it can apply diffs per chunk without rereading the entire manuscript.
 
 ### 11. Storyline consistency orchestration
+**Status:** 🟡 Foundations in place (Phase 4 plot state store + controller hints). Need dependency graphs and planner loops before calling this done.
 - **Problem:** When restructuring a long narrative, edits to chunk A (e.g., foreshadowing, character arc decisions) must ripple into later scenes. Without a stateful storyline model, the agent may produce contradictory changes across chunks.
 - **Proposal:** Introduce a `PlotStateMemory` that records beats, timelines, and dependencies extracted from each chunk. During a rewrite, the manager agent consults this state before editing the next chunk, ensuring new instructions respect previous changes. After each edit, the chunk-level subagent updates the plot state (e.g., "Chapter 4 now ends with cliffhanger"), and the manager uses those notes when planning the following chunk.
 - **Key touches:** New memory module (e.g., `memory/plot.py`) storing structured beat sheets, plus tools `PlotOutlineTool` and `PlotStateUpdateTool`. Update the prompt contract to require that storyline-wide tasks run in a loop: fetch plot state → edit chunk via chunk tool → apply patch → update plot state → repeat. Add guardrails so if the plot state indicates an unresolved dependency, the agent explicitly revisits affected chunks.
@@ -78,6 +81,6 @@ Current agent flows rely on `DocumentSnapshotTool` returning the entire buffer p
 
 ## Next steps
 1. Prototype the windowed snapshot + chunk tool (Ideas #1-2) since they deliver the biggest token savings and remain unsolved.
-2. Move into manager/subagent scaffolding and chunk result caching (Idea #9 + Phase 4 work items) once chunk tools are stable.
-3. Invest in entity/plot orchestration (Ideas #10-11) to keep long-form edits coherent now that outline/retrieval primitives exist.
-4. Explore the preflight analysis layer (Idea #12) to help the agent choose between the now-available outline, retrieval, and future chunk tools without wasting tokens.
+2. Build on the Phase 4 helper/plot-state bedrock by delivering full concordance + storyline orchestration (Ideas #10-11) and exposing that data in the UI.
+3. Explore the preflight analysis layer (Idea #12) to help the agent choose between outline, retrieval, plot-state, and upcoming chunk tools without wasting tokens.
+4. Once chunk tooling is live, iterate on helper orchestration (Idea #9 follow-ups) to stream chunk queues, reuse cached subagent results, and graduate the feature from flag-only to GA.

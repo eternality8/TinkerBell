@@ -81,6 +81,7 @@ def tool_use_instructions() -> str:
         "- DocumentApplyPatch: send `target_range` + replacement text for single-span rewrites; it composes the diff + DocumentEdit for you.\n"
         "- DocumentEdit: prefer `action=\"patch\"` referencing the latest snapshot version; fall back to targeted inserts/replaces sparingly.\n"
         "- SearchReplace & Validation: use them to stage scoped regex replacements and lint JSON/YAML/Markdown before committing patches.\n"
+        "- DocumentPlotStateTool: when the controller hints that plot scaffolding refreshed (or when continuity risks arise), call it to read cached character/entity + arc summaries before drafting edits; treat the payload as read-only context.\n"
         "- When the controller inserts pointer summaries (e.g., `[pointer:abc123 kind=text]`), follow the rehydrate instructions by re-running the same tool with a narrower scope to recover the full payload before proceeding.\n"
         "- Tool loop exit: only stop when diffs are applied or you've provided a rationale for deferring the edit."
     )

@@ -30,6 +30,7 @@ from .editor.document_model import DocumentMetadata, DocumentState, SelectionRan
 from .editor.workspace import DocumentTab
 from .editor.tabbed_editor import TabbedEditorWidget
 from .services import telemetry as telemetry_service
+from .ai.ai_types import SubagentRuntimeConfig
 from .ai.memory import EmbeddingProvider, DocumentEmbeddingIndex, LangChainEmbeddingProvider, OpenAIEmbeddingProvider
 from .ai.memory.buffers import DocumentSummaryMemory
 from .ai.services import OutlineBuilderWorker
@@ -44,14 +45,16 @@ from .ai.tools.document_edit import DocumentEditTool
 from .ai.tools.document_apply_patch import DocumentApplyPatchTool
 from .ai.tools.document_find_sections import DocumentFindSectionsTool
 from .ai.tools.document_outline import DocumentOutlineTool
+from .ai.tools.document_plot_state import DocumentPlotStateTool
 from .ai.tools.list_tabs import ListTabsTool
 from .ai.tools.search_replace import SearchReplaceTool
 from .ai.tools.validation import validate_snippet
-from .theme import Theme, load_theme, theme_manager
+from .theme import load_theme, theme_manager
 
 if TYPE_CHECKING:  # pragma: no cover - import only for static analysis
     from .ai.agents.executor import AIController
     from .ai.client import AIStreamEvent
+    from .ai.memory.plot_state import DocumentPlotStateStore
     from .widgets.dialogs import SettingsDialogResult
 
 QApplication: Any
@@ -321,6 +324,7 @@ class MainWindow(QMainWindow):
         self._context = context
         initial_settings = context.settings
         self._phase3_outline_enabled = bool(getattr(initial_settings, "phase3_outline_tools", False))
+        self._plot_scaffolding_enabled = bool(getattr(initial_settings, "enable_plot_scaffolding", False))
         show_tool_panel = bool(getattr(initial_settings, "show_tool_activity_panel", False))
         self._editor = TabbedEditorWidget()
         self._workspace = self._editor.workspace
@@ -330,6 +334,11 @@ class MainWindow(QMainWindow):
         self._editor.add_tab_created_listener(self._bridge.track_tab)
         self._workspace.add_active_listener(self._handle_active_tab_changed)
         self._status_bar = StatusBar()
+        self._subagent_enabled = bool(getattr(initial_settings, "enable_subagents", False))
+        self._subagent_active_jobs: set[str] = set()
+        self._subagent_job_totals: dict[str, int] = {"completed": 0, "failed": 0, "skipped": 0}
+        self._subagent_last_event: str = ""
+        self._subagent_telemetry_registered = False
         self._splitter: Any = None
         self._actions: Dict[str, WindowAction] = {}
         self._menus: Dict[str, MenuSpec] = {}
@@ -362,6 +371,7 @@ class MainWindow(QMainWindow):
         self._outline_worker: OutlineBuilderWorker | None = None
         self._outline_tool: DocumentOutlineTool | None = None
         self._find_sections_tool: DocumentFindSectionsTool | None = None
+        self._plot_state_tool: DocumentPlotStateTool | None = None
         self._embedding_index: DocumentEmbeddingIndex | None = None
         self._embedding_state = EmbeddingRuntimeState()
         self._embedding_signature: tuple[Any, ...] | None = None
@@ -369,6 +379,8 @@ class MainWindow(QMainWindow):
         self._embedding_resource: Any | None = None
         self._last_outline_status: tuple[str, str] | None = None
         self._initialize_ui()
+        self._register_subagent_listeners()
+        self._update_subagent_indicator()
         if initial_settings is not None:
             self._apply_theme_setting(initial_settings)
         self._refresh_embedding_runtime(initial_settings)
@@ -812,6 +824,7 @@ class MainWindow(QMainWindow):
             )
 
             self._register_phase3_ai_tools(register_fn=register)
+            self._register_plot_state_tool(register_fn=register)
 
             edit_tool = DocumentEditTool(bridge=self._bridge, patch_only=True)
             register(
@@ -991,6 +1004,8 @@ class MainWindow(QMainWindow):
             if self._phase3_outline_enabled:
                 registered.insert(1, "document_outline")
                 registered.insert(2, "document_find_sections")
+            if self._plot_scaffolding_enabled:
+                registered.append("document_plot_state")
             _LOGGER.debug("Default AI tools registered: %s", ", ".join(registered))
         except Exception as exc:  # pragma: no cover - defensive logging
             _LOGGER.warning("Failed to register default AI tools: %s", exc)
@@ -1101,6 +1116,96 @@ class MainWindow(QMainWindow):
                 unregister(name)
             except Exception:  # pragma: no cover - defensive
                 _LOGGER.debug("Failed to unregister tool %s", name, exc_info=True)
+
+    def _register_plot_state_tool(self, *, register_fn: Callable[..., Any] | None = None) -> None:
+        if not self._plot_scaffolding_enabled:
+            return
+        controller = self._context.ai_controller
+        if controller is None:
+            return
+        register = register_fn or getattr(controller, "register_tool", None)
+        if not callable(register):
+            _LOGGER.debug("AI controller does not expose register_tool; skipping plot-state wiring.")
+            return
+
+        tool = self._ensure_plot_state_tool()
+        if tool is None:
+            return
+
+        try:
+            register(
+                "document_plot_state",
+                tool,
+                description=(
+                    "Return cached character/entity scaffolding and plot arcs extracted from recent subagent runs."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "document_id": {
+                            "type": "string",
+                            "description": "Optional explicit target; defaults to the active document.",
+                        },
+                        "include_entities": {
+                            "type": "boolean",
+                            "description": "When false, omit entity payloads to conserve tokens.",
+                        },
+                        "include_arcs": {
+                            "type": "boolean",
+                            "description": "When false, omit plot arc beats from the response.",
+                        },
+                        "max_entities": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 50,
+                            "description": "Limit the number of entities returned before budgeting.",
+                        },
+                        "max_beats": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 50,
+                            "description": "Limit the number of beats returned per arc before budgeting.",
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            _LOGGER.warning("Failed to register DocumentPlotStateTool: %s", exc)
+
+    def _unregister_plot_state_tool(self) -> None:
+        controller = self._context.ai_controller
+        if controller is None:
+            return
+        unregister = getattr(controller, "unregister_tool", None)
+        if not callable(unregister):
+            return
+        try:
+            unregister("document_plot_state")
+        except Exception:  # pragma: no cover - defensive
+            _LOGGER.debug("Failed to unregister document_plot_state", exc_info=True)
+
+    def _ensure_plot_state_tool(self) -> DocumentPlotStateTool | None:
+        if self._plot_state_tool is not None:
+            return self._plot_state_tool
+        try:
+            tool = DocumentPlotStateTool(
+                plot_state_resolver=self._resolve_plot_state_store,
+                active_document_provider=self._safe_active_document,
+                feature_enabled=lambda: self._plot_scaffolding_enabled,
+            )
+        except Exception:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to initialize DocumentPlotStateTool", exc_info=True)
+            return None
+        self._plot_state_tool = tool
+        return tool
+
+    def _resolve_plot_state_store(self) -> DocumentPlotStateStore | None:
+        controller = self._context.ai_controller
+        if controller is None:
+            return None
+        return getattr(controller, "plot_state_store", None)
+
     def _ensure_outline_tool(self) -> DocumentOutlineTool | None:
         if not self._phase3_outline_enabled:
             return None
@@ -1689,6 +1794,161 @@ class MainWindow(QMainWindow):
             totals=dashboard.totals_text,
             last_tool=dashboard.summary.last_tool,
         )
+
+    def _register_subagent_listeners(self) -> None:
+        if self._subagent_telemetry_registered:
+            return
+        for event_name in (
+            "subagent.job_started",
+            "subagent.job_completed",
+            "subagent.job_failed",
+            "subagent.job_skipped",
+        ):
+            telemetry_service.register_event_listener(event_name, self._handle_subagent_telemetry)
+        self._subagent_telemetry_registered = True
+
+    def _handle_subagent_telemetry(self, payload: Mapping[str, Any] | None) -> None:
+        if not isinstance(payload, Mapping):
+            return
+        event_name = str(payload.get("event") or "")
+        if not event_name.startswith("subagent."):
+            return
+        handler_map = {
+            "subagent.job_started": self._record_subagent_job_started,
+            "subagent.job_completed": self._record_subagent_job_completed,
+            "subagent.job_failed": self._record_subagent_job_failed,
+            "subagent.job_skipped": self._record_subagent_job_skipped,
+        }
+        handler = handler_map.get(event_name)
+        if handler is None:
+            return
+        handler(payload)
+        self._update_subagent_indicator()
+
+    def _record_subagent_job_started(self, payload: Mapping[str, Any]) -> None:
+        job_id = self._coerce_subagent_job_id(payload)
+        if job_id:
+            self._subagent_active_jobs.add(job_id)
+        chunk_id = payload.get("chunk_id") or payload.get("document_id")
+        estimate = payload.get("token_estimate") or payload.get("prompt_tokens")
+        bits = []
+        if chunk_id:
+            bits.append(f"chunk {chunk_id}")
+        if estimate:
+            bits.append(f"~{estimate:,} tokens")
+        self._subagent_last_event = self._format_subagent_event_detail("Job started", job_id, bits)
+
+    def _record_subagent_job_completed(self, payload: Mapping[str, Any]) -> None:
+        job_id = self._coerce_subagent_job_id(payload)
+        if job_id:
+            self._subagent_active_jobs.discard(job_id)
+        self._increment_subagent_total("completed")
+        chunk_id = payload.get("chunk_id") or payload.get("document_id")
+        latency = payload.get("latency_ms")
+        tokens = payload.get("tokens_used")
+        bits = []
+        if chunk_id:
+            bits.append(f"chunk {chunk_id}")
+        if latency is not None:
+            bits.append(f"{float(latency):.0f} ms")
+        if tokens is not None:
+            bits.append(f"{int(tokens):,} tokens")
+        self._subagent_last_event = self._format_subagent_event_detail("Job completed", job_id, bits)
+
+    def _record_subagent_job_failed(self, payload: Mapping[str, Any]) -> None:
+        job_id = self._coerce_subagent_job_id(payload)
+        if job_id:
+            self._subagent_active_jobs.discard(job_id)
+        self._increment_subagent_total("failed")
+        reason = str(payload.get("error") or payload.get("details") or "Failed")
+        chunk_id = payload.get("chunk_id") or payload.get("document_id")
+        bits = [reason[:160]]
+        if chunk_id:
+            bits.insert(0, f"chunk {chunk_id}")
+        self._subagent_last_event = self._format_subagent_event_detail("Job failed", job_id, bits)
+
+    def _record_subagent_job_skipped(self, payload: Mapping[str, Any]) -> None:
+        job_id = self._coerce_subagent_job_id(payload)
+        if job_id:
+            self._subagent_active_jobs.discard(job_id)
+        self._increment_subagent_total("skipped")
+        reason = str(payload.get("reason") or payload.get("details") or "Skipped")
+        chunk_id = payload.get("chunk_id") or payload.get("document_id")
+        bits = [reason[:160]]
+        if chunk_id:
+            bits.insert(0, f"chunk {chunk_id}")
+        self._subagent_last_event = self._format_subagent_event_detail("Job skipped", job_id, bits)
+
+    def _increment_subagent_total(self, key: str) -> None:
+        current = self._subagent_job_totals.get(key, 0)
+        self._subagent_job_totals[key] = current + 1
+
+    def _coerce_subagent_job_id(self, payload: Mapping[str, Any]) -> str:
+        job_id = payload.get("job_id") or payload.get("subagent_job_id") or payload.get("id")
+        if not job_id:
+            return ""
+        return str(job_id)
+
+    def _format_subagent_event_detail(
+        self,
+        prefix: str,
+        job_id: str | None,
+        segments: Iterable[str] | None = None,
+    ) -> str:
+        bits: list[str] = [prefix]
+        if job_id:
+            bits.append(f"#{job_id}")
+        if segments:
+            for segment in segments:
+                if segment is None:
+                    continue
+                text = str(segment).strip()
+                if text:
+                    bits.append(text)
+        return " – ".join(bits)
+
+    def _format_subagent_totals(self) -> str:
+        labels = {
+            "completed": "Done",
+            "failed": "Failed",
+            "skipped": "Skipped",
+        }
+        parts = []
+        for key, label in labels.items():
+            count = int(self._subagent_job_totals.get(key, 0))
+            if count:
+                parts.append(f"{label} {count}")
+        return " · ".join(parts)
+
+    def _update_subagent_indicator(self) -> None:
+        status_bar = getattr(self, "_status_bar", None)
+        if status_bar is None:
+            return
+        enabled = bool(self._subagent_enabled)
+        if not enabled:
+            detail = "Enable Phase 4 subagents in Settings to capture chunk-level scouts."
+            try:
+                status_bar.set_subagent_status("Off", detail=detail)
+            except Exception:
+                pass
+            return
+
+        active_jobs = len(self._subagent_active_jobs)
+        status = f"Running ({active_jobs})" if active_jobs else "Idle"
+        detail_parts: list[str] = []
+        if active_jobs:
+            detail_parts.append(f"{active_jobs} active job{'s' if active_jobs != 1 else ''}")
+        totals_text = self._format_subagent_totals()
+        if totals_text:
+            detail_parts.append(totals_text)
+        event_text = (self._subagent_last_event or "").strip()
+        if event_text:
+            detail_parts.append(event_text)
+        detail = " · ".join(detail_parts) or "No subagent telemetry yet."
+        try:
+            status_bar.set_subagent_status(status, detail=detail)
+        except Exception:
+            pass
 
     def _update_autosave_indicator(
         self,
@@ -3423,6 +3683,7 @@ class MainWindow(QMainWindow):
     def _apply_runtime_settings(self, settings: Settings) -> None:
         self._apply_chat_panel_settings(settings)
         self._apply_phase3_outline_setting(settings)
+        self._apply_plot_scaffolding_setting(settings)
         self._apply_debug_logging_setting(settings)
         self._apply_theme_setting(settings)
         self._refresh_embedding_runtime(settings)
@@ -3449,6 +3710,17 @@ class MainWindow(QMainWindow):
         if self._status_bar is not None:
             self._status_bar.set_outline_status("")
         self._unregister_phase3_ai_tools()
+
+    def _apply_plot_scaffolding_setting(self, settings: Settings) -> None:
+        enabled = bool(getattr(settings, "enable_plot_scaffolding", False))
+        if enabled == self._plot_scaffolding_enabled:
+            return
+        self._plot_scaffolding_enabled = enabled
+        if enabled:
+            self._register_plot_state_tool()
+            return
+        self._unregister_plot_state_tool()
+        self._plot_state_tool = None
 
     def _apply_chat_panel_settings(self, settings: Settings) -> None:
         visible = bool(getattr(settings, "show_tool_activity_panel", False))
@@ -3534,6 +3806,13 @@ class MainWindow(QMainWindow):
             response_token_reserve=reserve,
         )
 
+    def _build_subagent_runtime_config(self, settings: Settings) -> SubagentRuntimeConfig:
+        enabled = bool(getattr(settings, "enable_subagents", False))
+        return SubagentRuntimeConfig(
+            enabled=enabled,
+            plot_scaffolding_enabled=bool(getattr(settings, "enable_plot_scaffolding", False)),
+        )
+
     @staticmethod
     def _resolve_max_tool_iterations(settings: Settings | None) -> int:
         raw = getattr(settings, "max_tool_iterations", 8) if settings else 8
@@ -3550,6 +3829,16 @@ class MainWindow(QMainWindow):
             self._debug_logging_enabled = new_debug
         self._update_ai_debug_logging(new_debug)
 
+    def _apply_subagent_runtime_config(self, controller: Any, settings: Settings) -> None:
+        configurator = getattr(controller, "configure_subagents", None)
+        if not callable(configurator):
+            return
+        config = self._build_subagent_runtime_config(settings)
+        try:
+            configurator(config)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to update subagent runtime config: %s", exc)
+
     def _apply_theme_setting(self, settings: Settings) -> None:
         requested_name = (getattr(settings, "theme", "") or "default").strip() or "default"
         normalized_request = requested_name.lower()
@@ -3565,6 +3854,11 @@ class MainWindow(QMainWindow):
         theme_manager.apply_to_application(theme)
 
     def _refresh_ai_runtime(self, settings: Settings) -> None:
+        new_subagent_flag = bool(getattr(settings, "enable_subagents", False))
+        self._subagent_enabled = new_subagent_flag
+        if not new_subagent_flag:
+            self._subagent_active_jobs.clear()
+        self._update_subagent_indicator()
         if not self._ai_settings_ready(settings):
             self._disable_ai_controller()
             return
@@ -3591,6 +3885,7 @@ class MainWindow(QMainWindow):
             self._apply_max_tool_iterations(controller, iteration_limit)
             self._apply_context_window_settings(controller, settings)
             self._apply_context_policy_settings(controller, settings)
+            self._apply_subagent_runtime_config(controller, settings)
 
         self._update_ai_debug_logging(bool(getattr(settings, "debug_logging", False)))
 
@@ -3660,6 +3955,7 @@ class MainWindow(QMainWindow):
                 max_context_tokens=getattr(settings, "max_context_tokens", 128_000),
                 response_token_reserve=getattr(settings, "response_token_reserve", 16_000),
                 budget_policy=policy,
+                subagent_config=self._build_subagent_runtime_config(settings),
             )
         except Exception as exc:
             _LOGGER.warning("Failed to initialize AI controller: %s", exc)

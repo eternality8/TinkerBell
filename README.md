@@ -25,6 +25,8 @@ TinkerBell pairs a PySide6 editor with a full LangChain/LangGraph tool stack so 
 - **Deterministic token budgets** – A shared `TokenCounterRegistry` normalizes counts per model, falls back to a byte-length estimator when `tiktoken` is unavailable, and ships with `scripts/inspect_tokens.py` for quick sanity checks.
 - **Context budget policy + trace compactor** – Budget checks now run (and enforce) by default, compacting oversized tool payloads into pointer summaries while keeping the original trace available for auditing. Settings still expose dry-run/override switches when you need to experiment.
 - **Phase 3 outline + retrieval** – Guardrail-aware `DocumentOutlineTool` and `DocumentFindSectionsTool` stream structured digests, surface pending/unsupported/huge-document hints, and fall back to offline heuristics while the controller injects "Guardrail hint" messages the agent must obey.
+- **Subagent sandbox toggle + telemetry** – Phase 4 selection scouts remain opt-in via the settings dialog, CLI flags, or `TINKERBELL_ENABLE_SUBAGENTS`, and the status bar now surfaces a "Subagents" indicator with live job counts and the latest telemetry event.
+- **Plot scaffolding memory (experimental)** – Optional character/entity + plot arc scaffolding ingests subagent summaries into a guarded store and exposes it through `DocumentPlotStateTool` so the controller can nudge agents toward continuity-aware edits when the flag is enabled.
 - **Turn-level telemetry** – The status bar and debug settings can stream per-turn prompt/tool budgets via `ContextUsageEvent` objects so regressions are visible before shipping.
 - **Versioned document bus** – Every snapshot now includes `{document_id, version_id, content_hash}` and `DocumentCacheBus` broadcasts `DocumentChanged`/`DocumentClosed` events so downstream caches can stay coherent.
 - **Markdown-first editor** – `EditorWidget` wraps `QPlainTextEdit`/`QsciScintilla` with headless fallbacks, Markdown preview, undo/redo, selection tracking, and theme hooks.
@@ -133,6 +135,16 @@ If embeddings are disabled or initialization fails, the outline worker keeps run
 - Use the curated fixtures under `test_data/phase3/` to validate each guardrail quickly. For example, `stacked_outline_demo.md` is perfect for pointer hydration loops, `guardrail_scenarios.md` documents huge/pending/offline playbooks, and `firmware_dump.bin` triggers the unsupported-format path instantly.
 - Full troubleshooting steps (including a matrix that maps tool statuses to actions) live in `docs/ai_v2.md` under “Phase 3 – Outline & Retrieval Quickstart.”
 
+### Phase 4 – Plot scaffolding quickstart
+
+- **Flip the flag** – Toggle **Settings → Experimental → Plot scaffolding** to instantiate the in-memory `DocumentPlotStateStore`. One-off sessions can pass `--enable-plot-scaffolding` (or `--disable-plot-scaffolding`) to the launcher, and automation can export `TINKERBELL_ENABLE_PLOT_SCAFFOLDING=1` to force the feature on without mutating `settings.json`.
+- **Ingestion path** – Each time a Phase 4 subagent job succeeds, its 200-ish token summary flows into the plot store where lightweight heuristics capture recurring character names plus a primary arc beat list (24 entities/24 beats per arc max). The store is ephemeral: closing a document or receiving a cache-bus invalidation clears the corresponding entry immediately.
+- **Tooling** – When enabled, `DocumentPlotStateTool` appears in the registry (non-summarizable) so LangGraph agents can request `{status:"ok", entities:[…], arcs:[…]}` payloads for the active or explicit `document_id`. The controller also emits a short system hint (“Plot scaffolding refreshed…”) after fresh ingests so prompts know when a call will succeed.
+- **Graceful fallbacks** – If subagents are disabled, no summaries have landed, or the target document has been cleared, the tool returns diagnostic statuses (`plot_state_disabled`, `plot_state_unavailable`, or `no_plot_state`) and the system hints stop until new data exists. Treat the responses as advisory context only; authors still approve every edit.
+- **Telemetry & release notes** – Phase 4.4 tracks helper cache hits and TraceCompactor entries, adds the new `subagent.turn_summary` telemetry event, and ships repeatable latency data (`benchmarks/subagent_latency.md`). See `docs/ai_v2_release_notes.md` for the full change log plus rollout guidance; the flags remain opt-in by default until those metrics stay green in production.
+
+See `docs/operations/subagents.md` for operator-focused instructions that cover runtime expectations, telemetry, and troubleshooting tips for both toggles.
+
 ## Configuring AI access
 
 You can supply OpenAI-compatible credentials in three interchangeable ways:
@@ -145,6 +157,8 @@ You can supply OpenAI-compatible credentials in three interchangeable ways:
 	 - `TINKERBELL_THEME` / `TINKERBELL_ORGANIZATION`
 	 - `TINKERBELL_DEBUG_LOGGING` (set to `1`/`true` to force verbose logging and prompt dumps)
 	 - `TINKERBELL_REQUEST_TIMEOUT` (seconds before an AI request fails; defaults to `90`)
+	 - `TINKERBELL_ENABLE_SUBAGENTS` (set to `1`/`true` to opt into the Phase 4 subagent sandbox for the current session)
+	 - `TINKERBELL_ENABLE_PLOT_SCAFFOLDING` (set to `1`/`true` to expose the experimental character/plot memory tool for the current session)
 3. **Programmatic injection** – Instantiate `Settings` or `ClientSettings` yourself if you embed TinkerBell in a larger Python workflow.
 4. **CLI overrides** – Pass `--set key=value` flags to the launcher to override persisted settings for a single session:
 
@@ -153,6 +167,8 @@ uv run tinkerbell --set base_url=https://proxy.example.com --set max_tool_iterat
 ```
 
 Add `--settings-path` when you want to point at a custom `settings.json` file.
+
+Use `--enable-subagents` / `--disable-subagents` and `--enable-plot-scaffolding` / `--disable-plot-scaffolding` (or their respective `TINKERBELL_ENABLE_SUBAGENTS` / `TINKERBELL_ENABLE_PLOT_SCAFFOLDING` env vars) to toggle the experimental Phase 4 features without editing the persisted settings; the status bar immediately reflects the active state.
 
 Precedence is deterministic: **environment variables override CLI flags, which in turn override the values saved via the UI**. This matches the debugging workflow where you might hardcode safe defaults, tweak them per-session with CLI overrides, and fall back to environment variables for quick emergency switches (e.g., rotating API keys).
 
@@ -191,6 +207,7 @@ Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat m
 | `SearchReplaceTool` | `tinkerbell.ai.tools.search_replace` | Provides regex/literal transforms with capped replacements, diff previews, and optional dry-run summaries before edits are enqueued.
 | `ValidationTool` | `tinkerbell.ai.tools.validation` | Checks YAML/JSON snippets via `ruamel.yaml`/`jsonschema`, lint-stubs Markdown for heading/fence issues, and exposes hooks for custom validators.
 | `ListTabsTool` | `tinkerbell.ai.tools.list_tabs` | Enumerates open tabs (`tab_id`, title, path, dirty flag) so agents can target any document without stealing focus.
+| `DocumentPlotStateTool` *(flagged)* | `tinkerbell.ai.tools.document_plot_state` | Returns cached character/entity rosters plus plot arc beats assembled from recent subagent summaries; available only when plot scaffolding is enabled.
 | `Memory Buffers` | `tinkerbell.ai.memory.buffers` | Maintains conversation + document summaries so prompts stay concise without losing context.
 
 You can register custom tools at runtime via `AIController.register_tool`, and the LangGraph plan automatically picks them up.
@@ -204,6 +221,7 @@ You can register custom tools at runtime via `AIController.register_tool`, and t
 - **`search_replace`** — parameters include `pattern`, `replacement`, `is_regex`, `scope` (`document` or `selection`), `dry_run`, `max_replacements` (defaults to a guarded cap), `match_case`, and `whole_word`. Each call reports replacement counts, whether the cap was hit, and a unified diff preview; with `dry_run=True`, no edit occurs and only previews/diff metadata are returned.
 - **`validate_snippet`** — requires `text` and `fmt` (`yaml`, `yml`, `json`, `markdown`, or `md`) and responds with a `ValidationOutcome` describing the first issue plus a count of remaining problems. JSON calls optionally accept a schema, Markdown checks flag heading jumps/unclosed fences, and you can register additional formats at runtime via `tinkerbell.ai.tools.validation.register_snippet_validator`.
 - **`list_tabs`** — no parameters; returns `{tabs: [...], active_tab_id, total}` so the agent can map natural-language references ("roadmap tab") to actual `tab_id` values before issuing snapshot/edit requests.
+- **`document_plot_state`** *(experimental)* — accepts optional `document_id`, `include_entities`, `include_arcs`, `max_entities`, and `max_beats` arguments. Returns `status="ok"` with cached entities/arcs when plot scaffolding is enabled and the active document has ingested subagent summaries; otherwise surfaces diagnostic statuses (`plot_state_disabled`, `plot_state_unavailable`, `no_plot_state`).
 
 ## Phase 0 instrumentation & observability
 

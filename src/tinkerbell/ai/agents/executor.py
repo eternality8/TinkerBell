@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import logging
@@ -17,8 +18,17 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, Mapping, MutableMap
 from openai.types.chat import ChatCompletionToolParam
 
 from .. import prompts
-from ..ai_types import AgentConfig
+from ..ai_types import (
+    AgentConfig,
+    ChunkReference,
+    SubagentBudget,
+    SubagentJob,
+    SubagentJobState,
+    SubagentRuntimeConfig,
+)
 from ..client import AIClient, AIStreamEvent
+from ..memory.plot_state import DocumentPlotStateStore
+from ..memory.result_cache import SubagentResultCache
 from ..services import ToolPayload, build_pointer, summarize_tool_content, telemetry as telemetry_service
 from ..services.trace_compactor import TraceCompactor
 from ...chat.message_model import ToolPointerMessage
@@ -30,6 +40,7 @@ from ..services.telemetry import (
     default_telemetry_path,
 )
 from .graph import build_agent_graph
+from .subagents import SubagentManager
 
 LOGGER = logging.getLogger(__name__)
 _PROMPT_HEADROOM = 4_096
@@ -137,6 +148,7 @@ class AIController:
     telemetry_sink: TelemetrySink | None = None
     agent_config: AgentConfig | None = None
     budget_policy: ContextBudgetPolicy | None = None
+    subagent_config: SubagentRuntimeConfig = field(default_factory=SubagentRuntimeConfig)
     _graph: Dict[str, Any] = field(init=False, repr=False)
     _active_task: asyncio.Task[dict] | None = field(default=None, init=False, repr=False)
     _task_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
@@ -144,6 +156,9 @@ class AIController:
     _last_budget_decision: BudgetDecision | None = field(default=None, init=False, repr=False)
     _trace_compactor: TraceCompactor | None = field(default=None, init=False, repr=False)
     _outline_digest_cache: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _subagent_manager: SubagentManager | None = field(default=None, init=False, repr=False)
+    _subagent_cache: SubagentResultCache | None = field(default=None, init=False, repr=False)
+    _plot_state_store: DocumentPlotStateStore | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.tools:
@@ -165,6 +180,7 @@ class AIController:
         )
         self._configure_telemetry_sink()
         self.configure_budget_policy(self.budget_policy)
+        self.configure_subagents(self.subagent_config)
         self._trace_compactor = TraceCompactor(
             pointer_builder=self._build_tool_pointer,
             estimate_message_tokens=self._estimate_message_tokens,
@@ -175,6 +191,12 @@ class AIController:
         """Return the current compiled graph representation."""
 
         return dict(self._graph)
+
+    @property
+    def plot_state_store(self) -> DocumentPlotStateStore | None:
+        """Return the active plot/entity memory store (when enabled)."""
+
+        return self._plot_state_store
 
     def register_tool(
         self,
@@ -244,6 +266,42 @@ class AIController:
                 max_context_tokens=self.max_context_tokens,
             )
         self.budget_policy = policy
+        if self._subagent_manager is not None:
+            self._subagent_manager.update_budget_policy(policy)
+
+    def configure_subagents(self, config: SubagentRuntimeConfig | None) -> None:
+        """Enable or disable the subagent sandbox at runtime."""
+
+        runtime = (config or SubagentRuntimeConfig()).clamp()
+        self.subagent_config = runtime
+        if not runtime.enabled:
+            self._subagent_manager = None
+            return
+
+        if self._subagent_cache is None:
+            self._subagent_cache = SubagentResultCache()
+
+        if self._subagent_manager is None:
+            self._subagent_manager = SubagentManager(
+                self.client,
+                tool_resolver=self._tool_registry_snapshot,
+                config=runtime,
+                budget_policy=self.budget_policy,
+                result_cache=self._subagent_cache,
+            )
+        else:
+            self._subagent_manager.update_client(self.client)
+            self._subagent_manager.update_config(runtime)
+            self._subagent_manager.update_budget_policy(self.budget_policy)
+            self._subagent_manager.update_cache(self._subagent_cache)
+
+        self._ensure_plot_state_store(runtime)
+
+    def _ensure_plot_state_store(self, runtime: SubagentRuntimeConfig) -> None:
+        if not runtime.plot_scaffolding_enabled:
+            return
+        if self._plot_state_store is None:
+            self._plot_state_store = DocumentPlotStateStore()
 
     def unregister_tool(self, name: str) -> None:
         """Remove a tool and rebuild the agent graph."""
@@ -257,6 +315,8 @@ class AIController:
         """Swap the underlying AI client (e.g., when settings change)."""
 
         self.client = client
+        if self._subagent_manager is not None:
+            self._subagent_manager.update_client(client)
 
     async def run_chat(
         self,
@@ -315,6 +375,42 @@ class AIController:
                 conversation_length=len(base_messages),
                 response_reserve=completion_budget,
             )
+            subagent_jobs: list[SubagentJob] = []
+            subagent_messages: list[dict[str, str]] = []
+            if self._subagent_manager is not None and self.subagent_config.enabled:
+                try:
+                    subagent_jobs, subagent_messages = await self._run_subagent_pipeline(
+                        prompt=prompt,
+                        snapshot=snapshot,
+                        turn_context=turn_metrics,
+                    )
+                except Exception:  # pragma: no cover - defensive guard
+                    LOGGER.debug("Subagent pipeline failed; continuing without helper context", exc_info=True)
+                    subagent_jobs = []
+                    subagent_messages = []
+                job_pointer_ids = tuple(job.job_id for job in subagent_jobs if job.job_id)
+                document_id_hint = self._resolve_document_id(snapshot)
+                for message in subagent_messages:
+                    pending_tokens = self._estimate_message_tokens(message)
+                    decision = self._evaluate_budget(
+                        prompt_tokens=conversation_tokens,
+                        response_reserve=completion_budget,
+                        snapshot=snapshot,
+                        pending_tool_tokens=pending_tokens,
+                        suppress_telemetry=True,
+                    )
+                    if decision is not None and decision.verdict == "reject" and not decision.dry_run:
+                        LOGGER.debug("Skipping subagent summary due to budget limits")
+                        break
+                    conversation.append(message)
+                    conversation_tokens += pending_tokens
+                    turn_metrics["prompt_tokens"] += pending_tokens
+                    self._register_subagent_trace_entry(
+                        message,
+                        token_count=pending_tokens,
+                        job_ids=job_pointer_ids,
+                        document_id=document_id_hint,
+                    )
             while True:
                 turn_count += 1
                 turn = await self._invoke_model_turn(
@@ -425,6 +521,7 @@ class AIController:
                 "tool_calls": executed_tool_calls,
                 "graph": self.graph,
                 "trace_compaction": compaction_stats,
+                "subagent_jobs": [job.as_payload() for job in subagent_jobs],
             }
 
         async with self._task_lock:
@@ -1217,6 +1314,245 @@ class AIController:
         byte_length = len(text.encode("utf-8", errors="ignore"))
         return max(1, math.ceil(byte_length / 4))
 
+    async def _run_subagent_pipeline(
+        self,
+        *,
+        prompt: str,
+        snapshot: Mapping[str, Any],
+        turn_context: dict[str, Any],
+    ) -> tuple[list[SubagentJob], list[dict[str, str]]]:
+        manager = self._subagent_manager
+        if manager is None or not self.subagent_config.enabled:
+            return [], []
+
+        jobs = self._plan_subagent_jobs(prompt, snapshot, turn_context)
+        if not jobs:
+            return [], []
+
+        results = await manager.run_jobs(jobs)
+        summary_text = self._subagent_summary_message(results)
+        messages: list[dict[str, str]] = []
+        if summary_text:
+            messages.append({"role": "system", "content": summary_text})
+        plot_hint = self._maybe_update_plot_state(snapshot, results)
+        if plot_hint:
+            messages.append({"role": "system", "content": plot_hint})
+        turn_context["subagent_jobs"] = len(results)
+        return results, messages
+
+    def _plan_subagent_jobs(
+        self,
+        prompt: str,
+        snapshot: Mapping[str, Any],
+        turn_context: Mapping[str, Any],
+    ) -> list[SubagentJob]:
+        config = self.subagent_config
+        if not config.enabled:
+            return []
+        selection_span = self._selection_span(snapshot)
+        if selection_span is None:
+            return []
+        start, end = selection_span
+        span_length = end - start
+        if span_length <= 0 or span_length < config.selection_min_chars:
+            return []
+        text = snapshot.get("text")
+        if not isinstance(text, str) or not text:
+            return []
+        chunk_text = text[start:end]
+        preview = chunk_text[: config.chunk_preview_chars].strip()
+        if not preview:
+            return []
+
+        document_id = self._resolve_document_id(snapshot) or "document"
+        version = snapshot.get("version") or snapshot.get("document_version")
+        chunk_id = f"selection:{start}-{end}"
+        chunk_hash = self._hash_subagent_chunk(document_id, version, chunk_text)
+        token_estimate = self._estimate_text_tokens(chunk_text)
+        chunk_ref = ChunkReference(
+            document_id=document_id,
+            chunk_id=chunk_id,
+            version_id=str(version) if version else None,
+            pointer_id=f"selection:{document_id}:{chunk_id}",
+            char_range=(start, end),
+            token_estimate=token_estimate,
+            chunk_hash=chunk_hash,
+            preview=preview,
+        )
+        allowed_tools = tuple(tool for tool in config.allowed_tools if tool in self.tools)
+        budget = self._build_subagent_budget(token_estimate)
+        instructions = self._render_subagent_instructions(prompt, chunk_ref)
+        job = SubagentJob(
+            job_id=uuid.uuid4().hex,
+            parent_run_id=str(turn_context.get("run_id") or uuid.uuid4().hex),
+            instructions=instructions,
+            chunk_ref=chunk_ref,
+            allowed_tools=allowed_tools,
+            budget=budget,
+            dedup_hash=chunk_hash,
+        )
+        return [job]
+
+    @staticmethod
+    def _selection_span(snapshot: Mapping[str, Any]) -> tuple[int, int] | None:
+        selection = snapshot.get("selection")
+        start: int | None = None
+        end: int | None = None
+        if isinstance(selection, Mapping):
+            start = selection.get("start")  # type: ignore[assignment]
+            end = selection.get("end")  # type: ignore[assignment]
+        elif isinstance(selection, Sequence) and len(selection) >= 2:
+            try:
+                start = int(selection[0])  # type: ignore[arg-type]
+                end = int(selection[1])  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
+        if start is None or end is None:
+            return None
+        try:
+            start_idx = int(start)
+            end_idx = int(end)
+        except (TypeError, ValueError):
+            return None
+        if end_idx < start_idx:
+            start_idx, end_idx = end_idx, start_idx
+        text = snapshot.get("text")
+        if isinstance(text, str):
+            length = len(text)
+            start_idx = max(0, min(start_idx, length))
+            end_idx = max(start_idx, min(end_idx, length))
+        if end_idx == start_idx:
+            return None
+        return (start_idx, end_idx)
+
+    @staticmethod
+    def _hash_subagent_chunk(document_id: str, version: Any, chunk_text: str) -> str:
+        token = f"{document_id}:{version}:{chunk_text}".encode("utf-8", errors="ignore")
+        return hashlib.sha1(token).hexdigest()
+
+    def _build_subagent_budget(self, token_estimate: int) -> SubagentBudget:
+        prompt_cap = min(self.max_context_tokens // 2, max(512, token_estimate + 256))
+        reserve_slice = max(256, self.response_token_reserve // 4 if self.response_token_reserve else 256)
+        completion_cap = min(reserve_slice, self.response_token_reserve or reserve_slice)
+        budget = SubagentBudget(
+            max_prompt_tokens=prompt_cap,
+            max_completion_tokens=max(256, completion_cap),
+            max_runtime_seconds=45.0,
+            max_tool_iterations=0,
+        )
+        return budget.clamp()
+
+    def _render_subagent_instructions(self, prompt: str, chunk_ref: ChunkReference) -> str:
+        base_prompt = self.subagent_config.instructions_template.strip()
+        user_prompt = prompt.strip() or "(no additional user guidance provided)"
+        document_label = chunk_ref.document_id or "document"
+        return (
+            f"{base_prompt}\n\nUser prompt:\n{user_prompt}\n\n"
+            f"Focus on document '{document_label}' chunk {chunk_ref.chunk_id}. "
+            "Summaries must stay under 200 tokens and include:"
+            "\n1. Current intent\n2. Risks or continuity gaps\n3. Recommended follow-up tools."
+        )
+
+    def _subagent_summary_message(self, jobs: Sequence[SubagentJob]) -> str:
+        if not jobs:
+            return ""
+        lines: list[str] = []
+        for job in jobs:
+            if job.state != SubagentJobState.SUCCEEDED or job.result is None:
+                continue
+            summary = (job.result.summary or "").strip()
+            if not summary:
+                continue
+            label = job.chunk_ref.chunk_id or job.job_id
+            trimmed = summary if len(summary) <= 280 else f"{summary[:277].rstrip()}…"
+            lines.append(f"- {label}: {trimmed}")
+            if len(lines) >= 4:
+                break
+        if not lines:
+            if any(job.state == SubagentJobState.FAILED for job in jobs):
+                return "Subagent scouting report: helper job failed; rerun if deeper analysis is required."
+            return ""
+        header = "Subagent scouting report (chunk-level analysis):"
+        return "\n".join([header, *lines])
+
+    def _maybe_update_plot_state(
+        self,
+        snapshot: Mapping[str, Any],
+        jobs: Sequence[SubagentJob],
+    ) -> str | None:
+        if not jobs or not self.subagent_config.plot_scaffolding_enabled:
+            return None
+        store = self._plot_state_store
+        if store is None:
+            store = DocumentPlotStateStore()
+            self._plot_state_store = store
+
+        document_id = self._resolve_document_id(snapshot)
+        ingested = 0
+        for job in jobs:
+            if job.state != SubagentJobState.SUCCEEDED or job.result is None:
+                continue
+            summary = (job.result.summary or "").strip()
+            if not summary:
+                continue
+            chunk = job.chunk_ref
+            target_document_id = chunk.document_id or document_id
+            if not target_document_id:
+                continue
+            store.ingest_chunk_summary(
+                target_document_id,
+                summary,
+                version_id=chunk.version_id,
+                chunk_hash=chunk.chunk_hash,
+                pointer_id=chunk.pointer_id,
+                metadata={
+                    "source_job_id": job.job_id,
+                    "tokens_used": job.result.tokens_used,
+                    "latency_ms": job.result.latency_ms,
+                },
+            )
+            ingested += 1
+
+        if not ingested:
+            return None
+
+        doc_label = document_id or jobs[0].chunk_ref.document_id or "document"
+        return (
+            f"Plot scaffolding refreshed for '{doc_label}'. Call DocumentPlotStateTool when you need "
+            "character or arc continuity before editing."
+        )
+
+    def _register_subagent_trace_entry(
+        self,
+        message: MutableMapping[str, Any],
+        *,
+        token_count: int,
+        job_ids: Sequence[str],
+        document_id: str | None,
+    ) -> None:
+        compactor = self._trace_compactor
+        if compactor is None:
+            return
+        record_id = "subagent:" + (job_ids[0] if job_ids else uuid.uuid4().hex)
+        record: dict[str, Any] = {
+            "id": record_id,
+            "name": "subagent_scouting_report",
+            "pointer_kind": "subagent_summary",
+            "subagent_jobs": list(job_ids),
+            "document_id": document_id,
+            "summarizable": True,
+        }
+        entry = compactor.new_entry(
+            message,
+            record,
+            raw_content=str(message.get("content") or ""),
+            summarizable=True,
+        )
+        compactor.commit_entry(entry, current_tokens=token_count)
+
+    def _tool_registry_snapshot(self) -> Mapping[str, ToolRegistration]:
+        return dict(self.tools)
+
     def _build_metadata(
         self,
         snapshot: Mapping[str, Any],
@@ -1511,6 +1847,9 @@ class AIController:
         return compacted, updated_tokens
 
     def _build_tool_pointer(self, record: Mapping[str, Any], content_text: str) -> ToolPointerMessage:
+        pointer_kind = str(record.get("pointer_kind") or "")
+        if pointer_kind == "subagent_summary":
+            return self._build_subagent_pointer(record, content_text)
         tool_name = str(record.get("name") or "tool")
         arguments = record.get("resolved_arguments")
         if not isinstance(arguments, Mapping):
@@ -1528,6 +1867,30 @@ class AIController:
         instructions = self._pointer_rehydrate_instructions(tool_name, arguments)
         pointer = build_pointer(summary, tool_name=tool_name, rehydrate_instructions=instructions)
         pointer.metadata.setdefault("source", "context_budget")
+        return pointer
+
+    def _build_subagent_pointer(self, record: Mapping[str, Any], content_text: str) -> ToolPointerMessage:
+        job_ids = tuple(str(job_id) for job_id in record.get("subagent_jobs", ()) if job_id)
+        arguments: Mapping[str, Any] | None = {"job_ids": list(job_ids)} if job_ids else None
+        payload = ToolPayload(
+            name="SubagentScoutingReport",
+            content=content_text,
+            arguments=arguments,
+            metadata={"source": "subagent_summary"},
+        )
+        summary = summarize_tool_content(payload, budget_tokens=_POINTER_SUMMARY_TOKENS)
+        instructions = (
+            "Re-run the AI helper with Subagents enabled on the same document selection or call "
+            "DocumentPlotStateTool to rebuild the scouting report referenced by this pointer."
+        )
+        pointer = build_pointer(summary, tool_name="SubagentScoutingReport", rehydrate_instructions=instructions)
+        pointer.metadata.setdefault("source", "context_budget")
+        pointer.metadata["pointer_kind"] = "subagent_summary"
+        if job_ids:
+            pointer.metadata["job_ids"] = list(job_ids)
+        document_id = record.get("document_id")
+        if document_id:
+            pointer.metadata["document_id"] = str(document_id)
         return pointer
 
     @staticmethod

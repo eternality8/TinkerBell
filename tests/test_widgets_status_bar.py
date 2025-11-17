@@ -56,3 +56,15 @@ def test_status_bar_embedding_status_tracks_detail() -> None:
     bar.set_embedding_status(None, detail=None)
 
     assert bar.embedding_state == ("", "")
+
+
+def test_status_bar_subagent_status_tracks_tooltip() -> None:
+    bar = StatusBar()
+
+    bar.set_subagent_status("Idle", detail="Waiting for jobs")
+
+    assert bar.subagent_state == ("Idle", "Waiting for jobs")
+
+    bar.set_subagent_status(None, detail=None)
+
+    assert bar.subagent_state == ("", "")

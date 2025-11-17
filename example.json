@@ -1,0 +1,58 @@
+{
+    "glossary": {
+        "title": "example glossary",
+		"GlossDiv": {
+            "title": "S",
+			"GlossList": {
+                "GlossEntry": {
+                    "ID": "SGML",
+					"SortAs": "SGML",
+					"GlossTerm": "Standard Generalized Markup Language",
+					"Acronym": "SGML",
+					"Abbrev": "ISO 8879:1986",
+					"GlossDef": {
+                        "para": "A meta-markup language, used to create markup languages such as DocBook.",
+						"GlossSeeAlso": ["GML", "XML"]
+                    },
+					"GlossSee": "markup"
+                },
+                "GlossEntry2": {
+                    "ID": "XML",
+					"SortAs": "XML",
+					"GlossTerm": "Extensible Markup Language",
+					"Acronym": "XML",
+					"Abbrev": "W3C REC-xml-20081126",
+					"GlossDef": {
+                        "para": "A markup language that defines a set of rules for encoding documents in a format that is both human-readable and machine-readable.",
+						"GlossSeeAlso": ["SGML", "HTML"]
+                    },
+					"GlossSee": "markup"
+                },
+                "GlossEntry3": {
+                    "ID": "HTML",
+					"SortAs": "HTML",
+					"GlossTerm": "HyperText Markup Language",
+					"Acronym": "HTML",
+					"Abbrev": "W3C REC-html5-20141028",
+					"GlossDef": {
+                        "para": "The standard markup language for creating web pages and web applications.",
+						"GlossSeeAlso": ["XML", "CSS"]
+                    },
+					"GlossSee": "markup"
+                },
+                "GlossEntry4": {
+                    "ID": "JSON",
+					"SortAs": "JSON",
+					"GlossTerm": "JavaScript Object Notation",
+					"Acronym": "JSON",
+					"Abbrev": "RFC 8259",
+					"GlossDef": {
+                        "para": "A lightweight data-interchange format that is easy for humans to read and write and easy for machines to parse and generate.",
+						"GlossSeeAlso": ["XML", "YAML"]
+                    },
+					"GlossSee": "data format"
+                }
+            }
+        }
+    }
+}

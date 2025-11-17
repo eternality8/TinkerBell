@@ -42,6 +42,40 @@ Open a sample, ask the agent to outline or retrieve, and observe the tool payloa
 
 Additional reproduction ideas plus prompt language live in `test_data/phase3/README.md`.
 
+## Phase 4 – Character & plot scaffolding (experimental)
+
+Phase 4.3 adds an opt-in memory layer that captures lightweight character/entity and plot beat summaries from subagent jobs. The goal is to give the controller+agents continuity hints without persisting sensitive data or bloating prompts.
+
+### Components
+
+- **`DocumentPlotStateStore`** (`tinkerbell.ai.memory.plot_state`) keeps an in-memory map of `{document_id → DocumentPlotState}` with capped entity/beat counts (24 each by default). It subscribes to the shared cache bus so edits/closed tabs purge stale entries immediately. Entities are detected via conservative proper-noun heuristics; beats are appended to a primary arc along with metadata (chunk hash, pointer ID, timing).
+- **Controller ingestion** – When `SubagentRuntimeConfig.plot_scaffolding_enabled` is true the `AIController` instantiates the store, and every successful subagent job calls `store.ingest_chunk_summary(...)`. After ingests the controller emits a short system hint (“Plot scaffolding refreshed…”) so prompt templates can remind the agent to call the new tool.
+- **Tooling surface** – `DocumentPlotStateTool` exposes the cached payload via `document_plot_state`. It is marked `summarizable=False` to prevent the compactor from stripping entities/beats mid-turn. Responses include diagnostic statuses: `plot_state_disabled` (flag off), `plot_state_unavailable` (store missing), `no_document`, `no_plot_state`, or `status="ok"` with entity/arc arrays and metadata.
+- **Settings & overrides** – The feature is disabled by default. Enable it via **Settings → Experimental → Plot scaffolding**, CLI flags (`--enable-plot-scaffolding` / `--disable-plot-scaffolding`), or the environment variable `TINKERBELL_ENABLE_PLOT_SCAFFOLDING`. Because ingestion relies on subagent summaries, the best experience pairs the flag with `enable_subagents=True`, but the tool remains callable even when no jobs have run (it will simply report `status="no_plot_state"`).
+
+### Usage & limitations
+
+1. Enable Phase 4 subagents and plot scaffolding in the settings dialog (or via CLI/env overrides) and restart the controller if it was already running.
+2. Trigger a chat turn that causes the controller to spawn a subagent job (e.g., select >400 chars and ask for a scoped analysis). After the helper finishes, watch for the injected hint acknowledging that scaffolding refreshed for the document.
+3. Within the same turn, the agent can call `document_plot_state` to retrieve the cached roster before drafting edits. The tool accepts `document_id`, `include_entities`, `include_arcs`, `max_entities`, and `max_beats` arguments to trim payloads when token budgets are tight.
+4. No data is persisted between sessions. Closing a document or emitting a `DocumentChanged`/`DocumentClosed` event wipes its entry. This keeps the feature investigatory while the UX for human-authored plot data is still out-of-scope.
+
+### Validation
+
+- Unit tests in `tests/test_plot_state.py` validate entity heuristics, beat limits, cache-bus evictions, and telemetry stats.
+- Tool tests in `tests/test_document_plot_state_tool.py` assert resolver fallbacks, feature-flag behavior, and response schemas for both populated and empty stores.
+- Controller tests (`tests/test_agent.py`, `tests/test_ai_tools.py`) gained coverage for the runtime flag plumbing and the injected “plot scaffolding refreshed” hint to ensure the end-to-end flow remains guarded.
+
+Future iterations may add richer arc detection, manual editing UI, or persistence hooks, but for Phase 4 the emphasis stays on advisory context that surfaces only when explicitly enabled.
+
+### Phase 4.4 – Integration, telemetry, hardening
+
+- **TraceCompactor coverage** – Subagent scouting reports now register ledger entries with `TraceCompactor`, so when later tool calls exceed the budget their summaries compact into pointers that explain how to rebuild the cached context (“rerun the helper or call `DocumentPlotStateTool`”).
+- **Turn-level telemetry** – `SubagentManager` emits `subagent.turn_summary` after every run, reporting requested/scheduled jobs, cache hits, skipped or failed jobs, cumulative latency, and tokens consumed. Diagnostics UI widgets (and the persistent telemetry sink) pick these up automatically.
+- **Sequential execution smoke tests** – `tests/test_subagent_manager.py` verifies multi-job queues stay strictly sequential and that budget-policy rejections skip work rather than touching the AI client. `tests/test_agent.py::test_ai_controller_registers_subagent_messages_in_trace_compactor` ensures the controller ledger captures helper summaries.
+- **Benchmarks & docs** – `benchmarks/measure_subagent_latency.py` plus the published snapshot in `benchmarks/subagent_latency.md` quantify scheduling overhead (<4 ms/job on a 6 ms simulated helper). Release management details, toggles, and rollout guidance live in `docs/ai_v2_release_notes.md`.
+- **Flags remain opt-in** – Even with the telemetry + testing guardrails, both `enable_subagents` and `plot_scaffolding_enabled` default to `False`. Keep them disabled outside staging until the new telemetry stays green for at least two weeks.
+
 ## 1. Tokenizer parity layer
 
 - **Registry + protocols** – `TokenCounterRegistry` and `TokenCounterProtocol` live in `tinkerbell.ai.client` / `tinkerbell.ai.ai_types`. Every `AIClient` registers a counter for its active model and falls back to a deterministic byte estimator when no backend is available.

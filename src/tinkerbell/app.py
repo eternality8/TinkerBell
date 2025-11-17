@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, TextIO, cast, get_args, get_origin, get_type_hints
 
+from .ai.ai_types import SubagentRuntimeConfig
 from .ai.agents.executor import AIController
 from .ai.client import AIClient, ClientSettings
 from .main_window import MainWindow, WindowContext
@@ -112,6 +113,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.phase3_outline_tools is not None:
         cli_overrides["phase3_outline_tools"] = args.phase3_outline_tools
+    if args.enable_subagents is not None:
+        cli_overrides["enable_subagents"] = args.enable_subagents
+    if args.enable_plot_scaffolding is not None:
+        cli_overrides["enable_plot_scaffolding"] = args.enable_plot_scaffolding
     if args.embedding_backend is not None:
         cli_overrides["embedding_backend"] = args.embedding_backend
     if args.embedding_model is not None:
@@ -286,6 +291,10 @@ def _build_ai_controller(settings: Settings, *, debug_logging: bool = False) -> 
         telemetry_limit = int(telemetry_limit)
     except (TypeError, ValueError):
         telemetry_limit = 200
+    subagent_config = SubagentRuntimeConfig(
+        enabled=bool(getattr(settings, "enable_subagents", False)),
+        plot_scaffolding_enabled=bool(getattr(settings, "enable_plot_scaffolding", False)),
+    )
     return AIController(
         client=client,
         max_tool_iterations=limit,
@@ -293,6 +302,7 @@ def _build_ai_controller(settings: Settings, *, debug_logging: bool = False) -> 
         response_token_reserve=response_reserve,
         telemetry_enabled=telemetry_enabled,
         telemetry_limit=telemetry_limit,
+        subagent_config=subagent_config,
     )
 
 
@@ -345,6 +355,36 @@ def _parse_cli_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, lis
         action="store_const",
         const=False,
         help="Disable Phase 3 outline + retrieval tooling for this session.",
+    )
+    parser.add_argument(
+        "--enable-subagents",
+        dest="enable_subagents",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Enable the Phase 4 subagent sandbox for this session.",
+    )
+    parser.add_argument(
+        "--disable-subagents",
+        dest="enable_subagents",
+        action="store_const",
+        const=False,
+        help="Disable the Phase 4 subagent sandbox for this session.",
+    )
+    parser.add_argument(
+        "--enable-plot-scaffolding",
+        dest="enable_plot_scaffolding",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Enable experimental plot/entity scaffolding without editing settings.json.",
+    )
+    parser.add_argument(
+        "--disable-plot-scaffolding",
+        dest="enable_plot_scaffolding",
+        action="store_const",
+        const=False,
+        help="Disable plot/entity scaffolding for this session.",
     )
     parser.add_argument(
         "--embedding-backend",

@@ -10,6 +10,14 @@ import pytest
 
 import tinkerbell.ai.agents.executor as agent_executor
 from tinkerbell.ai.agents.executor import AIController
+from tinkerbell.ai.ai_types import (
+    ChunkReference,
+    SubagentBudget,
+    SubagentJob,
+    SubagentJobResult,
+    SubagentJobState,
+    SubagentRuntimeConfig,
+)
 from tinkerbell.ai.client import AIClient, AIStreamEvent
 from tinkerbell.ai.services.context_policy import BudgetDecision, ContextBudgetPolicy
 from tinkerbell.ai import prompts
@@ -225,6 +233,52 @@ def test_ai_controller_records_context_usage_events(sample_snapshot):
     assert event.embedding_model == "deepseek-embedding"
     assert event.embedding_status == "ready"
     assert event.embedding_detail == "LangChain/DeepSeek"
+
+
+def test_ai_controller_registers_subagent_messages_in_trace_compactor(sample_snapshot, monkeypatch):
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="ok")])
+    runtime_config = SubagentRuntimeConfig(enabled=True, chunk_preview_chars=400)
+    controller = AIController(client=cast(AIClient, stub_client), subagent_config=runtime_config)
+
+    chunk = ChunkReference(
+        document_id="doc-trace",
+        chunk_id="selection:0-10",
+        version_id="v1",
+        pointer_id="selection:doc-trace",
+        char_range=(0, 10),
+        token_estimate=120,
+        chunk_hash="chunk-trace",
+        preview="Example text",
+    )
+    job = SubagentJob(
+        job_id="job-trace",
+        parent_run_id="run-trace",
+        instructions="Analyze",
+        chunk_ref=chunk,
+        allowed_tools=(),
+        budget=SubagentBudget(max_prompt_tokens=400, max_completion_tokens=200, max_runtime_seconds=15.0),
+    )
+    job.state = SubagentJobState.SUCCEEDED
+    job.result = SubagentJobResult(status="ok", summary="Continuity looks good", tokens_used=12, latency_ms=3.2)
+
+    async def _fake_pipeline(self: AIController, *, prompt: str, snapshot: dict, turn_context: dict):
+        turn_context["subagent_jobs"] = 1
+        return [job], [{"role": "system", "content": "Subagent scouting report: continuity ok."}]
+
+    monkeypatch.setattr(AIController, "_run_subagent_pipeline", _fake_pipeline, raising=False)
+
+    async def run() -> dict:
+        return await controller.run_chat("hi", sample_snapshot)
+
+    result = asyncio.run(run())
+
+    stats = result["trace_compaction"]
+    assert stats is not None
+    assert stats["entries_tracked"] >= 1
+    compactor = controller._trace_compactor
+    assert compactor is not None
+    ledger = compactor.ledger_snapshot()
+    assert any(entry.record.get("pointer_kind") == "subagent_summary" for entry in ledger)
 
 
 def test_ai_controller_executes_tool_and_continues(sample_snapshot):

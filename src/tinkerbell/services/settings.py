@@ -33,6 +33,8 @@ _BOOL_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_DEBUG_LOGGING": "debug_logging",
     "TINKERBELL_TOOL_ACTIVITY_PANEL": "show_tool_activity_panel",
     "TINKERBELL_PHASE3_OUTLINE_TOOLS": "phase3_outline_tools",
+    "TINKERBELL_ENABLE_SUBAGENTS": "enable_subagents",
+    "TINKERBELL_ENABLE_PLOT_SCAFFOLDING": "enable_plot_scaffolding",
 }
 _FLOAT_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_REQUEST_TIMEOUT": "request_timeout",
@@ -96,6 +98,8 @@ class Settings:
     debug_logging: bool = False
     show_tool_activity_panel: bool = False
     phase3_outline_tools: bool = False
+    enable_subagents: bool = False
+    enable_plot_scaffolding: bool = False
     debug: DebugSettings = field(default_factory=DebugSettings)
     context_policy: ContextPolicySettings = field(default_factory=ContextPolicySettings)
 

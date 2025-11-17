@@ -82,6 +82,8 @@ class StatusBar:
         self._outline_detail: str = ""
         self._embedding_status: str = ""
         self._embedding_detail: str = ""
+        self._subagent_status: str = ""
+        self._subagent_detail: str = ""
         self._context_widget = ContextUsageWidget()
 
         self._qt_bar = self._build_qt_status_bar(parent)
@@ -91,6 +93,7 @@ class StatusBar:
         self._outline_label: Any = None
         self._embedding_label: Any = None
         self._autosave_label: Any = None
+        self._subagent_label: Any = None
 
         if self._qt_bar is not None:
             self._init_widgets()
@@ -177,6 +180,18 @@ class StatusBar:
             except Exception:
                 pass
 
+    def set_subagent_status(self, status: str | None, *, detail: str | None = None) -> None:
+        """Show whether the subagent sandbox is active plus optional detail text."""
+
+        self._subagent_status = (status or "").strip()
+        self._subagent_detail = (detail or "").strip()
+        if self._subagent_label is not None:
+            self._update_label(self._subagent_label, self._format_subagent_text())
+            try:
+                self._subagent_label.setToolTip(self._subagent_detail)
+            except Exception:
+                pass
+
     def widget(self) -> Any | None:
         """Return the underlying :class:`QStatusBar` when available."""
 
@@ -221,6 +236,10 @@ class StatusBar:
     def embedding_state(self) -> tuple[str, str]:
         return (self._embedding_status, self._embedding_detail)
 
+    @property
+    def subagent_state(self) -> tuple[str, str]:
+        return (self._subagent_status, self._subagent_detail)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -240,6 +259,8 @@ class StatusBar:
         self._embedding_label.setObjectName("tb-status-embedding")
         self._autosave_label = QLabel(self._format_autosave_text())
         self._autosave_label.setObjectName("tb-status-autosave")
+        self._subagent_label = QLabel(self._format_subagent_text())
+        self._subagent_label.setObjectName("tb-status-subagents")
 
         for label in (
             self._cursor_label,
@@ -248,6 +269,7 @@ class StatusBar:
             self._outline_label,
             self._embedding_label,
             self._autosave_label,
+            self._subagent_label,
         ):
             label.setContentsMargins(8, 0, 8, 0)
             try:
@@ -279,6 +301,9 @@ class StatusBar:
 
     def _format_embedding_text(self) -> str:
         return f"Embeddings: {self._embedding_status}" if self._embedding_status else ""
+
+    def _format_subagent_text(self) -> str:
+        return f"Subagents: {self._subagent_status}" if self._subagent_status else ""
 
     @staticmethod
     def _coerce_state(state: str | Enum) -> str:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Dict, Mapping, Sequence, Tuple
 
 ColorTuple = Tuple[int, int, int]
 PaletteLike = Mapping[str, Any] | Sequence[tuple[str, Any]]

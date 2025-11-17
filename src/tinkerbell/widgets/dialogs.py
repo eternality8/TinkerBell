@@ -744,6 +744,22 @@ class SettingsDialog(QDialog):
         self._phase3_outline_hint = QLabel("Experimental outlines/retrieval with status bar indicators and telemetry.")
         self._phase3_outline_hint.setObjectName("phase3_outline_hint")
         self._prepare_hint_label(self._phase3_outline_hint)
+        self._subagent_checkbox = QCheckBox("Enable Phase 4 subagent sandbox (selection scouts)")
+        self._subagent_checkbox.setObjectName("subagent_enable_checkbox")
+        self._subagent_checkbox.setChecked(bool(getattr(self._original, "enable_subagents", False)))
+        self._subagent_hint = QLabel(
+            "Injects helper summaries from chunk-level scouts when selections exceed the threshold."
+        )
+        self._subagent_hint.setObjectName("subagent_hint")
+        self._prepare_hint_label(self._subagent_hint)
+        self._plot_scaffolding_checkbox = QCheckBox("Enable experimental plot/entity scaffolding")
+        self._plot_scaffolding_checkbox.setObjectName("plot_scaffolding_checkbox")
+        self._plot_scaffolding_checkbox.setChecked(bool(getattr(self._original, "enable_plot_scaffolding", False)))
+        self._plot_scaffolding_hint = QLabel(
+            "Caches lightweight character + arc summaries from subagent runs for read-only inspection."
+        )
+        self._plot_scaffolding_hint.setObjectName("plot_scaffolding_hint")
+        self._prepare_hint_label(self._plot_scaffolding_hint)
         self._max_tool_iterations_input = QSpinBox()
         self._max_tool_iterations_input.setObjectName("max_tool_iterations_input")
         self._max_tool_iterations_input.setRange(1, 25)
@@ -881,6 +897,20 @@ class SettingsDialog(QDialog):
         phase3_layout.addWidget(self._phase3_outline_checkbox)
         phase3_layout.addWidget(self._phase3_outline_hint)
         form_layout.addRow("Phase 3 Tools", phase3_container)
+        subagent_container = QWidget()
+        subagent_layout = QVBoxLayout(subagent_container)
+        subagent_layout.setContentsMargins(0, 0, 0, 0)
+        subagent_layout.setSpacing(2)
+        subagent_layout.addWidget(self._subagent_checkbox)
+        subagent_layout.addWidget(self._subagent_hint)
+        form_layout.addRow("Phase 4 Subagents", subagent_container)
+        plot_container = QWidget()
+        plot_layout = QVBoxLayout(plot_container)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_layout.setSpacing(2)
+        plot_layout.addWidget(self._plot_scaffolding_checkbox)
+        plot_layout.addWidget(self._plot_scaffolding_hint)
+        form_layout.addRow("Plot Scaffolding", plot_container)
         form_layout.addRow("Max Tool Iterations", self._max_tool_iterations_input)
         form_layout.addRow("Max Context Tokens", self._max_context_tokens_input)
         reserve_container = QWidget()
@@ -1002,6 +1032,8 @@ class SettingsDialog(QDialog):
         debug_logging = self._debug_checkbox.isChecked()
         show_tool_activity_panel = self._tool_panel_checkbox.isChecked()
         phase3_outline_tools = self._phase3_outline_checkbox.isChecked()
+        enable_subagents = self._subagent_checkbox.isChecked()
+        enable_plot_scaffolding = self._plot_scaffolding_checkbox.isChecked()
         max_tool_iterations = int(self._max_tool_iterations_input.value())
         max_context_tokens = int(self._max_context_tokens_input.value())
         response_token_reserve = int(self._response_token_reserve_input.value())
@@ -1019,6 +1051,8 @@ class SettingsDialog(QDialog):
             debug_logging=debug_logging,
             show_tool_activity_panel=show_tool_activity_panel,
             phase3_outline_tools=phase3_outline_tools,
+            enable_subagents=enable_subagents,
+            enable_plot_scaffolding=enable_plot_scaffolding,
             max_tool_iterations=max_tool_iterations,
             max_context_tokens=max_context_tokens,
             response_token_reserve=response_token_reserve,
