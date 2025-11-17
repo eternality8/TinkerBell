@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import math
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -49,6 +50,43 @@ _SUGGESTION_SYSTEM_PROMPT = (
     "You are a proactive writing assistant that proposes the next helpful user prompts after reviewing the prior "
     "conversation. Respond ONLY with a JSON array of concise suggestion strings (each under 120 characters). "
     "Return at most {max_suggestions} unique ideas tailored to the conversation."
+)
+
+_TOOL_MARKER_TRANSLATION = str.maketrans(
+    {
+        ord("｜"): "|",
+        ord("￨"): "|",
+        ord("∣"): "|",
+        ord("▕"): "|",
+        ord("＜"): "<",
+        ord("﹤"): "<",
+        ord("〈"): "<",
+        ord("⟨"): "<",
+        ord("《"): "<",
+        ord("＞"): ">",
+        ord("﹥"): ">",
+        ord("〉"): ">",
+        ord("⟩"): ">",
+        ord("》"): ">",
+        ord("▁"): "_",
+        ord("＿"): "_",
+        ord("﹍"): "_",
+        ord("﹎"): "_",
+        ord("﹏"): "_",
+        ord("　"): " ",
+        ord("\u200b"): " ",
+        ord("\u200c"): " ",
+        ord("\u200d"): " ",
+        ord("\ufeff"): " ",
+    }
+)
+_TOOL_CALLS_BLOCK_RE = re.compile(
+    r"<\s*\|?\s*tool[\s_]*calls[\s_]*begin\s*\|?\s*>(?P<body>.*?)<\s*\|?\s*tool[\s_]*calls[\s_]*end\s*\|?\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_TOOL_CALL_ENTRY_RE = re.compile(
+    r"<\s*\|?\s*tool[\s_]*call[\s_]*begin\s*\|?\s*>(?P<name>.*?)<\s*\|?\s*tool[\s_]*sep\s*\|?\s*>(?P<args>.*?)<\s*\|?\s*tool[\s_]*call[\s_]*end\s*\|?\s*>",
+    re.IGNORECASE | re.DOTALL,
 )
 
 ToolCallback = Callable[[AIStreamEvent], Awaitable[None] | None]
@@ -141,6 +179,8 @@ class AIController:
     max_tool_iterations: int = 8
     diff_builder_reminder_threshold: int = 3
     max_pending_patch_reminders: int = 2
+    max_tool_followup_prompts: int = 2
+    max_tool_followup_user_prompts: int = 1
     max_context_tokens: int = 128_000
     response_token_reserve: int = 16_000
     telemetry_enabled: bool = False
@@ -368,6 +408,8 @@ class AIController:
             pending_patch_application = False
             diff_builders_since_edit = 0
             patch_reminders_sent = 0
+            tool_followup_prompts_sent = 0
+            tool_followup_user_prompts_sent = 0
 
             turn_metrics = self._new_turn_context(
                 snapshot=snapshot,
@@ -420,12 +462,53 @@ class AIController:
                     on_event=on_event,
                     max_completion_tokens=completion_budget,
                 )
-                conversation.append(turn.assistant_message)
-                conversation_tokens += self._estimate_message_tokens(turn.assistant_message)
+                assistant_message = turn.assistant_message
+                assistant_tokens = self._estimate_message_tokens(assistant_message)
+                conversation.append(assistant_message)
+                conversation_tokens += assistant_tokens
                 response_text = turn.response_text
 
                 if not turn.tool_calls:
-                    if pending_patch_application and patch_reminders_sent < self.max_pending_patch_reminders:
+                    fallback_applied = False
+                    if not response_text and executed_tool_calls:
+                        if tool_followup_prompts_sent < self.max_tool_followup_prompts:
+                            reminder_text = self._tool_only_response_prompt()
+                            LOGGER.debug(
+                                "Injected tool follow-up reminder (empty assistant response, attempt=%s)",
+                                tool_followup_prompts_sent + 1,
+                            )
+                            reminder_message = {"role": "system", "content": reminder_text}
+                            conversation.append(reminder_message)
+                            conversation_tokens += self._estimate_message_tokens(reminder_message)
+                            tool_followup_prompts_sent += 1
+                            continue
+                        if tool_followup_user_prompts_sent < self.max_tool_followup_user_prompts:
+                            user_followup = self._tool_only_response_user_prompt(executed_tool_calls)
+                            LOGGER.debug(
+                                "Injected tool follow-up user prompt (empty assistant response, attempt=%s)",
+                                tool_followup_user_prompts_sent + 1,
+                            )
+                            user_message = {"role": "user", "content": user_followup}
+                            conversation.append(user_message)
+                            conversation_tokens += self._estimate_message_tokens(user_message)
+                            tool_followup_user_prompts_sent += 1
+                            continue
+                        response_text = self._tool_only_response_fallback(executed_tool_calls)
+                        assistant_message["content"] = response_text
+                        new_tokens = self._estimate_message_tokens(assistant_message)
+                        conversation_tokens += new_tokens - assistant_tokens
+                        assistant_tokens = new_tokens
+                        fallback_applied = True
+                        LOGGER.warning(
+                            "No assistant response after %s follow-up prompt(s); returning fallback summary.",
+                            tool_followup_prompts_sent,
+                        )
+
+                    if (
+                        pending_patch_application
+                        and not fallback_applied
+                        and patch_reminders_sent < self.max_pending_patch_reminders
+                    ):
                         reminder = self._pending_patch_prompt()
                         LOGGER.debug("Injected patch reminder (pending diff)")
                         reminder_message = {"role": "system", "content": reminder}
@@ -435,6 +518,8 @@ class AIController:
                         continue
                     break
 
+                tool_followup_prompts_sent = 0
+                tool_followup_user_prompts_sent = 0
                 tool_iterations += 1
                 if tool_iterations > max_iterations:
                     LOGGER.warning(
@@ -770,6 +855,49 @@ class AIController:
         return (
             "You generated a diff via diff_builder but did not call document_edit to apply it yet. "
             "Use document_edit with action=\"patch\", include the diff text, and pass the latest document_version before responding."
+        )
+
+    def _tool_only_response_prompt(self) -> str:
+        return (
+            "You executed tools but did not provide any assistant response. "
+            "Summarize the tool results for the user and describe next actions before ending the turn."
+        )
+
+    def _tool_only_response_user_prompt(self, records: Sequence[Mapping[str, Any]]) -> str:
+        latest = records[-1] if records else {}
+        tool_name = str(latest.get("name") or "document tool")
+        status = str(latest.get("status") or "ok")
+        diff_summary = str(latest.get("diff_summary") or "").strip()
+        result_text = str(latest.get("result") or "").strip()
+        summary = diff_summary if diff_summary else result_text
+        if summary and len(summary) > 400:
+            summary = f"{summary[:397].rstrip()}…"
+        if not summary:
+            summary = "(Tool result contained structured data)"
+        return (
+            "You already executed {tool} (status={status}) but did not send a reply. "
+            "Draft the assistant response now summarizing the tool output before taking any new tools.\nSummary:\n{summary}"
+        ).format(tool=tool_name, status=status, summary=summary)
+
+    def _tool_only_response_fallback(self, records: Sequence[Mapping[str, Any]]) -> str:
+        if not records:
+            return (
+                "Tool execution completed, but the assistant returned an empty response. "
+                "Describe the latest tool results manually before continuing."
+            )
+        latest = records[-1]
+        name = str(latest.get("name") or "tool")
+        status = str(latest.get("status") or "ok")
+        diff_summary = str(latest.get("diff_summary") or "").strip()
+        result_text = str(latest.get("result") or "").strip()
+        summary = diff_summary or result_text
+        if summary and len(summary) > 400:
+            summary = f"{summary[:397].rstrip()}…"
+        if not summary:
+            summary = "Tool completed without returning additional details."
+        return (
+            "Tool execution completed, but the assistant did not send a response. "
+            f"Latest tool: {name} (status={status}).\n{summary}"
         )
 
     def _diff_accumulation_prompt(self, diff_count: int) -> str:
@@ -1713,13 +1841,22 @@ class AIController:
                     )
                 )
 
-        response_text = "".join(deltas)
+        raw_response_text = "".join(deltas)
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug("Raw assistant text before parsing:\n%s", raw_response_text)
         if final_chunk:
-            if not response_text:
-                response_text = final_chunk
-            elif not response_text.endswith(final_chunk):
-                response_text += final_chunk
-        response_text = response_text.strip()
+            if not raw_response_text:
+                raw_response_text = final_chunk
+            elif not raw_response_text.endswith(final_chunk):
+                raw_response_text += final_chunk
+        response_text = raw_response_text.strip()
+        if response_text:
+            response_text, embedded_calls = self._parse_embedded_tool_calls(
+                response_text,
+                start_index=len(tool_calls),
+            )
+            if embedded_calls:
+                tool_calls.extend(embedded_calls)
         assistant_message: Dict[str, Any] = {"role": "assistant", "content": response_text or None}
         if tool_calls:
             assistant_message["tool_calls"] = [
@@ -1734,6 +1871,140 @@ class AIController:
                 for call in tool_calls
             ]
         return _ModelTurnResult(assistant_message=assistant_message, response_text=response_text, tool_calls=tool_calls)
+
+    def _parse_embedded_tool_calls(self, text: str, *, start_index: int = 0) -> tuple[str, list[_ToolCallRequest]]:
+        if not text or "<" not in text:
+            return text, []
+        normalized, index_map = self._normalize_tool_marker_text(text)
+        matches = list(_TOOL_CALLS_BLOCK_RE.finditer(normalized))
+        if not matches:
+            return text, []
+
+        cleaned_parts: list[str] = []
+        cursor = 0
+        parsed_calls: list[_ToolCallRequest] = []
+        for block in matches:
+            block_start, block_end = block.span()
+            orig_block_start = index_map[block_start]
+            orig_block_end = index_map[block_end]
+            cleaned_parts.append(text[cursor:orig_block_start])
+            try:
+                body_start, body_end = block.span("body")
+            except IndexError:  # pragma: no cover - defensive guard
+                body_start = body_end = -1
+            block_calls: list[_ToolCallRequest] = []
+            if body_start >= 0 and body_end >= body_start:
+                start_offset = start_index + len(parsed_calls)
+                block_calls = self._parse_tool_call_entries(
+                    text,
+                    normalized,
+                    body_start=index_map[body_start],
+                    body_end=index_map[body_end],
+                    starting_index=start_offset,
+                )
+            if block_calls:
+                parsed_calls.extend(block_calls)
+            else:
+                LOGGER.debug("Dropping embedded tool_calls block that could not be parsed")
+            cursor = orig_block_end
+        cleaned_parts.append(text[cursor:])
+        cleaned_text = "".join(cleaned_parts)
+        return cleaned_text, parsed_calls
+
+    def _parse_tool_call_entries(
+        self,
+        original_text: str,
+        normalized_text: str,
+        *,
+        body_start: int,
+        body_end: int,
+        starting_index: int,
+    ) -> list[_ToolCallRequest]:
+        # `body_start`/`body_end` indices are expressed in the original text.
+        body_original = original_text[body_start:body_end]
+        # Normalize the sliced body so we can reuse the regex tokenization logic reliably.
+        body_normalized, body_index_map = self._normalize_tool_marker_text(body_original)
+        parsed: list[_ToolCallRequest] = []
+        for match in _TOOL_CALL_ENTRY_RE.finditer(body_normalized):
+            try:
+                name_start, name_end = match.span("name")
+                args_start, args_end = match.span("args")
+            except IndexError:  # pragma: no cover - defensive guard
+                continue
+            orig_name_start = body_index_map[name_start]
+            orig_name_end = body_index_map[name_end]
+            orig_args_start = body_index_map[args_start]
+            orig_args_end = body_index_map[args_end]
+            name_text = (
+                body_original[orig_name_start:orig_name_end]
+                .translate(_TOOL_MARKER_TRANSLATION)
+                .strip()
+                .strip("<>|")
+            )
+            args_text = body_original[orig_args_start:orig_args_end].strip()
+            if not name_text:
+                continue
+            parsed_args = self._try_parse_json_block(args_text)
+            ordinal = starting_index + len(parsed)
+            call_id = self._parsed_tool_call_id(name_text, ordinal)
+            parsed.append(
+                _ToolCallRequest(
+                    call_id=call_id,
+                    name=name_text,
+                    index=ordinal,
+                    arguments=args_text,
+                    parsed=parsed_args,
+                )
+            )
+        return parsed
+
+    @staticmethod
+    def _normalize_tool_marker_text(text: str) -> tuple[str, list[int]]:
+        if not text:
+            return "", [0]
+        translation = _TOOL_MARKER_TRANSLATION
+        normalized_chars: list[str] = []
+        index_map: list[int] = []
+        idx = 0
+        length = len(text)
+        while idx < length:
+            char = text[idx]
+            if char == "\r":
+                next_idx = idx + 1
+                if next_idx < length and text[next_idx] == "\n":
+                    normalized_chars.append("\n")
+                    index_map.append(idx)
+                    idx += 2
+                    continue
+                normalized_chars.append("\n")
+                index_map.append(idx)
+                idx += 1
+                continue
+            mapped = translation.get(ord(char))
+            if mapped is None:
+                normalized_chars.append(char)
+            else:
+                normalized_chars.append(mapped)
+            index_map.append(idx)
+            idx += 1
+        normalized_text = "".join(normalized_chars)
+        index_map.append(len(text))
+        return normalized_text, index_map
+
+    @staticmethod
+    def _parsed_tool_call_id(name: str, ordinal: int) -> str:
+        safe_name = re.sub(r"\s+", "_", name.strip().lower()) or "tool"
+        return f"{safe_name}:{ordinal}"
+
+    @staticmethod
+    def _try_parse_json_block(text: str) -> Any | None:
+        stripped = text.strip()
+        if not stripped:
+            return {}
+        try:
+            return json.loads(stripped, strict=False)
+        except (TypeError, ValueError):
+            return None
 
     async def _handle_tool_calls(
         self,
@@ -1914,6 +2185,7 @@ class AIController:
         on_event: ToolCallback | None,
     ) -> tuple[str, Any, Any]:
         resolved_arguments = self._coerce_tool_arguments(call.arguments, call.parsed)
+        resolved_arguments = self._normalize_tool_arguments(call, resolved_arguments)
         if registration is None:
             message = f"Tool '{call.name or 'unknown'}' is not registered."
             await self._emit_tool_result_event(call, message, None, on_event)
@@ -2022,9 +2294,29 @@ class AIController:
         if not text:
             return {}
         try:
-            return json.loads(text)
+            return json.loads(text, strict=False)
         except (ValueError, TypeError):
             return text
+
+    def _normalize_tool_arguments(self, call: _ToolCallRequest, arguments: Any) -> Any:
+        if not isinstance(arguments, Mapping):
+            return arguments
+        name = (call.name or "").strip().lower()
+        normalized = dict(arguments)
+        if name == "document_apply_patch":
+            replacement = normalized.get("replacement_text")
+            content = normalized.get("content")
+            if isinstance(replacement, str) and not isinstance(content, str):
+                normalized["content"] = replacement
+            if "replacement_text" in normalized:
+                normalized.pop("replacement_text", None)
+        elif name == "document_edit":
+            text_value = normalized.get("text")
+            content_value = normalized.get("content")
+            if isinstance(text_value, str) and not isinstance(content_value, str):
+                normalized["content"] = text_value
+                normalized.pop("text", None)
+        return normalized
 
     async def _invoke_tool_impl(self, tool_impl: Any, arguments: Any) -> Any:
         target = getattr(tool_impl, "run", tool_impl)

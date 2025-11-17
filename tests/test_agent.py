@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Iterable, List, cast
 
@@ -324,6 +325,315 @@ def test_ai_controller_executes_tool_and_continues(sample_snapshot):
     assert tool_trace["duration_ms"] >= 0
     assert tool_trace["diff_summary"] is None
     assert "started_at" in tool_trace
+
+
+def test_ai_controller_parses_embedded_tool_call_markers(sample_snapshot):
+    tool_args = {
+        "target_range": [0, 0],
+        "replacement_text": "# The Case of the Misplaced Wand\n\nBartholomew Bumblewick was, by all accounts, a perfectly adequate wizard.",
+    }
+    sandwich = (
+        "I'll help you write a funny story! Let me start by checking the current document state and then create an entertaining story for you."
+        "Perfect! I have a clean slate to work with. Now I'll create a funny story about a clumsy wizard and apply it to the document."
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>document_apply_patch<｜tool▁sep｜>"
+        f"{json.dumps(tool_args, ensure_ascii=False)}"
+        "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+    )
+
+    first_turn = [AIStreamEvent(type="content.delta", content=sandwich)]
+    second_turn = [
+        AIStreamEvent(type="content.delta", content="Here you go!"),
+        AIStreamEvent(type="content.done", content="Here you go!"),
+    ]
+    stub_client = _StubClient([first_turn, second_turn])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    calls: list[dict[str, Any]] = []
+
+    class _PatchTool:
+        def run(self, target_range: list[int], content: str) -> dict[str, Any]:
+            calls.append({"target_range": target_range, "content": content})
+            return {"status": "ok"}
+
+    controller.register_tool("document_apply_patch", _PatchTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("funny story", sample_snapshot)
+
+    result = asyncio.run(run())
+
+    assert result["response"] == "Here you go!"
+    assert calls and calls[0]["target_range"] == [0, 0]
+    assert "Misplaced Wand" in calls[0]["content"]
+    tool_trace = result["tool_calls"][0]
+    assert tool_trace["name"] == "document_apply_patch"
+    assert tool_trace["status"] == "ok"
+
+
+def test_ai_controller_handles_multiple_embedded_tool_calls(sample_snapshot):
+    fw_lt = "\uFF1C"
+    fw_bar = "\uFF5C"
+    fw_rt = "\uFF1E"
+    zero_width = "\u200b"
+
+    patch_args = {
+        "target_range": [0, 0],
+        "replacement_text": "# The Day Everything Went Wrong (But Funny Wrong)\n\nIt all started...",
+    }
+    edit_text_args = {
+        "action": "insert",
+        "position": 0,
+        "text": "Story draft v1",
+    }
+    edit_content_args = {
+        "action": "insert",
+        "position": 0,
+        "content": "Story draft v2",
+    }
+
+    block1 = (
+        f"{fw_lt}{fw_bar}tool▁calls▁begin{fw_bar}{fw_rt}"
+        f"{fw_lt}{fw_bar}tool▁call▁begin{fw_bar}{fw_rt}document_apply_patch"
+        f"{fw_lt}{fw_bar}tool▁sep{fw_bar}{fw_rt}{json.dumps(patch_args, ensure_ascii=False)}"
+        f"{fw_lt}{fw_bar}tool▁call▁end{fw_bar}{fw_rt}{fw_lt}{fw_bar}tool▁calls▁end{fw_bar}{fw_rt}"
+    )
+    block2 = (
+        f"{zero_width}<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>document_edit<｜tool▁sep｜>"
+        f"{json.dumps(edit_text_args, ensure_ascii=False)}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+    )
+    block3 = (
+        "< | tool▁calls▁begin | >< | tool▁call▁begin | >document_edit< | tool▁sep | >"
+        f"{json.dumps(edit_content_args, ensure_ascii=False)}< | tool▁call▁end | >< | tool▁calls▁end | >"
+    )
+    block4 = (
+        f"{zero_width}<|tool▁calls▁begin|><|tool▁call▁begin|>document_snapshot<|tool▁sep|>{{}}"
+        "<|tool▁call▁end|><|tool▁calls▁end|>"
+    )
+
+    sandwich = (
+        "I'll help you write a funny story! Let me first check the current document to understand what we're working with."
+        + block1
+        + "Let me try using the DocumentEdit tool instead to add the story content."
+        + block2
+        + "Let me try the correct format for DocumentEdit."
+        + block3
+        + "Perfect! I've successfully written and inserted a funny story into your document. Let me verify the final result by taking another snapshot."
+        + block4
+        + "## Summary\n\nInserted full story and verified via snapshot."
+    )
+
+    first_turn = [AIStreamEvent(type="content.delta", content=sandwich)]
+    second_turn = [
+        AIStreamEvent(type="content.delta", content="Final tidy response."),
+        AIStreamEvent(type="content.done", content="Final tidy response."),
+    ]
+    stub_client = _StubClient([first_turn, second_turn])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    calls: list[tuple[str, Any]] = []
+
+    class _PatchTool:
+        def run(self, target_range: list[int] | tuple[int, int], content: str) -> dict[str, Any]:
+            calls.append(("patch", {"target_range": list(target_range), "content": content}))
+            return {"status": "ok"}
+
+    class _EditTool:
+        def run(self, action: str, position: int, text: str | None = None, content: str | None = None) -> dict[str, Any]:
+            calls.append(("edit", {"action": action, "position": position, "text": text, "content": content}))
+            return {"status": "ok"}
+
+    class _SnapshotTool:
+        def run(self) -> dict[str, Any]:  # pragma: no cover - deterministic helper
+            calls.append(("snapshot", {}))
+            return {"status": "ok"}
+
+    controller.register_tool("document_apply_patch", _PatchTool())
+    controller.register_tool("document_edit", _EditTool())
+    controller.register_tool("document_snapshot", _SnapshotTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("funny story", sample_snapshot)
+
+    result = asyncio.run(run())
+
+    names = [trace["name"] for trace in result["tool_calls"]]
+    assert names[:4] == [
+        "document_apply_patch",
+        "document_edit",
+        "document_edit",
+        "document_snapshot",
+    ]
+    assert len(calls) == 4
+    first_call = calls[0]
+    assert first_call[0] == "patch"
+    assert first_call[1]["content"].startswith("# The Day Everything Went Wrong")
+    edit_calls = [entry for entry in calls if entry[0] == "edit"]
+    assert edit_calls and edit_calls[0][1]["content"] == "Story draft v1"
+    assert calls[-1][0] == "snapshot"
+
+    second_payload = stub_client.calls[1]
+    assistant_messages = [msg for msg in second_payload["messages"] if msg.get("role") == "assistant"]
+    assert assistant_messages
+    assert all("tool▁calls" not in (msg.get("content") or "") for msg in assistant_messages)
+
+
+def test_embedded_tool_calls_preserve_text_with_crlf(sample_snapshot):
+    sandwich = (
+        "Checking current state\r\n"
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>document_snapshot<｜tool▁sep｜>{}"
+        "<｜tool▁call▁end｜><｜tool▁calls▁end｜>\r\n"
+        "Here is my plan after reviewing the snapshot."
+    )
+
+    first_turn = [AIStreamEvent(type="content.delta", content=sandwich)]
+    second_turn = [AIStreamEvent(type="content.done", content="All done")]
+    stub_client = _StubClient([first_turn, second_turn])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    class _SnapshotTool:
+        def run(self, delta_only: bool = False) -> dict[str, Any]:
+            return {"delta_only": delta_only}
+
+    controller.register_tool("document_snapshot", _SnapshotTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("please snapshot", sample_snapshot)
+
+    result = asyncio.run(run())
+    assert result["response"] == "All done"
+
+    second_payload = stub_client.calls[1]
+    assistant_messages = [
+        msg
+        for msg in second_payload["messages"]
+        if msg.get("role") == "assistant" and (msg.get("content") or "").strip()
+    ]
+    assert any("plan after reviewing" in msg["content"] for msg in assistant_messages)
+
+
+def test_ai_controller_prompts_after_tool_only_turn(sample_snapshot):
+    sandwich = (
+        "Checking the latest snapshot."
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>document_snapshot<｜tool▁sep｜>{}"
+        "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+    )
+
+    first_turn = [AIStreamEvent(type="content.delta", content=sandwich)]
+    empty_turn = [AIStreamEvent(type="content.done", content="")]
+    final_turn = [
+        AIStreamEvent(type="content.delta", content="Snapshot ready"),
+        AIStreamEvent(type="content.done", content="Snapshot ready"),
+    ]
+
+    stub_client = _StubClient([first_turn, empty_turn, empty_turn, final_turn])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    calls: list[dict[str, Any]] = []
+
+    class _SnapshotTool:
+        def run(self, **_kwargs: Any) -> dict[str, Any]:
+            calls.append({})
+            return {"status": "ok"}
+
+    controller.register_tool("document_snapshot", _SnapshotTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("take snapshot", sample_snapshot)
+
+    result = asyncio.run(run())
+
+    assert result["response"] == "Snapshot ready"
+    assert len(calls) == 1
+    assert len(stub_client.calls) == 4
+
+    final_payload = stub_client.calls[-1]
+    followup_messages = [
+        msg.get("content", "")
+        for msg in final_payload["messages"]
+        if msg.get("role") == "system" and "executed tools" in (msg.get("content") or "")
+    ]
+    assert len(followup_messages) == 2
+    followup_users = [msg for msg in final_payload["messages"] if msg.get("role") == "user" and "already executed" in (msg.get("content") or "")]
+    assert not followup_users
+
+
+def test_ai_controller_injects_user_followup_before_response(sample_snapshot):
+    sandwich = (
+        "Running snapshot."
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>document_snapshot<｜tool▁sep｜>{}"
+        "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+    )
+
+    first_turn = [AIStreamEvent(type="content.delta", content=sandwich)]
+    empty_turn = [AIStreamEvent(type="content.done", content="")]
+    final_turn = [AIStreamEvent(type="content.done", content="Ready to edit")]
+
+    stub_client = _StubClient([first_turn, empty_turn, empty_turn, final_turn])
+    controller = AIController(
+        client=cast(AIClient, stub_client),
+        max_tool_followup_prompts=1,
+        max_tool_followup_user_prompts=1,
+    )
+
+    calls: list[dict[str, Any]] = []
+
+    class _SnapshotTool:
+        def run(self, **_kwargs: Any) -> dict[str, Any]:
+            calls.append({})
+            return {"status": "ok", "preview": "latest"}
+
+    controller.register_tool("document_snapshot", _SnapshotTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("take snapshot", sample_snapshot)
+
+    result = asyncio.run(run())
+
+    assert result["response"] == "Ready to edit"
+    assert len(stub_client.calls) == 4
+    final_payload = stub_client.calls[-1]
+    user_messages = [
+        msg for msg in final_payload["messages"]
+        if msg.get("role") == "user" and "already executed" in (msg.get("content") or "")
+    ]
+    assert user_messages
+
+
+def test_ai_controller_falls_back_after_exhausting_followups(sample_snapshot):
+    sandwich = (
+        "Running snapshot."
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>document_snapshot<｜tool▁sep｜>{}"
+        "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+    )
+
+    first_turn = [AIStreamEvent(type="content.delta", content=sandwich)]
+    empty_turn = [AIStreamEvent(type="content.done", content="")]
+
+    stub_client = _StubClient([first_turn, empty_turn, empty_turn, empty_turn])
+    controller = AIController(
+        client=cast(AIClient, stub_client),
+        max_tool_followup_prompts=1,
+        max_tool_followup_user_prompts=1,
+    )
+
+    calls: list[dict[str, Any]] = []
+
+    class _SnapshotTool:
+        def run(self, **_kwargs: Any) -> dict[str, Any]:
+            calls.append({})
+            return {"status": "ok", "preview": "latest"}
+
+    controller.register_tool("document_snapshot", _SnapshotTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("take snapshot", sample_snapshot)
+
+    result = asyncio.run(run())
+
+    assert len(stub_client.calls) == 4
+    assert len(calls) == 1
+    assert "assistant did not send a response" in result["response"]
+    assert "document_snapshot" in result["response"]
 
 
 def test_ai_controller_injects_outline_guardrail_hint(sample_snapshot):

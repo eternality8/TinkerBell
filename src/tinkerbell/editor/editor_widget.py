@@ -131,6 +131,7 @@ class EditorWidget(QWidgetBase):
         self._redo_stack: list[_UndoEntry] = []
         self._diff_overlay: DiffOverlayState | None = None
         self._overlay_brush: Any | None = None
+        self._overlay_text_brush: Any | None = None
         self._last_change_source: str = "init"
 
         self._build_ui()
@@ -358,6 +359,7 @@ class EditorWidget(QWidgetBase):
 
         self._theme = load_theme(theme)
         self._overlay_brush = None
+        self._overlay_text_brush = None
         # Re-render preview markup so CSS colors stay in sync with the palette.
         self._refresh_preview(if_enabled=False)
         return self._theme
@@ -547,9 +549,15 @@ class EditorWidget(QWidgetBase):
                 selection.cursor = cursor
                 format_obj = selection.format
                 color = self._overlay_color()
+                text_color = self._overlay_text_color()
                 if color is not None:
                     try:
                         format_obj.setBackground(color)
+                    except Exception:
+                        pass
+                if text_color is not None:
+                    try:
+                        format_obj.setForeground(text_color)
                     except Exception:
                         pass
                 selections.append(selection)
@@ -572,6 +580,18 @@ class EditorWidget(QWidgetBase):
 
     def _mark_change_source(self, source: str) -> None:
         self._last_change_source = source
+
+    def _overlay_text_color(self) -> Any | None:
+        if QColor is None:
+            return None
+        if self._overlay_text_brush is not None:
+            return self._overlay_text_brush
+        rgb = self._theme.color("diff_highlight_foreground", (32, 33, 36))
+        try:
+            self._overlay_text_brush = QColor(*rgb)
+        except Exception:  # pragma: no cover - defensive guard
+            self._overlay_text_brush = None
+        return self._overlay_text_brush
 
 
 # Syntax package -----------------------------------------------------------------

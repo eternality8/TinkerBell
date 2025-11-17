@@ -493,6 +493,32 @@ class MainWindow(QMainWindow):
             except Exception:  # pragma: no cover - defensive guard
                 _LOGGER.debug("QApplication.quit() raised", exc_info=True)
 
+        self._ensure_asyncio_loop_stops()
+
+    def _ensure_asyncio_loop_stops(self) -> None:
+        """Force the qasync loop to receive a stop signal if Qt skips it."""
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
+
+        is_running = getattr(loop, "is_running", None)
+        if not callable(is_running) or not is_running():
+            return
+
+        stopper = getattr(loop, "stop", None)
+        if not callable(stopper):
+            return
+
+        try:
+            loop.call_soon(stopper)
+        except RuntimeError:
+            try:
+                stopper()
+            except Exception:  # pragma: no cover - defensive guard
+                _LOGGER.debug("loop.stop() failed during shutdown", exc_info=True)
+
     # ------------------------------------------------------------------
     # UI setup helpers
     # ------------------------------------------------------------------

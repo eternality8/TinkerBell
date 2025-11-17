@@ -92,6 +92,44 @@ def test_close_event_requests_application_quit(monkeypatch: pytest.MonkeyPatch):
     assert quit_calls["count"] == 1
 
 
+def test_close_event_stops_asyncio_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    window = _make_window()
+
+    class _FakeApp:
+        def closingDown(self) -> bool:
+            return False
+
+        def quit(self) -> None:
+            pass
+
+    fake_app = _FakeApp()
+    monkeypatch.setattr(
+        main_window_module,
+        "QApplication",
+        SimpleNamespace(instance=lambda: fake_app),
+    )
+
+    stop_calls = {"scheduled": 0, "direct": 0}
+
+    def _fake_stop() -> None:
+        stop_calls["direct"] += 1
+
+    def _fake_call_soon(callback):
+        stop_calls["scheduled"] += 1
+        assert callback is _fake_stop
+
+    fake_loop = SimpleNamespace(
+        is_running=lambda: True,
+        stop=_fake_stop,
+        call_soon=_fake_call_soon,
+    )
+    monkeypatch.setattr(main_window_module.asyncio, "get_event_loop", lambda: fake_loop)
+
+    window.closeEvent(SimpleNamespace(accept=lambda: None))
+
+    assert stop_calls == {"scheduled": 1, "direct": 0}
+
+
 def test_chat_suggestions_initialized_on_startup():
     window = _make_window()
     suggestions = window.chat_panel.suggestions()

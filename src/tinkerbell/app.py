@@ -34,6 +34,20 @@ class QtRuntime:
     loop: asyncio.AbstractEventLoop
 
 
+def _choose_qt_event_loop_class(
+    default_cls: type[Any],
+    selector_cls: type[Any],
+    *,
+    platform: str | None = None,
+) -> type[Any]:
+    """Return the Qt event loop class to use for the current platform."""
+
+    active_platform = platform or os.name
+    if active_platform == "nt":  # Windows Proactor loops can hang on close.
+        return selector_cls
+    return default_cls
+
+
 def configure_logging(debug: bool = False, *, force: bool = False) -> None:
     """Configure structured logging for the application."""
 
@@ -72,7 +86,7 @@ def create_qapp(settings: Settings) -> QtRuntime:
         ) from exc
 
     try:
-        from qasync import QEventLoop
+        from qasync import QEventLoop, QSelectorEventLoop
     except ImportError as exc:  # pragma: no cover - depends on env setup
         raise RuntimeError("qasync is required to run the async Qt event loop.") from exc
 
@@ -81,7 +95,10 @@ def create_qapp(settings: Settings) -> QtRuntime:
     app.setApplicationName("TinkerBell")
     app.setApplicationDisplayName("TinkerBell")
 
-    loop = QEventLoop(app)
+    loop_class = _choose_qt_event_loop_class(QEventLoop, QSelectorEventLoop)
+    if loop_class is not QEventLoop:
+        _LOGGER.debug("Using selector-based Qt event loop (platform=%s).", os.name)
+    loop = loop_class(app)
     asyncio.set_event_loop(loop)
     try:
         app.aboutToQuit.connect(loop.stop)  # type: ignore[attr-defined]

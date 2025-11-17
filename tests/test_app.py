@@ -180,3 +180,27 @@ def test_dump_settings_redacts_api_key(tmp_path: Path) -> None:
     assert "super-secret" not in redacted
     assert payload["meta"]["secret_backend"] == store.vault.strategy
     assert "base_url" in payload["meta"]["cli_overrides"]
+
+
+def test_choose_qt_event_loop_uses_selector_on_windows() -> None:
+    class _Default:
+        pass
+
+    class _Selector:
+        pass
+
+    selected = app._choose_qt_event_loop_class(_Default, _Selector, platform="nt")
+
+    assert selected is _Selector
+
+
+def test_choose_qt_event_loop_uses_default_elsewhere() -> None:
+    class _Default:
+        pass
+
+    class _Selector:
+        pass
+
+    selected = app._choose_qt_event_loop_class(_Default, _Selector, platform="posix")
+
+    assert selected is _Default

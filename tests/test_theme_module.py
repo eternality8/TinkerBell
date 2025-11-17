@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tinkerbell.theme import Theme, ThemeManager
+from tinkerbell.theme import Theme, ThemeManager, build_default_dark_theme
 
 
 def test_theme_serialization_round_trip() -> None:
@@ -48,3 +48,8 @@ def test_theme_manager_export_and_import(tmp_path: Path) -> None:
 
     assert imported.name == "default"
     assert other_manager.resolve("default").palette["background"] == (0, 0, 0)
+
+
+def test_default_dark_theme_exposes_diff_highlight_foreground() -> None:
+    theme = build_default_dark_theme()
+    assert theme.palette["diff_highlight_foreground"] == (32, 33, 36)
