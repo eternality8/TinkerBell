@@ -130,6 +130,7 @@ class EditorWidget(QWidgetBase):
         self._undo_stack: list[_UndoEntry] = []
         self._redo_stack: list[_UndoEntry] = []
         self._diff_overlay: DiffOverlayState | None = None
+        self._overlay_brush: Any | None = None
         self._last_change_source: str = "init"
 
         self._build_ui()
@@ -352,11 +353,13 @@ class EditorWidget(QWidgetBase):
 
         self.set_preview_mode(not self._preview_enabled)
 
-    def apply_theme(self, theme_name: str) -> Theme:
-        """Load and apply a theme, returning the resolved Theme object."""
+    def apply_theme(self, theme: Theme | str | None) -> Theme:
+        """Load and apply a theme, returning the resolved :class:`Theme`."""
 
-        self._theme = load_theme(theme_name)
-        # Qt styling hooks will live here once palette files are introduced.
+        self._theme = load_theme(theme)
+        self._overlay_brush = None
+        # Re-render preview markup so CSS colors stay in sync with the palette.
+        self._refresh_preview(if_enabled=False)
         return self._theme
 
     # ------------------------------------------------------------------
@@ -558,10 +561,14 @@ class EditorWidget(QWidgetBase):
     def _overlay_color(self) -> Any | None:
         if QColor is None:
             return None
+        if self._overlay_brush is not None:
+            return self._overlay_brush
+        rgb = self._theme.color("diff_highlight", (255, 243, 196))
         try:
-            return QColor(255, 243, 196)
+            self._overlay_brush = QColor(*rgb)
         except Exception:  # pragma: no cover - defensive guard
-            return None
+            self._overlay_brush = None
+        return self._overlay_brush
 
     def _mark_change_source(self, source: str) -> None:
         self._last_change_source = source

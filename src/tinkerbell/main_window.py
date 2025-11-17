@@ -47,6 +47,7 @@ from .ai.tools.document_outline import DocumentOutlineTool
 from .ai.tools.list_tabs import ListTabsTool
 from .ai.tools.search_replace import SearchReplaceTool
 from .ai.tools.validation import validate_snippet
+from .theme import Theme, load_theme, theme_manager
 
 if TYPE_CHECKING:  # pragma: no cover - import only for static analysis
     from .ai.agents.executor import AIController
@@ -351,7 +352,8 @@ class MainWindow(QMainWindow):
         self._outline_status_by_document: dict[str, OutlineStatusInfo] = {}
         self._snapshot_persistence_block = 0
         self._debug_logging_enabled = bool(getattr(initial_settings, "debug_logging", False))
-        self._active_theme = (getattr(initial_settings, "theme", "") or "default").strip() or "default"
+        self._active_theme: str | None = None
+        self._active_theme_request: str | None = None
         self._auto_patch_tool: DocumentApplyPatchTool | None = None
         self._ai_client_signature: tuple[Any, ...] | None = self._ai_settings_signature(initial_settings)
         self._restoring_workspace = False
@@ -367,6 +369,8 @@ class MainWindow(QMainWindow):
         self._embedding_resource: Any | None = None
         self._last_outline_status: tuple[str, str] | None = None
         self._initialize_ui()
+        if initial_settings is not None:
+            self._apply_theme_setting(initial_settings)
         self._refresh_embedding_runtime(initial_settings)
         if self._phase3_outline_enabled:
             self._outline_worker = self._create_outline_worker()
@@ -3547,50 +3551,18 @@ class MainWindow(QMainWindow):
         self._update_ai_debug_logging(new_debug)
 
     def _apply_theme_setting(self, settings: Settings) -> None:
-        theme_name = (getattr(settings, "theme", "") or "default").strip() or "default"
-        if theme_name == self._active_theme:
+        requested_name = (getattr(settings, "theme", "") or "default").strip() or "default"
+        normalized_request = requested_name.lower()
+        if normalized_request == self._active_theme_request:
             return
-        self._active_theme = theme_name
+        self._active_theme_request = normalized_request
+        theme = load_theme(requested_name)
+        self._active_theme = theme.name
         try:
-            self._editor.apply_theme(theme_name)
+            self._editor.apply_theme(theme)
         except Exception as exc:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to apply editor theme %s: %s", theme_name, exc)
-        self._apply_application_theme(theme_name)
-
-    def _apply_application_theme(self, theme_name: str) -> None:
-        try:
-            from PySide6.QtWidgets import QApplication
-        except Exception:  # pragma: no cover - PySide optional during tests
-            return
-
-        app = QApplication.instance()
-        if app is None:
-            return
-
-        normalized = theme_name.lower()
-        setter = getattr(app, "setStyle", None)
-        if not callable(setter):
-            return
-
-        if normalized == "dark":
-            try:
-                setter("Fusion")
-            except Exception:  # pragma: no cover - style availability varies
-                pass
-            return
-
-        if normalized in {"default", "light", ""}:
-            default_style = getattr(app, "_tinkerbell_default_style", None)
-            if default_style is None:
-                style_getter = getattr(app, "style", None)
-                style_obj = style_getter() if callable(style_getter) else None
-                object_name_getter = getattr(style_obj, "objectName", None)
-                default_style = object_name_getter() if callable(object_name_getter) else None
-                setattr(app, "_tinkerbell_default_style", default_style or "Fusion")
-            try:
-                setter(default_style or "Fusion")
-            except Exception:  # pragma: no cover - defensive guard
-                pass
+            _LOGGER.debug("Unable to apply editor theme %s: %s", theme.name, exc)
+        theme_manager.apply_to_application(theme)
 
     def _refresh_ai_runtime(self, settings: Settings) -> None:
         if not self._ai_settings_ready(settings):

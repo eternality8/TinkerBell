@@ -45,7 +45,7 @@ class _StubEditor:
     def toggle_preview(self) -> None:
         return None
 
-    def apply_theme(self, _theme_name: str) -> None:
+    def apply_theme(self, _theme) -> None:
         return None
 
     def apply_ai_edit(self, directive) -> DocumentState:  # pragma: no cover - not exercised

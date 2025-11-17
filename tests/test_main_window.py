@@ -17,6 +17,7 @@ from tinkerbell.main_window import MainWindow, WindowContext
 from tinkerbell.services.importers import FileImporter, ImportResult, ImporterError
 from tinkerbell.services.settings import Settings, SettingsStore
 from tinkerbell.services.telemetry import ContextUsageEvent
+from tinkerbell.theme import theme_manager
 
 
 def _ensure_qapp() -> None:
@@ -839,10 +840,10 @@ def test_debug_logging_disable_reconfigures_logging(
 
 def test_theme_change_applies_immediately(monkeypatch: pytest.MonkeyPatch) -> None:
     window = _make_window()
-    applied: dict[str, str] = {}
+    applied: dict[str, Any] = {}
 
-    def _capture_theme(name: str):
-        applied["theme"] = name
+    def _capture_theme(theme_obj):
+        applied["theme"] = theme_obj
 
     monkeypatch.setattr(window._editor, "apply_theme", _capture_theme)
     updated = Settings(theme="midnight")
@@ -854,7 +855,7 @@ def test_theme_change_applies_immediately(monkeypatch: pytest.MonkeyPatch) -> No
 
     window._handle_settings_requested()
 
-    assert applied["theme"] == "midnight"
+    assert applied["theme"].name == theme_manager.resolve("midnight").name
 
 
 def test_ai_client_reconfigured_on_connection_change(monkeypatch: pytest.MonkeyPatch) -> None:

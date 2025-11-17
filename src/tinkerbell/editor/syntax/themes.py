@@ -1,29 +1,20 @@
-"""Theme definitions applied to editor widgets and previews."""
+"""Compatibility helpers that route editor theming through the new module."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Tuple
+from ...theme import Theme, load_theme as _load_theme, theme_manager
 
 
-@dataclass(slots=True)
-class Theme:
-    """Simple theme descriptor for syntax highlighting."""
-
-    name: str
-    palette: Dict[str, Tuple[int, int, int]]
+DEFAULT_THEME = _load_theme()
 
 
-DEFAULT_THEME = Theme(name="default", palette={"background": (30, 30, 30), "foreground": (235, 235, 235)})
+def load_theme(theme: Theme | str | None = None) -> Theme:
+    """Resolve ``theme`` to a :class:`Theme` instance via the shared registry."""
 
-
-def load_theme(name: str = "default") -> Theme:
-    """Return the requested theme; defaults to dark palette."""
-
-    return DEFAULT_THEME if name == "default" else DEFAULT_THEME
+    return _load_theme(theme)
 
 
 def available_themes() -> list[str]:
-    """List bundled theme names."""
+    """List bundled theme names for legacy call sites."""
 
-    return ["default"]
+    return theme_manager.available_names()

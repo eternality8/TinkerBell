@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Sequence
 
 from .document_model import DocumentState, SelectionRange
 from .editor_widget import EditorWidget, SelectionListener, SnapshotListener, TextChangeListener, QWidgetBase
+from .syntax.themes import Theme, load_theme
 from .workspace import DocumentTab, DocumentWorkspace
 from ..services.bridge import DocumentBridge, Executor
 
@@ -112,9 +113,11 @@ class TabbedEditorWidget(QWidgetBase):
     def toggle_preview(self) -> None:
         self._workspace.active_editor().toggle_preview()
 
-    def apply_theme(self, theme_name: str) -> None:
+    def apply_theme(self, theme: Theme | str | None) -> Theme:
+        resolved = load_theme(theme)
         for tab in self._workspace.iter_tabs():
-            tab.editor.apply_theme(theme_name)
+            tab.editor.apply_theme(resolved)
+        return resolved
 
     def show_diff_overlay(
         self,

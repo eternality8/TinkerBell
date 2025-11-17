@@ -17,6 +17,7 @@ from .ai.agents.executor import AIController
 from .ai.client import AIClient, ClientSettings
 from .main_window import MainWindow, WindowContext
 from .services.settings import Settings, SettingsStore
+from .theme import theme_manager
 from .utils import logging as logging_utils
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
@@ -86,12 +87,7 @@ def create_qapp(settings: Settings) -> QtRuntime:
     except AttributeError:  # pragma: no cover - in case of mock QApplication
         pass
 
-    theme = (getattr(settings, "theme", "") or "").lower()
-    if theme == "dark":
-        try:
-            app.setStyle("Fusion")
-        except Exception:  # pragma: no cover - style availability varies
-            _LOGGER.debug("Fusion style unavailable; continuing with default theme.")
+    theme_manager.apply_to_application(getattr(settings, "theme", None), app=app)
 
     return QtRuntime(app=app, loop=loop)
 

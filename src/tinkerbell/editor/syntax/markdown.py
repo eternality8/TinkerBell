@@ -187,10 +187,10 @@ def _calculate_stats(text: str) -> Dict[str, Any]:
 
 
 def _wrap_with_theme(html_body: str, theme: Theme) -> str:
-    fg = _palette_to_css(theme.palette.get("foreground", (235, 235, 235)))
-    bg = _palette_to_css(theme.palette.get("background", (30, 30, 30)))
-    accent = _palette_to_css(theme.palette.get("accent", (97, 175, 239)))
-    code_bg = _palette_to_css(_adjust_color(theme.palette.get("background", (30, 30, 30)), 1.2))
+    fg = _palette_to_css(theme.color("preview_foreground", theme.color("foreground", (235, 235, 235))))
+    bg = _palette_to_css(theme.color("preview_background", theme.color("background", (30, 30, 30))))
+    accent = _palette_to_css(theme.color("accent", (97, 175, 239)))
+    code_bg = _palette_to_css(_adjust_color(theme.color("preview_code_background", theme.color("background", (30, 30, 30))), 1.05))
     style = f"""
 <style>
 .tb-markdown-preview {{

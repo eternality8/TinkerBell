@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import gc
+import platform
 import weakref
 
 from tinkerbell.ai.memory import buffers
@@ -15,6 +16,27 @@ from tinkerbell.ai.memory.cache_bus import (
     DocumentChangedEvent,
     DocumentClosedEvent,
 )
+
+
+def _ensure_weakref_clears(ref: weakref.ReferenceType, *, max_collects: int = 5) -> None:
+    """Best-effort helper to clear weakrefs without destabilizing CPython on Windows.
+
+    We only force a collection on interpreters that need it (e.g. PyPy). CPython
+    relies on reference counting, so dropping the last reference is enough and
+    avoids the sporadic heap corruption seen when invoking gc.collect() while
+    Qt/PySide objects are mid-teardown on Windows.
+    """
+
+    if ref() is None:
+        return
+
+    if platform.python_implementation() != "CPython":
+        for _ in range(max_collects):
+            gc.collect()
+            if ref() is None:
+                return
+
+    assert ref() is None, "Observer was expected to be released"
 
 
 def test_conversation_memory_trims_messages_and_tokens() -> None:
@@ -176,7 +198,7 @@ def test_document_cache_bus_supports_weak_subscribers() -> None:
 
     observer_ref = weakref.ref(observer)
     del observer
-    gc.collect()
+    _ensure_weakref_clears(observer_ref)
 
     bus.publish(DocumentChangedEvent(document_id="doc-weak-2", version_id=2, content_hash="y"))
 

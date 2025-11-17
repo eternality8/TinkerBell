@@ -23,21 +23,25 @@ Current agent flows rely on `DocumentSnapshotTool` returning the entire buffer p
 - **Streaming vs batch retrieval:** For summarization workloads, queue chunks in order and stream them to subagents; for precision edits, fetch on demand. The `DocumentChunkTool` API should expose both modes (single chunk vs iterator handle) so the controller picks the most efficient path.
 
 ### 3. Token-aware tool gating inside `AIController`
+**Status:** ✅ Delivered in Phase 2 (context-budget policy, summarizer helper, pointer messages, and trace compactor hooks now live per `ai_v2_plan.md`).
 - **Problem:** The controller currently only trims prior history, not tool payloads. If the agent naively adds multi-kilobyte tool outputs, the conversation still spills over the *response* reserve.
 - **Proposal:** Before appending tool responses, measure their token count via `_estimate_text_tokens`. If a candidate blow past `prompt_budget`, summarize it (e.g., via a `summarize_tool_content` helper calling a tiny local heuristic) or replace it with a pointer (`"chunk:123"`). Also surface the current context usage in metadata so the agent can adapt its plan.
 - **Key touches:** `_handle_tool_calls` / `_invoke_model_turn` to record token deltas, plus a new Controller-level policy object (configurable via settings) so advanced users can tune budgets per model.
 
 ### 4. Hierarchical document summaries & outlines
+**Status:** ✅ Delivered in Phase 3 (outline worker, `DocumentOutlineTool`, and outline-aware snapshots shipped on the AI v2 branch).
 - **Problem:** For extremely large files, even chunk sampling is noisy without a global map.
 - **Proposal:** Leverage `DocumentSummaryMemory` to maintain multi-level summaries (whole file + per top-level heading). Expose a `DocumentOutlineTool` that returns only headings + short blurbs, and allow `DocumentSnapshotTool` to attach the latest outline digest. The agent can skim the outline and request precise chunks afterwards.
 - **Key touches:** `memory/buffers.py` (extend `DocumentSummaryMemory` to store outlines), new tool wrapper referencing it, and a periodic job in `DocumentBridge` (or the editor widget) that refreshes summaries when the file crosses size thresholds.
 
 ### 5. Retrieval-augmented focusing via embeddings
+**Status:** ✅ Delivered in Phase 3 (`DocumentEmbeddingIndex` + `DocumentFindSectionsTool` landed with guardrail-aware controller updates).
 - **Problem:** The current toolset only supports regex search. Semantic lookups ("find the paragraph talking about quotas") force the model to read everything.
 - **Proposal:** Index the document into embeddings (can reuse OpenAI embeddings via `AIClient` or a local model). Provide a `DocumentFindSectionsTool` that, given a query, returns top-k passages (chunk ids + text). Combine with the chunk-aware snapshot so the agent only sees relevant passages.
 - **Key touches:** New service or extension to `services.importers` for indexing, a lightweight vector store (FAISS / sqlite w/ cosine), and a tool shim under `ai/tools`. Cache embeddings per version hash to avoid recompute for each prompt.
 
 ### 6. Automatic plan/summarize loop for long tool traces
+**Status:** ✅ Delivered in Phase 2 (TraceCompactor GA plus controller logic to summarize oversized tool traces).
 - **Problem:** Tool traces themselves accumulate; the controller appends every diff_builder or document_edit result verbatim.
 - **Proposal:** After each tool round, if the accumulated tool trace exceeds X tokens, call a local summarizer (can be a minimal on-device model or heuristics) to compress earlier tool outputs into a "plan log" message. Keep the detailed trace separately in UI logs but feed only the summary back to the LLM.
 - **Key touches:** `AIController.run_chat` loop (when `tool_iterations` increments), new helper to replace chunks of `conversation` with summaries while retaining the raw trace returned to the UI need (through `executed_tool_calls`).
@@ -73,6 +77,7 @@ Current agent flows rely on `DocumentSnapshotTool` returning the entire buffer p
 - **Key touches:** New module `ai/analysis` housing pluggable analyzers (rule-based + optional small LLM). Extend `AIController` to call the analyzer before `_build_messages`, injecting its output into the system prompt metadata. Provide tooling like `ToolUsageAdvisorTool` that the agent can invoke mid-turn to reassess if conditions change (e.g., doc size ballooned). Surface the analyzer’s verdict in the UI so users understand why the agent picked certain tools or chunk sizes.
 
 ## Next steps
-1. Prototype the windowed snapshot + chunk tool (Ideas #1-2) since they deliver the biggest token savings.
-2. Once chunking is stable, add controller-level gating (Idea #3) to prevent regressions.
-3. Layer in summarization/outline + retrieval tools (#4-5) to keep the UX smooth on 100K+ token buffers.
+1. Prototype the windowed snapshot + chunk tool (Ideas #1-2) since they deliver the biggest token savings and remain unsolved.
+2. Move into manager/subagent scaffolding and chunk result caching (Idea #9 + Phase 4 work items) once chunk tools are stable.
+3. Invest in entity/plot orchestration (Ideas #10-11) to keep long-form edits coherent now that outline/retrieval primitives exist.
+4. Explore the preflight analysis layer (Idea #12) to help the agent choose between the now-available outline, retrieval, and future chunk tools without wasting tokens.
