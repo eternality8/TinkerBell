@@ -11,6 +11,7 @@ import math
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, cast
 
 from openai.types.chat import ChatCompletionToolParam
@@ -142,6 +143,7 @@ class AIController:
     _telemetry_sink: TelemetrySink | None = field(default=None, init=False, repr=False)
     _last_budget_decision: BudgetDecision | None = field(default=None, init=False, repr=False)
     _trace_compactor: TraceCompactor | None = field(default=None, init=False, repr=False)
+    _outline_digest_cache: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.tools:
@@ -269,7 +271,12 @@ class AIController:
 
         snapshot = dict(doc_snapshot or {})
         message_plan = self._build_messages(prompt, snapshot, history)
+        outline_hint = self._outline_routing_hint(prompt, snapshot)
         base_messages = list(message_plan.messages)
+        if outline_hint:
+            hint_message = {"role": "system", "content": outline_hint}
+            base_messages.insert(1, hint_message)
+            message_plan.prompt_tokens += self._estimate_message_tokens(hint_message)
         completion_budget = message_plan.completion_budget
         merged_metadata = self._build_metadata(snapshot, metadata)
         tool_specs = [registration.as_openai_tool() for registration in self.tools.values()]
@@ -356,6 +363,12 @@ class AIController:
                 turn_metrics["tool_tokens"] += tool_token_cost
                 turn_metrics["conversation_length"] = len(conversation)
                 self._record_tool_names(turn_metrics, tool_records)
+                self._record_tool_metrics(turn_metrics, tool_records)
+                guardrail_hints = self._guardrail_hints_from_records(tool_records)
+                for hint in guardrail_hints:
+                    hint_message = {"role": "system", "content": hint}
+                    conversation.append(hint_message)
+                    conversation_tokens += self._estimate_message_tokens(hint_message)
 
                 for record in tool_records:
                     name = str(record.get("name") or "").lower()
@@ -694,6 +707,8 @@ class AIController:
             prompt_tokens=int(prompt_tokens),
             response_reserve=response_reserve,
         )
+        self._copy_snapshot_outline_metrics(context, snapshot)
+        self._copy_snapshot_embedding_metadata(context, snapshot)
         return context
 
     def _record_tool_names(self, context: dict[str, Any], records: Sequence[Mapping[str, Any]]) -> None:
@@ -704,6 +719,302 @@ class AIController:
             name = str(record.get("name") or "").strip()
             if name:
                 names.add(name)
+
+    def _record_tool_metrics(self, context: dict[str, Any], records: Sequence[Mapping[str, Any]]) -> None:
+        if not records:
+            return
+        for record in records:
+            name = str(record.get("name") or "").strip().lower()
+            if name == "document_outline":
+                self._capture_outline_tool_metrics(context, record)
+            elif name == "document_find_sections":
+                self._capture_retrieval_tool_metrics(context, record)
+
+    def _guardrail_hints_from_records(self, records: Sequence[Mapping[str, Any]]) -> list[str]:
+        if not records:
+            return []
+        hints: list[str] = []
+        seen: set[str] = set()
+        for record in records:
+            payload = self._deserialize_tool_result(record)
+            if not isinstance(payload, Mapping):
+                continue
+            name = str(record.get("name") or "").lower()
+            candidate: Sequence[str] | None = None
+            if name == "document_outline":
+                candidate = self._outline_guardrail_hints(payload)
+            elif name == "document_find_sections":
+                candidate = self._retrieval_guardrail_hints(payload)
+            if not candidate:
+                continue
+            for entry in candidate:
+                text = entry.strip()
+                if not text or text in seen:
+                    continue
+                hints.append(text)
+                seen.add(text)
+        return hints
+
+    def _outline_guardrail_hints(self, payload: Mapping[str, Any]) -> list[str]:
+        hints: list[str] = []
+        guardrails = payload.get("guardrails")
+        if isinstance(guardrails, Sequence):
+            for entry in guardrails:
+                if not isinstance(entry, Mapping):
+                    continue
+                guardrail_type = str(entry.get("type") or "guardrail")
+                message = str(entry.get("message") or "").strip()
+                action = str(entry.get("action") or "").strip()
+                lines: list[str] = []
+                if message:
+                    lines.append(message)
+                if action:
+                    lines.append(f"Action: {action}")
+                hint = self._format_guardrail_hint(f"DocumentOutlineTool • {guardrail_type}", lines)
+                if hint:
+                    hints.append(hint)
+        status = str(payload.get("status") or "").lower()
+        document_id = str(payload.get("document_id") or "this document")
+        reason = str(payload.get("reason") or "").strip()
+        retry_after_ms = payload.get("retry_after_ms")
+        is_stale = bool(payload.get("is_stale")) or status == "stale"
+        trimmed_reason = str(payload.get("trimmed_reason") or "").lower()
+        outline_available = payload.get("outline_available")
+        if status == "pending":
+            retry_hint = None
+            if isinstance(retry_after_ms, (int, float)) and retry_after_ms > 0:
+                retry_seconds = retry_after_ms / 1000.0
+                retry_hint = f"Retry after ~{retry_seconds:.1f}s or continue with DocumentSnapshot while the worker rebuilds."
+            lines = [f"Outline for {document_id} is still building; treat existing nodes as stale hints only."]
+            if retry_hint:
+                lines.append(retry_hint)
+            hints.append(self._format_guardrail_hint("DocumentOutlineTool", lines))
+        elif status == "unsupported_format":
+            detail = reason or "unsupported format"
+            lines = [
+                f"Outline unavailable for {document_id}: {detail}.",
+                "Navigate manually with DocumentSnapshot or other tools.",
+            ]
+            hints.append(self._format_guardrail_hint("DocumentOutlineTool", lines))
+        elif status in {"outline_missing", "outline_unavailable", "no_document"}:
+            detail = reason or "outline not cached yet"
+            lines = [
+                f"Outline missing for {document_id} ({detail}).",
+                "Queue the worker or rely on selection-scoped snapshots until it exists.",
+            ]
+            hints.append(self._format_guardrail_hint("DocumentOutlineTool", lines))
+        if is_stale:
+            lines = [
+                f"Outline for {document_id} is stale compared to the latest DocumentSnapshot.",
+                "Refresh the outline or treat headings as hints only before editing.",
+            ]
+            hints.append(self._format_guardrail_hint("DocumentOutlineTool", lines))
+        if trimmed_reason == "token_budget":
+            lines = [
+                "Outline was trimmed by the token budget.",
+                "Request fewer levels or hydrate specific pointers before editing deeper sections.",
+            ]
+            hints.append(self._format_guardrail_hint("DocumentOutlineTool", lines))
+        if outline_available is False and status not in {"pending", "unsupported_format", "outline_missing", "outline_unavailable"}:
+            lines = [
+                f"Outline payload for {document_id} indicated no nodes were returned.",
+                "Avoid planning edits that rely on missing structure until the worker succeeds.",
+            ]
+            hints.append(self._format_guardrail_hint("DocumentOutlineTool", lines))
+        return [hint for hint in hints if hint]
+
+    def _retrieval_guardrail_hints(self, payload: Mapping[str, Any]) -> list[str]:
+        hints: list[str] = []
+        status = str(payload.get("status") or "").lower()
+        document_id = str(payload.get("document_id") or "this document")
+        reason = str(payload.get("reason") or "").strip()
+        fallback_reason = str(payload.get("fallback_reason") or "").strip()
+        offline_mode = bool(payload.get("offline_mode"))
+        if status == "unsupported_format":
+            detail = reason or "unsupported format"
+            lines = [
+                f"Retrieval disabled for {document_id}: {detail}.",
+                "Use DocumentSnapshot, manual navigation, or outline pointers instead.",
+            ]
+            hints.append(self._format_guardrail_hint("DocumentFindSectionsTool", lines))
+        if offline_mode or status in {"offline_fallback", "offline_no_results"}:
+            label_reason = fallback_reason or ("offline mode" if offline_mode else "fallback strategy")
+            lines = [
+                f"Retrieval is running without embeddings ({label_reason}).",
+                "Treat matches as low-confidence hints and rehydrate via DocumentSnapshot before editing.",
+            ]
+            hints.append(self._format_guardrail_hint("DocumentFindSectionsTool", lines))
+        if status == "offline_no_results":
+            lines = [
+                f"Offline fallback could not find matches for {document_id}.",
+                "Try a different query or scan the outline/snapshot manually.",
+            ]
+            hints.append(self._format_guardrail_hint("DocumentFindSectionsTool", lines))
+        return [hint for hint in hints if hint]
+
+    def _format_guardrail_hint(self, source: str, lines: Sequence[str]) -> str:
+        filtered = [str(line).strip() for line in lines if str(line).strip()]
+        if not filtered:
+            return ""
+        body = "\n".join(f"- {line}" for line in filtered)
+        return f"Guardrail hint ({source}):\n{body}"
+
+    def _capture_outline_tool_metrics(self, context: dict[str, Any], record: Mapping[str, Any]) -> None:
+        payload = self._deserialize_tool_result(record)
+        if not isinstance(payload, Mapping):
+            return
+        digest = payload.get("outline_digest") or payload.get("outline_hash")
+        if digest:
+            context["outline_digest"] = str(digest)
+        version_id = self._coerce_optional_int(payload.get("version_id"))
+        if version_id is not None:
+            context["outline_version_id"] = version_id
+        status = payload.get("status")
+        if status:
+            context["outline_status"] = str(status)
+        node_count = self._coerce_optional_int(payload.get("node_count"))
+        if node_count is not None:
+            context["outline_node_count"] = node_count
+        token_count = self._coerce_optional_int(payload.get("token_count"))
+        if token_count is not None:
+            context["outline_token_count"] = token_count
+        trimmed = payload.get("trimmed")
+        if isinstance(trimmed, bool):
+            context["outline_trimmed"] = trimmed
+        is_stale = payload.get("is_stale")
+        if isinstance(is_stale, bool):
+            context["outline_is_stale"] = is_stale
+            if status is None:
+                context["outline_status"] = "stale" if is_stale else "ok"
+        latency = self._coerce_optional_float(record.get("duration_ms"))
+        if latency is not None:
+            context["outline_latency_ms"] = latency
+        generated_at = payload.get("generated_at")
+        age = self._outline_age_from_timestamp(generated_at)
+        if age is not None:
+            context["outline_age_seconds"] = age
+
+    def _capture_retrieval_tool_metrics(self, context: dict[str, Any], record: Mapping[str, Any]) -> None:
+        payload = self._deserialize_tool_result(record)
+        if not isinstance(payload, Mapping):
+            return
+        strategy = payload.get("strategy")
+        if strategy:
+            context["retrieval_strategy"] = str(strategy)
+        status = payload.get("status")
+        if status:
+            context["retrieval_status"] = str(status)
+        pointer_count = payload.get("pointers")
+        if isinstance(pointer_count, Sequence) and not isinstance(pointer_count, (str, bytes)):
+            context["retrieval_pointer_count"] = len(pointer_count)
+        latency = payload.get("latency_ms")
+        latency_value = self._coerce_optional_float(latency)
+        if latency_value is None:
+            latency_value = self._coerce_optional_float(record.get("duration_ms"))
+        if latency_value is not None:
+            context["retrieval_latency_ms"] = latency_value
+
+    def _deserialize_tool_result(self, record: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        result_text = record.get("result")
+        if not isinstance(result_text, str) or not result_text.strip():
+            return None
+        try:
+            parsed = json.loads(result_text)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, Mapping):
+            return parsed
+        return None
+
+    def _copy_snapshot_outline_metrics(self, context: dict[str, Any], snapshot: Mapping[str, Any]) -> None:
+        if not isinstance(snapshot, Mapping):
+            return
+        digest = snapshot.get("outline_digest")
+        if digest:
+            context["outline_digest"] = str(digest)
+        status = snapshot.get("outline_status")
+        if status:
+            context["outline_status"] = str(status)
+        version_id = self._coerce_optional_int(snapshot.get("outline_version_id"))
+        if version_id is not None:
+            context["outline_version_id"] = version_id
+        latency = self._coerce_optional_float(snapshot.get("outline_latency_ms"))
+        if latency is not None:
+            context["outline_latency_ms"] = latency
+        node_count = self._coerce_optional_int(snapshot.get("outline_node_count"))
+        if node_count is not None:
+            context["outline_node_count"] = node_count
+        token_count = self._coerce_optional_int(snapshot.get("outline_token_count"))
+        if token_count is not None:
+            context["outline_token_count"] = token_count
+        trimmed = snapshot.get("outline_trimmed")
+        if isinstance(trimmed, bool):
+            context["outline_trimmed"] = trimmed
+        is_stale = snapshot.get("outline_is_stale")
+        if isinstance(is_stale, bool):
+            context["outline_is_stale"] = is_stale
+        age_seconds = self._coerce_optional_float(snapshot.get("outline_age_seconds"))
+        if age_seconds is not None:
+            context["outline_age_seconds"] = age_seconds
+        else:
+            completed = snapshot.get("outline_completed_at")
+            age_from_completed = self._outline_age_from_timestamp(completed)
+            if age_from_completed is not None:
+                context["outline_age_seconds"] = age_from_completed
+
+    def _copy_snapshot_embedding_metadata(self, context: dict[str, Any], snapshot: Mapping[str, Any]) -> None:
+        if not isinstance(snapshot, Mapping):
+            return
+        backend = snapshot.get("embedding_backend")
+        if backend:
+            context["embedding_backend"] = str(backend)
+        model = snapshot.get("embedding_model")
+        if model:
+            context["embedding_model"] = str(model)
+        status = snapshot.get("embedding_status")
+        if status:
+            context["embedding_status"] = str(status)
+        detail = snapshot.get("embedding_detail")
+        if detail:
+            context["embedding_detail"] = str(detail)
+
+    def _outline_age_from_timestamp(self, value: object) -> float | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float)):
+            return max(0.0, time.time() - float(value))
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            return max(0.0, time.time() - parsed.timestamp())
+        return None
+
+    @staticmethod
+    def _coerce_optional_int(value: object) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _coerce_optional_float(value: object) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _coerce_optional_str(value: object) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
     def _evaluate_budget(
         self,
@@ -765,6 +1076,23 @@ class AIController:
             conversation_length=int(context.get("conversation_length", 0)),
             tool_names=tool_names_tuple,
             run_id=str(context.get("run_id") or uuid.uuid4().hex),
+            embedding_backend=self._coerce_optional_str(context.get("embedding_backend")),
+            embedding_model=self._coerce_optional_str(context.get("embedding_model")),
+            embedding_status=self._coerce_optional_str(context.get("embedding_status")),
+            embedding_detail=self._coerce_optional_str(context.get("embedding_detail")),
+            outline_digest=self._coerce_optional_str(context.get("outline_digest")),
+            outline_status=self._coerce_optional_str(context.get("outline_status")),
+            outline_version_id=self._coerce_optional_int(context.get("outline_version_id")),
+            outline_latency_ms=self._coerce_optional_float(context.get("outline_latency_ms")),
+            outline_node_count=self._coerce_optional_int(context.get("outline_node_count")),
+            outline_token_count=self._coerce_optional_int(context.get("outline_token_count")),
+            outline_trimmed=context.get("outline_trimmed"),
+            outline_is_stale=context.get("outline_is_stale"),
+            outline_age_seconds=self._coerce_optional_float(context.get("outline_age_seconds")),
+            retrieval_status=self._coerce_optional_str(context.get("retrieval_status")),
+            retrieval_strategy=self._coerce_optional_str(context.get("retrieval_strategy")),
+            retrieval_latency_ms=self._coerce_optional_float(context.get("retrieval_latency_ms")),
+            retrieval_pointer_count=self._coerce_optional_int(context.get("retrieval_pointer_count")),
         )
         try:
             self._telemetry_sink.record(event)
@@ -906,6 +1234,92 @@ class AIController:
         if runtime_metadata:
             metadata.update(runtime_metadata)
         return metadata or None
+
+    def _outline_routing_hint(self, prompt: str, snapshot: Mapping[str, Any]) -> str | None:
+        prompt_text = (prompt or "").strip().lower()
+        if not prompt_text and not snapshot:
+            return None
+        doc_id = self._resolve_document_id(snapshot)
+        raw_text = snapshot.get("text")
+        if isinstance(raw_text, str):
+            doc_chars = len(raw_text)
+        else:
+            try:
+                doc_chars = int(snapshot.get("char_count") or 0)
+            except (TypeError, ValueError):
+                doc_chars = 0
+
+        outline_keywords = (
+            "outline",
+            "heading",
+            "headings",
+            "section",
+            "sections",
+            "toc",
+            "table of contents",
+            "chapter",
+        )
+        retrieval_keywords = (
+            "find section",
+            "find heading",
+            "find chapter",
+            "locate",
+            "where is",
+            "which section",
+            "quote",
+            "passage",
+            "excerpt",
+        )
+
+        def _contains(text: str, keywords: tuple[str, ...]) -> bool:
+            return any(keyword in text for keyword in keywords)
+
+        mentions_outline = _contains(prompt_text, outline_keywords)
+        mentions_retrieval = _contains(prompt_text, retrieval_keywords)
+        large_doc = doc_chars >= prompts.LARGE_DOC_CHAR_THRESHOLD if doc_chars else False
+
+        guidance: list[str] = []
+        if mentions_outline or large_doc:
+            reasons: list[str] = []
+            if large_doc:
+                reasons.append(f"the document is large (~{doc_chars:,} chars)")
+            if mentions_outline:
+                reasons.append("the user referenced headings/sections")
+            reason_text = " and ".join(reasons) if reasons else "document context"
+            guidance.append(
+                f"Call DocumentOutlineTool first because {reason_text}. Compare outline_digest values to avoid redundant calls."
+            )
+        if mentions_retrieval:
+            guidance.append(
+                "After reviewing the outline, call DocumentFindSectionsTool to pull the passages requested before drafting edits."
+            )
+
+        digest_hint: str | None = None
+        digest = str(snapshot.get("outline_digest") or "").strip()
+        if digest and doc_id:
+            previous = self._outline_digest_cache.get(doc_id)
+            self._outline_digest_cache[doc_id] = digest
+            digest_prefix = digest[:8]
+            if previous and previous == digest:
+                digest_hint = (
+                    f"Outline digest {digest_prefix}… matches your prior fetch this session; reuse the previous outline data unless it was marked stale."
+                )
+            else:
+                digest_hint = (
+                    f"Outline digest updated to {digest_prefix}…; use this version when reasoning about structure."
+                )
+
+        if not guidance and not digest_hint:
+            return None
+
+        lines = ["Controller hint:"]
+        for entry in guidance:
+            lines.append(f"- {entry}")
+        if digest_hint:
+            lines.append(f"- {digest_hint}")
+        if not guidance and digest_hint:
+            lines.append("- Only re-run DocumentOutlineTool if the digest changes or the tool reports stale data.")
+        return "\n".join(lines)
 
     def _log_response_text(self, response_text: str) -> None:
         settings = getattr(self.client, "settings", None)

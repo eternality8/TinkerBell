@@ -14,7 +14,8 @@ Deliver a second-generation AI editing loop that handles 100K+ token files witho
 - ✅ **Phase 0 delivered:** Tokenizer registry + CLI, telemetry sinks/toggles, document versioning, cache bus, and supporting docs/benchmarks are merged with full pytest coverage.
 - ✅ **Phase 1 delivered:** LangGraph-driven editor affordances (diff overlays, autosave signal, improved dialogs), deterministic tool traces, telemetry/memory upgrades, and benchmarking artifacts are complete with tests/docs.
 - ✅ **Phase 2 delivered:** Context-budget enforcement, pointer summaries, TraceCompactor GA, refreshed docs/benchmarks, and opt-out controls now live on the AI v2 branch.
-- 🔜 **Next focus – Phase 3:** Outline, retrieval, and chunk-aware tooling layered on top of the enforced policy described below.
+- ✅ **Phase 3 delivered:** Guardrail-aware outline/retrieval stack (Outline worker/tool, embedding-backed DocumentFindSectionsTool, controller hints, docs/samples) is complete and flight-ready.
+- 🔜 **Next focus – Phase 4:** Advanced coordination/subagent scaffolding on top of the now-stable outline + retrieval flows.
 
 ## Phase 0 – Telemetry & shared infrastructure ✅
 **Status:** Completed in November 2025. The token counter registry (`ai/client.py` + `scripts/inspect_tokens.py`), telemetry events + sinks (`ai/services/telemetry.py`, status bar hooks, settings toggles), document versioning (`editor/document_model.py`, `services/bridge.py`, optimistic patch enforcement), and the cache invalidation bus (`ai/memory/cache_bus.py`) are live with docs + benchmarks. These foundations now back every subsequent phase.
@@ -81,7 +82,8 @@ With observability, diff safety, and UI affordances in place, Phase 2 can concen
 - **Lossy summaries corrupting reasoning:** retain original payload IDs so the agent can refetch via chunk tools.
 - **Performance hit from frequent summaries:** cache summarizer results per payload hash.
 
-## Phase 3 – Outline + retrieval tools
+## Phase 3 – Outline + retrieval tools ✅
+**Status:** Completed in November 2025 alongside the guardrail-aware prompt/controller work.
 **Goal:** Provide global navigation aids so the agent can target relevant chunks without full scans.
 
 ### Work items
@@ -97,13 +99,12 @@ With observability, diff safety, and UI affordances in place, Phase 2 can concen
    - Cache embeddings per chunk hash and invalidate via cache bus.
 
 ### Validation
-- Tests generating outlines for markdown/YAML fixtures.
-- Retrieval tests verifying changed chunk triggers re-embedding.
-- Benchmark showing top-k retrieval reduces chunk calls vs regex search.
+- Tests covering the outline worker/tool (`tests/test_outline_worker.py`, `tests/test_document_outline_tool.py`), retrieval (`tests/test_retrieval_tool.py`), memory buffers, and guardrail-aware controller prompts (`tests/test_agent.py`).
+- Benchmark scripts (`benchmarks/measure_diff_latency.py`, forthcoming retrieval latency helper) document token savings vs. full-document scans.
 
 ### Risks & mitigations
-- **Embedding latency/cost:** batch chunk embeddings and reuse cached vectors; allow disabling embeddings in settings.
-- **Outline staleness:** include version ID in tool response; controller requests fresh outline when mismatch occurs.
+- **Embedding latency/cost:** batch chunk embeddings and reuse cached vectors; allow disabling embeddings in settings and surface fallback hints.
+- **Outline staleness:** include version ID in tool response; controller requests fresh outline when mismatch occurs and surfaces guardrail hints when pending.
 
 ## Phase 4 – Advanced coordination (optional stretch)
 **Goal:** Prepare for manager/subagent workflows without shipping the full orchestration yet.

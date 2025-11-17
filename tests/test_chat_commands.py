@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from tinkerbell.chat.commands import ActionType, parse_agent_payload, resolve_tab_reference, validate_directive
+from tinkerbell.chat.commands import (
+    ActionType,
+    ManualCommandType,
+    parse_agent_payload,
+    parse_manual_command,
+    resolve_tab_reference,
+    validate_directive,
+)
 
 
 _TABS = [
@@ -110,3 +117,39 @@ def test_resolve_tab_reference_matches_titles_and_paths() -> None:
     assert resolve_tab_reference("readme.md", _TABS) == "tab-a"
     assert resolve_tab_reference("notes", _TABS) == "tab-b"
     assert resolve_tab_reference("unknown", _TABS) is None
+
+
+def test_parse_manual_outline_command_with_flags() -> None:
+    request = parse_manual_command("/outline --doc Tab 2 --levels 3 --max 25 --no-blurbs")
+
+    assert request is not None
+    assert request.command is ManualCommandType.OUTLINE
+    assert request.args["document_id"] == "Tab 2"
+    assert request.args["desired_levels"] == 3
+    assert request.args["max_nodes"] == 25
+    assert request.args["include_blurbs"] is False
+
+
+def test_parse_manual_find_command_with_query_and_flags() -> None:
+    request = parse_manual_command('::find --doc "tab-a" --top 4 --confidence 0.5 "intro section"')
+
+    assert request is not None
+    assert request.command is ManualCommandType.FIND_SECTIONS
+    assert request.args["document_id"] == "tab-a"
+    assert request.args["top_k"] == 4
+    assert pytest.approx(request.args["min_confidence"], rel=1e-6) == 0.5
+    assert request.args["query"] == "intro section"
+
+
+def test_parse_manual_find_requires_query() -> None:
+    with pytest.raises(ValueError):
+        parse_manual_command("!find --doc tab-a")
+
+
+def test_parse_manual_command_ignored_without_prefix() -> None:
+    assert parse_manual_command("outline please") is None
+
+
+def test_parse_manual_command_rejects_unknown_command() -> None:
+    with pytest.raises(ValueError):
+        parse_manual_command("/summarize this")

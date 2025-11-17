@@ -114,6 +114,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(f"Invalid --set override: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
+    if args.phase3_outline_tools is not None:
+        cli_overrides["phase3_outline_tools"] = args.phase3_outline_tools
+    if args.embedding_backend is not None:
+        cli_overrides["embedding_backend"] = args.embedding_backend
+    if args.embedding_model is not None:
+        cli_overrides["embedding_model_name"] = args.embedding_model
+
     overrides_mapping: Dict[str, Any] | None = cli_overrides or None
     settings = load_settings(resolved_path, store=settings_store, overrides=overrides_mapping)
 
@@ -327,6 +334,31 @@ def _parse_cli_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, lis
         action="append",
         default=[],
         help="Override persisted settings before launch (repeatable).",
+    )
+    parser.add_argument(
+        "--enable-phase3-outline-tools",
+        dest="phase3_outline_tools",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Enable Phase 3 outline + retrieval tooling without editing settings.json.",
+    )
+    parser.add_argument(
+        "--disable-phase3-outline-tools",
+        dest="phase3_outline_tools",
+        action="store_const",
+        const=False,
+        help="Disable Phase 3 outline + retrieval tooling for this session.",
+    )
+    parser.add_argument(
+        "--embedding-backend",
+        choices=["auto", "openai", "langchain", "disabled"],
+        help="Override the embedding backend (auto, openai, langchain, disabled).",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        metavar="MODEL",
+        help="Override the embedding model name used for retrieval.",
     )
     return parser.parse_known_args(argv)
 

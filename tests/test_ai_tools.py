@@ -63,7 +63,7 @@ class _EditBridgeStub:
 
 class _SnapshotProviderStub:
     def __init__(self) -> None:
-        self.snapshot = {"text": "Hello", "selection": (0, 5), "version": "base"}
+        self.snapshot = {"text": "Hello", "selection": (0, 5), "version": "base", "document_id": "doc-stub"}
         self.delta_only_calls: list[bool] = []
         self.last_diff_summary: str | None = "+1 char"
         self.last_snapshot_version: str | None = "digest-1"
@@ -377,6 +377,36 @@ def test_document_snapshot_tool_falls_back_to_provider_version():
     snapshot = tool.run()
 
     assert snapshot["version"] == "digest-1"
+
+
+def test_document_snapshot_tool_attaches_outline_digest_when_resolver_present():
+    provider = _SnapshotProviderStub()
+    calls: list[str | None] = []
+
+    def resolver(document_id: str | None) -> str | None:
+        calls.append(document_id)
+        return "outline-hash" if document_id == "doc-stub" else None
+
+    tool = DocumentSnapshotTool(provider=provider, outline_digest_resolver=resolver)
+
+    snapshot = tool.run()
+
+    assert snapshot["outline_digest"] == "outline-hash"
+    assert calls == ["doc-stub"]
+
+
+def test_document_snapshot_tool_uses_tab_identifier_when_document_id_missing():
+    provider = _SnapshotProviderStub()
+    provider.snapshot.pop("document_id", None)
+
+    tool = DocumentSnapshotTool(
+        provider=provider,
+        outline_digest_resolver=lambda doc_id: "tab-digest" if doc_id == "tab-extra" else None,
+    )
+
+    snapshot = tool.run(tab_id="tab-extra")
+
+    assert snapshot["outline_digest"] == "tab-digest"
 
 
 def test_search_replace_tool_updates_document_scope():

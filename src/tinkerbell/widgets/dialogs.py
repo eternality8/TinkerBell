@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 from urllib.parse import urlparse
 
 import httpx
@@ -51,6 +51,12 @@ __all__ = [
 
 DEFAULT_FILE_FILTER = "Markdown / Text (*.md *.markdown *.mdx *.txt *.json *.yaml *.yml);;All Files (*)"
 _MODEL_SUGGESTIONS = ("gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "o4-mini")
+_EMBEDDING_BACKENDS: tuple[tuple[str, str], ...] = (
+    ("auto", "Auto (match chat model)"),
+    ("openai", "OpenAI (direct)"),
+    ("langchain", "LangChain (OpenAI-compatible)"),
+    ("disabled", "Disabled"),
+)
 _HINT_COLORS = {
     "info": "#6a737d",
     "success": "#1a7f37",
@@ -706,6 +712,24 @@ class SettingsDialog(QDialog):
         self._organization_input.setObjectName("organization_input")
         self._theme_input = QLineEdit(self._original.theme)
         self._theme_input.setObjectName("theme_input")
+        self._embedding_backend_combo = QComboBox()
+        self._embedding_backend_combo.setObjectName("embedding_backend_combo")
+        for backend_value, backend_label in _EMBEDDING_BACKENDS:
+            self._embedding_backend_combo.addItem(backend_label, backend_value)
+        backend_default = (getattr(self._original, "embedding_backend", "auto") or "auto").lower()
+        backend_index = self._embedding_backend_combo.findData(backend_default)
+        self._embedding_backend_combo.setCurrentIndex(backend_index if backend_index >= 0 else 0)
+        self._embedding_backend_combo.currentIndexChanged.connect(self._handle_embedding_backend_changed)
+        self._embedding_backend_hint = QLabel("Use LangChain to reach DeepSeek, GLM, or other OpenAI-compatible APIs.")
+        self._embedding_backend_hint.setObjectName("embedding_backend_hint")
+        self._prepare_hint_label(self._embedding_backend_hint)
+        embedding_model_default = getattr(self._original, "embedding_model_name", "text-embedding-3-large") or "text-embedding-3-large"
+        self._embedding_model_input = QLineEdit(embedding_model_default)
+        self._embedding_model_input.setObjectName("embedding_model_input")
+        self._embedding_model_input.textChanged.connect(self._validate_embedding_fields)
+        self._embedding_model_hint = QLabel("Defaults to text-embedding-3-large when left blank.")
+        self._embedding_model_hint.setObjectName("embedding_model_hint")
+        self._prepare_hint_label(self._embedding_model_hint)
         self._debug_checkbox = QCheckBox("Enable debug logging")
         self._debug_checkbox.setObjectName("debug_logging_checkbox")
         self._debug_checkbox.setChecked(self._original.debug_logging)
@@ -714,6 +738,12 @@ class SettingsDialog(QDialog):
         self._tool_panel_checkbox.setChecked(
             bool(getattr(self._original, "show_tool_activity_panel", False))
         )
+        self._phase3_outline_checkbox = QCheckBox("Enable Phase 3 outline + retrieval tools")
+        self._phase3_outline_checkbox.setObjectName("phase3_outline_tools_checkbox")
+        self._phase3_outline_checkbox.setChecked(bool(getattr(self._original, "phase3_outline_tools", False)))
+        self._phase3_outline_hint = QLabel("Experimental outlines/retrieval with status bar indicators and telemetry.")
+        self._phase3_outline_hint.setObjectName("phase3_outline_hint")
+        self._prepare_hint_label(self._phase3_outline_hint)
         self._max_tool_iterations_input = QSpinBox()
         self._max_tool_iterations_input.setObjectName("max_tool_iterations_input")
         self._max_tool_iterations_input.setRange(1, 25)
@@ -828,8 +858,29 @@ class SettingsDialog(QDialog):
         form_layout.addRow("Model", self._model_combo)
         form_layout.addRow("Organization", self._organization_input)
         form_layout.addRow("Theme", self._theme_input)
+        embedding_backend_container = QWidget()
+        embedding_backend_layout = QVBoxLayout(embedding_backend_container)
+        embedding_backend_layout.setContentsMargins(0, 0, 0, 0)
+        embedding_backend_layout.setSpacing(2)
+        embedding_backend_layout.addWidget(self._embedding_backend_combo)
+        embedding_backend_layout.addWidget(self._embedding_backend_hint)
+        form_layout.addRow("Embedding Backend", embedding_backend_container)
+        embedding_model_container = QWidget()
+        embedding_model_layout = QVBoxLayout(embedding_model_container)
+        embedding_model_layout.setContentsMargins(0, 0, 0, 0)
+        embedding_model_layout.setSpacing(2)
+        embedding_model_layout.addWidget(self._embedding_model_input)
+        embedding_model_layout.addWidget(self._embedding_model_hint)
+        form_layout.addRow("Embedding Model", embedding_model_container)
         form_layout.addRow("Debug", self._debug_checkbox)
         form_layout.addRow("Tool Traces", self._tool_panel_checkbox)
+        phase3_container = QWidget()
+        phase3_layout = QVBoxLayout(phase3_container)
+        phase3_layout.setContentsMargins(0, 0, 0, 0)
+        phase3_layout.setSpacing(2)
+        phase3_layout.addWidget(self._phase3_outline_checkbox)
+        phase3_layout.addWidget(self._phase3_outline_hint)
+        form_layout.addRow("Phase 3 Tools", phase3_container)
         form_layout.addRow("Max Tool Iterations", self._max_tool_iterations_input)
         form_layout.addRow("Max Context Tokens", self._max_context_tokens_input)
         reserve_container = QWidget()
@@ -902,6 +953,8 @@ class SettingsDialog(QDialog):
         self._update_reserve_hint()
         self._update_timeout_hint()
         self._update_context_policy_hint()
+        self._handle_embedding_backend_changed()
+        self._validate_embedding_fields()
         self._update_buttons_state()
 
     # ------------------------------------------------------------------
@@ -944,8 +997,11 @@ class SettingsDialog(QDialog):
         model = self._model_combo.currentText().strip() or self._original.model
         organization = self._organization_input.text().strip() or None
         theme = self._theme_input.text().strip() or self._original.theme
+        embedding_backend = self._selected_embedding_backend()
+        embedding_model = self._embedding_model_input.text().strip() or self._original.embedding_model_name
         debug_logging = self._debug_checkbox.isChecked()
         show_tool_activity_panel = self._tool_panel_checkbox.isChecked()
+        phase3_outline_tools = self._phase3_outline_checkbox.isChecked()
         max_tool_iterations = int(self._max_tool_iterations_input.value())
         max_context_tokens = int(self._max_context_tokens_input.value())
         response_token_reserve = int(self._response_token_reserve_input.value())
@@ -958,8 +1014,11 @@ class SettingsDialog(QDialog):
             model=model,
             organization=organization,
             theme=theme,
+            embedding_backend=embedding_backend,
+            embedding_model_name=embedding_model,
             debug_logging=debug_logging,
             show_tool_activity_panel=show_tool_activity_panel,
+            phase3_outline_tools=phase3_outline_tools,
             max_tool_iterations=max_tool_iterations,
             max_context_tokens=max_context_tokens,
             response_token_reserve=response_token_reserve,
@@ -1149,6 +1208,31 @@ class SettingsDialog(QDialog):
 
         box.destroyed.connect(lambda *_: _cleanup())
         QTimer.singleShot(3500, box.close)
+
+    def _selected_embedding_backend(self) -> str:
+        index = self._embedding_backend_combo.currentIndex()
+        value = self._embedding_backend_combo.itemData(index)
+        if isinstance(value, str) and value:
+            return value
+        return "auto"
+
+    def _handle_embedding_backend_changed(self) -> None:
+        backend = self._selected_embedding_backend()
+        hint = "Embeddings disabled; retrieval falls back to regex + outlines." if backend == "disabled" else "LangChain adapters support OpenAI-compatible providers like DeepSeek or GLM." if backend == "langchain" else "Use your configured OpenAI endpoint for embeddings."
+        self._set_hint(self._embedding_backend_hint, hint)
+        self._embedding_model_input.setEnabled(backend != "disabled")
+        self._validate_embedding_fields()
+
+    def _validate_embedding_fields(self) -> None:
+        backend = self._selected_embedding_backend()
+        model = self._embedding_model_input.text().strip()
+        if backend == "disabled":
+            self._set_field_error("embedding_model_name", None)
+            return
+        if not model:
+            self._set_field_error("embedding_model_name", "Embedding model is required unless embeddings are disabled.")
+            return
+        self._set_field_error("embedding_model_name", None)
 
 
 def show_settings_dialog(

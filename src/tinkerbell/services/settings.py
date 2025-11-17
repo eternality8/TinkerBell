@@ -24,12 +24,15 @@ _ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_API_KEY": "api_key",
     "TINKERBELL_BASE_URL": "base_url",
     "TINKERBELL_MODEL": "model",
+    "TINKERBELL_EMBEDDING_BACKEND": "embedding_backend",
+    "TINKERBELL_EMBEDDING_MODEL": "embedding_model_name",
     "TINKERBELL_THEME": "theme",
     "TINKERBELL_ORGANIZATION": "organization",
 }
 _BOOL_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_DEBUG_LOGGING": "debug_logging",
     "TINKERBELL_TOOL_ACTIVITY_PANEL": "show_tool_activity_panel",
+    "TINKERBELL_PHASE3_OUTLINE_TOOLS": "phase3_outline_tools",
 }
 _FLOAT_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_REQUEST_TIMEOUT": "request_timeout",
@@ -74,6 +77,8 @@ class Settings:
     max_tool_iterations: int = 8
     max_context_tokens: int = 128_000
     response_token_reserve: int = 16_000
+    embedding_backend: str = "auto"
+    embedding_model_name: str = "text-embedding-3-large"
     autosave_interval: float = 60.0
     default_headers: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, str] = field(default_factory=dict)
@@ -90,6 +95,7 @@ class Settings:
     window_geometry: str | None = None
     debug_logging: bool = False
     show_tool_activity_panel: bool = False
+    phase3_outline_tools: bool = False
     debug: DebugSettings = field(default_factory=DebugSettings)
     context_policy: ContextPolicySettings = field(default_factory=ContextPolicySettings)
 

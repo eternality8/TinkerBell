@@ -4,23 +4,35 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import logging
+import os
 import time
-from datetime import datetime, timezone, timedelta
 from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING
+from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING, cast
 
 from .chat.chat_panel import ChatPanel
-from .chat.commands import ActionType, DIRECTIVE_SCHEMA
+from .chat.commands import (
+    ActionType,
+    DIRECTIVE_SCHEMA,
+    ManualCommandRequest,
+    ManualCommandType,
+    parse_manual_command,
+    resolve_tab_reference,
+)
 from .chat.message_model import ChatMessage, EditDirective, ToolTrace
 from .editor.document_model import DocumentMetadata, DocumentState, SelectionRange
 from .editor.workspace import DocumentTab
 from .editor.tabbed_editor import TabbedEditorWidget
 from .services import telemetry as telemetry_service
+from .ai.memory import EmbeddingProvider, DocumentEmbeddingIndex, LangChainEmbeddingProvider, OpenAIEmbeddingProvider
+from .ai.memory.buffers import DocumentSummaryMemory
+from .ai.services import OutlineBuilderWorker
 from .services.bridge_router import WorkspaceBridgeRouter
 from .services.importers import FileImporter, ImportResult, ImporterError
 from .services.settings import Settings, SettingsStore
@@ -30,6 +42,8 @@ from .ai.tools.diff_builder import DiffBuilderTool
 from .ai.tools.document_snapshot import DocumentSnapshotTool
 from .ai.tools.document_edit import DocumentEditTool
 from .ai.tools.document_apply_patch import DocumentApplyPatchTool
+from .ai.tools.document_find_sections import DocumentFindSectionsTool
+from .ai.tools.document_outline import DocumentOutlineTool
 from .ai.tools.list_tabs import ListTabsTool
 from .ai.tools.search_replace import SearchReplaceTool
 from .ai.tools.validation import validate_snippet
@@ -108,6 +122,7 @@ _LOGGER = logging.getLogger(__name__)
 WINDOW_APP_NAME = "TinkerBell"
 UNTITLED_DOCUMENT_NAME = "Untitled"
 SUGGESTION_LOADING_LABEL = "Generating personalized suggestions…"
+OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 
 
 @dataclass(slots=True)
@@ -177,6 +192,123 @@ class _PendingToolTrace:
     tool_call_id: str | None = None
 
 
+@dataclass(slots=True)
+class OutlineStatusInfo:
+    """Tracks outline freshness/latency metadata per document."""
+
+    status_label: str = ""
+    status_code: str = ""
+    tooltip: str = ""
+    version_id: int | None = None
+    outline_hash: str | None = None
+    latency_ms: float | None = None
+    completed_at: float | None = None
+    node_count: int | None = None
+    token_count: int | None = None
+    stale: bool = False
+    stale_since: float | None = None
+
+
+@dataclass(slots=True)
+class EmbeddingRuntimeState:
+    """Bookkeeping structure describing the active embedding backend."""
+
+    backend: str = "disabled"
+    model: str | None = None
+    provider_label: str | None = None
+    status: str = "disabled"
+    detail: str | None = None
+    error: str | None = None
+
+    @property
+    def label(self) -> str:
+        if self.status in {"disabled", "unavailable"}:
+            return "Off" if self.status == "disabled" else "Unavailable"
+        if self.status == "error":
+            return "Error"
+        return self.provider_label or self.backend.title()
+
+    def as_snapshot(self) -> dict[str, Any]:
+        return {
+            "embedding_backend": self.backend if self.backend != "disabled" else None,
+            "embedding_model": self.model,
+            "embedding_status": self.status,
+            "embedding_detail": self.detail or self.error,
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class _LangChainProviderTemplate:
+    """Describes heuristics for provider-specific LangChain wiring."""
+
+    family: str
+    match_keywords: tuple[str, ...]
+    default_base_url: str | None = None
+    api_key_env: str | None = None
+    tokenizer: str | None = None
+    default_headers: Mapping[str, str] | None = None
+    dimensions: Mapping[str, int] = field(default_factory=dict)
+    extra_kwargs: Mapping[str, Any] = field(default_factory=dict)
+
+    def matches(self, model_name: str, *, forced_family: str | None = None) -> bool:
+        if forced_family:
+            return forced_family == self.family
+        if not self.match_keywords:
+            return True
+        lowered = model_name.lower()
+        return any(keyword in lowered for keyword in self.match_keywords)
+
+    def dimension_for(self, model_name: str) -> int | None:
+        lookup = self.dimensions or {}
+        if not lookup:
+            return None
+        return lookup.get(model_name.lower())
+
+
+_DEFAULT_LANGCHAIN_PROVIDER = _LangChainProviderTemplate(
+    family="openai",
+    match_keywords=("text-embedding", "openai", "ada"),
+    default_base_url=OPENAI_API_BASE_URL,
+    tokenizer="cl100k_base",
+    dimensions={
+        "text-embedding-3-large": 3072,
+        "text-embedding-3-small": 1536,
+        "text-embedding-ada-002": 1536,
+    },
+)
+
+_LANGCHAIN_PROVIDER_TEMPLATES: tuple[_LangChainProviderTemplate, ...] = (
+    _DEFAULT_LANGCHAIN_PROVIDER,
+    _LangChainProviderTemplate(
+        family="deepseek",
+        match_keywords=("deepseek",),
+        default_base_url="https://api.deepseek.com/v1",
+        api_key_env="DEEPSEEK_API_KEY",
+        tokenizer="cl100k_base",
+        dimensions={"deepseek-embedding": 1536},
+    ),
+    _LangChainProviderTemplate(
+        family="glm",
+        match_keywords=("glm", "zhipu"),
+        default_base_url="https://open.bigmodel.cn/api/paas/v4",
+        api_key_env="GLM_API_KEY",
+        tokenizer="cl100k_base",
+        dimensions={"glm-4-embed": 1024},
+    ),
+    _LangChainProviderTemplate(
+        family="moonshot",
+        match_keywords=("moonshot", "kimi"),
+        default_base_url="https://api.moonshot.cn/v1",
+        api_key_env="MOONSHOT_API_KEY",
+        tokenizer="cl100k_base",
+    ),
+)
+
+_LANGCHAIN_PROVIDER_ENV_VARS: tuple[str, ...] = tuple(
+    sorted({template.api_key_env for template in _LANGCHAIN_PROVIDER_TEMPLATES if template.api_key_env})
+)
+
+
 class MainWindow(QMainWindow):
     """Primary application window hosting the editor and chat splitter."""
 
@@ -187,6 +319,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._context = context
         initial_settings = context.settings
+        self._phase3_outline_enabled = bool(getattr(initial_settings, "phase3_outline_tools", False))
         show_tool_panel = bool(getattr(initial_settings, "show_tool_activity_panel", False))
         self._editor = TabbedEditorWidget()
         self._workspace = self._editor.workspace
@@ -214,6 +347,8 @@ class MainWindow(QMainWindow):
         self._suggestion_cache_key: str | None = None
         self._suggestion_cache_values: tuple[str, ...] | None = None
         self._unsaved_snapshot_digests: dict[str, str] = {}
+        self._outline_digest_cache: dict[str, str] = {}
+        self._outline_status_by_document: dict[str, OutlineStatusInfo] = {}
         self._snapshot_persistence_block = 0
         self._debug_logging_enabled = bool(getattr(initial_settings, "debug_logging", False))
         self._active_theme = (getattr(initial_settings, "theme", "") or "default").strip() or "default"
@@ -222,7 +357,20 @@ class MainWindow(QMainWindow):
         self._restoring_workspace = False
         self._tabs_with_overlay: set[str] = set()
         self._last_autosave_at: datetime | None = None
+        self._outline_worker: OutlineBuilderWorker | None = None
+        self._outline_tool: DocumentOutlineTool | None = None
+        self._find_sections_tool: DocumentFindSectionsTool | None = None
+        self._embedding_index: DocumentEmbeddingIndex | None = None
+        self._embedding_state = EmbeddingRuntimeState()
+        self._embedding_signature: tuple[Any, ...] | None = None
+        self._embedding_snapshot_metadata: dict[str, Any] = {}
+        self._embedding_resource: Any | None = None
+        self._last_outline_status: tuple[str, str] | None = None
         self._initialize_ui()
+        self._refresh_embedding_runtime(initial_settings)
+        if self._phase3_outline_enabled:
+            self._outline_worker = self._create_outline_worker()
+            self._propagate_embedding_index_to_worker()
 
     # ------------------------------------------------------------------
     # Qt lifecycle hooks
@@ -233,6 +381,7 @@ class MainWindow(QMainWindow):
         self._cancel_active_ai_turn()
         self._cancel_dynamic_suggestions()
         self._clear_suggestion_cache()
+        self._shutdown_outline_worker()
         self._request_app_shutdown()
 
         super_close = getattr(super(), "closeEvent", None)
@@ -297,6 +446,115 @@ class MainWindow(QMainWindow):
         self.update_status("Ready")
         self._restore_last_session_document()
         self._update_autosave_indicator(document=self._editor.to_document())
+
+    def _create_outline_worker(self) -> OutlineBuilderWorker | None:
+        loop = self._resolve_async_loop()
+        if loop is None:
+            return None
+        if loop.is_running():
+            return self._start_outline_worker(loop)
+        try:
+            loop.call_soon(self._start_outline_worker, loop)
+        except RuntimeError:  # pragma: no cover - loop may be closed in tests
+            return None
+        return None
+
+    def _start_outline_worker(self, loop: asyncio.AbstractEventLoop) -> OutlineBuilderWorker | None:
+        if getattr(self, "_outline_worker", None):
+            return self._outline_worker
+        cache_dir = self._resolve_outline_cache_root()
+        try:
+            worker = OutlineBuilderWorker(
+                document_provider=self._workspace.find_document_by_id,
+                storage_dir=cache_dir,
+                loop=loop,
+            )
+        except Exception:  # pragma: no cover - background worker optional in tests
+            _LOGGER.debug("Outline worker unavailable; continuing without outlines.", exc_info=True)
+            return None
+        self._outline_worker = worker
+        return worker
+
+    def _shutdown_outline_worker(self) -> None:
+        worker = getattr(self, "_outline_worker", None)
+        if worker is None:
+            return
+        self._outline_worker = None
+        close_coro = worker.aclose()
+        loop = worker.loop
+        if loop.is_running():
+            loop.create_task(close_coro)
+            return
+        try:
+            loop.run_until_complete(close_coro)
+        except RuntimeError:
+            asyncio.run(close_coro)
+
+    def _outline_memory(self) -> DocumentSummaryMemory | None:
+        worker = getattr(self, "_outline_worker", None)
+        if worker is None:
+            return None
+        return getattr(worker, "memory", None)
+
+    def _resolve_embedding_index(self) -> DocumentEmbeddingIndex | None:
+        return getattr(self, "_embedding_index", None)
+
+    def _safe_active_document(self) -> DocumentState | None:
+        try:
+            return self._workspace.active_document()
+        except Exception:
+            return None
+
+    def _resolve_outline_digest(self, document_id: str | None) -> str | None:
+        doc_id = str(document_id).strip() if document_id else ""
+        if not doc_id:
+            document = self._safe_active_document()
+            if document is None:
+                return None
+            doc_id = document.document_id
+        memory = self._outline_memory()
+        if memory is None:
+            return None
+        record = memory.get(doc_id)
+        return record.outline_hash if record else None
+
+    def _resolve_async_loop(self) -> asyncio.AbstractEventLoop | None:
+        try:
+            return asyncio.get_event_loop()
+        except RuntimeError:
+            return None
+
+    def _run_background_task(self, task_factory: Callable[[], Coroutine[Any, Any, Any]]) -> None:
+        def _build_coroutine() -> Coroutine[Any, Any, Any]:
+            coroutine = task_factory()
+            if not asyncio.iscoroutine(coroutine):  # pragma: no cover - defensive check
+                raise TypeError("Background task factory must return a coroutine")
+            return coroutine
+
+        try:
+            loop = self._resolve_async_loop()
+            if loop is not None and loop.is_running():
+                loop.create_task(_build_coroutine())
+                return
+            try:
+                asyncio.run(_build_coroutine())
+                return
+            except RuntimeError:
+                new_loop = asyncio.new_event_loop()
+                try:
+                    new_loop.run_until_complete(_build_coroutine())
+                finally:
+                    new_loop.close()
+        except Exception:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Background task failed", exc_info=True)
+
+    def _resolve_outline_cache_root(self) -> Path:
+        store = getattr(self._context, "settings_store", None)
+        if store is not None:
+            base_dir = store.path.parent
+        else:
+            base_dir = Path.home() / ".tinkerbell"
+        return base_dir / "cache" / "outline_builder"
 
     def _build_splitter(self) -> Any:
         """Create the editor/chat splitter, falling back to a lightweight state."""
@@ -510,37 +768,46 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            snapshot_tool = DocumentSnapshotTool(provider=self._bridge)
+            snapshot_tool = DocumentSnapshotTool(
+                provider=self._bridge,
+                outline_digest_resolver=self._resolve_outline_digest,
+            )
             register(
                 "document_snapshot",
                 snapshot_tool,
                 description=(
-                    "Return the latest editor snapshot including text, selection, metadata, and diff markers."
+                    "Return the freshest document snapshot (text, metadata, diff summaries) for the active or specified tab."
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "delta_only": {
                             "type": "boolean",
-                            "description": "Return only fields that changed since the previous snapshot.",
+                            "description": "When true, include only the selection and surrounding context instead of the full document.",
+                        },
+                        "include_diff": {
+                            "type": "boolean",
+                            "description": "Attach the most recent diff summary when available (default true).",
                         },
                         "tab_id": {
                             "type": "string",
-                            "description": "Optional tab identifier; defaults to the active tab when omitted.",
+                            "description": "Target a specific tab instead of the active document.",
                         },
                         "source_tab_ids": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Collect additional snapshots for the provided tab IDs (read-only).",
+                            "description": "Optional list of additional tab snapshots to gather alongside the active document.",
                         },
                         "include_open_documents": {
                             "type": "boolean",
-                            "description": "When true, include metadata for every open tab in the response.",
+                            "description": "When true, include a summary of all open documents in the snapshot payload.",
                         },
                     },
                     "additionalProperties": False,
                 },
             )
+
+            self._register_phase3_ai_tools(register_fn=register)
 
             edit_tool = DocumentEditTool(bridge=self._bridge, patch_only=True)
             register(
@@ -708,11 +975,170 @@ class MainWindow(QMainWindow):
                 },
             )
 
-            _LOGGER.debug(
-                "Default AI tools registered: document_snapshot, document_edit, document_apply_patch, diff_builder, search_replace, validate_snippet, list_tabs"
-            )
+            registered = [
+                "document_snapshot",
+                "document_edit",
+                "document_apply_patch",
+                "diff_builder",
+                "search_replace",
+                "validate_snippet",
+                "list_tabs",
+            ]
+            if self._phase3_outline_enabled:
+                registered.insert(1, "document_outline")
+                registered.insert(2, "document_find_sections")
+            _LOGGER.debug("Default AI tools registered: %s", ", ".join(registered))
         except Exception as exc:  # pragma: no cover - defensive logging
             _LOGGER.warning("Failed to register default AI tools: %s", exc)
+
+    def _register_phase3_ai_tools(self, *, register_fn: Callable[..., Any] | None = None) -> None:
+        if not self._phase3_outline_enabled:
+            return
+
+        controller = self._context.ai_controller
+        if controller is None:
+            return
+
+        register = register_fn or getattr(controller, "register_tool", None)
+        if not callable(register):
+            _LOGGER.debug("AI controller does not expose register_tool; skipping phase3 tool wiring.")
+            return
+
+        outline_tool = self._ensure_outline_tool()
+        if outline_tool is not None:
+            register(
+                "document_outline",
+                outline_tool,
+                description=(
+                    "Return the most recent outline for the active document, including pointer IDs, blurbs, and staleness metadata."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "document_id": {
+                            "type": "string",
+                            "description": "Optional explicit document identifier; defaults to the active tab.",
+                        },
+                        "desired_levels": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Limit the outline depth to this heading level before budgeting.",
+                        },
+                        "include_blurbs": {
+                            "type": "boolean",
+                            "description": "When false, omit excerpt blurbs to conserve tokens.",
+                        },
+                        "max_nodes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 1000,
+                            "description": "Cap the number of nodes returned prior to budget enforcement.",
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            )
+
+        find_sections_tool = self._ensure_find_sections_tool()
+        if find_sections_tool is not None:
+            register(
+                "document_find_sections",
+                find_sections_tool,
+                description=(
+                    "Return the best-matching document chunks for a natural language query using embeddings or fallback heuristics."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "document_id": {
+                            "type": "string",
+                            "description": "Optional target document identifier; defaults to the active document.",
+                        },
+                        "query": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Natural-language description of the section(s) to find.",
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 12,
+                            "description": "Maximum number of pointers to return.",
+                        },
+                        "min_confidence": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "description": "Minimum embedding match score before falling back to heuristics.",
+                        },
+                        "filters": {
+                            "type": "object",
+                            "description": "Optional additional filtering hints understood by custom index providers.",
+                        },
+                        "include_outline_context": {
+                            "type": "boolean",
+                            "description": "When true, include nearby outline headings for each pointer.",
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            )
+
+    def _unregister_phase3_ai_tools(self) -> None:
+        controller = self._context.ai_controller
+        if controller is None:
+            return
+        unregister = getattr(controller, "unregister_tool", None)
+        if not callable(unregister):
+            return
+        for name in ("document_outline", "document_find_sections"):
+            try:
+                unregister(name)
+            except Exception:  # pragma: no cover - defensive
+                _LOGGER.debug("Failed to unregister tool %s", name, exc_info=True)
+    def _ensure_outline_tool(self) -> DocumentOutlineTool | None:
+        if not self._phase3_outline_enabled:
+            return None
+        if self._outline_tool is not None:
+            return self._outline_tool
+        try:
+            def _pending_outline(document_id: str) -> bool:
+                worker = getattr(self, "_outline_worker", None)
+                if worker is None:
+                    return False
+                return worker.is_rebuild_pending(document_id)
+
+            tool = DocumentOutlineTool(
+                memory_resolver=self._outline_memory,
+                document_lookup=self._workspace.find_document_by_id,
+                active_document_provider=self._safe_active_document,
+                budget_policy=None,
+                pending_outline_checker=_pending_outline,
+            )
+        except Exception:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to initialize DocumentOutlineTool", exc_info=True)
+            return None
+        self._outline_tool = tool
+        return tool
+
+    def _ensure_find_sections_tool(self) -> DocumentFindSectionsTool | None:
+        if not self._phase3_outline_enabled:
+            return None
+        if self._find_sections_tool is not None:
+            return self._find_sections_tool
+        try:
+            tool = DocumentFindSectionsTool(
+                embedding_index_resolver=self._resolve_embedding_index,
+                document_lookup=self._workspace.find_document_by_id,
+                active_document_provider=self._safe_active_document,
+                outline_memory=self._outline_memory,
+            )
+        except Exception:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to initialize DocumentFindSectionsTool", exc_info=True)
+            return None
+        self._find_sections_tool = tool
+        return tool
 
     @staticmethod
     def _directive_parameters_schema() -> Dict[str, Any]:
@@ -729,6 +1155,16 @@ class MainWindow(QMainWindow):
     # AI coordination
     # ------------------------------------------------------------------
     def _handle_chat_request(self, prompt: str, metadata: dict[str, Any]) -> None:
+        try:
+            manual_request = parse_manual_command(prompt)
+        except ValueError as exc:
+            self._post_assistant_notice(str(exc))
+            self.update_status("Manual command error")
+            return
+        if manual_request is not None:
+            self._handle_manual_command(manual_request)
+            return
+
         controller = self._context.ai_controller
         if controller is None:
             self._post_assistant_notice(
@@ -743,6 +1179,7 @@ class MainWindow(QMainWindow):
             self.update_status("Previous AI request canceled")
 
         snapshot = self._bridge.generate_snapshot()
+        self._apply_embedding_metadata(snapshot)
         history_payload = self._serialize_chat_history(
             self._chat_panel.history(),
             limit=0,
@@ -755,6 +1192,343 @@ class MainWindow(QMainWindow):
         self._ai_task = task
         if task is None:
             self._chat_panel.set_ai_running(False)
+
+    def _handle_manual_command(self, request: ManualCommandRequest) -> None:
+        if request.command is ManualCommandType.OUTLINE:
+            self._handle_manual_outline_command(request)
+            return
+        if request.command is ManualCommandType.FIND_SECTIONS:
+            self._handle_manual_find_sections_command(request)
+            return
+        self._post_assistant_notice(f"Unsupported manual command '{request.command.value}'.")
+        self.update_status("Manual command unsupported")
+
+    def _handle_manual_outline_command(self, request: ManualCommandRequest) -> None:
+        if not self._phase3_outline_enabled:
+            self._post_assistant_notice("Outline tooling is disabled. Enable it in Settings > AI to use /outline.")
+            self.update_status("Outline disabled")
+            return
+
+        tool = self._ensure_outline_tool()
+        if tool is None:
+            self._post_assistant_notice("Outline tool is unavailable.")
+            self.update_status("Outline unavailable")
+            return
+
+        args = dict(request.args)
+        doc_reference = args.get("document_id")
+        resolved_id = self._resolve_manual_document_id(doc_reference)
+        if doc_reference and resolved_id is None:
+            self._post_assistant_notice(f"Couldn't find a document matching '{doc_reference}'.")
+            self.update_status("Document not found")
+            return
+        if resolved_id:
+            args["document_id"] = resolved_id
+        else:
+            args.pop("document_id", None)
+
+        try:
+            response = tool.run(**args)
+        except Exception as exc:  # pragma: no cover - defensive path
+            _LOGGER.debug("Manual outline command failed", exc_info=True)
+            self._post_assistant_notice(f"Outline command failed: {exc}")
+            self.update_status("Outline command failed")
+            return
+
+        message = self._render_manual_outline_response(response, doc_reference)
+        self._post_assistant_notice(message)
+        status_text = str(response.get("status") or "ok") if isinstance(response, Mapping) else "ok"
+        self._record_manual_tool_trace(
+            name="manual:document_outline",
+            input_summary=self._summarize_manual_input("document_outline", args),
+            output_summary=status_text,
+            args=args,
+            response=response,
+        )
+        self.update_status("Outline ready")
+
+    def _handle_manual_find_sections_command(self, request: ManualCommandRequest) -> None:
+        if not self._phase3_outline_enabled:
+            self._post_assistant_notice("Retrieval tooling is disabled. Enable it in Settings > AI to use /find.")
+            self.update_status("Retrieval disabled")
+            return
+
+        tool = self._ensure_find_sections_tool()
+        if tool is None:
+            self._post_assistant_notice("Find sections tool is unavailable.")
+            self.update_status("Retrieval unavailable")
+            return
+
+        args = dict(request.args)
+        doc_reference = args.get("document_id")
+        resolved_id = self._resolve_manual_document_id(doc_reference)
+        if doc_reference and resolved_id is None:
+            self._post_assistant_notice(f"Couldn't find a document matching '{doc_reference}'.")
+            self.update_status("Document not found")
+            return
+        if resolved_id:
+            args["document_id"] = resolved_id
+        else:
+            args.pop("document_id", None)
+
+        try:
+            response = tool.run(**args)
+        except Exception as exc:  # pragma: no cover - defensive path
+            _LOGGER.debug("Manual find sections command failed", exc_info=True)
+            self._post_assistant_notice(f"Find sections command failed: {exc}")
+            self.update_status("Find sections failed")
+            return
+
+        message = self._render_manual_retrieval_response(response, args.get("query"), doc_reference)
+        self._post_assistant_notice(message)
+        status_text = str(response.get("status") or "ok") if isinstance(response, Mapping) else "ok"
+        self._record_manual_tool_trace(
+            name="manual:document_find_sections",
+            input_summary=self._summarize_manual_input("document_find_sections", args),
+            output_summary=status_text,
+            args=args,
+            response=response,
+        )
+        self.update_status("Find sections ready")
+
+    def _resolve_manual_document_id(self, reference: str | None) -> str | None:
+        text = (reference or "").strip()
+        if not text:
+            return None
+        lowered = text.lower()
+        if lowered in {"active", "current"}:
+            document = self._safe_active_document()
+            return document.document_id if document is not None else None
+
+        direct = self._workspace.find_document_by_id(text)
+        if direct is not None:
+            return direct.document_id
+
+        try:
+            tab = self._workspace.get_tab(text)
+        except KeyError:
+            tab = None
+        if tab is not None:
+            return tab.document().document_id
+
+        entries: list[dict[str, Any]] = []
+        for tab in self._workspace.iter_tabs():
+            document = tab.document()
+            entry: dict[str, Any] = {
+                "tab_id": tab.id,
+                "title": tab.title,
+                "label": tab.title,
+            }
+            if tab.untitled_index is not None:
+                entry["untitled_index"] = tab.untitled_index
+            path = document.metadata.path
+            if path is not None:
+                entry["path"] = str(path)
+            entries.append(entry)
+
+        resolved_tab_id = resolve_tab_reference(text, entries, active_tab_id=self._workspace.active_tab_id)
+        if resolved_tab_id:
+            try:
+                tab = self._workspace.get_tab(resolved_tab_id)
+            except KeyError:
+                tab = None
+            if tab is not None:
+                return tab.document().document_id
+        return None
+
+    def _document_label_from_id(self, document_id: str | None, fallback: str | None = None) -> str:
+        if document_id:
+            document = self._workspace.find_document_by_id(document_id)
+            if document is not None:
+                return self._document_display_name(document)
+            return document_id
+        if fallback:
+            return fallback
+        document = self._safe_active_document()
+        if document is not None:
+            return self._document_display_name(document)
+        return WINDOW_APP_NAME
+
+    def _render_manual_outline_response(
+        self,
+        response: Mapping[str, Any],
+        requested_label: str | None,
+    ) -> str:
+        status = str(response.get("status") or "unknown")
+        doc_label = self._document_label_from_id(response.get("document_id"), fallback=requested_label)
+        parts = [f"Document outline ({status}) for {doc_label}."]
+        reason = response.get("reason")
+        if reason:
+            parts.append(f"Reason: {reason}.")
+
+        nodes = response.get("nodes") or []
+        if nodes:
+            parts.append("Headings:")
+            parts.extend(self._render_outline_tree_lines(nodes))
+        else:
+            outline_available = response.get("outline_available")
+            if outline_available is False:
+                parts.append("No outline is available for this document yet.")
+
+        notes: list[str] = []
+        if response.get("trimmed"):
+            reason_text = response.get("trimmed_reason") or "request limits"
+            notes.append(f"trimmed={reason_text}")
+        if response.get("is_stale"):
+            notes.append("stale compared to current document")
+        if notes:
+            parts.append("Notes: " + ", ".join(notes) + ".")
+
+        generated = response.get("generated_at")
+        if generated:
+            parts.append(f"Generated at {generated}.")
+        outline_digest = response.get("outline_digest")
+        if outline_digest:
+            parts.append(f"Digest: {outline_digest}.")
+
+        return "\n".join(part for part in parts if part)
+
+    def _render_outline_tree_lines(self, nodes: Sequence[Mapping[str, Any]], limit: int = 24) -> list[str]:
+        lines: list[str] = []
+        truncated = False
+
+        def visit(node: Mapping[str, Any], level_hint: int) -> None:
+            nonlocal truncated
+            if len(lines) >= limit:
+                truncated = True
+                return
+            level = int(node.get("level") or level_hint or 1)
+            indent = "  " * max(0, level - 1)
+            text = str(node.get("text") or "Untitled").strip() or "Untitled"
+            pointer = node.get("pointer_id") or node.get("id")
+            suffix = f" ({pointer})" if pointer else ""
+            lines.append(f"{indent}- {text}{suffix}")
+            children = node.get("children") or []
+            for child in children:
+                if not isinstance(child, Mapping):
+                    continue
+                visit(child, level + 1)
+                if truncated:
+                    return
+
+        for entry in nodes:
+            if not isinstance(entry, Mapping):
+                continue
+            visit(entry, int(entry.get("level") or 1))
+            if truncated:
+                break
+
+        if truncated:
+            lines.append("  … additional headings omitted.")
+        return lines
+
+    def _render_manual_retrieval_response(
+        self,
+        response: Mapping[str, Any],
+        requested_query: str | None,
+        requested_document_label: str | None,
+    ) -> str:
+        status = str(response.get("status") or "unknown")
+        doc_label = self._document_label_from_id(response.get("document_id"), fallback=requested_document_label)
+        query_text = response.get("query") or (requested_query or "")
+        if query_text:
+            header = f"Find sections ({status}) for {doc_label} — \"{query_text}\""
+        else:
+            header = f"Find sections ({status}) for {doc_label}."
+        parts = [header]
+
+        details: list[str] = []
+        strategy = response.get("strategy")
+        if strategy:
+            details.append(f"strategy={strategy}")
+        fallback_reason = response.get("fallback_reason")
+        if fallback_reason:
+            details.append(f"fallback={fallback_reason}")
+        latency = response.get("latency_ms")
+        if isinstance(latency, (int, float)):
+            details.append(f"latency={latency:.1f} ms")
+        if details:
+            parts.append("Details: " + ", ".join(details) + ".")
+
+        pointers = response.get("pointers") or []
+        if pointers:
+            parts.append("Matches:")
+            parts.extend(self._format_retrieval_pointers(pointers))
+            extra = max(0, len(pointers) - 5)
+            if extra:
+                parts.append(f"… {extra} additional match(es).")
+        else:
+            parts.append("No matching sections were found.")
+
+        return "\n".join(parts)
+
+    def _format_retrieval_pointers(
+        self,
+        pointers: Sequence[Mapping[str, Any]],
+        *,
+        limit: int = 5,
+    ) -> list[str]:
+        lines: list[str] = []
+        for index, pointer in enumerate(pointers[:limit], start=1):
+            if not isinstance(pointer, Mapping):
+                continue
+            pointer_id = pointer.get("pointer_id") or pointer.get("chunk_id") or f"chunk-{index}"
+            outline_context = pointer.get("outline_context")
+            heading = outline_context.get("heading") if isinstance(outline_context, Mapping) else None
+            label_parts = [str(pointer_id)]
+            if heading:
+                label_parts.append(str(heading))
+            score = pointer.get("score")
+            score_text = f"{float(score):.2f}" if isinstance(score, (int, float)) else "n/a"
+            lines.append(f"{index}. {' · '.join(label_parts)} (score {score_text})")
+            preview = pointer.get("preview")
+            snippet = self._condense_whitespace(str(preview)) if isinstance(preview, str) else ""
+            if snippet:
+                if len(snippet) > 180:
+                    snippet = f"{snippet[:177]}…"
+                lines.append(f"    {snippet}")
+        return lines
+
+    def _summarize_manual_input(self, label: str, args: Mapping[str, Any]) -> str:
+        if not args:
+            return label
+        preferred = ("document_id", "query", "top_k", "desired_levels", "max_nodes", "min_confidence")
+        parts: list[str] = []
+        for key in preferred:
+            if key in args:
+                parts.append(f"{key}={args[key]}")
+        if not parts:
+            for key, value in list(args.items())[:4]:
+                parts.append(f"{key}={value}")
+        summary = ", ".join(parts[:4])
+        return f"{label} ({summary})" if summary else label
+
+    def _record_manual_tool_trace(
+        self,
+        *,
+        name: str,
+        input_summary: str,
+        output_summary: str,
+        args: Mapping[str, Any],
+        response: Mapping[str, Any] | Any,
+    ) -> None:
+        args_payload = dict(args) if isinstance(args, Mapping) else {"value": args}
+        if isinstance(response, Mapping):
+            response_payload: Mapping[str, Any] | Any = response
+        else:
+            response_payload = {"value": response}
+        metadata = {
+            "raw_input": json.dumps(args_payload, default=str),
+            "raw_output": json.dumps(response_payload, default=str),
+            "manual_command": True,
+        }
+        trace = ToolTrace(
+            name=name,
+            input_summary=input_summary,
+            output_summary=output_summary,
+            metadata=metadata,
+        )
+        self._chat_panel.show_tool_trace(trace)
 
     async def _run_ai_turn(
         self,
@@ -1399,6 +2173,18 @@ class MainWindow(QMainWindow):
         """Cache the latest snapshot for future agent requests."""
 
         self._last_snapshot = snapshot
+        digest = str(snapshot.get("outline_digest") or "").strip()
+        document_id = str(snapshot.get("document_id") or "").strip()
+        if not document_id:
+            document = self._safe_active_document()
+            if document is not None:
+                document_id = document.document_id
+        if not digest or not document_id:
+            return
+        if self._outline_digest_cache.get(document_id) == digest:
+            return
+        self._outline_digest_cache[document_id] = digest
+        self._emit_outline_timeline_event(document_id, digest)
 
     def _handle_editor_text_changed(self, text: str, state: DocumentState) -> None:
         """Update window title when the editor content or metadata shifts."""
@@ -1484,6 +2270,27 @@ class MainWindow(QMainWindow):
         if len(condensed) > 80:
             condensed = f"{condensed[:77].rstrip()}…"
         return condensed
+
+    def _emit_outline_timeline_event(self, document_id: str, outline_digest: str) -> None:
+        try:
+            document = self._workspace.find_document_by_id(document_id)
+        except Exception:
+            document = None
+        label = self._document_display_name(document) if document is not None else document_id
+        trace = ToolTrace(
+            name="document_outline",
+            input_summary=label,
+            output_summary="Outline updated",
+            metadata={
+                "document_id": document_id,
+                "outline_digest": outline_digest,
+                "timestamp": time.time(),
+            },
+        )
+        try:
+            self._chat_panel.show_tool_trace(trace)
+        except Exception:  # pragma: no cover - UI optional in tests
+            _LOGGER.debug("Unable to surface outline availability trace", exc_info=True)
 
     @staticmethod
     def _condense_whitespace(text: str) -> str:
@@ -2216,12 +3023,17 @@ class MainWindow(QMainWindow):
 
     def _show_settings_dialog(self, settings: Settings) -> "SettingsDialogResult":
         try:
-            from .widgets.dialogs import show_settings_dialog
+            module = importlib.import_module(".widgets.dialogs", __package__)
         except Exception as exc:  # pragma: no cover - depends on Qt availability
             raise RuntimeError("Settings dialog requires the PySide6 dependency.") from exc
 
+        show_settings_dialog = getattr(module, "show_settings_dialog", None)
+        if not callable(show_settings_dialog):  # pragma: no cover - defensive guard
+            raise RuntimeError("Settings dialog is unavailable.")
+
         parent = self._qt_parent_widget()
-        return show_settings_dialog(parent=parent, settings=settings)
+        result = show_settings_dialog(parent=parent, settings=settings)
+        return cast("SettingsDialogResult", result)
 
     def _persist_settings(self, settings: Settings | None) -> None:
         if settings is None:
@@ -2252,11 +3064,387 @@ class MainWindow(QMainWindow):
         if persist:
             self._persist_settings(settings)
 
+    def _refresh_embedding_runtime(self, settings: Settings | None) -> None:
+        if settings is None or not self._phase3_outline_enabled:
+            self._teardown_embedding_runtime(reason="Phase 3 tools disabled", hide_status=not self._phase3_outline_enabled)
+            return
+
+        backend = (getattr(settings, "embedding_backend", "auto") or "auto").strip().lower()
+        if backend in {"", "auto"}:
+            backend = "openai"
+        if backend == "disabled":
+            self._teardown_embedding_runtime(reason="Embeddings disabled in settings")
+            return
+
+        model_name = (getattr(settings, "embedding_model_name", "") or "").strip() or "text-embedding-3-large"
+        signature = self._embedding_settings_signature(settings, backend, model_name)
+        if signature == self._embedding_signature and self._embedding_index is not None:
+            self._set_embedding_state(self._embedding_state)
+            return
+
+        self._teardown_embedding_runtime(reason="Reinitializing embedding backend", keep_status=True)
+
+        provider, provider_state = self._build_embedding_provider(backend, model_name, settings)
+        if provider is None:
+            self._set_embedding_state(provider_state)
+            return
+
+        cache_root = self._resolve_embedding_cache_root()
+        index = self._create_embedding_index(provider, storage_dir=cache_root)
+        if index is None:
+            error_state = EmbeddingRuntimeState(
+                backend=backend,
+                model=model_name,
+                provider_label=provider_state.provider_label,
+                status="error",
+                error=f"Unable to initialize embedding cache under {cache_root}",
+            )
+            self._set_embedding_state(error_state)
+            return
+
+        self._embedding_index = index
+        self._embedding_signature = signature
+        self._set_embedding_state(provider_state)
+        self._propagate_embedding_index_to_worker()
+
+    def _embedding_settings_signature(self, settings: Settings, backend: str, model: str) -> tuple[Any, ...]:
+        metadata = getattr(settings, "metadata", {}) or {}
+        class_override = metadata.get("langchain_embeddings_class")
+        kwargs_payload = metadata.get("langchain_embeddings_kwargs")
+        provider_hint = metadata.get("langchain_provider_family")
+        env_class = os.environ.get("TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS")
+        env_kwargs = os.environ.get("TINKERBELL_LANGCHAIN_EMBEDDINGS_KWARGS")
+        env_provider_family = os.environ.get("TINKERBELL_LANGCHAIN_PROVIDER_FAMILY")
+        provider_env_secrets = tuple(os.environ.get(var) for var in _LANGCHAIN_PROVIDER_ENV_VARS)
+        return (
+            backend,
+            model,
+            getattr(settings, "base_url", None),
+            getattr(settings, "api_key", None),
+            getattr(settings, "organization", None),
+            class_override,
+            kwargs_payload,
+            env_class,
+            env_kwargs,
+            provider_hint,
+            env_provider_family,
+            provider_env_secrets,
+        )
+
+    def _build_embedding_provider(
+        self,
+        backend: str,
+        model_name: str,
+        settings: Settings,
+    ) -> tuple[EmbeddingProvider | None, EmbeddingRuntimeState]:
+        if backend == "openai":
+            return self._build_openai_embedding_provider(model_name, settings)
+        if backend == "langchain":
+            return self._build_langchain_embedding_provider(model_name, settings)
+        state = EmbeddingRuntimeState(backend=backend, model=model_name, status="error", error=f"Unknown backend '{backend}'")
+        return None, state
+
+    def _build_openai_embedding_provider(
+        self,
+        model_name: str,
+        settings: Settings,
+    ) -> tuple[EmbeddingProvider | None, EmbeddingRuntimeState]:
+        state = EmbeddingRuntimeState(backend="openai", model=model_name, provider_label="OpenAI", status="error")
+        api_key = (getattr(settings, "api_key", "") or "").strip()
+        base_url = (getattr(settings, "base_url", "") or "").strip() or OPENAI_API_BASE_URL
+        if not api_key:
+            state.error = "API key required for OpenAI embeddings"
+            return None, state
+        try:
+            from openai import AsyncOpenAI
+        except Exception as exc:  # pragma: no cover - optional dependency
+            state.error = f"openai package unavailable: {exc}"
+            return None, state
+
+        try:
+            client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                organization=getattr(settings, "organization", None),
+                timeout=getattr(settings, "request_timeout", 90.0),
+            )
+            provider = OpenAIEmbeddingProvider(client=client, model=model_name)
+        except Exception as exc:
+            state.error = f"Failed to initialize OpenAI embeddings: {exc}"
+            return None, state
+
+        state.status = "ready"
+        state.detail = model_name
+        self._embedding_resource = client
+        return provider, state
+
+    def _build_langchain_embedding_provider(
+        self,
+        model_name: str,
+        settings: Settings,
+    ) -> tuple[EmbeddingProvider | None, EmbeddingRuntimeState]:
+        state = EmbeddingRuntimeState(backend="langchain", model=model_name, provider_label="LangChain")
+        try:
+            embeddings, provider_template = self._instantiate_langchain_embeddings(model_name, settings)
+        except Exception as exc:
+            state.status = "error"
+            state.error = str(exc)
+            return None, state
+        provider = LangChainEmbeddingProvider(embeddings=embeddings)
+        label = getattr(embeddings, "__class__", type(embeddings)).__name__
+        template_label = provider_template.family.title() if provider_template else label
+        state.provider_label = f"LangChain/{template_label}"
+        model_detail = getattr(embeddings, "model", None) or getattr(embeddings, "model_name", None)
+        state.detail = str(model_detail or model_name)
+        state.status = "ready"
+        return provider, state
+
+    def _instantiate_langchain_embeddings(self, model_name: str, settings: Settings) -> tuple[Any, _LangChainProviderTemplate]:
+        metadata = getattr(settings, "metadata", {}) or {}
+        class_override = metadata.get("langchain_embeddings_class") or os.environ.get("TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS")
+        raw_kwargs = metadata.get("langchain_embeddings_kwargs") or os.environ.get("TINKERBELL_LANGCHAIN_EMBEDDINGS_KWARGS")
+        extra_kwargs = self._parse_langchain_kwargs(raw_kwargs)
+        provider_template = self._detect_langchain_provider_template(model_name, metadata)
+        params = dict(extra_kwargs)
+        params.setdefault("model", model_name)
+        self._apply_langchain_provider_template(params, provider_template, model_name, settings, metadata)
+        if class_override:
+            module_name, _, attr_name = class_override.rpartition(".")
+            if not module_name or not attr_name:
+                raise RuntimeError("LangChain embeddings class override must include module path, e.g., 'langchain_openai.OpenAIEmbeddings'")
+            module = importlib.import_module(module_name)
+            factory = getattr(module, attr_name)
+            embeddings = factory(**params)
+            return embeddings, provider_template
+        try:
+            from langchain_openai import OpenAIEmbeddings  # type: ignore[import-not-found]
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "langchain-openai package is required for the LangChain embedding backend. "
+                "Install it or set metadata['langchain_embeddings_class'] to a custom implementation."
+            ) from exc
+
+        embeddings = OpenAIEmbeddings(**params)
+        return embeddings, provider_template
+
+    def _detect_langchain_provider_template(
+        self,
+        model_name: str,
+        metadata: Mapping[str, Any],
+    ) -> _LangChainProviderTemplate:
+        forced = str(
+            metadata.get("langchain_provider_family")
+            or os.environ.get("TINKERBELL_LANGCHAIN_PROVIDER_FAMILY")
+            or ""
+        ).strip().lower()
+        forced_family = forced or None
+        for template in _LANGCHAIN_PROVIDER_TEMPLATES:
+            if template.matches(model_name, forced_family=forced_family):
+                return template
+        return _DEFAULT_LANGCHAIN_PROVIDER
+
+    def _apply_langchain_provider_template(
+        self,
+        params: dict[str, Any],
+        template: _LangChainProviderTemplate,
+        model_name: str,
+        settings: Settings,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        metadata_base_override = str(metadata.get(f"{template.family}_base_url") or "").strip()
+        configured_base_url = metadata_base_override or (getattr(settings, "base_url", "") or "").strip()
+        if template.family != "openai" and template.default_base_url:
+            if self._should_override_base_url(configured_base_url, template.default_base_url):
+                params.setdefault("base_url", template.default_base_url)
+            elif configured_base_url:
+                params.setdefault("base_url", configured_base_url)
+            else:
+                params.setdefault("base_url", template.default_base_url)
+        else:
+            if configured_base_url:
+                params.setdefault("base_url", configured_base_url)
+            elif template.default_base_url:
+                params.setdefault("base_url", template.default_base_url)
+
+        metadata_key = metadata.get(f"{template.family}_api_key")
+        api_key = str(metadata_key).strip() if isinstance(metadata_key, str) else ""
+        if not api_key:
+            api_key = (getattr(settings, "api_key", "") or "").strip()
+        if not api_key and template.api_key_env:
+            api_key = (os.environ.get(template.api_key_env, "") or "").strip()
+        if api_key:
+            params.setdefault("api_key", api_key)
+
+        organization = getattr(settings, "organization", None)
+        if organization:
+            params.setdefault("organization", organization)
+
+        headers: dict[str, str] = {}
+        if template.default_headers:
+            headers.update(template.default_headers)
+        user_headers = getattr(settings, "default_headers", None) or {}
+        headers.update({str(k): str(v) for k, v in user_headers.items()})
+        if headers:
+            params.setdefault("default_headers", headers)
+
+        if template.tokenizer:
+            params.setdefault("tiktoken_model_name", template.tokenizer)
+
+        dimension_override = template.dimension_for(model_name)
+        if dimension_override:
+            params.setdefault("dimensions", dimension_override)
+
+        for key, value in (template.extra_kwargs or {}).items():
+            params.setdefault(key, value)
+
+    @staticmethod
+    def _should_override_base_url(current: str, candidate: str) -> bool:
+        normalized_current = (current or "").strip().lower()
+        normalized_candidate = (candidate or "").strip().lower()
+        if not normalized_candidate:
+            return False
+        if not normalized_current:
+            return True
+        openai_default = OPENAI_API_BASE_URL.lower()
+        return normalized_current == openai_default and normalized_candidate != openai_default
+
+    @staticmethod
+    def _parse_langchain_kwargs(payload: object) -> dict[str, Any]:
+        if not payload:
+            return {}
+        if isinstance(payload, Mapping):
+            return dict(payload)
+        if isinstance(payload, str):
+            text = payload.strip()
+            if not text:
+                return {}
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                return {}
+            return data if isinstance(data, dict) else {}
+        return {}
+
+    def _create_embedding_index(self, provider: EmbeddingProvider, *, storage_dir: Path) -> DocumentEmbeddingIndex | None:
+        try:
+            loop = self._resolve_async_loop()
+            if loop is not None:
+                return DocumentEmbeddingIndex(storage_dir=storage_dir, provider=provider, loop=loop)
+            return DocumentEmbeddingIndex(storage_dir=storage_dir, provider=provider)
+        except Exception as exc:
+            _LOGGER.warning("Failed to initialize embedding index: %s", exc)
+            return None
+
+    def _teardown_embedding_runtime(
+        self,
+        *,
+        reason: str,
+        hide_status: bool = False,
+        keep_status: bool = False,
+    ) -> None:
+        if self._embedding_index is not None:
+            self._close_embedding_index(self._embedding_index)
+        self._embedding_index = None
+        self._embedding_signature = None
+        self._embedding_snapshot_metadata = {}
+        self._propagate_embedding_index_to_worker()
+        self._dispose_embedding_resource()
+        if keep_status:
+            return
+        fallback_backend = "disabled" if self._phase3_outline_enabled else "unavailable"
+        state = EmbeddingRuntimeState(
+            backend=fallback_backend,
+            model=None,
+            status=fallback_backend if fallback_backend != "unavailable" else "unavailable",
+            detail=reason,
+        )
+        self._set_embedding_state(state, hide_status=hide_status)
+
+    def _close_embedding_index(self, index: DocumentEmbeddingIndex) -> None:
+        async_close = cast(Callable[[], Coroutine[Any, Any, Any]], index.aclose)
+        self._run_background_task(async_close)
+
+    def _dispose_embedding_resource(self) -> None:
+        resource = self._embedding_resource
+        self._embedding_resource = None
+        if resource is None:
+            return
+        close = getattr(resource, "aclose", None)
+        if callable(close):
+            try:
+                async_close = cast(Callable[[], Coroutine[Any, Any, Any]], close)
+                self._run_background_task(async_close)
+            except Exception:
+                _LOGGER.debug("Failed to dispose async embedding resource", exc_info=True)
+            return
+        close = getattr(resource, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _set_embedding_state(self, state: EmbeddingRuntimeState, *, hide_status: bool = False) -> None:
+        self._embedding_state = state
+        snapshot = {k: v for k, v in state.as_snapshot().items() if v not in (None, "")}
+        self._embedding_snapshot_metadata = snapshot
+        label = "" if hide_status else state.label
+        detail = state.detail or state.error or ""
+        try:
+            self._status_bar.set_embedding_status(label, detail=detail)
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+
+    def _propagate_embedding_index_to_worker(self) -> None:
+        worker = getattr(self, "_outline_worker", None)
+        if worker is None:
+            return
+        updater = getattr(worker, "update_embedding_index", None)
+        if callable(updater):
+            try:
+                updater(self._embedding_index)
+            except Exception:
+                _LOGGER.debug("Failed to propagate embedding index to worker", exc_info=True)
+
+    def _apply_embedding_metadata(self, snapshot: dict[str, Any]) -> None:
+        if not self._embedding_snapshot_metadata:
+            for field in ("embedding_backend", "embedding_model", "embedding_status", "embedding_detail"):
+                snapshot.pop(field, None)
+            return
+        snapshot.update(self._embedding_snapshot_metadata)
+
+    def _resolve_embedding_cache_root(self) -> Path:
+        return self._resolve_outline_cache_root().parent
+
     def _apply_runtime_settings(self, settings: Settings) -> None:
         self._apply_chat_panel_settings(settings)
+        self._apply_phase3_outline_setting(settings)
         self._apply_debug_logging_setting(settings)
         self._apply_theme_setting(settings)
+        self._refresh_embedding_runtime(settings)
         self._refresh_ai_runtime(settings)
+
+    def _apply_phase3_outline_setting(self, settings: Settings) -> None:
+        enabled = bool(getattr(settings, "phase3_outline_tools", False))
+        if enabled == self._phase3_outline_enabled:
+            return
+
+        self._phase3_outline_enabled = enabled
+        if enabled:
+            self._outline_worker = self._outline_worker or self._create_outline_worker()
+            if self._status_bar is not None:
+                self._status_bar.set_outline_status("")
+            self._register_phase3_ai_tools()
+            return
+
+        self._shutdown_outline_worker()
+        self._outline_worker = None
+        self._outline_tool = None
+        self._find_sections_tool = None
+        self._outline_digest_cache.clear()
+        if self._status_bar is not None:
+            self._status_bar.set_outline_status("")
+        self._unregister_phase3_ai_tools()
 
     def _apply_chat_panel_settings(self, settings: Settings) -> None:
         visible = bool(getattr(settings, "show_tool_activity_panel", False))
@@ -2315,12 +3503,14 @@ class MainWindow(QMainWindow):
             return
         policy = builder(settings)
         configurator = getattr(controller, "configure_budget_policy", None)
-        if not callable(configurator):
-            return
-        try:
-            configurator(policy)
-        except Exception as exc:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to update context budget policy: %s", exc)
+        if callable(configurator):
+            try:
+                configurator(policy)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                _LOGGER.debug("Unable to update context budget policy: %s", exc)
+        outline_tool = getattr(self, "_outline_tool", None)
+        if outline_tool is not None:
+            outline_tool.budget_policy = policy
 
     def _build_context_budget_policy(self, settings: Settings):
         try:

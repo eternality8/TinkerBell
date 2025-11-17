@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, ClassVar, Iterable, Mapping, Protocol, cast
+from typing import Any, Callable, ClassVar, Iterable, Mapping, Protocol, cast
 
 
 class SnapshotProvider(Protocol):
@@ -31,6 +31,7 @@ class DocumentSnapshotTool:
     """Simple synchronous tool returning document snapshots."""
 
     provider: SnapshotProvider
+    outline_digest_resolver: Callable[[str | None], str | None] | None = None
     summarizable: ClassVar[bool] = True
 
     def run(
@@ -48,6 +49,10 @@ class DocumentSnapshotTool:
             tab_id=tab_id,
             include_open_documents=include_open_documents,
         )
+
+        digest = self._resolve_outline_digest(snapshot, tab_id)
+        if digest:
+            snapshot["outline_digest"] = digest
 
         extras = self._build_additional_snapshots(
             source_tab_ids,
@@ -153,4 +158,14 @@ class DocumentSnapshotTool:
         if callable(getter):
             return cast(str | None, getter(tab_id=tab_id))
         return cast(str | None, getattr(self.provider, "last_snapshot_version", None))
+
+    def _resolve_outline_digest(self, snapshot: Mapping[str, Any], tab_id: str | None) -> str | None:
+        resolver = self.outline_digest_resolver
+        if not callable(resolver):
+            return None
+        raw_id = snapshot.get("document_id")
+        if (raw_id is None or not str(raw_id).strip()) and tab_id:
+            raw_id = tab_id
+        document_id = str(raw_id).strip() if raw_id is not None else None
+        return resolver(document_id or None)
 

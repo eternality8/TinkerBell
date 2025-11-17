@@ -32,3 +32,27 @@ def test_status_bar_autosave_state_tracks_detail() -> None:
     bar.set_autosave_state("Autosaved just now", detail="draft.md")
 
     assert bar.autosave_state == ("Autosaved just now", "draft.md")
+
+
+def test_status_bar_outline_status_tracks_tooltip() -> None:
+    bar = StatusBar()
+
+    bar.set_outline_status("Fresh", tooltip="Last build 120 ms")
+
+    assert bar.outline_state == ("Fresh", "Last build 120 ms")
+
+    bar.set_outline_status("", tooltip=None)
+
+    assert bar.outline_state == ("", "")
+
+
+def test_status_bar_embedding_status_tracks_detail() -> None:
+    bar = StatusBar()
+
+    bar.set_embedding_status("LangChain", detail="text-embedding-3-large")
+
+    assert bar.embedding_state == ("LangChain", "text-embedding-3-large")
+
+    bar.set_embedding_status(None, detail=None)
+
+    assert bar.embedding_state == ("", "")

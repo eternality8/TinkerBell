@@ -17,6 +17,7 @@ def base_system_prompt(*, model_name: str | None = None) -> str:
     """Return the structured system prompt for agent conversations."""
 
     planner_section = planner_instructions()
+    outline_section = outline_retrieval_instructions()
     tool_section = tool_use_instructions()
     budget_hint = _token_budget_hint(model_name)
     fallback_hint = _tokenizer_fallback_hint(model_name)
@@ -25,6 +26,8 @@ def base_system_prompt(*, model_name: str | None = None) -> str:
         "Your job is to plan, execute, and validate multi-step edits without breaking document safety guarantees.\n\n"
         "## Planning contract\n"
         f"{planner_section}\n\n"
+        "## Outline & retrieval tools\n"
+        f"{outline_section}\n\n"
         "## Tool execution contract\n"
         f"{tool_section}\n\n"
         "## Safety & budgeting\n"
@@ -42,9 +45,30 @@ def planner_instructions() -> str:
 
     return (
         "1. Inspect the latest DocumentSnapshot (path, language, selection hash, hashes).\n"
-        "2. Summarize the user's intent and map it to concrete tool steps (snapshot → diff → edit).\n"
-        "3. Respect selection metadata: if a range is provided, focus edits there first and confirm with the user before touching other sections.\n"
-        "4. Budget thoughts to stay within the planner token window and hand off clear instructions to the tool loop."
+        "2. Summarize the user's intent and map it to concrete tool steps (snapshot → outline/retrieval → diff → edit).\n"
+        "3. Ask for DocumentOutlineTool when the request references headings/sections or when the document exceeds the large-doc threshold; compare the returned outline_digest with prior values to avoid redundant calls.\n"
+        "4. Call DocumentFindSectionsTool when you need specific passages or when the outline points at pointer IDs that must be hydrated before editing.\n"
+        "5. Respect selection metadata: if a range is provided, focus edits there first and confirm with the user before touching other sections.\n"
+        "6. Budget thoughts to stay within the planner token window and hand off clear instructions to the tool loop.\n"
+        "7. When outline/retrieval responses include guardrails, pending status, or retry hints, echo the warning back to the user and adapt the plan instead of ignoring it."
+    )
+
+
+def outline_retrieval_instructions() -> str:
+    """Guidance for when and how to use outline and retrieval tools."""
+
+    return (
+        "- DocumentOutlineTool returns cached hierarchies with pointer_id entries (`outline:{document_id}:{node_id}`) and an outline_digest. "
+        "Use it to reason about structure, cite headings in plans, and skip re-requests when the digest matches one you've already seen.\n"
+        "- Treat stale outlines (`status=\"stale\"` or `is_stale=true`) as hints only; request a fresh snapshot or wait for the worker to rebuild before editing the referenced spans.\n"
+        "- Pay attention to `guardrails`, `status`, and `retry_after_ms` from both outline and retrieval tools. Pending or unsupported states mean switch strategies, wait, or narrow scope instead of hammering the same tool call.\n"
+        "- If DocumentOutlineTool reports `guardrails` such as `huge_document` or `trimmed_reason=token_budget`, stay in chunked workflows: operate on one pointer at a time, hydrate ranges before diffing, and explain the limitation to the user.\n"
+        "- If either tool returns `status=\"unsupported_format\"`, stop requesting it for that document and fall back to targeted snapshots or manual navigation.\n"
+        "- When DocumentOutlineTool returns `status=\"pending\"`, honor `retry_after_ms` and use interim DocumentSnapshot/DocumentFindSections calls to stay productive without stale structure.\n"
+        "- DocumentFindSectionsTool takes natural-language questions and responds with ranked chunk pointers (`pointer:chunk/...`). Call it when you need concrete paragraphs, to hydrate outline pointers, or when the user asks to \"find\" or \"quote\" portions of a large file.\n"
+        "- When retrieval runs in offline fallback mode (`status=\"offline_fallback\"` or `offline_mode=true`), treat previews as low-confidence hints and always rehydrate via DocumentSnapshot before editing.\n"
+        "- Returned pointers are summaries. Before inserting text into the document, re-run DocumentSnapshot/DiffBuilder/DocumentApplyPatch on the pointer's range to pull the full body.\n"
+        "- Avoid blasting entire documents into the prompt. Prefer pointer hydration loops: outline → find sections → rehydrate the minimal spans needed for the current edit."
     )
 
 
@@ -53,7 +77,7 @@ def tool_use_instructions() -> str:
 
     return (
         "- DocumentSnapshot: capture the freshest text, selection hashes, and version ids before planning edits.\n"
-    "- DiffBuilder: convert \"before\"/\"after\" snippets into unified diffs; include context lines.\n"
+        "- DiffBuilder: convert \"before\"/\"after\" snippets into unified diffs; include context lines.\n"
         "- DocumentApplyPatch: send `target_range` + replacement text for single-span rewrites; it composes the diff + DocumentEdit for you.\n"
         "- DocumentEdit: prefer `action=\"patch\"` referencing the latest snapshot version; fall back to targeted inserts/replaces sparingly.\n"
         "- SearchReplace & Validation: use them to stage scoped regex replacements and lint JSON/YAML/Markdown before committing patches.\n"

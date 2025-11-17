@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -24,12 +26,28 @@ class ActionType(str, Enum):
     PATCH = "patch"
 
 
+class ManualCommandType(str, Enum):
+    """Manual chat commands handled locally without the AI model."""
+
+    OUTLINE = "outline"
+    FIND_SECTIONS = "find_sections"
+
+
 @dataclass(slots=True)
 class ValidationResult:
     """Outcome of validating an edit directive."""
 
     ok: bool
     message: str = ""
+
+
+@dataclass(slots=True)
+class ManualCommandRequest:
+    """Parsed representation of a manual chat command string."""
+
+    command: ManualCommandType
+    args: dict[str, Any]
+    raw: str
 
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*(?P<body>.*)```$", re.IGNORECASE | re.DOTALL)
@@ -48,6 +66,268 @@ _TAB_REFERENCE_KEYS = (
 )
 _UNTITLED_REFERENCE_RE = re.compile(r"^untitled\s*(?P<index>\d+)$", re.IGNORECASE)
 _TAB_NUMBER_RE = re.compile(r"^(?:tab\s*#?|#)(?P<number>\d+)$", re.IGNORECASE)
+_MANUAL_PREFIXES = ("/", "::", "!")
+_OUTLINE_FLAG_ALIASES = {
+    "--doc": "document_id",
+    "--document": "document_id",
+    "--tab": "document_id",
+    "--levels": "desired_levels",
+    "-l": "desired_levels",
+    "--max-nodes": "max_nodes",
+    "--max": "max_nodes",
+}
+_FIND_FLAG_ALIASES = {
+    "--doc": "document_id",
+    "--document": "document_id",
+    "--tab": "document_id",
+    "--top": "top_k",
+    "--top-k": "top_k",
+    "--k": "top_k",
+    "--confidence": "min_confidence",
+    "--min-confidence": "min_confidence",
+    "--query": "query",
+    "-q": "query",
+}
+_MANUAL_COMMAND_ALIASES = {
+    "outline": ManualCommandType.OUTLINE,
+    "out": ManualCommandType.OUTLINE,
+    "ol": ManualCommandType.OUTLINE,
+    "find": ManualCommandType.FIND_SECTIONS,
+    "search": ManualCommandType.FIND_SECTIONS,
+    "sections": ManualCommandType.FIND_SECTIONS,
+    "retrieve": ManualCommandType.FIND_SECTIONS,
+    "retrieval": ManualCommandType.FIND_SECTIONS,
+}
+_OUTLINE_BOOLEAN_FLAGS = {
+    "--blurbs": True,
+    "--include-blurbs": True,
+    "--with-blurbs": True,
+    "--no-blurbs": False,
+    "--without-blurbs": False,
+    "--brief": False,
+}
+_FIND_BOOLEAN_FLAGS = {
+    "--outline": True,
+    "--outline-context": True,
+    "--with-outline": True,
+    "--no-outline": False,
+    "--no-outline-context": False,
+    "--without-outline": False,
+}
+
+
+def is_manual_command(text: str) -> bool:
+    """Return ``True`` when ``text`` starts with a manual command prefix."""
+
+    normalized = (text or "").strip()
+    if not normalized:
+        return False
+    return _split_manual_prefix(normalized) is not None
+
+
+def parse_manual_command(text: str) -> ManualCommandRequest | None:
+    """Parse ``text`` into a :class:`ManualCommandRequest` when prefixed."""
+
+    normalized = (text or "").strip()
+    if not normalized:
+        return None
+    prefix = _split_manual_prefix(normalized)
+    if prefix is None:
+        return None
+    _, remainder = prefix
+    if not remainder:
+        raise ValueError("Manual command is missing a verb. Try /outline or /find.")
+    tokens = _tokenize_manual_command(remainder)
+    if not tokens:
+        raise ValueError("Manual command is missing a verb. Try /outline or /find.")
+    command_token = tokens.popleft().lower()
+    command = _MANUAL_COMMAND_ALIASES.get(command_token)
+    if command is None:
+        raise ValueError(f"Unknown manual command '{command_token}'. Try /outline or /find.")
+    if command is ManualCommandType.OUTLINE:
+        args = _parse_outline_command(tokens)
+    else:
+        args = _parse_find_sections_command(tokens)
+    return ManualCommandRequest(command=command, args=args, raw=normalized)
+
+
+def _split_manual_prefix(text: str) -> tuple[str, str] | None:
+    candidate = text.lstrip()
+    for prefix in _MANUAL_PREFIXES:
+        if candidate.startswith(prefix):
+            remainder = candidate[len(prefix) :].lstrip()
+            return prefix, remainder
+    return None
+
+
+def _tokenize_manual_command(text: str) -> deque[str]:
+    try:
+        parts = shlex.split(text, posix=True)
+    except ValueError as exc:  # pragma: no cover - shlex provides the details
+        raise ValueError(f"Unable to parse manual command: {exc}") from exc
+    return deque(parts)
+
+
+def _parse_outline_command(tokens: deque[str]) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    positional: list[str] = []
+    while tokens:
+        token = tokens.popleft()
+        if token == "--":
+            positional.extend(tokens)
+            tokens.clear()
+            break
+        if _is_flag_token(token):
+            flag, inline_value = _split_flag_value(token)
+            bool_value = _OUTLINE_BOOLEAN_FLAGS.get(flag)
+            if bool_value is not None:
+                args["include_blurbs"] = bool_value
+                continue
+            normalized = _OUTLINE_FLAG_ALIASES.get(flag)
+            if normalized is None:
+                raise ValueError(f"Unknown outline flag '{token}'")
+            value = inline_value if inline_value is not None else _pop_flag_value(tokens, token)
+            cleaned = value.strip()
+            if inline_value is None and normalized == "document_id":
+                cleaned = _collect_reference_value(cleaned, tokens)
+            if not cleaned:
+                raise ValueError(f"Flag '{token}' requires a value")
+            if normalized == "desired_levels":
+                args[normalized] = _coerce_int_flag(cleaned, token, minimum=1)
+            elif normalized == "max_nodes":
+                args[normalized] = _coerce_int_flag(cleaned, token, minimum=1, maximum=1000)
+            else:
+                args[normalized] = cleaned
+            continue
+        positional.append(token)
+    if positional and "document_id" not in args:
+        reference = " ".join(positional).strip()
+        if reference:
+            args["document_id"] = reference
+    return args
+
+
+def _parse_find_sections_command(tokens: deque[str]) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    query_tokens: list[str] = []
+    while tokens:
+        token = tokens.popleft()
+        if token == "--":
+            query_tokens.extend(tokens)
+            tokens.clear()
+            break
+        if _is_flag_token(token):
+            flag, inline_value = _split_flag_value(token)
+            bool_value = _FIND_BOOLEAN_FLAGS.get(flag)
+            if bool_value is not None:
+                args["include_outline_context"] = bool_value
+                continue
+            normalized = _FIND_FLAG_ALIASES.get(flag)
+            if normalized is None:
+                raise ValueError(f"Unknown retrieval flag '{token}'")
+            value = inline_value if inline_value is not None else _pop_flag_value(tokens, token)
+            cleaned = value.strip()
+            if inline_value is None and normalized == "document_id":
+                cleaned = _collect_reference_value(cleaned, tokens)
+            if not cleaned:
+                raise ValueError(f"Flag '{token}' requires a value")
+            if normalized == "top_k":
+                args[normalized] = _coerce_int_flag(cleaned, token, minimum=1, maximum=12)
+            elif normalized == "min_confidence":
+                args[normalized] = _coerce_float_flag(cleaned, token, minimum=0.0, maximum=1.0)
+            else:
+                args[normalized] = cleaned
+            continue
+        if "document_id" not in args and _looks_like_tab_reference(token):
+            args["document_id"] = token.strip()
+            continue
+        query_tokens.append(token)
+    if query_tokens:
+        existing = (args.get("query") or "").strip()
+        suffix = " ".join(query_tokens).strip()
+        args["query"] = suffix if not existing else f"{existing} {suffix}".strip()
+    query_text = (args.get("query") or "").strip()
+    if not query_text:
+        raise ValueError("Find sections command requires a query, e.g., /find introduction paragraph")
+    args["query"] = query_text
+    return args
+
+
+def _is_flag_token(token: str) -> bool:
+    if not token or token == "--":
+        return token == "--"
+    return token.startswith("-") and token not in {"-"}
+
+
+def _split_flag_value(token: str) -> tuple[str, str | None]:
+    if "=" in token:
+        flag, value = token.split("=", 1)
+        return flag.lower(), value
+    return token.lower(), None
+
+
+def _pop_flag_value(tokens: deque[str], flag: str) -> str:
+    if not tokens:
+        raise ValueError(f"Flag '{flag}' requires a value")
+    value = tokens.popleft()
+    if value == "--":
+        raise ValueError(f"Flag '{flag}' requires a value")
+    if _is_flag_token(value) and not _looks_numeric(value):
+        raise ValueError(f"Flag '{flag}' requires a value")
+    return value
+
+
+def _collect_reference_value(initial: str, tokens: deque[str]) -> str:
+    parts: list[str] = [initial]
+    while tokens:
+        peek = tokens[0]
+        if peek == "--" or _is_flag_token(peek):
+            break
+        parts.append(tokens.popleft())
+    return " ".join(part for part in parts if part).strip()
+
+
+def _coerce_int_flag(value: str, flag: str, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{flag} expects an integer value") from exc
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{flag} must be >= {minimum}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{flag} must be <= {maximum}")
+    return number
+
+
+def _coerce_float_flag(value: str, flag: str, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{flag} expects a numeric value") from exc
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{flag} must be >= {minimum}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{flag} must be <= {maximum}")
+    return number
+
+
+def _looks_like_tab_reference(token: str) -> bool:
+    normalized = (token or "").strip().lower()
+    if not normalized:
+        return False
+    if _TAB_NUMBER_RE.match(normalized):
+        return True
+    if _UNTITLED_REFERENCE_RE.match(normalized):
+        return True
+    return normalized in {"active", "current"}
+
+
+def _looks_numeric(token: str) -> bool:
+    try:
+        float(token)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 DIRECTIVE_SCHEMA: Dict[str, Any] = {
     "type": "object",

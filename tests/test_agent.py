@@ -12,6 +12,7 @@ import tinkerbell.ai.agents.executor as agent_executor
 from tinkerbell.ai.agents.executor import AIController
 from tinkerbell.ai.client import AIClient, AIStreamEvent
 from tinkerbell.ai.services.context_policy import BudgetDecision, ContextBudgetPolicy
+from tinkerbell.ai import prompts
 from tinkerbell.services.settings import ContextPolicySettings
 
 
@@ -199,8 +200,18 @@ def test_ai_controller_records_context_usage_events(sample_snapshot):
     stub_client.settings.model = "fake-model"
     controller = AIController(client=cast(AIClient, stub_client), telemetry_enabled=True, telemetry_limit=10)
 
+    snapshot = dict(sample_snapshot)
+    snapshot.update(
+        {
+            "embedding_backend": "langchain",
+            "embedding_model": "deepseek-embedding",
+            "embedding_status": "ready",
+            "embedding_detail": "LangChain/DeepSeek",
+        }
+    )
+
     async def run() -> dict:
-        return await controller.run_chat("track", sample_snapshot)
+        return await controller.run_chat("track", snapshot)
 
     result = asyncio.run(run())
     assert result["response"] == "ok"
@@ -210,6 +221,10 @@ def test_ai_controller_records_context_usage_events(sample_snapshot):
     event = events[0]
     assert event.model == "fake-model"
     assert event.prompt_tokens > 0
+    assert event.embedding_backend == "langchain"
+    assert event.embedding_model == "deepseek-embedding"
+    assert event.embedding_status == "ready"
+    assert event.embedding_detail == "LangChain/DeepSeek"
 
 
 def test_ai_controller_executes_tool_and_continues(sample_snapshot):
@@ -255,6 +270,101 @@ def test_ai_controller_executes_tool_and_continues(sample_snapshot):
     assert tool_trace["duration_ms"] >= 0
     assert tool_trace["diff_summary"] is None
     assert "started_at" in tool_trace
+
+
+def test_ai_controller_injects_outline_guardrail_hint(sample_snapshot):
+    first_turn = [
+        AIStreamEvent(
+            type="tool_calls.function.arguments.done",
+            tool_name="document_outline",
+            tool_index=0,
+            tool_arguments="{}",
+            parsed={},
+        )
+    ]
+    second_turn = [AIStreamEvent(type="content.done", content="ok")]
+    stub_client = _StubClient([first_turn, second_turn])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    class _OutlineTool:
+        def run(self) -> dict[str, Any]:
+            return {
+                "status": "pending",
+                "reason": "outline_pending",
+                "document_id": "doc-guardrail",
+                "outline_available": False,
+                "retry_after_ms": 1200,
+                "guardrails": [
+                    {
+                        "type": "huge_document",
+                        "message": "Document exceeds safe outline size; only top-level sections returned.",
+                        "action": "Work in chunks",
+                    }
+                ],
+            }
+
+    controller.register_tool("document_outline", _OutlineTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("plan", sample_snapshot)
+
+    asyncio.run(run())
+
+    assert len(stub_client.calls) >= 2
+    second_messages = stub_client.calls[1]["messages"]
+    hint_messages = [
+        msg
+        for msg in second_messages
+        if msg.get("role") == "system" and isinstance(msg.get("content"), str) and "Guardrail hint" in msg.get("content", "")
+    ]
+    assert hint_messages, second_messages
+    assert any("DocumentOutlineTool" in msg["content"] for msg in hint_messages)
+    assert any("still building" in msg["content"].lower() for msg in hint_messages)
+
+
+def test_ai_controller_injects_retrieval_guardrail_hint(sample_snapshot):
+    first_turn = [
+        AIStreamEvent(
+            type="tool_calls.function.arguments.done",
+            tool_name="document_find_sections",
+            tool_index=0,
+            tool_arguments='{"query": "intro"}',
+            parsed={"query": "intro"},
+        )
+    ]
+    second_turn = [AIStreamEvent(type="content.done", content="done")]
+    stub_client = _StubClient([first_turn, second_turn])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    class _RetrievalTool:
+        def run(self, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "status": "offline_fallback",
+                "document_id": "doc-retrieval",
+                "query": "intro",
+                "strategy": "fallback",
+                "offline_mode": True,
+                "fallback_reason": "embedding_unavailable",
+                "pointers": [],
+            }
+
+    controller.register_tool("document_find_sections", _RetrievalTool())
+
+    async def run() -> dict:
+        return await controller.run_chat("find intro", sample_snapshot)
+
+    asyncio.run(run())
+
+    assert len(stub_client.calls) >= 2
+    second_messages = stub_client.calls[1]["messages"]
+    hint_messages = [
+        msg
+        for msg in second_messages
+        if msg.get("role") == "system" and isinstance(msg.get("content"), str) and "Guardrail hint" in msg.get("content", "")
+    ]
+    assert hint_messages, second_messages
+    assert any("DocumentFindSectionsTool" in msg["content"] for msg in hint_messages)
+    assert any("embeddings" in msg["content"].lower() for msg in hint_messages)
 
 
 def test_ai_controller_emits_result_events_with_fallback_ids(sample_snapshot):
@@ -304,7 +414,7 @@ def test_ai_controller_emits_result_events_with_fallback_ids(sample_snapshot):
 def test_ai_controller_emits_budget_decision(monkeypatch, sample_snapshot):
     stub_client = _StubClient([AIStreamEvent(type="content.done", content="ready")])
     policy = ContextBudgetPolicy.from_settings(
-        ContextPolicySettings(enabled=True, dry_run=True, prompt_budget_override=1_000),
+        ContextPolicySettings(enabled=True, dry_run=True, prompt_budget_override=1_500),
         model_name="stub",
         max_context_tokens=2_000,
         response_token_reserve=200,
@@ -371,6 +481,53 @@ def test_ai_controller_suggest_followups_returns_parsed_json():
     payload = stub_client.calls[-1]
     assert payload["messages"][0]["role"] == "system"
     assert payload["messages"][1]["role"] == "user"
+
+
+def test_outline_routing_hint_flags_large_documents(sample_snapshot):
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="ok")])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    snapshot = dict(sample_snapshot)
+    snapshot["text"] = "# Heading\n" + ("body\n" * (prompts.LARGE_DOC_CHAR_THRESHOLD // 5 + 10))
+    snapshot["document_id"] = "doc-large"
+
+    hint = controller._outline_routing_hint("Please outline this document", snapshot)
+
+    assert hint is not None
+    assert "DocumentOutlineTool" in hint
+    assert "large" in hint.lower()
+
+
+def test_outline_routing_hint_promotes_retrieval_requests(sample_snapshot):
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="ok")])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    snapshot = dict(sample_snapshot)
+    snapshot["text"] = "Short"
+    snapshot["document_id"] = "doc-retrieval"
+
+    hint = controller._outline_routing_hint("Can you find section about safety policies?", snapshot)
+
+    assert hint is not None
+    assert "DocumentFindSectionsTool" in hint
+
+
+def test_outline_routing_hint_tracks_outline_digest(sample_snapshot):
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="ok")])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    snapshot = dict(sample_snapshot)
+    snapshot["document_id"] = "doc-digest"
+    snapshot.pop("text", None)
+    snapshot["outline_digest"] = "deadbeefcafefeed"
+
+    first = controller._outline_routing_hint("", snapshot)
+    assert first is not None
+    assert "Outline digest updated" in first
+
+    repeat = controller._outline_routing_hint("", snapshot)
+    assert repeat is not None
+    assert "matches your prior fetch" in repeat
 
 
 def test_ai_controller_prompts_until_document_edit_runs(sample_snapshot):

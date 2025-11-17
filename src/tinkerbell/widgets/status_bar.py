@@ -78,12 +78,18 @@ class StatusBar:
         self._memory_usage: str = ""
         self._autosave_state: str = "Saved"
         self._autosave_detail: str = ""
+        self._outline_status: str = ""
+        self._outline_detail: str = ""
+        self._embedding_status: str = ""
+        self._embedding_detail: str = ""
         self._context_widget = ContextUsageWidget()
 
         self._qt_bar = self._build_qt_status_bar(parent)
         self._cursor_label: Any = None
         self._format_label: Any = None
         self._ai_label: Any = None
+        self._outline_label: Any = None
+        self._embedding_label: Any = None
         self._autosave_label: Any = None
 
         if self._qt_bar is not None:
@@ -147,6 +153,30 @@ class StatusBar:
         self._autosave_detail = (detail or "").strip()
         self._update_label(self._autosave_label, self._format_autosave_text())
 
+    def set_outline_status(self, status: str | None, *, tooltip: str | None = None) -> None:
+        """Update the outline freshness indicator."""
+
+        self._outline_status = (status or "").strip()
+        self._outline_detail = (tooltip or "").strip()
+        if self._outline_label is not None:
+            self._update_label(self._outline_label, self._format_outline_text())
+            try:
+                self._outline_label.setToolTip(self._outline_detail)
+            except Exception:
+                pass
+
+    def set_embedding_status(self, status: str | None, *, detail: str | None = None) -> None:
+        """Display the active embedding backend/provider status."""
+
+        self._embedding_status = (status or "").strip()
+        self._embedding_detail = (detail or "").strip()
+        if self._embedding_label is not None:
+            self._update_label(self._embedding_label, self._format_embedding_text())
+            try:
+                self._embedding_label.setToolTip(self._embedding_detail)
+            except Exception:
+                pass
+
     def widget(self) -> Any | None:
         """Return the underlying :class:`QStatusBar` when available."""
 
@@ -183,6 +213,14 @@ class StatusBar:
     def autosave_state(self) -> tuple[str, str]:
         return (self._autosave_state, self._autosave_detail)
 
+    @property
+    def outline_state(self) -> tuple[str, str]:
+        return (self._outline_status, self._outline_detail)
+
+    @property
+    def embedding_state(self) -> tuple[str, str]:
+        return (self._embedding_status, self._embedding_detail)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -196,10 +234,21 @@ class StatusBar:
         self._format_label.setObjectName("tb-status-format")
         self._ai_label = QLabel(self._ai_state)
         self._ai_label.setObjectName("tb-status-ai")
+        self._outline_label = QLabel(self._format_outline_text())
+        self._outline_label.setObjectName("tb-status-outline")
+        self._embedding_label = QLabel(self._format_embedding_text())
+        self._embedding_label.setObjectName("tb-status-embedding")
         self._autosave_label = QLabel(self._format_autosave_text())
         self._autosave_label.setObjectName("tb-status-autosave")
 
-        for label in (self._cursor_label, self._format_label, self._ai_label, self._autosave_label):
+        for label in (
+            self._cursor_label,
+            self._format_label,
+            self._ai_label,
+            self._outline_label,
+            self._embedding_label,
+            self._autosave_label,
+        ):
             label.setContentsMargins(8, 0, 8, 0)
             try:
                 self._qt_bar.addPermanentWidget(label)
@@ -224,6 +273,12 @@ class StatusBar:
         detail = self._autosave_detail
         base = f"Autosave: {self._autosave_state}"
         return f"{base} · {detail}" if detail else base
+
+    def _format_outline_text(self) -> str:
+        return f"Outline: {self._outline_status}" if self._outline_status else ""
+
+    def _format_embedding_text(self) -> str:
+        return f"Embeddings: {self._embedding_status}" if self._embedding_status else ""
 
     @staticmethod
     def _coerce_state(state: str | Enum) -> str:

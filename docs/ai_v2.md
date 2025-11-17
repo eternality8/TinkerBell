@@ -2,6 +2,46 @@
 
 Phase 0 introduces the shared infrastructure that every subsequent AI milestone depends on. This document summarizes what shipped, how to exercise it, and where to hook follow-on work.
 
+## Phase 3 – Outline & Retrieval Quickstart
+
+Phase 3 layers guardrail-aware outline/retrieval tooling on top of the Phase 0/1/2 foundation. Use this section as the TL;DR before diving into the historical notes below.
+
+### Feature highlights
+
+- **DocumentOutlineTool vNext** – Returns nested headings, blurbs, pointer IDs, digest hashes, and guardrail metadata (`status`, `guardrails`, `trimmed_reason`, `retry_after_ms`).
+- **DocumentFindSectionsTool** – Queries the embedding index (OpenAI or LangChain) and falls back to regex/outline heuristics when offline. Responses now flag `offline_mode`, `fallback_reason`, and per-pointer outline context.
+- **Controller guardrail hints** – `AIController` injects `Guardrail hint (…)` system messages whenever a tool reports pending, unsupported, stale, trimmed, or offline states so the agent must acknowledge constraints before making edits.
+- **Telemetry** – Outline/retrieval events record latency, cache hits, and `tokens_saved`, and the trace compactor continues to pointerize oversized payloads whenever the budget policy demands it.
+
+### Setup checklist
+
+1. **Enable the flag** – Toggle **Settings → Experimental → Phase 3 outline tools** (or launch with `--enable-phase3-outline-tools`).
+2. **Pick an embedding backend** – In **Settings → AI → Embeddings** choose `Auto/OpenAI`, `LangChain`, or `Disabled`. Env/CLI overrides remain available (`TINKERBELL_EMBEDDING_BACKEND`, `--embedding-backend`).
+3. **Seed samples** – Open any file under `test_data/phase3/` (see that folder’s README) to exercise the workflows without hunting for fixtures.
+4. **Watch guardrails** – When the controller inserts a guardrail hint, restate it to the user and follow the suggested remediation (work in chunks, wait for pending outlines, disable offline fallbacks, etc.).
+
+### Sample walkthrough (`test_data/phase3`)
+
+| File | Purpose | Suggested prompt |
+| --- | --- | --- |
+| `stacked_outline_demo.md` | Deeply nested headings for outline/retrieval smoke tests. | “Summarize the Control Plane goals and cite pointer IDs.” |
+| `guardrail_scenarios.md` | Step-by-step guardrail reproductions referencing other large fixtures. | “Walk me through the pending outline scenario.” |
+| `firmware_dump.bin` | Tiny binary placeholder that forces `status="unsupported_format"`. | “Generate an outline for this firmware dump.” |
+
+Open a sample, ask the agent to outline or retrieve, and observe the tool payload plus guardrail hint that follows. The existing megabyte-scale fixtures (`5MB.json`, `War and Peace.txt`, `1MB.json`) remain useful for large-document depth limiting and pending rebuild tests.
+
+### Guardrail & troubleshooting matrix
+
+| Tool status / hint | What it means | Next step |
+| --- | --- | --- |
+| `guardrails[].type = "huge_document"`, `trimmed_reason = token_budget` | Outline capped depth/size. | Work pointer-by-pointer (DocumentFindSectionsTool + DocumentSnapshot) and mention the guardrail in your reasoning. |
+| `status = "pending"`, `retry_after_ms` present | Worker is rebuilding the outline after rapid edits. | Wait the suggested delay or keep working off DocumentSnapshot until the rebuild completes. |
+| `status = "unsupported_format"` / `reason = binary_*` | File detected as binary/unsupported (e.g., `.bin`). | Convert to Markdown/YAML/JSON/plain text or skip the tool entirely. |
+| `status = "offline_fallback"`, `offline_mode = true` | Embedding provider is offline, retrieval switched to heuristics. | Treat previews as hints, rehydrate via DocumentSnapshot before editing, and restore connectivity/backend when possible. |
+| `is_stale = true` | Cached outline digest no longer matches the current document version. | Trigger a rebuild (wait or poke the worker) and avoid committing edits that rely solely on stale headings. |
+
+Additional reproduction ideas plus prompt language live in `test_data/phase3/README.md`.
+
 ## 1. Tokenizer parity layer
 
 - **Registry + protocols** – `TokenCounterRegistry` and `TokenCounterProtocol` live in `tinkerbell.ai.client` / `tinkerbell.ai.ai_types`. Every `AIClient` registers a counter for its active model and falls back to a deterministic byte estimator when no backend is available.
@@ -15,11 +55,12 @@ Phase 0 introduces the shared infrastructure that every subsequent AI milestone 
 
 ## 2. Context usage instrumentation
 
-- **Event schema** – `ContextUsageEvent` (in `tinkerbell.ai.services.telemetry`) captures `document_id`, `model`, `prompt_tokens`, `tool_tokens`, `response_reserve`, `conversation_length`, `tool_names`, and a monotonic timestamp.
+- **Event schema** – `ContextUsageEvent` (in `tinkerbell.ai.services.telemetry`) captures `document_id`, `model`, `prompt_tokens`, `tool_tokens`, `response_reserve`, `conversation_length`, `tool_names`, a monotonic timestamp, and the active embedding backend/model/status tuple so downstream dashboards can segment runs.
 - **Collection points** – `AIController` (`ai.agents.executor.AIController`) emits an event per turn and aggregates tool invocations. Tool payload sizes are counted via the new token registry so metrics stay consistent.
 - **Settings & UI** – The Settings dialog now exposes **Debug → Token logging enabled** and **Token log limit**. When enabled, the status bar shows running totals and the in-memory sink keeps the last *N* events for inspection/test assertions.
 - **Programmatic access** – `AIController.get_recent_context_events()` exposes the rolling buffer for tests or external dashboards. Additional sinks can be registered via `TelemetrySink` to stream events elsewhere.
 - **Export script** – `uv run python -m tinkerbell.scripts.export_context_usage --format csv --limit 50` dumps the persisted buffer (JSON/CSV) from `~/.tinkerbell/telemetry/context_usage.json` for audits or support bundles.
+- **Outline/Retrieval telemetry** – Outline builder (`ai/services/outline_worker.py`), `DocumentOutlineTool`, `DocumentFindSectionsTool`, and `DocumentEmbeddingIndex` now emit structured events (`outline.build.start/end`, `outline.tool.hit/miss`, `outline.stale`, `retrieval.query`, `retrieval.provider.error`, `embedding.cache.hit/miss`) that include latency, cache hit counts, provider names, and `tokens_saved` deltas. Dashboards can subscribe via `TelemetrySink` or reuse `scripts/export_context_usage.py` to trend outline freshness, retrieval performance, and embedding cost spikes.
 
 ## 3. Document version IDs & optimistic patching
 
@@ -113,3 +154,21 @@ Sprint 3 flips the context policy + trace compactor stack to General Availabili
 
 - New tests `tests/test_trace_compactor.py`, `tests/test_chat_panel.py`, and `tests/test_main_window.py` cover ledger math, pointer metadata propagation, and status-bar stats.
 - Full regression suites (`uv run pytest`) run green, and the refreshed benchmark numbers in `benchmarks/phase0_token_counts.md` document the <50 ms overhead requirement despite compaction.
+
+## 11. Embedding runtime & LangChain backends (Phase 3 preview)
+
+- **Feature flag** – Everything is gated behind `settings.phase3_outline_tools` (UI toggle or CLI `--enable-phase3-outline-tools`). When disabled, the embedding runtime tears down automatically and retrieval tools fall back to outline heuristics.
+- **Backend selection** – `settings.embedding_backend` accepts `auto` (OpenAI), `langchain`, or `disabled`. Users can override via CLI (`--embedding-backend langchain`) or env vars (`TINKERBELL_EMBEDDING_BACKEND`, `TINKERBELL_EMBEDDING_MODEL`).
+- **Model routing** – `settings.embedding_model_name` feeds both OpenAI and LangChain adapters. LangChain mode defaults to `langchain_openai.OpenAIEmbeddings` but now auto-detects known provider families (OpenAI, DeepSeek, GLM/Zhipu, Moonshot/Kimi) to preconfigure base URLs, tokenizer hints, and embedding dimensions. Provide family-specific keys via `settings.metadata["<family>_api_key"]` or env vars such as `DEEPSEEK_API_KEY`, `GLM_API_KEY`, and `MOONSHOT_API_KEY`; force a family with `settings.metadata.langchain_provider_family` or `TINKERBELL_LANGCHAIN_PROVIDER_FAMILY`. You can still point at any custom class by populating `settings.metadata.langchain_embeddings_class` and `settings.metadata.langchain_embeddings_kwargs` (or the mirrored env vars `TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS` / `..._KWARGS`).
+- **Credentials & packages** – LangChain mode requires the provider-specific package (e.g., `langchain-openai`, `langchain-community`) and whatever API keys/base URLs those classes expect. The kwargs blob supports JSON strings or literal dicts in `settings.json` so secrets can come from the same vault.
+- **Status + telemetry** – The status bar now surfaces `Embeddings: {backend}` labels, and every `ContextUsageEvent` records `embedding_backend`, `embedding_model`, `embedding_status`, and `embedding_detail`. Export scripts and dashboards use those fields to separate OpenAI vs. LangChain usage and spot misconfigurations quickly.
+- **Troubleshooting** – Runtime errors set `embedding_status="error"` and bubble the message into both the status bar tooltip and telemetry exports. Clearing `~/.tinkerbell/cache/embeddings/` plus toggling the backend forces a clean reinitialization.
+
+## 12. Edge cases & resilience guardrails (Phase 3)
+
+- **Document checks** – `ai/utils/document_checks.py` centralizes size + MIME heuristics (`document_size_bytes`, `is_huge_document`, `unsupported_format_reason`). Both the outline worker and retrieval tool reuse these helpers so every entry point agrees on what “unsupported” means.
+- **Huge doc throttling** – `OutlineBuilderWorker` switches to top-level headings once `is_huge_document()` trips, tags the cache entry with `huge_document_guardrail`, and `DocumentOutlineTool` relays those guardrails + byte counts to the controller along with guidance to run targeted scans.
+- **Unsupported / pending statuses** – Outline/retrieval tools now respond with `status="unsupported_format"` (reason string included) whenever binary files slip in, and they advertise `status="pending"` with a `retry_after_ms` when edits arrive faster than the worker debounce window.
+- **Offline embeddings** – `DocumentFindSectionsTool` reports `offline_mode=True` and `status="offline_fallback"` whenever the embedding provider is unavailable so calling agents can treat results as heuristic-only.
+- **Cache validation** – Outline cache entries persist the originating `content_hash`; mismatches trigger `_schedule_rebuild`, ensuring corrupted files never hydrate stale outlines.
+- **Regression coverage** – Tests in `tests/test_outline_worker.py`, `tests/test_document_outline_tool.py`, `tests/test_retrieval_tool.py`, and `tests/test_memory_buffers.py` cover guardrails, unsupported flows, offline fallbacks, and metadata persistence.

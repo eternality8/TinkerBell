@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -9,6 +10,55 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence, cast
 
 from openai.types.chat import ChatCompletionMessageParam
+
+@dataclass(slots=True)
+class OutlineNode:
+    """Represents a single outline node within a document hierarchy."""
+
+    id: str
+    parent_id: str | None
+    level: int
+    text: str
+    char_range: tuple[int, int]
+    chunk_id: str | None = None
+    blurb: str = ""
+    token_estimate: int = 0
+    truncated: bool = False
+    children: list["OutlineNode"] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "parent_id": self.parent_id,
+            "level": self.level,
+            "text": self.text,
+            "char_range": list(self.char_range),
+            "chunk_id": self.chunk_id,
+            "blurb": self.blurb,
+            "token_estimate": self.token_estimate,
+            "truncated": self.truncated,
+            "children": [child.to_dict() for child in self.children],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "OutlineNode":
+        children_payload = payload.get("children", [])
+        char_values = list(payload.get("char_range", (0, 0)))
+        start = int(char_values[0]) if char_values else 0
+        end = int(char_values[1]) if len(char_values) > 1 else start
+        node = cls(
+            id=str(payload.get("id", "")),
+            parent_id=payload.get("parent_id"),
+            level=int(payload.get("level", 0)),
+            text=str(payload.get("text", "")),
+            char_range=(start, end),
+            chunk_id=payload.get("chunk_id"),
+            blurb=str(payload.get("blurb", "")),
+            token_estimate=int(payload.get("token_estimate", 0)),
+            truncated=bool(payload.get("truncated", False)),
+        )
+        node.children = [OutlineNode.from_dict(child) for child in children_payload if isinstance(child, Mapping)]
+        return node
 
 ChatRole = Literal["system", "user", "assistant", "tool"]
 TokenCounter = Callable[[str], int]
@@ -165,6 +215,11 @@ class SummaryRecord:
     summary: str
     highlights: list[str] = field(default_factory=list)
     updated_at: datetime = field(default_factory=_utcnow)
+    version_id: int | None = None
+    outline_hash: str | None = None
+    nodes: list[OutlineNode] = field(default_factory=list)
+    content_hash: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -172,6 +227,11 @@ class SummaryRecord:
             "summary": self.summary,
             "highlights": list(self.highlights),
             "updated_at": self.updated_at.isoformat(),
+            "version_id": self.version_id,
+            "outline_hash": self.outline_hash,
+            "content_hash": self.content_hash,
+            "nodes": [node.to_dict() for node in self.nodes],
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
@@ -182,11 +242,17 @@ class SummaryRecord:
             if isinstance(updated, str)
             else _utcnow()
         )
+        nodes_payload = payload.get("nodes", [])
         return cls(
             document_id=str(payload.get("document_id", "unknown")),
             summary=str(payload.get("summary", "")),
             highlights=list(payload.get("highlights", [])),
             updated_at=timestamp,
+            version_id=payload.get("version_id"),
+            outline_hash=payload.get("outline_hash"),
+            nodes=[OutlineNode.from_dict(node) for node in nodes_payload if isinstance(node, Mapping)],
+            content_hash=payload.get("content_hash"),
+            metadata=dict(payload.get("metadata", {})),
         )
 
 
@@ -224,6 +290,11 @@ class DocumentSummaryMemory:
         summary: str | None = None,
         text: str | None = None,
         highlights: Sequence[str] | None = None,
+        version_id: int | None = None,
+        outline_hash: str | None = None,
+        nodes: Sequence[OutlineNode | Mapping[str, Any]] | None = None,
+        content_hash: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> SummaryRecord:
         if not summary and not text:
             raise ValueError("Either summary or text must be provided to update memory")
@@ -231,10 +302,37 @@ class DocumentSummaryMemory:
         computed_summary = summary or self._summarizer(previous.summary if previous else None, text or "")
         if self._max_summary_chars:
             computed_summary = computed_summary[: self._max_summary_chars]
+        outline_nodes: list[OutlineNode] | None = None
+        if nodes is not None:
+            outline_nodes = []
+            for node in nodes:
+                if isinstance(node, OutlineNode):
+                    outline_nodes.append(node)
+                elif isinstance(node, Mapping):
+                    outline_nodes.append(OutlineNode.from_dict(node))
+        fallback_nodes = list(previous.nodes) if previous and previous.nodes else []
+        merged_metadata: dict[str, Any] = {}
+        if previous and previous.metadata:
+            merged_metadata.update(previous.metadata)
+        if metadata:
+            for key, value in metadata.items():
+                merged_metadata[str(key)] = value
+        if highlights is not None:
+            highlight_values = list(highlights)
+        elif previous:
+            highlight_values = list(previous.highlights)
+        else:
+            highlight_values = []
+
         record = SummaryRecord(
             document_id=document_id,
             summary=computed_summary,
-            highlights=list(highlights or (previous.highlights if previous else [])),
+            highlights=highlight_values,
+            version_id=version_id if version_id is not None else getattr(previous, "version_id", None),
+            outline_hash=outline_hash if outline_hash is not None else getattr(previous, "outline_hash", None),
+            nodes=outline_nodes if outline_nodes is not None else fallback_nodes,
+            content_hash=content_hash if content_hash is not None else getattr(previous, "content_hash", None),
+            metadata=merged_metadata,
         )
         self._records[document_id] = record
         self._prune_if_needed()
@@ -309,4 +407,47 @@ class MemoryStore:
 
     def _conversation_path(self, document_id: str) -> Path:
         return self._storage_dir / f"{_safe_document_id(document_id)}.conversation.json"
+
+
+class OutlineCacheStore:
+    """Persist outline payloads per document for fast cold-start hydration."""
+
+    def __init__(self, cache_dir: Path) -> None:
+        self._cache_dir = cache_dir
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def save(self, record: SummaryRecord) -> Path:
+        payload = record.to_dict()
+        path = self._path_for(record.document_id)
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(path)
+        return path
+
+    def load(self, document_id: str) -> SummaryRecord | None:
+        path = self._path_for(document_id)
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return SummaryRecord.from_dict(payload)
+
+    def load_all(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for path in sorted(self._cache_dir.glob("*.outline.json")):
+            try:
+                record_payload = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            document_id = str(record_payload.get("document_id")) or path.stem
+            payload[document_id] = record_payload
+        return payload
+
+    def delete(self, document_id: str) -> None:
+        path = self._path_for(document_id)
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+
+    def _path_for(self, document_id: str) -> Path:
+        safe_id = _safe_document_id(document_id)
+        return self._cache_dir / f"{safe_id}.outline.json"
 

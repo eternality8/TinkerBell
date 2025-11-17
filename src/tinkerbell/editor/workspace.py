@@ -253,6 +253,15 @@ class DocumentWorkspace:
     def active_bridge(self) -> DocumentBridge:
         return self.require_active_tab().bridge
 
+    def find_document_by_id(self, document_id: str) -> DocumentState | None:
+        """Return the document matching ``document_id`` if one of the tabs owns it."""
+
+        for tab in self.iter_tabs():
+            document = tab.document()
+            if document.document_id == document_id:
+                return document
+        return None
+
     # ------------------------------------------------------------------
     # Persistence helpers
     # ------------------------------------------------------------------

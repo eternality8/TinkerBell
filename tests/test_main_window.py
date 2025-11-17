@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from types import SimpleNamespace
@@ -36,6 +37,15 @@ def _make_window(controller: Any | None = None, settings: Settings | None = None
     if controller is not None and not (resolved_settings.api_key or "").strip():
         resolved_settings.api_key = "test-key"
     return MainWindow(WindowContext(settings=resolved_settings, ai_controller=controller))
+
+
+def _install_fake_langchain_module(monkeypatch: pytest.MonkeyPatch, sink: dict[str, Any]) -> None:
+    class _FakeEmbeddings:
+        def __init__(self, **kwargs: Any) -> None:
+            sink.clear()
+            sink.update(kwargs)
+
+    monkeypatch.setitem(sys.modules, "langchain_openai", SimpleNamespace(OpenAIEmbeddings=_FakeEmbeddings))
 
 
 def test_main_window_registers_default_actions():
@@ -191,6 +201,86 @@ def test_suggestion_panel_with_history_requests_ai_suggestions():
     payload = controller.suggestion_calls[-1]
     assert payload["max"] == 4
     assert payload["history"][0]["content"] == "Hi there"
+
+
+def test_apply_embedding_metadata_updates_snapshot():
+    window = _make_window()
+    window._embedding_snapshot_metadata = {
+        "embedding_backend": "langchain",
+        "embedding_model": "deepseek-embedding",
+        "embedding_status": "ready",
+        "embedding_detail": "LangChain/DeepSeek",
+    }
+    snapshot: dict[str, Any] = {}
+
+    window._apply_embedding_metadata(snapshot)
+
+    assert snapshot["embedding_backend"] == "langchain"
+    assert snapshot["embedding_model"] == "deepseek-embedding"
+    assert snapshot["embedding_status"] == "ready"
+    assert snapshot["embedding_detail"] == "LangChain/DeepSeek"
+
+    window._embedding_snapshot_metadata = {}
+    snapshot = {
+        "embedding_backend": "old",
+        "embedding_model": "legacy",
+        "embedding_status": "error",
+        "embedding_detail": "failure",
+    }
+
+    window._apply_embedding_metadata(snapshot)
+
+    for field in ("embedding_backend", "embedding_model", "embedding_status", "embedding_detail"):
+        assert field not in snapshot
+
+
+def test_langchain_autodetects_deepseek_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    window = _make_window()
+    settings = Settings()
+    sink: dict[str, Any] = {}
+    _install_fake_langchain_module(monkeypatch, sink)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-deepseek")
+
+    embeddings, template = window._instantiate_langchain_embeddings("deepseek-embedding", settings)
+
+    assert embeddings is not None
+    assert template.family == "deepseek"
+    assert sink["model"] == "deepseek-embedding"
+    assert sink["base_url"] == "https://api.deepseek.com/v1"
+    assert sink["api_key"] == "secret-deepseek"
+    assert sink["dimensions"] == 1536
+    assert sink["tiktoken_model_name"] == "cl100k_base"
+
+
+def test_langchain_autodetect_respects_custom_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    window = _make_window()
+    settings = Settings(base_url="https://api.custom.example/v1", api_key="glm-key")
+    sink: dict[str, Any] = {}
+    _install_fake_langchain_module(monkeypatch, sink)
+
+    embeddings, template = window._instantiate_langchain_embeddings("glm-4-embed", settings)
+
+    assert embeddings is not None
+    assert template.family == "glm"
+    assert sink["base_url"] == "https://api.custom.example/v1"
+    assert sink["api_key"] == "glm-key"
+    assert sink["dimensions"] == 1024
+
+
+def test_langchain_provider_forced_via_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    window = _make_window()
+    settings = Settings()
+    settings.metadata["langchain_provider_family"] = "moonshot"
+    sink: dict[str, Any] = {}
+    _install_fake_langchain_module(monkeypatch, sink)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "moon-key")
+
+    embeddings, template = window._instantiate_langchain_embeddings("custom-provider-model", settings)
+
+    assert embeddings is not None
+    assert template.family == "moonshot"
+    assert sink["base_url"] == "https://api.moonshot.cn/v1"
+    assert sink["api_key"] == "moon-key"
 
 
 def test_suggestion_panel_reuses_cached_results_for_same_history():
@@ -943,6 +1033,114 @@ def test_chat_prompt_routes_to_ai_controller():
     assert "hello world" in history[-1].content.lower()
     assert controller.prompts == ["Summarize this"]
     assert controller.history_payloads[-1] == []
+
+
+def test_manual_outline_command_uses_outline_tool():
+    window = _make_window(settings=Settings(phase3_outline_tools=True))
+    document = window.editor_widget.to_document()
+
+    class _StubOutlineTool:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def run(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            return {
+                "status": "ok",
+                "document_id": document.document_id,
+                "nodes": [
+                    {
+                        "level": 1,
+                        "text": "Intro",
+                        "pointer_id": f"outline:{document.document_id}:intro",
+                        "children": [],
+                    }
+                ],
+            }
+
+    stub_tool = _StubOutlineTool()
+    window._outline_tool = stub_tool  # type: ignore[assignment]
+
+    panel = window.chat_panel
+    panel.set_composer_text("/outline")
+    panel.send_prompt()
+
+    assert stub_tool.calls == [{}]
+    response = panel.history()[-1].content
+    assert "Document outline" in response
+    assert "Intro" in response
+
+
+def test_manual_outline_command_disabled_without_flag():
+    window = _make_window(settings=Settings(phase3_outline_tools=False))
+    panel = window.chat_panel
+    panel.set_composer_text("/outline")
+    panel.send_prompt()
+
+    response = panel.history()[-1].content.lower()
+    assert "disabled" in response
+    assert window.last_status_message == "Outline disabled"
+
+
+def test_manual_find_sections_command_uses_tool():
+    window = _make_window(settings=Settings(phase3_outline_tools=True))
+    document = window.editor_widget.to_document()
+
+    class _StubFindTool:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def run(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            query = kwargs.get("query", "")
+            return {
+                "status": "ok",
+                "document_id": document.document_id,
+                "query": query,
+                "strategy": "fallback",
+                "pointers": [
+                    {
+                        "pointer_id": f"chunk:{document.document_id}:1",
+                        "score": 0.9,
+                        "preview": "Example paragraph about introductions.",
+                    }
+                ],
+            }
+
+    stub_tool = _StubFindTool()
+    window._find_sections_tool = stub_tool  # type: ignore[assignment]
+
+    panel = window.chat_panel
+    panel.set_composer_text("/find introduction")
+    panel.send_prompt()
+
+    assert stub_tool.calls and stub_tool.calls[0]["query"] == "introduction"
+    response = panel.history()[-1].content
+    assert "Find sections" in response
+    assert "introduction" in response.lower()
+    assert "Example paragraph" in response
+
+
+def test_manual_find_sections_command_disabled_without_flag():
+    window = _make_window(settings=Settings(phase3_outline_tools=False))
+    panel = window.chat_panel
+    panel.set_composer_text("/find intro")
+    panel.send_prompt()
+
+    response = panel.history()[-1].content.lower()
+    assert "disabled" in response
+    assert window.last_status_message == "Retrieval disabled"
+
+
+def test_manual_command_parse_error_skips_ai_controller():
+    controller = _StubAIController()
+    window = _make_window(controller)
+    panel = window.chat_panel
+    panel.set_composer_text("/find   ")
+    panel.send_prompt()
+
+    assert controller.prompts == []
+    assert "requires a query" in panel.history()[-1].content.lower()
 
 
 def test_chat_prompt_includes_prior_history_for_ai_requests():

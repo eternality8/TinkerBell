@@ -24,6 +24,7 @@ TinkerBell pairs a PySide6 editor with a full LangChain/LangGraph tool stack so 
 - **Structured safety rails** – All AI edits flow through `DocumentBridge` where schema validation, document-version checks, and diff summaries prevent stale or destructive operations.
 - **Deterministic token budgets** – A shared `TokenCounterRegistry` normalizes counts per model, falls back to a byte-length estimator when `tiktoken` is unavailable, and ships with `scripts/inspect_tokens.py` for quick sanity checks.
 - **Context budget policy + trace compactor** – Budget checks now run (and enforce) by default, compacting oversized tool payloads into pointer summaries while keeping the original trace available for auditing. Settings still expose dry-run/override switches when you need to experiment.
+- **Phase 3 outline + retrieval** – Guardrail-aware `DocumentOutlineTool` and `DocumentFindSectionsTool` stream structured digests, surface pending/unsupported/huge-document hints, and fall back to offline heuristics while the controller injects "Guardrail hint" messages the agent must obey.
 - **Turn-level telemetry** – The status bar and debug settings can stream per-turn prompt/tool budgets via `ContextUsageEvent` objects so regressions are visible before shipping.
 - **Versioned document bus** – Every snapshot now includes `{document_id, version_id, content_hash}` and `DocumentCacheBus` broadcasts `DocumentChanged`/`DocumentClosed` events so downstream caches can stay coherent.
 - **Markdown-first editor** – `EditorWidget` wraps `QPlainTextEdit`/`QsciScintilla` with headless fallbacks, Markdown preview, undo/redo, selection tracking, and theme hooks.
@@ -86,7 +87,7 @@ The console script calls `tinkerbell.app:main`, which boots the qasync-enabled Q
 
 ### 3. Explore sample docs (optional)
 
-`assets/sample_docs/` contains Markdown and YAML snippets used by tests and demos. Use **File → Open…** to load them or seed your own via `src/tinkerbell/scripts/seed_examples.py`.
+`test_data/phase3/` now ships the Phase 3 sample pack (stacked outline demo, guardrail scenario cookbook, and a binary placeholder). Read `test_data/phase3/README.md` for reproduction steps. The legacy `assets/sample_docs/` snippets and large fixtures under `test_data/` remain available for broader smoke tests.
 
 ### Optional extras (tokenizers)
 
@@ -97,6 +98,40 @@ uv sync --extra ai_tokenizers
 ```
 
 > `tiktoken` currently requires a Rust toolchain for Python 3.13 on Windows. Install [rustup](https://rustup.rs/) or run the command under Python 3.12 until official wheels are published. Without the extra, the editor automatically falls back to the deterministic byte-length estimator.
+
+### Embedding backends & configuration
+
+Phase 3 outline/retrieval tooling relies on an embedding index that can speak either native OpenAI embeddings or any LangChain-compatible provider. The runtime picks the backend from **Settings → AI → Embeddings** and mirrors the choice into telemetry/status widgets.
+
+1. **Enable the tools** – Toggle **Settings → Experimental → Phase 3 outline tools** (or launch with `--enable-phase3-outline-tools`) so the outline worker + embedding runtime spin up.
+2. **Choose a backend** – In the settings dialog select `Auto/OpenAI`, `LangChain`, or `Disabled`. `Auto` resolves to OpenAI unless the feature flag is off. The same knobs are exposed via CLI/environment overrides:
+	 - CLI: `uv run tinkerbell --embedding-backend langchain --embedding-model deepseek-embedding`
+	 - Env vars: `TINKERBELL_EMBEDDING_BACKEND=langchain`, `TINKERBELL_EMBEDDING_MODEL=deepseek-embedding`
+3. **Provide credentials** – OpenAI embeddings reuse the global API key/base URL/org. LangChain adapters fall back to `langchain_openai.OpenAIEmbeddings`, so install `langchain-openai` and set the relevant API key/env vars for whichever provider you target.
+	- The app auto-detects common LangChain families (OpenAI, DeepSeek, GLM/Zhipu, Moonshot/Kimi). It inspects `embedding_model_name` (or `settings.metadata["langchain_provider_family"]` / `TINKERBELL_LANGCHAIN_PROVIDER_FAMILY`) and wires the correct base URL, tokenizer hint, and embedding dimensionality. Provider-specific API keys can live in `settings.metadata["<family>_api_key"]` or env vars such as `DEEPSEEK_API_KEY`, `GLM_API_KEY`, and `MOONSHOT_API_KEY`. Override URLs per family with `settings.metadata["<family>_base_url"]` when needed. Unknown models fall back to the stock OpenAI configuration until you supply manual overrides.
+4. **Advanced overrides** – When you need a non-OpenAI LangChain class, drop this into `settings.metadata` (or export `TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS/KWARGS`):
+
+	 ```jsonc
+	 {
+		 "langchain_embeddings_class": "langchain_community.embeddings.DeepSeekEmbeddings",
+		 "langchain_embeddings_kwargs": {
+			 "model": "deepseek-embedding",
+			 "api_key": "${DEEPSEEK_API_KEY}",
+			 "base_url": "https://api.deepseek.com/v1"
+		 }
+	 }
+	 ```
+
+	 The kwargs blob can be stored as a dict in `settings.metadata` or as a JSON string in `TINKERBELL_LANGCHAIN_EMBEDDINGS_KWARGS`. All fields merge with the automatically supplied `model` argument.
+5. **Observe the runtime** – The status bar shows `Embeddings: LangChain/OpenAI/Error` labels, and every `ContextUsageEvent` now includes `embedding_backend`, `embedding_model`, and `embedding_status` so exports/audits can segment LangChain usage.
+
+If embeddings are disabled or initialization fails, the outline worker keeps running but retrieval calls degrade gracefully and telemetry marks the backend as `unavailable`.
+
+#### Phase 3 outline + retrieval field guide
+
+- The controller injects `Guardrail hint (…)` system messages whenever outline/retrieval responses include `guardrails`, `status != "ok"`, or `offline_mode=true`. Restate the warning to the user and follow the suggested remediation before editing.
+- Use the curated fixtures under `test_data/phase3/` to validate each guardrail quickly. For example, `stacked_outline_demo.md` is perfect for pointer hydration loops, `guardrail_scenarios.md` documents huge/pending/offline playbooks, and `firmware_dump.bin` triggers the unsupported-format path instantly.
+- Full troubleshooting steps (including a matrix that maps tool statuses to actions) live in `docs/ai_v2.md` under “Phase 3 – Outline & Retrieval Quickstart.”
 
 ## Configuring AI access
 
@@ -184,7 +219,7 @@ You can register custom tools at runtime via `AIController.register_tool`, and t
 
 ### Context usage telemetry
 
-- `ContextUsageEvent` objects capture per-turn prompt tokens, tool tokens, response reserves, tool names, and timestamps.
+- `ContextUsageEvent` objects capture per-turn prompt tokens, tool tokens, response reserves, tool names, timestamps, and the active embedding backend/model/status so audits can distinguish LangChain vs. OpenAI runs.
 - Toggle **Settings → Debug → Token logging enabled** (or set `settings.debug.token_logging_enabled` programmatically) to surface live totals in the status bar and capture up to *N* events (default 200).
 - Retrieve the rolling buffer via `AIController.get_recent_context_events()` for assertions, diagnostics, or custom sinks.
 - Export recent events anytime with the CLI below (JSON or CSV) which reads the persisted buffer from `~/.tinkerbell/telemetry/context_usage.json`:

@@ -9,14 +9,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
-LOGGER = logging.getLogger(__name__)
-
-_EVENT_LISTENERS: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
-
 
 from ..ai import client as ai_client
 from ..ai.ai_types import TokenCounterProtocol
 from ..ai.client import TokenCounterRegistry
+
+LOGGER = logging.getLogger(__name__)
+
+_EVENT_LISTENERS: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
 _TELEMETRY_DIR = Path.home() / ".tinkerbell" / "telemetry"
 _DEFAULT_TELEMETRY_PATH = _TELEMETRY_DIR / "context_usage.json"
 
@@ -34,6 +34,23 @@ class ContextUsageEvent:
     conversation_length: int
     tool_names: tuple[str, ...]
     run_id: str
+    embedding_backend: str | None = None
+    embedding_model: str | None = None
+    embedding_status: str | None = None
+    embedding_detail: str | None = None
+    outline_digest: str | None = None
+    outline_status: str | None = None
+    outline_version_id: int | None = None
+    outline_latency_ms: float | None = None
+    outline_node_count: int | None = None
+    outline_token_count: int | None = None
+    outline_trimmed: bool | None = None
+    outline_is_stale: bool | None = None
+    outline_age_seconds: float | None = None
+    retrieval_status: str | None = None
+    retrieval_strategy: str | None = None
+    retrieval_latency_ms: float | None = None
+    retrieval_pointer_count: int | None = None
 
 
 class TelemetrySink(Protocol):
@@ -370,9 +387,67 @@ def _event_from_payload(payload: object) -> ContextUsageEvent | None:
             conversation_length=int(payload.get("conversation_length", 0)),
             tool_names=tuple(payload.get("tool_names") or ()),
             run_id=str(payload.get("run_id") or ""),
+            embedding_backend=_coerce_optional_str(payload.get("embedding_backend")),
+            embedding_model=_coerce_optional_str(payload.get("embedding_model")),
+            embedding_status=_coerce_optional_str(payload.get("embedding_status")),
+            embedding_detail=_coerce_optional_str(payload.get("embedding_detail")),
+            outline_digest=_coerce_optional_str(payload.get("outline_digest")),
+            outline_status=_coerce_optional_str(payload.get("outline_status")),
+            outline_version_id=_coerce_optional_int(payload.get("outline_version_id")),
+            outline_latency_ms=_coerce_optional_float(payload.get("outline_latency_ms")),
+            outline_node_count=_coerce_optional_int(payload.get("outline_node_count")),
+            outline_token_count=_coerce_optional_int(payload.get("outline_token_count")),
+            outline_trimmed=_coerce_optional_bool(payload.get("outline_trimmed")),
+            outline_is_stale=_coerce_optional_bool(payload.get("outline_is_stale")),
+            outline_age_seconds=_coerce_optional_float(payload.get("outline_age_seconds")),
+            retrieval_status=_coerce_optional_str(payload.get("retrieval_status")),
+            retrieval_strategy=_coerce_optional_str(payload.get("retrieval_strategy")),
+            retrieval_latency_ms=_coerce_optional_float(payload.get("retrieval_latency_ms")),
+            retrieval_pointer_count=_coerce_optional_int(payload.get("retrieval_pointer_count")),
         )
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_optional_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _coerce_optional_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no"}:
+            return False
+    return None
 
 
 __all__ = [

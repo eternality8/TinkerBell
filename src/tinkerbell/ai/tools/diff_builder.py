@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import difflib
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import ClassVar
 
 
 @dataclass(slots=True)

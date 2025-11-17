@@ -63,7 +63,24 @@ def test_memory_store_roundtrip(tmp_path: Path) -> None:
     assert [message.content for message in loaded.get_messages()] == ["Hello world"]
 
     summaries = buffers.DocumentSummaryMemory()
-    summaries.update("doc-42", summary="Short summary", highlights=["Intro", "Conclusion"])
+    node = buffers.OutlineNode(
+        id="node-1",
+        parent_id=None,
+        level=1,
+        text="Intro",
+        char_range=(0, 5),
+        chunk_id="chunk-1",
+        blurb="Intro details",
+        token_estimate=2,
+    )
+    summaries.update(
+        "doc-42",
+        summary="Short summary",
+        highlights=["Intro", "Conclusion"],
+        version_id=7,
+        outline_hash="hash-123",
+        nodes=[node],
+    )
 
     store.save_document_summaries(summaries)
     restored = buffers.DocumentSummaryMemory()
@@ -73,6 +90,44 @@ def test_memory_store_roundtrip(tmp_path: Path) -> None:
     assert record is not None
     assert record.summary == "Short summary"
     assert record.highlights == ["Intro", "Conclusion"]
+    assert record.version_id == 7
+    assert record.outline_hash == "hash-123"
+    assert record.nodes and record.nodes[0].text == "Intro"
+
+
+def test_outline_cache_store_roundtrip(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "outline_cache"
+    store = buffers.OutlineCacheStore(cache_dir)
+    node = buffers.OutlineNode(
+        id="node-cache",
+        parent_id=None,
+        level=1,
+        text="Cache",
+        char_range=(0, 10),
+        chunk_id="chunk-cache",
+        blurb="Cached section",
+        token_estimate=2,
+    )
+    record = buffers.SummaryRecord(
+        document_id="doc-cache",
+        summary="Cached",
+        highlights=["Cache"],
+        nodes=[node],
+        outline_hash="digest",
+        version_id=3,
+    )
+
+    store.save(record)
+    loaded = store.load("doc-cache")
+    assert loaded is not None
+    assert loaded.outline_hash == "digest"
+    assert loaded.nodes and loaded.nodes[0].text == "Cache"
+
+    payload = store.load_all()
+    assert "doc-cache" in payload
+
+    store.delete("doc-cache")
+    assert store.load("doc-cache") is None
 
 
 def test_document_cache_bus_notifies_subscribers_in_order() -> None:

@@ -22,7 +22,24 @@ _FIELDNAMES = [
     "response_reserve",
     "conversation_length",
     "run_id",
+    "embedding_backend",
+    "embedding_model",
+    "embedding_status",
+    "embedding_detail",
     "tool_names",
+    "outline_status",
+    "outline_digest",
+    "outline_version_id",
+    "outline_latency_ms",
+    "outline_node_count",
+    "outline_token_count",
+    "outline_trimmed",
+    "outline_is_stale",
+    "outline_age_seconds",
+    "retrieval_status",
+    "retrieval_strategy",
+    "retrieval_latency_ms",
+    "retrieval_pointer_count",
 ]
 
 
@@ -41,23 +58,31 @@ def _write_csv(events: Sequence[ContextUsageEvent], destination) -> None:
     writer = csv.DictWriter(destination, fieldnames=_FIELDNAMES)
     writer.writeheader()
     for event in events:
-        writer.writerow(
-            {
-                "timestamp": f"{event.timestamp:.6f}",
-                "document_id": event.document_id or "",
-                "model": event.model,
-                "prompt_tokens": event.prompt_tokens,
-                "tool_tokens": event.tool_tokens,
-                "response_reserve": event.response_reserve or "",
-                "conversation_length": event.conversation_length,
-                "run_id": event.run_id,
-                "tool_names": ",".join(event.tool_names),
-            }
-        )
+        payload = _event_to_dict(event)
+        row: dict[str, str] = {}
+        for field in _FIELDNAMES:
+            if field == "timestamp":
+                row[field] = f"{event.timestamp:.6f}"
+                continue
+            if field == "tool_names":
+                names = payload.get("tool_names") or []
+                row[field] = ",".join(names)
+                continue
+            row[field] = _stringify(payload.get(field))
+        writer.writerow(row)
 
 
 def _load_events(path: Path, limit: int | None) -> list[ContextUsageEvent]:
     return telemetry_service.load_persistent_events(path, limit=limit)
+
+
+def _stringify(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        formatted = f"{value:.6f}".rstrip("0").rstrip(".")
+        return formatted or "0"
+    return str(value)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
