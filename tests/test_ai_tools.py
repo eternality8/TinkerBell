@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any, Mapping
 
 import pytest
 
+from tinkerbell.ai.tools.registry import (
+    ToolRegistrationError,
+    ToolRegistryContext,
+    register_default_tools,
+)
 from tinkerbell.ai.tools.diff_builder import DiffBuilderTool
 from tinkerbell.ai.tools.document_apply_patch import DocumentApplyPatchTool
 from tinkerbell.ai.tools.document_edit import DocumentEditTool
@@ -13,6 +19,7 @@ from tinkerbell.ai.tools.document_snapshot import DocumentSnapshotTool
 from tinkerbell.ai.tools.list_tabs import ListTabsTool
 from tinkerbell.ai.tools.search_replace import SearchReplaceTool
 from tinkerbell.ai.tools.validation import validate_snippet
+from tinkerbell.chat.commands import DIRECTIVE_SCHEMA
 from tinkerbell.editor.syntax import yaml_json
 from tinkerbell.services.bridge import DocumentVersionMismatchError
 
@@ -111,6 +118,31 @@ class _LegacyBridgeStub(_EditBridgeStub):
     def queue_edit(self, directive) -> None:  # type: ignore[override]
         # Legacy bridges do not accept tab_id keyword arguments
         self.calls.append(directive)
+
+
+class _ControllerStub:
+    def __init__(self, *, fail_on: set[str] | None = None) -> None:
+        self.fail_on = fail_on or set()
+        self.registered: list[str] = []
+
+    def register_tool(self, name: str, tool: Any, **_: Any) -> None:
+        if name in self.fail_on:
+            raise RuntimeError(f"boom: {name}")
+        self.registered.append(name)
+
+    @contextmanager
+    def suspend_graph_rebuilds(self):
+        yield
+
+
+def _registry_context(controller: _ControllerStub) -> ToolRegistryContext:
+    bridge = _EditBridgeStub()
+    return ToolRegistryContext(
+        controller=controller,
+        bridge=bridge,
+        outline_digest_resolver=lambda _doc_id=None: None,
+        directive_schema_provider=lambda: DIRECTIVE_SCHEMA,
+    )
 
 
 def test_document_edit_tool_accepts_json_payload_and_reports_status():
@@ -343,6 +375,29 @@ def test_document_apply_patch_tool_handles_missing_rationale():
 
     assert bridge.calls and bridge.calls[-1]["action"] == "patch"
     assert "digest-9" in status
+
+
+def test_register_default_tools_succeeds_when_controller_accepts_all():
+    controller = _ControllerStub()
+    context = _registry_context(controller)
+
+    register_default_tools(context)
+
+    registered = set(controller.registered)
+    assert {"document_snapshot", "document_edit", "document_apply_patch", "list_tabs"}.issubset(registered)
+
+
+def test_register_default_tools_aggregates_failures_without_stopping_others():
+    controller = _ControllerStub(fail_on={"document_edit", "list_tabs"})
+    context = _registry_context(controller)
+
+    with pytest.raises(ToolRegistrationError) as excinfo:
+        register_default_tools(context)
+
+    failure_names = {failure.name for failure in excinfo.value.failures}
+    assert {"document_edit", "list_tabs"} <= failure_names
+    # Remaining tools (like snapshot) still register successfully.
+    assert "document_snapshot" in controller.registered
 
 
 def test_diff_builder_tool_generates_diff_and_detects_noop():

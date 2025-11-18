@@ -8,9 +8,7 @@ import importlib
 import json
 import logging
 import os
-import time
 from copy import deepcopy
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING, cast
@@ -26,42 +24,42 @@ from ..chat.commands import (
 )
 from ..chat.message_model import ChatMessage, EditDirective, ToolTrace
 from ..editor.document_model import DocumentMetadata, DocumentState, SelectionRange
-from ..editor.editor_widget import DiffOverlayState
 from ..editor.workspace import DocumentTab
 from ..editor.tabbed_editor import TabbedEditorWidget
-from ..ai.ai_types import SubagentRuntimeConfig
 from ..ai.memory.buffers import DocumentSummaryMemory
-from ..ai.services import OutlineBuilderWorker
 from ..services.bridge_router import WorkspaceBridgeRouter
 from ..services.importers import FileImporter
 from ..services.settings import Settings, SettingsStore
-from ..utils import file_io, logging as logging_utils
+from ..utils import file_io
 from ..widgets.status_bar import StatusBar
 from ..ai.tools.document_apply_patch import DocumentApplyPatchTool
-from ..ai.tools.document_find_sections import DocumentFindSectionsTool
-from ..ai.tools.document_outline import DocumentOutlineTool
-from ..ai.tools.document_plot_state import DocumentPlotStateTool
 from ..ai.tools.registry import (
     ToolRegistryContext,
+    ToolRegistrationError,
     register_default_tools,
     register_phase3_tools,
     register_plot_state_tool,
     unregister_phase3_tools,
     unregister_plot_state_tool,
 )
-from ..theme import load_theme, theme_manager
+from .settings_runtime import SettingsRuntime
 from .ai_review_controller import AIReviewController, EditSummary, PendingReviewSession, PendingTurnReview
+from .ai_turn_coordinator import AITurnCoordinator
+from .document_session_service import DocumentSessionService
+from .document_state_monitor import DocumentStateMonitor
 from .embedding_controller import EmbeddingController, EmbeddingRuntimeState
 from .import_controller import ImportController
 from .models.actions import MenuSpec, ToolbarSpec, WindowAction
-from .models.tool_traces import PendingToolTrace
 from .models.window_state import OutlineStatusInfo, WindowContext
+from .review_overlay_manager import ReviewOverlayManager
+from .outline_runtime import OutlineRuntime
 from .telemetry_controller import TelemetryController
+from .tool_trace_presenter import ToolTracePresenter
+from .tools.provider import ToolProvider
 from .window_shell import WindowChrome
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from ..ai.orchestration import AIController
-    from ..ai.client import AIStreamEvent
     from ..ai.memory import DocumentEmbeddingIndex
     from ..ai.memory.plot_state import DocumentPlotStateStore
     from ..widgets.dialogs import SettingsDialogResult
@@ -83,51 +81,6 @@ except Exception:  # pragma: no cover - runtime stubs keep tests headless
 
         def __init__(self, *args: object, **kwargs: object) -> None:
             del args, kwargs
-            self._central_widget: Any = None
-            self._status_bar: Any = None
-            self._window_title: str = ""
-            self._shown: bool = False
-
-        def setCentralWidget(self, widget: Any) -> None:  # noqa: N802 - Qt API
-            self._central_widget = widget
-
-        def centralWidget(self) -> Any:  # noqa: N802 - Qt API
-            return self._central_widget
-
-        def setStatusBar(self, status_bar: Any) -> None:  # noqa: N802
-            self._status_bar = status_bar
-
-        def statusBar(self) -> Any:  # noqa: N802
-            return self._status_bar
-
-        def setWindowTitle(self, title: str) -> None:  # noqa: N802
-            self._window_title = title
-
-        def windowTitle(self) -> str:  # noqa: N802
-            return self._window_title
-
-        def show(self) -> None:
-            self._shown = True
-
-
-    class _StubQWidget:  # type: ignore[misc]
-        """Fallback placeholder when PySide6 is unavailable."""
-
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            del args, kwargs
-
-
-    QMainWindow = _StubQMainWindow
-    QWidget = _StubQWidget
-
-    class _StubQApplication:  # type: ignore[misc]
-        """Minimal QApplication placeholder for headless tests."""
-
-        @staticmethod
-        def instance() -> Any:
-            return None
-
-    QApplication = _StubQApplication
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -156,8 +109,40 @@ class MainWindow(QMainWindow):
         self._chat_panel = ChatPanel(show_tool_activity_panel=show_tool_panel)
         self._bridge = WorkspaceBridgeRouter(self._workspace)
         self._editor.add_tab_created_listener(self._bridge.track_tab)
-        self._workspace.add_active_listener(self._handle_active_tab_changed)
         self._status_bar = StatusBar()
+        self._document_monitor: DocumentStateMonitor | None = None
+        self._document_session = DocumentSessionService(
+            context=self._context,
+            editor=self._editor,
+            workspace=self._workspace,
+            document_monitor_resolver=lambda: self._document_monitor,
+            open_document=lambda path: self.open_document(path),
+            status_updater=self.update_status,
+            qt_parent_provider=self._qt_parent_widget,
+            untitled_document_name=UNTITLED_DOCUMENT_NAME,
+            untitled_snapshot_key=self._UNTITLED_SNAPSHOT_KEY,
+        )
+        self._review_overlay_manager: ReviewOverlayManager | None = None
+        self._document_monitor = DocumentStateMonitor(
+            editor=self._editor,
+            workspace=self._workspace,
+            chat_panel=self._chat_panel,
+            status_bar=self._status_bar,
+            settings_provider=lambda: self._context.settings,
+            settings_persister=self._document_session.persist_settings,
+            refresh_window_title=self._refresh_window_title,
+            sync_workspace_state=lambda persist: self._document_session.sync_workspace_state(persist=persist),
+            current_path_getter=self._document_session.get_current_path,
+            current_path_setter=self._document_session.set_current_path,
+            last_snapshot_setter=lambda snapshot: setattr(self, "_last_snapshot", snapshot),
+            active_document_provider=self._safe_active_document,
+            maybe_clear_diff_overlay=self._maybe_clear_diff_overlay,
+            window_app_name=WINDOW_APP_NAME,
+            untitled_document_name=UNTITLED_DOCUMENT_NAME,
+            untitled_snapshot_key=self._UNTITLED_SNAPSHOT_KEY,
+        )
+        self._workspace.add_active_listener(self._document_monitor.handle_active_tab_changed)
+        self._workspace.add_active_listener(self._handle_active_tab_for_review)
         initial_subagent_enabled = bool(getattr(initial_settings, "enable_subagents", False))
         self._telemetry_controller = TelemetryController(
             status_bar=self._status_bar,
@@ -174,17 +159,31 @@ class MainWindow(QMainWindow):
             accept_callback=self._handle_accept_ai_changes,
             reject_callback=self._handle_reject_ai_changes,
         )
+        self._document_session.set_review_controller(self._review_controller)
+        self._review_overlay_manager = ReviewOverlayManager(
+            editor=self._editor,
+            workspace=self._workspace,
+            review_controller=self._review_controller,
+            chat_panel=self._chat_panel,
+            status_updater=self.update_status,
+            notice_poster=self._post_assistant_notice,
+            window_title_refresher=self._refresh_window_title,
+            autosave_updater=lambda document: self._document_monitor.update_autosave_indicator(document=document),
+            sync_workspace_state=lambda: self._document_session.sync_workspace_state(),
+        )
+        self._document_session.set_review_overlay_manager(self._review_overlay_manager)
         file_importer = FileImporter()
         self._import_controller = ImportController(
             file_importer=file_importer,
             prompt_for_path=lambda: self._prompt_for_import_path(),
             new_tab_factory=self._create_import_tab,
             status_updater=self.update_status,
-            remember_recent_file=self._remember_recent_file,
+            remember_recent_file=self._document_session.remember_recent_file,
             refresh_window_title=self._refresh_window_title,
-            sync_workspace_state=lambda: self._sync_settings_workspace_state(),
-            update_autosave_indicator=lambda document: self._update_autosave_indicator(document=document),
+            sync_workspace_state=lambda: self._document_session.sync_workspace_state(),
+            update_autosave_indicator=lambda document: self._document_monitor.update_autosave_indicator(document=document),
         )
+        self._document_session.set_import_dialog_filter_provider(lambda: self._import_controller.dialog_filter())
         self._splitter: Any = None
         self._actions: Dict[str, WindowAction] = {}
         self._menus: Dict[str, MenuSpec] = {}
@@ -192,50 +191,84 @@ class MainWindow(QMainWindow):
         self._qt_actions: Dict[str, Any] = {}
         self._last_snapshot: dict[str, Any] = {}
         self._last_status_message: str = ""
-        self._current_document_path: Optional[Path] = None
         self._ai_task: asyncio.Task[Any] | None = None
         self._ai_stream_active = False
         self._pending_turn_snapshot: ChatTurnSnapshot | None = None
-        self._pending_tool_traces: Dict[str, PendingToolTrace] = {}
         self._tool_trace_index: Dict[str, ToolTrace] = {}
+        self._tool_trace_presenter = ToolTracePresenter(
+            chat_panel=self._chat_panel,
+            tool_trace_index=self._tool_trace_index,
+        )
         self._suggestion_task: asyncio.Task[Any] | None = None
         self._suggestion_request_id = 0
         self._suggestion_cache_key: str | None = None
         self._suggestion_cache_values: tuple[str, ...] | None = None
-        self._unsaved_snapshot_digests: dict[str, str] = {}
-        self._outline_digest_cache: dict[str, str] = {}
         self._outline_status_by_document: dict[str, OutlineStatusInfo] = {}
-        self._snapshot_persistence_block = 0
-        self._debug_logging_enabled = bool(getattr(initial_settings, "debug_logging", False))
-        self._active_theme: str | None = None
-        self._active_theme_request: str | None = None
         self._auto_patch_tool: DocumentApplyPatchTool | None = None
-        self._ai_client_signature: tuple[Any, ...] | None = self._ai_settings_signature(initial_settings)
-        self._restoring_workspace = False
-        self._tabs_with_overlay: set[str] = set()
-        self._last_autosave_at: datetime | None = None
         self._suppress_cancel_abort = False
-        self._outline_worker: OutlineBuilderWorker | None = None
-        self._outline_tool: DocumentOutlineTool | None = None
-        self._find_sections_tool: DocumentFindSectionsTool | None = None
-        self._plot_state_tool: DocumentPlotStateTool | None = None
+        self._outline_runtime: OutlineRuntime | None = None
+        self._tool_provider: ToolProvider | None = None
         self._embedding_controller = EmbeddingController(
             status_bar=self._status_bar,
             cache_root_resolver=self._resolve_embedding_cache_root,
-            outline_worker_resolver=lambda: self._outline_worker,
+            outline_worker_resolver=lambda: self._outline_runtime.worker() if self._outline_runtime else None,
             async_loop_resolver=self._resolve_async_loop,
             background_task_runner=self._run_background_task,
             phase3_outline_enabled=self._phase3_outline_enabled,
+        )
+        self._outline_runtime = OutlineRuntime(
+            document_provider=self._workspace.find_document_by_id,
+            storage_root=self._resolve_outline_cache_root(),
+            loop_resolver=self._resolve_async_loop,
+            index_propagator=lambda: self._embedding_controller.propagate_index_to_worker(),
+        )
+        self._tool_provider = ToolProvider(
+            controller_resolver=lambda: self._context.ai_controller,
+            bridge=self._bridge,
+            document_lookup=self._workspace.find_document_by_id,
+            active_document_provider=self._safe_active_document,
+            outline_worker_resolver=lambda: self._outline_runtime.worker() if self._outline_runtime else None,
+            outline_memory_resolver=lambda: self._outline_runtime.outline_memory() if self._outline_runtime else None,
+            embedding_index_resolver=self._resolve_embedding_index,
+            outline_digest_resolver=self._resolve_outline_digest,
+            directive_schema_provider=self._directive_parameters_schema,
+            plot_state_store_resolver=self._resolve_plot_state_store,
+            phase3_outline_enabled=self._phase3_outline_enabled,
+            plot_scaffolding_enabled=self._plot_scaffolding_enabled,
+        )
+        self._ai_turn_coordinator = AITurnCoordinator(
+            controller_resolver=lambda: self._context.ai_controller,
+            chat_panel=self._chat_panel,
+            review_controller=self._review_controller,
+            telemetry_controller=self._telemetry_controller,
+            status_updater=self.update_status,
+            failure_handler=self._handle_ai_failure,
+            response_finalizer=self._finalize_ai_response,
+            tool_trace_presenter=self._tool_trace_presenter,
+            stream_state_setter=self._set_ai_stream_active,
+            stream_text_coercer=self._coerce_stream_text,
+        )
+        self._settings_runtime = SettingsRuntime(
+            context=self._context,
+            editor=self._editor,
+            telemetry_controller=self._telemetry_controller,
+            embedding_controller=self._embedding_controller,
+            register_default_ai_tools=self._register_default_ai_tools,
+            outline_tool_provider=lambda: self._tool_provider.peek_outline_tool() if self._tool_provider else None,
+            ai_task_getter=lambda: self._ai_task,
+            ai_task_setter=lambda task: setattr(self, "_ai_task", task),
+            ai_stream_state_setter=self._set_ai_stream_active,
+            initial_settings=initial_settings,
         )
         self._last_outline_status: tuple[str, str] | None = None
         self._initialize_ui()
         self._telemetry_controller.register_subagent_listeners()
         self._telemetry_controller.update_subagent_indicator()
         if initial_settings is not None:
-            self._apply_theme_setting(initial_settings)
+            self._settings_runtime.apply_theme_setting(initial_settings)
         self._embedding_controller.refresh_runtime(initial_settings)
-        if self._phase3_outline_enabled:
-            self._outline_worker = self._create_outline_worker()
+        if self._phase3_outline_enabled and self._outline_runtime is not None:
+            self._outline_runtime.ensure_started()
             self._embedding_controller.propagate_index_to_worker()
 
     # ------------------------------------------------------------------
@@ -247,7 +280,8 @@ class MainWindow(QMainWindow):
         self._cancel_active_ai_turn()
         self._cancel_dynamic_suggestions()
         self._clear_suggestion_cache()
-        self._shutdown_outline_worker()
+        if self._outline_runtime is not None:
+            self._outline_runtime.shutdown()
         self._request_app_shutdown()
 
         super_close = getattr(super(), "closeEvent", None)
@@ -340,8 +374,8 @@ class MainWindow(QMainWindow):
         self._register_default_ai_tools()
 
         self.update_status("Ready")
-        self._restore_last_session_document()
-        self._update_autosave_indicator(document=self._editor.to_document())
+        self._document_session.restore_last_session_document()
+        self._document_monitor.update_autosave_indicator(document=self._editor.to_document())
 
     def _action_callbacks(self) -> Dict[str, Callable[[], Any]]:
         """Return the callbacks wired into menu and toolbar actions."""
@@ -360,55 +394,36 @@ class MainWindow(QMainWindow):
             "settings_open": self._handle_settings_requested,
         }
 
-    def _create_outline_worker(self) -> OutlineBuilderWorker | None:
-        loop = self._resolve_async_loop()
-        if loop is None:
-            return None
-        if loop.is_running():
-            return self._start_outline_worker(loop)
-        try:
-            loop.call_soon(self._start_outline_worker, loop)
-        except RuntimeError:  # pragma: no cover - loop may be closed in tests
-            return None
-        return None
+    def _wire_signals(self) -> None:
+        """Connect editor and chat events to the window handlers."""
 
-    def _start_outline_worker(self, loop: asyncio.AbstractEventLoop) -> OutlineBuilderWorker | None:
-        if getattr(self, "_outline_worker", None):
-            return self._outline_worker
-        cache_dir = self._resolve_outline_cache_root()
-        try:
-            worker = OutlineBuilderWorker(
-                document_provider=self._workspace.find_document_by_id,
-                storage_dir=cache_dir,
-                loop=loop,
-            )
-        except Exception:  # pragma: no cover - background worker optional in tests
-            _LOGGER.debug("Outline worker unavailable; continuing without outlines.", exc_info=True)
-            return None
-        self._outline_worker = worker
-        self._embedding_controller.propagate_index_to_worker()
-        return worker
+        monitor = self._document_monitor
+        if monitor is not None:
+            self._editor.add_snapshot_listener(monitor.handle_editor_snapshot)
+            self._editor.add_text_listener(monitor.handle_editor_text_changed)
+            self._editor.add_selection_listener(monitor.handle_editor_selection_changed)
+        else:  # pragma: no cover - monitor is always set in production
+            def _noop(*args: Any, **kwargs: Any) -> None:  # noqa: ANN002, ANN003 - fallback stub
+                return None
 
-    def _shutdown_outline_worker(self) -> None:
-        worker = getattr(self, "_outline_worker", None)
-        if worker is None:
-            return
-        self._outline_worker = None
-        close_coro = worker.aclose()
-        loop = worker.loop
-        if loop.is_running():
-            loop.create_task(close_coro)
-            return
-        try:
-            loop.run_until_complete(close_coro)
-        except RuntimeError:
-            asyncio.run(close_coro)
+            self._editor.add_snapshot_listener(_noop)
+            self._editor.add_text_listener(_noop)
+            self._editor.add_selection_listener(_noop)
+
+        self._chat_panel.add_request_listener(self._handle_chat_request)
+        self._chat_panel.add_session_reset_listener(self._handle_chat_session_reset)
+        self._chat_panel.add_suggestion_panel_listener(self._handle_suggestion_panel_toggled)
+        self._chat_panel.set_stop_ai_callback(self._cancel_active_ai_turn)
+        self._bridge.add_edit_listener(self._handle_edit_applied)
+        self._bridge.add_failure_listener(self._handle_edit_failure)
+        if monitor is not None:
+            monitor.handle_editor_selection_changed(self._editor.to_document().selection)
 
     def _outline_memory(self) -> DocumentSummaryMemory | None:
-        worker = getattr(self, "_outline_worker", None)
-        if worker is None:
+        runtime = self._outline_runtime
+        if runtime is None:
             return None
-        return getattr(worker, "memory", None)
+        return runtime.outline_memory()
 
     def _resolve_embedding_index(self) -> DocumentEmbeddingIndex | None:
         return self._embedding_controller.resolve_index()
@@ -462,52 +477,22 @@ class MainWindow(QMainWindow):
         except Exception:  # pragma: no cover - defensive guard
             _LOGGER.debug("Background task failed", exc_info=True)
 
-    def _resolve_outline_cache_root(self) -> Path:
-        store = getattr(self._context, "settings_store", None)
-        if store is not None:
-            base_dir = store.path.parent
-        else:
-            base_dir = Path.home() / ".tinkerbell"
-        return base_dir / "cache" / "outline_builder"
-
-    def _wire_signals(self) -> None:
-        """Connect editor/chat events required for AI coordination."""
-
-        self._editor.add_snapshot_listener(self._handle_editor_snapshot)
-        self._editor.add_text_listener(self._handle_editor_text_changed)
-        self._editor.add_selection_listener(self._handle_editor_selection_changed)
-        self._chat_panel.add_request_listener(self._handle_chat_request)
-        self._chat_panel.add_session_reset_listener(self._handle_chat_session_reset)
-        self._chat_panel.add_suggestion_panel_listener(self._handle_suggestion_panel_toggled)
-        self._chat_panel.set_stop_ai_callback(self._cancel_active_ai_turn)
-        self._bridge.add_edit_listener(self._handle_edit_applied)
-        self._bridge.add_failure_listener(self._handle_edit_failure)
-        self._handle_editor_selection_changed(self._editor.to_document().selection)
-
-    def _register_default_ai_tools(self) -> None:
-        """Register the default document-aware tools with the AI controller."""
-
-        context = self._tool_registry_context()
-        register_default_tools(context)
-
     def _tool_registry_context(self) -> ToolRegistryContext:
-        """Build the dependency bundle passed into the tool registry."""
-
-        return ToolRegistryContext(
-            controller=self._context.ai_controller,
-            bridge=self._bridge,
-            outline_digest_resolver=self._resolve_outline_digest,
-            directive_schema_provider=self._directive_parameters_schema,
-            phase3_outline_enabled=self._phase3_outline_enabled,
-            plot_scaffolding_enabled=self._plot_scaffolding_enabled,
-            ensure_outline_tool=self._ensure_outline_tool,
-            ensure_find_sections_tool=self._ensure_find_sections_tool,
-            ensure_plot_state_tool=self._ensure_plot_state_tool,
-            auto_patch_consumer=self._set_auto_patch_tool,
-        )
+        if self._tool_provider is None:
+            raise RuntimeError("Tool provider is not initialized")
+        return self._tool_provider.build_tool_registry_context(auto_patch_consumer=self._set_auto_patch_tool)
 
     def _set_auto_patch_tool(self, tool: DocumentApplyPatchTool) -> None:
         self._auto_patch_tool = tool
+
+    def _register_default_ai_tools(self, *, register_fn: Callable[..., Any] | None = None) -> None:
+        context = self._tool_registry_context()
+        try:
+            register_default_tools(context, register_fn=register_fn)
+        except ToolRegistrationError as exc:  # pragma: no cover - defensive logging
+            _LOGGER.warning("Default tool registration failed: %s", exc)
+            self.update_status("AI tools unavailable")
+            self._post_assistant_notice("Some AI tools could not be registered; check logs for details.")
 
     def _register_phase3_ai_tools(self, *, register_fn: Callable[..., Any] | None = None) -> None:
         context = self._tool_registry_context()
@@ -523,69 +508,11 @@ class MainWindow(QMainWindow):
     def _unregister_plot_state_tool(self) -> None:
         unregister_plot_state_tool(self._context.ai_controller)
 
-    def _ensure_plot_state_tool(self) -> DocumentPlotStateTool | None:
-        if self._plot_state_tool is not None:
-            return self._plot_state_tool
-        try:
-            tool = DocumentPlotStateTool(
-                plot_state_resolver=self._resolve_plot_state_store,
-                active_document_provider=self._safe_active_document,
-                feature_enabled=lambda: self._plot_scaffolding_enabled,
-            )
-        except Exception:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to initialize DocumentPlotStateTool", exc_info=True)
-            return None
-        self._plot_state_tool = tool
-        return tool
-
     def _resolve_plot_state_store(self) -> DocumentPlotStateStore | None:
         controller = self._context.ai_controller
         if controller is None:
             return None
         return getattr(controller, "plot_state_store", None)
-
-    def _ensure_outline_tool(self) -> DocumentOutlineTool | None:
-        if not self._phase3_outline_enabled:
-            return None
-        if self._outline_tool is not None:
-            return self._outline_tool
-        try:
-            def _pending_outline(document_id: str) -> bool:
-                worker = getattr(self, "_outline_worker", None)
-                if worker is None:
-                    return False
-                return worker.is_rebuild_pending(document_id)
-
-            tool = DocumentOutlineTool(
-                memory_resolver=self._outline_memory,
-                document_lookup=self._workspace.find_document_by_id,
-                active_document_provider=self._safe_active_document,
-                budget_policy=None,
-                pending_outline_checker=_pending_outline,
-            )
-        except Exception:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to initialize DocumentOutlineTool", exc_info=True)
-            return None
-        self._outline_tool = tool
-        return tool
-
-    def _ensure_find_sections_tool(self) -> DocumentFindSectionsTool | None:
-        if not self._phase3_outline_enabled:
-            return None
-        if self._find_sections_tool is not None:
-            return self._find_sections_tool
-        try:
-            tool = DocumentFindSectionsTool(
-                embedding_index_resolver=self._resolve_embedding_index,
-                document_lookup=self._workspace.find_document_by_id,
-                active_document_provider=self._safe_active_document,
-                outline_memory=self._outline_memory,
-            )
-        except Exception:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to initialize DocumentFindSectionsTool", exc_info=True)
-            return None
-        self._find_sections_tool = tool
-        return tool
 
     @staticmethod
     def _directive_parameters_schema() -> Dict[str, Any]:
@@ -647,7 +574,12 @@ class MainWindow(QMainWindow):
         )
         self._chat_panel.set_ai_running(True)
         task = self._run_coroutine(
-            self._run_ai_turn(controller, prompt, snapshot, metadata or {}, history_payload)
+            self._ai_turn_coordinator.run_ai_turn(
+                prompt=prompt,
+                snapshot=snapshot,
+                metadata=metadata or {},
+                history=history_payload,
+            )
         )
         self._ai_task = task
         if task is None:
@@ -669,7 +601,8 @@ class MainWindow(QMainWindow):
             self.update_status("Outline disabled")
             return
 
-        tool = self._ensure_outline_tool()
+        provider = self._tool_provider
+        tool = provider.ensure_outline_tool() if provider is not None else None
         if tool is None:
             self._post_assistant_notice("Outline tool is unavailable.")
             self.update_status("Outline unavailable")
@@ -713,7 +646,8 @@ class MainWindow(QMainWindow):
             self.update_status("Retrieval disabled")
             return
 
-        tool = self._ensure_find_sections_tool()
+        provider = self._tool_provider
+        tool = provider.ensure_find_sections_tool() if provider is not None else None
         if tool is None:
             self._post_assistant_notice("Find sections tool is unavailable.")
             self.update_status("Retrieval unavailable")
@@ -800,13 +734,13 @@ class MainWindow(QMainWindow):
         if document_id:
             document = self._workspace.find_document_by_id(document_id)
             if document is not None:
-                return self._document_display_name(document)
+                return self._document_monitor.document_display_name(document)
             return document_id
         if fallback:
             return fallback
         document = self._safe_active_document()
         if document is not None:
-            return self._document_display_name(document)
+            return self._document_monitor.document_display_name(document)
         return WINDOW_APP_NAME
 
     def _render_manual_outline_response(
@@ -990,254 +924,17 @@ class MainWindow(QMainWindow):
         )
         self._chat_panel.show_tool_trace(trace)
 
-    async def _run_ai_turn(
-        self,
-        controller: "AIController",
-        prompt: str,
-        snapshot: Mapping[str, Any],
-        metadata: Mapping[str, Any],
-        history: Sequence[Mapping[str, str]] | None,
-    ) -> None:
-        self._ai_stream_active = False
-        normalized_metadata = self._normalize_metadata(metadata)
-        self.update_status("AI thinking…")
 
-        try:
-            result = await controller.run_chat(
-                prompt,
-                snapshot,
-                metadata=normalized_metadata,
-                history=history,
-                on_event=self._handle_ai_stream_event,
-            )
-        except Exception as exc:  # pragma: no cover - runtime safety
-            self._review_controller.finalize_pending_turn_review(success=False)
-            self._handle_ai_failure(exc)
-            return
 
-        payload = result or {}
-        tool_records = payload.get("tool_calls")
-        self._annotate_tool_traces_with_compaction(tool_records)
-        self._telemetry_controller.set_compaction_stats(payload.get("trace_compaction"))
-        response_text = payload.get("response", "").strip()
-        if not response_text:
-            response_text = "The AI did not return any content."
-        self._finalize_ai_response(response_text)
-        self._telemetry_controller.refresh_context_usage_status()
-        self.update_status("AI response ready")
-        self._review_controller.finalize_pending_turn_review(success=True)
-
-    async def _handle_ai_stream_event(self, event: "AIStreamEvent") -> None:
-        self._process_stream_event(event)
-
-    def _process_stream_event(self, event: "AIStreamEvent") -> None:
-        event_type = getattr(event, "type", "") or ""
-        if event_type in {"content.delta", "refusal.delta"}:
-            chunk = self._coerce_stream_text(getattr(event, "content", None))
-            if chunk:
-                self._chat_panel.append_ai_message(
-                    ChatMessage(role="assistant", content=chunk),
-                    streaming=True,
-                )
-                self._ai_stream_active = True
-            return
-
-        if event_type in {"content.done", "refusal.done"}:
-            if self._ai_stream_active:
-                return
-            chunk = self._coerce_stream_text(getattr(event, "content", None))
-            if chunk:
-                self._chat_panel.append_ai_message(
-                    ChatMessage(role="assistant", content=chunk),
-                    streaming=True,
-                )
-                self._ai_stream_active = True
-            return
-
-        if event_type == "tool_calls.function.arguments.delta":
-            self._record_tool_call_arguments_delta(event)
-            return
-
-        if event_type == "tool_calls.function.arguments.done":
-            self._finalize_tool_call_arguments(event)
-            return
-
-        if event_type == "tool_calls.result":
-            self._record_tool_call_result(event)
-            return
-
-    def _record_tool_call_arguments_delta(self, event: Any) -> None:
-        key = self._tool_call_key(event)
-        if not key:
-            return
-        state = self._pending_tool_traces.get(key)
-        if state is None:
-            state = PendingToolTrace(name=self._normalize_tool_name(event))
-            self._pending_tool_traces[key] = state
-        state.tool_call_id = key
-        delta = getattr(event, "arguments_delta", None) or getattr(event, "tool_arguments", None)
-        if delta:
-            state.arguments_chunks.append(str(delta))
-
-    def _finalize_tool_call_arguments(self, event: Any) -> None:
-        key = self._tool_call_key(event)
-        if not key:
-            return
-        state = self._pending_tool_traces.get(key)
-        if state is None:
-            state = PendingToolTrace(name=self._normalize_tool_name(event))
-            self._pending_tool_traces[key] = state
-        state.tool_call_id = key
-        arguments_text = getattr(event, "tool_arguments", None)
-        if not arguments_text:
-            arguments_text = "".join(state.arguments_chunks)
-        state.arguments_chunks.clear()
-        state.raw_input = str(arguments_text or "")
-        metadata: Dict[str, Any] = {"raw_input": state.raw_input}
-        metadata["tool_call_id"] = state.tool_call_id or key
-        trace = ToolTrace(
-            name=state.name,
-            input_summary=self._summarize_tool_io(state.raw_input),
-            output_summary="(running…)",
-            metadata=metadata,
-        )
-        state.trace = trace
-        state.started_at = time.perf_counter()
-        self._chat_panel.show_tool_trace(trace)
-        if state.pending_output is not None:
-            self._apply_tool_result_to_trace(key, state)
 
     
 
-    def _update_autosave_indicator(
-        self,
-        *,
-        autosaved: bool = False,
-        document: DocumentState | None = None,
-    ) -> None:
-        doc = document or self._editor.to_document()
-        if autosaved:
-            self._last_autosave_at = datetime.now(timezone.utc)
-        status, detail = self._format_autosave_label(doc)
-        try:
-            self._status_bar.set_autosave_state(status, detail=detail)
-        except Exception:  # pragma: no cover - defensive guard
-            pass
 
-    def _format_autosave_label(self, document: DocumentState) -> tuple[str, str]:
-        name = self._document_display_name(document)
-        if not document.dirty:
-            return ("Saved", name)
-        if self._last_autosave_at is None:
-            return ("Unsaved changes", name)
-        elapsed = datetime.now(timezone.utc) - self._last_autosave_at
-        return (f"Autosaved {self._format_elapsed(elapsed)}", name)
 
-    @staticmethod
-    def _format_elapsed(delta: timedelta) -> str:
-        seconds = max(0, int(delta.total_seconds()))
-        if seconds < 5:
-            return "just now"
-        if seconds < 60:
-            return f"{seconds}s ago"
-        minutes = seconds // 60
-        if minutes < 60:
-            return f"{minutes}m ago"
-        hours = minutes // 60
-        if hours < 24:
-            return f"{hours}h ago"
-        days = hours // 24
-        return f"{days}d ago"
 
-    def _record_tool_call_result(self, event: Any) -> None:
-        key = self._tool_call_key(event)
-        if not key:
-            return
-        state = self._pending_tool_traces.get(key)
-        if state is None:
-            state = PendingToolTrace(name=self._normalize_tool_name(event))
-            self._pending_tool_traces[key] = state
-        state.tool_call_id = key
-        content = getattr(event, "content", None) or getattr(event, "tool_arguments", None) or ""
-        state.pending_output = str(content)
-        state.pending_parsed = getattr(event, "parsed", None)
-        self._apply_tool_result_to_trace(key, state)
 
-    def _apply_tool_result_to_trace(self, key: str, state: PendingToolTrace) -> None:
-        trace = state.trace
-        if trace is None or state.pending_output is None:
-            return
-        trace.output_summary = self._summarize_tool_io(state.pending_output)
-        metadata = dict(trace.metadata)
-        if state.raw_input is not None:
-            metadata.setdefault("raw_input", state.raw_input)
-        metadata["raw_output"] = state.pending_output
-        if state.pending_parsed is not None:
-            metadata["parsed_output"] = state.pending_parsed
-        trace.metadata = metadata
-        tool_call_id = metadata.get("tool_call_id")
-        if isinstance(tool_call_id, str):
-            self._tool_trace_index[tool_call_id] = trace
-        if state.started_at is not None:
-            elapsed = max(0.0, time.perf_counter() - state.started_at)
-            trace.duration_ms = int(elapsed * 1000)
-        self._chat_panel.update_tool_trace(trace)
-        self._pending_tool_traces.pop(key, None)
-
-    def _annotate_tool_traces_with_compaction(self, records: Sequence[Mapping[str, Any]] | None) -> None:
-        if not records:
-            return
-        for record in records:
-            if not isinstance(record, Mapping):
-                continue
-            pointer = record.get("pointer")
-            if not pointer:
-                continue
-            call_id = record.get("id") or record.get("tool_call_id")
-            if not call_id:
-                continue
-            trace = self._tool_trace_index.get(str(call_id))
-            if trace is None:
-                continue
-            metadata = dict(trace.metadata or {})
-            metadata["compacted"] = True
-            metadata["pointer"] = pointer
-            instructions = pointer.get("rehydrate_instructions") if isinstance(pointer, Mapping) else None
-            if instructions:
-                metadata["pointer_instructions"] = instructions
-            summary = pointer.get("display_text") if isinstance(pointer, Mapping) else None
-            if summary:
-                metadata["pointer_summary"] = summary
-                trace.output_summary = summary
-            trace.metadata = metadata
-            self._chat_panel.update_tool_trace(trace)
-
-    def _tool_call_key(self, event: Any) -> str:
-        identifier = getattr(event, "tool_call_id", None) or getattr(event, "id", None)
-        if identifier:
-            return str(identifier)
-        index = getattr(event, "tool_index", None)
-        return f"{self._normalize_tool_name(event)}:{index if index is not None else 0}"
-
-    @staticmethod
-    def _normalize_tool_name(event: Any) -> str:
-        name = getattr(event, "tool_name", None) or "tool"
-        text = str(name).strip()
-        return text or "tool"
-
-    @staticmethod
-    def _summarize_tool_io(payload: Any, limit: int = 140) -> str:
-        if payload is None:
-            return "(empty)"
-        text = str(payload).strip()
-        if not text:
-            return "(empty)"
-        condensed = " ".join(text.split())
-        if not condensed:
-            return "(empty)"
-        if len(condensed) <= limit:
-            return condensed
-        return f"{condensed[: limit - 1].rstrip()}…"
+    def _set_ai_stream_active(self, active: bool) -> None:
+        self._ai_stream_active = active
 
     def _coerce_stream_text(self, payload: Any) -> str:
         if payload is None:
@@ -1330,9 +1027,9 @@ class MainWindow(QMainWindow):
         self._cancel_active_ai_turn()
         self._cancel_dynamic_suggestions()
         self._clear_suggestion_cache()
-        self._tool_trace_index.clear()
+        self._tool_trace_presenter.reset()
         self._telemetry_controller.set_compaction_stats(None)
-        self._refresh_chat_suggestions()
+        self._document_monitor.refresh_chat_suggestions()
         self.update_status("Chat reset")
 
     def _handle_suggestion_panel_toggled(self, is_open: bool) -> None:
@@ -1342,12 +1039,12 @@ class MainWindow(QMainWindow):
 
         history = self._chat_panel.history()
         if not history:
-            self._refresh_chat_suggestions()
+            self._document_monitor.refresh_chat_suggestions()
             return
 
         history_signature = self._history_signature(history)
         if history_signature is None:
-            self._refresh_chat_suggestions()
+            self._document_monitor.refresh_chat_suggestions()
             return
 
         if (
@@ -1360,7 +1057,7 @@ class MainWindow(QMainWindow):
 
         controller = self._context.ai_controller
         if controller is None:
-            self._refresh_chat_suggestions()
+            self._document_monitor.refresh_chat_suggestions()
             self.update_status("AI suggestions unavailable")
             return
 
@@ -1460,7 +1157,7 @@ class MainWindow(QMainWindow):
             return
 
         self._clear_suggestion_cache()
-        self._refresh_chat_suggestions()
+        self._document_monitor.refresh_chat_suggestions()
         self.update_status("Using preset suggestions")
 
     def _on_ai_task_finished(self, task: asyncio.Task[Any]) -> None:
@@ -1472,14 +1169,6 @@ class MainWindow(QMainWindow):
             self._handle_ai_failure(exc)
         finally:
             self._chat_panel.set_ai_running(False)
-
-    def _normalize_metadata(self, metadata: Mapping[str, Any] | None) -> Dict[str, str] | None:
-        if not metadata:
-            return None
-        normalized: Dict[str, str] = {}
-        for key, value in metadata.items():
-            normalized[str(key)] = str(value)
-        return normalized or None
 
     def _handle_edit_applied(self, directive: EditDirective, _state: DocumentState, diff: str) -> None:
         summary = f"Applied {directive.action} ({diff})"
@@ -1506,10 +1195,10 @@ class MainWindow(QMainWindow):
             output_summary=diff,
             metadata=metadata,
         )
-        spans = self._coerce_overlay_spans(metadata.get("spans"), fallback_range=range_hint)
+        spans = self._review_overlay_manager.coerce_overlay_spans(metadata.get("spans"), fallback_range=range_hint)
         diff_preview = metadata.get("diff_preview")
         overlay_label = str(diff_preview or trace.output_summary or trace.name)
-        tab_id = self._find_tab_id_for_document(_state)
+        tab_id = self._review_overlay_manager.find_tab_id_for_document(_state)
         tab: DocumentTab | None = None
         if tab_id:
             try:
@@ -1536,7 +1225,7 @@ class MainWindow(QMainWindow):
                 turn.total_edit_count += 1
                 if spans:
                     session.merged_spans = (
-                        self._merge_overlay_spans(session.merged_spans, spans)
+                        self._review_overlay_manager.merge_overlay_spans(session.merged_spans, spans)
                         if session.merged_spans
                         else spans
                     )
@@ -1545,7 +1234,7 @@ class MainWindow(QMainWindow):
                     session.latest_version_signature = current_document.version_signature()
 
         self._chat_panel.show_tool_trace(trace)
-        self._apply_diff_overlay(
+        self._review_overlay_manager.apply_diff_overlay(
             trace,
             document=_state,
             range_hint=range_hint,
@@ -1553,7 +1242,7 @@ class MainWindow(QMainWindow):
             spans_override=spans,
             label_override=overlay_label,
         )
-        self._update_autosave_indicator(document=current_document or _state)
+        self._document_monitor.update_autosave_indicator(document=current_document or _state)
 
     def _handle_edit_failure(self, directive: EditDirective, message: str) -> None:
         action = (directive.action or "").strip().lower()
@@ -1564,254 +1253,18 @@ class MainWindow(QMainWindow):
         else:
             self.update_status(f"Edit failed: {message or 'Unknown error'}")
 
-    def _apply_diff_overlay(
-        self,
-        trace: ToolTrace,
-        *,
-        document: DocumentState,
-        range_hint: tuple[int, int],
-        tab_id: str | None = None,
-        spans_override: tuple[tuple[int, int], ...] | None = None,
-        label_override: str | None = None,
-    ) -> None:
-        target_id = tab_id or self._find_tab_id_for_document(document)
-        if not target_id:
-            return
-        metadata = trace.metadata if isinstance(trace.metadata, Mapping) else {}
-        spans = spans_override if spans_override is not None else self._coerce_overlay_spans(
-            metadata.get("spans"),
-            fallback_range=range_hint,
-        )
-        diff_payload = metadata.get("diff_preview") if isinstance(metadata, Mapping) else None
-        label = label_override or str(diff_payload or trace.output_summary or trace.name)
-        try:
-            self._editor.show_diff_overlay(
-                label,
-                spans=spans,
-                summary=trace.output_summary,
-                source=trace.name,
-                tab_id=target_id,
-            )
-        except Exception:  # pragma: no cover - defensive guard
-            return
-        self._tabs_with_overlay.add(target_id)
-
-    def _coerce_overlay_spans(
-        self,
-        raw_spans: Any,
-        *,
-        fallback_range: tuple[int, int] | None,
-    ) -> tuple[tuple[int, int], ...]:
-        spans: list[tuple[int, int]] = []
-        if isinstance(raw_spans, Sequence):
-            for entry in raw_spans:
-                if not isinstance(entry, Sequence) or len(entry) != 2:
-                    continue
-                try:
-                    start = int(entry[0])
-                    end = int(entry[1])
-                except (TypeError, ValueError):
-                    continue
-                if start == end:
-                    continue
-                if end < start:
-                    start, end = end, start
-                spans.append((start, end))
-        if not spans and fallback_range is not None and fallback_range[0] != fallback_range[1]:
-            start, end = fallback_range
-            if end < start:
-                start, end = end, start
-            spans.append((start, end))
-        return tuple(spans)
-
-    def _merge_overlay_spans(
-        self,
-        existing: tuple[tuple[int, int], ...],
-        new_spans: tuple[tuple[int, int], ...],
-    ) -> tuple[tuple[int, int], ...]:
-        if not existing:
-            return new_spans
-        if not new_spans:
-            return existing
-        ordered = sorted(existing + new_spans, key=lambda span: span[0])
-        merged: list[list[int]] = []
-        for start, end in ordered:
-            if not merged or start > merged[-1][1]:
-                merged.append([start, end])
-                continue
-            merged[-1][1] = max(merged[-1][1], end)
-        return tuple((start, end) for start, end in merged)
-
     def _maybe_clear_diff_overlay(self, state: DocumentState) -> None:
-        tab_id = self._find_tab_id_for_document(state)
-        if not tab_id or tab_id not in self._tabs_with_overlay:
-            return
-        try:
-            tab = self._workspace.get_tab(tab_id)
-        except KeyError:
-            self._tabs_with_overlay.discard(tab_id)
-            return
-        change_source = getattr(tab.editor, "last_change_source", "")
-        if change_source != "user":
-            return
-        if self._review_controller.pending_turn_review is not None:
-            self._review_controller.abort_pending_review(
-                reason="manual-edit",
-                status="AI edits discarded after manual edit",
-                notice="Pending AI edits were cleared because you modified the document.",
-                clear_overlays=True,
-            )
-        self._clear_diff_overlay(tab_id=tab_id)
+        if self._review_overlay_manager is not None:
+            self._review_overlay_manager.maybe_clear_diff_overlay(state)
 
     def _clear_diff_overlay(self, *, tab_id: str | None = None) -> None:
-        target_id = tab_id or self._workspace.active_tab_id
-        if not target_id or target_id not in self._tabs_with_overlay:
-            return
-        try:
-            self._editor.clear_diff_overlay(tab_id=target_id)
-        except KeyError:  # pragma: no cover - tab already gone
-            pass
-        self._tabs_with_overlay.discard(target_id)
+        if self._review_overlay_manager is not None:
+            self._review_overlay_manager.clear_diff_overlay(tab_id)
 
-    def _find_tab_id_for_document(self, document: DocumentState) -> str | None:
-        document_id = getattr(document, "document_id", None)
-        for tab in self._workspace.iter_tabs():
-            try:
-                tab_document = tab.document()
-            except Exception:  # pragma: no cover - defensive guard
-                continue
-            if document_id and tab_document.document_id == document_id:
-                return tab.id
-        return self._workspace.active_tab_id
-
-    # ------------------------------------------------------------------
-    # Action callbacks
-    # ------------------------------------------------------------------
-    def _handle_editor_snapshot(self, snapshot: dict[str, Any]) -> None:
-        """Cache the latest snapshot for future agent requests."""
-
-        self._last_snapshot = snapshot
-        digest = str(snapshot.get("outline_digest") or "").strip()
-        document_id = str(snapshot.get("document_id") or "").strip()
-        if not document_id:
-            document = self._safe_active_document()
-            if document is not None:
-                document_id = document.document_id
-        if not digest or not document_id:
-            return
-        if self._outline_digest_cache.get(document_id) == digest:
-            return
-        self._outline_digest_cache[document_id] = digest
-        self._emit_outline_timeline_event(document_id, digest)
-
-    def _handle_editor_text_changed(self, text: str, state: DocumentState) -> None:
-        """Update window title when the editor content or metadata shifts."""
-
-        self._refresh_window_title(state)
-        self._refresh_chat_suggestions(state=state)
-        if self._snapshot_persistence_block > 0:
-            self._update_autosave_indicator(document=state)
-            self._maybe_clear_diff_overlay(state)
-            return
-        self._persist_unsaved_snapshot(state)
-        self._update_autosave_indicator(document=state)
-        self._maybe_clear_diff_overlay(state)
-
-    def _handle_editor_selection_changed(self, selection: SelectionRange) -> None:
-        """Refresh suggestions and composer context when the selection moves."""
-
-        self._refresh_chat_suggestions(selection=selection)
-
-    def _handle_active_tab_changed(self, tab: DocumentTab | None) -> None:
-        if tab is None:
-            self._current_document_path = None
-            self._sync_settings_workspace_state()
-            return
-        document = tab.document()
-        self._current_document_path = document.metadata.path
-        self._refresh_window_title(document)
-        self._refresh_chat_suggestions(state=document)
-        self._update_autosave_indicator(document=document)
-        self._sync_settings_workspace_state()
+    def _handle_active_tab_for_review(self, _tab: DocumentTab | None) -> None:
         pending_turn = self._review_controller.pending_turn_review
         if pending_turn and pending_turn.ready_for_review:
             self._review_controller.show_review_controls()
-
-    def _refresh_chat_suggestions(
-        self,
-        *,
-        state: DocumentState | None = None,
-        selection: SelectionRange | None = None,
-    ) -> None:
-        document = state or self._editor.to_document()
-        active_selection = selection or document.selection
-        start, end = active_selection.as_tuple()
-        text = document.text[start:end]
-        summary = self._summarize_selection_text(text)
-        self._chat_panel.set_selection_summary(summary)
-        suggestions = self._build_chat_suggestions(document, text)
-        self._chat_panel.set_suggestions(suggestions)
-
-    def _build_chat_suggestions(self, document: DocumentState, selection_text: str) -> list[str]:
-        has_selection = bool(selection_text.strip())
-        has_document_text = bool(document.text.strip())
-        if has_selection:
-            suggestions = [
-                "Summarize the selected text.",
-                "Rewrite the selected text for clarity.",
-                "Extract action items from the selection.",
-            ]
-        elif has_document_text:
-            suggestions = [
-                "Summarize the current document.",
-                "Suggest improvements to the document structure.",
-                "Highlight inconsistencies or missing sections.",
-            ]
-        else:
-            name = self._document_display_name(document)
-            suggestions = [
-                f"Draft an outline for {name}.",
-                "Propose a starter paragraph for this document.",
-                "List the key points this document should cover.",
-            ]
-        suggestions.append("Help me plan the next edits.")
-        return suggestions
-
-    def _document_display_name(self, document: DocumentState) -> str:
-        path = document.metadata.path or self._current_document_path
-        if path is not None:
-            name = path.name
-            return name if name else WINDOW_APP_NAME
-        return UNTITLED_DOCUMENT_NAME
-
-    def _summarize_selection_text(self, selection_text: str) -> Optional[str]:
-        condensed = self._condense_whitespace(selection_text)
-        if not condensed:
-            return None
-        if len(condensed) > 80:
-            condensed = f"{condensed[:77].rstrip()}…"
-        return condensed
-
-    def _emit_outline_timeline_event(self, document_id: str, outline_digest: str) -> None:
-        try:
-            document = self._workspace.find_document_by_id(document_id)
-        except Exception:
-            document = None
-        label = self._document_display_name(document) if document is not None else document_id
-        trace = ToolTrace(
-            name="document_outline",
-            input_summary=label,
-            output_summary="Outline updated",
-            metadata={
-                "document_id": document_id,
-                "outline_digest": outline_digest,
-                "timestamp": time.time(),
-            },
-        )
-        try:
-            self._chat_panel.show_tool_trace(trace)
-        except Exception:  # pragma: no cover - UI optional in tests
-            _LOGGER.debug("Unable to surface outline availability trace", exc_info=True)
 
     @staticmethod
     def _condense_whitespace(text: str) -> str:
@@ -1826,145 +1279,17 @@ class MainWindow(QMainWindow):
         self.update_status("Snapshot refreshed")
 
     def _handle_accept_ai_changes(self) -> None:
-        turn = self._review_controller.pending_turn_review
-        if turn is None:
-            self.update_status("No AI edits pending review")
-            return
-        if not turn.ready_for_review:
-            self.update_status("AI turn still running – review not ready")
-            return
-
-        skipped_tabs: list[str] = []
-        for session in list(turn.tab_sessions.values()):
-            tab_id = session.tab_id
-            if not tab_id:
-                continue
-            if session.orphaned:
-                skipped_tabs.append(tab_id)
-                continue
-            try:
-                self._workspace.get_tab(tab_id)
-            except KeyError:
-                session.orphaned = True
-                skipped_tabs.append(tab_id)
-                continue
-            self._clear_diff_overlay(tab_id=tab_id)
-
-        if skipped_tabs:
-            _LOGGER.debug(
-                "Skipped clearing overlays for %s tab(s) during accept: %s",
-                len(skipped_tabs),
-                ", ".join(skipped_tabs),
-            )
-
-        summary = self._review_controller.format_review_summary(turn)
-        notice = f"Accepted {summary}"
-        if skipped_tabs:
-            suffix = "tab" if len(skipped_tabs) == 1 else "tabs"
-            notice = f"{notice} (skipped {len(skipped_tabs)} closed {suffix})"
-        self._review_controller.drop_pending_turn_review(reason="accepted")
-        self.update_status(notice)
-        self._post_assistant_notice(notice)
+        if self._review_overlay_manager is not None:
+            self._review_overlay_manager.handle_accept_ai_changes()
 
     def _handle_reject_ai_changes(self) -> None:
-        turn = self._review_controller.pending_turn_review
-        if not turn or not turn.ready_for_review:
-            self.update_status("No AI edits pending review")
-            return
-        sessions = list(turn.tab_sessions.values())
-        if not sessions:
-            self.update_status("No AI edits pending review")
-            self._review_controller.drop_pending_turn_review(reason="empty-review")
-            return
-
-        skipped_tabs: list[str] = []
-        blocked_tabs: list[str] = []
-        tabs_to_restore: list[tuple[DocumentTab, PendingReviewSession]] = []
-        for session in sessions:
-            if session.orphaned:
-                skipped_tabs.append(session.tab_id)
-                continue
-            try:
-                tab = self._workspace.get_tab(session.tab_id)
-            except KeyError:
-                session.orphaned = True
-                skipped_tabs.append(session.tab_id)
-                continue
-
-            document = tab.document()
-            display_name = tab.title or session.tab_id
-            if document.document_id != session.document_id:
-                blocked_tabs.append(f"{display_name} now points to a different document")
-                continue
-            if session.latest_version_signature:
-                current_signature = document.version_signature()
-                if current_signature != session.latest_version_signature:
-                    blocked_tabs.append(f"{display_name} changed since the AI turn finished")
-                    continue
-            tabs_to_restore.append((tab, session))
-
-        if blocked_tabs:
-            detail = "; ".join(blocked_tabs)
-            self._post_assistant_notice(
-                "Reject canceled because some tabs changed after the AI edits: " + detail
-            )
-            self.update_status("Reject canceled; documents changed after AI edits")
-            return
-
-        for tab, session in tabs_to_restore:
-            snapshot_copy = deepcopy(session.document_snapshot)
-            tab.editor.load_document(snapshot_copy)
-            tab.update_title()
-            self._tabs_with_overlay.discard(tab.id)
-            prior_overlay = session.previous_overlay
-            if prior_overlay is not None:
-                try:
-                    tab.editor.show_diff_overlay(
-                        prior_overlay.diff,
-                        spans=prior_overlay.spans,
-                        summary=prior_overlay.summary,
-                        source=prior_overlay.source,
-                    )
-                    self._tabs_with_overlay.add(tab.id)
-                except Exception:
-                    _LOGGER.debug("Unable to restore previous overlay for tab %s", tab.id, exc_info=True)
-            document = tab.document()
-            if self._workspace.active_tab_id == tab.id:
-                self._refresh_window_title(document)
-            self._update_autosave_indicator(document=document)
-            try:
-                tab.bridge.generate_snapshot(delta_only=True)
-            except Exception:
-                _LOGGER.debug("Unable to refresh bridge snapshot for tab %s", tab.id, exc_info=True)
-
-        if skipped_tabs:
-            _LOGGER.debug(
-                "Skipped rolling back %s tab(s) during reject: %s",
-                len(skipped_tabs),
-                ", ".join(skipped_tabs),
-            )
-
-        snapshot = turn.chat_snapshot
-        if snapshot is not None:
-            try:
-                self._chat_panel.restore_state(snapshot)
-            except Exception:
-                _LOGGER.debug("Unable to restore chat snapshot during reject", exc_info=True)
-
-        self._sync_settings_workspace_state()
-        summary = self._review_controller.format_review_summary(turn)
-        notice = f"Rejected {summary}"
-        if skipped_tabs:
-            suffix = "tab" if len(skipped_tabs) == 1 else "tabs"
-            notice = f"{notice} (skipped {len(skipped_tabs)} closed {suffix})"
-        self._review_controller.drop_pending_turn_review(reason="rejected")
-        self.update_status(notice)
-        self._post_assistant_notice(notice)
+        if self._review_overlay_manager is not None:
+            self._review_overlay_manager.handle_reject_ai_changes()
 
     def _handle_open_requested(self) -> None:
         """Prompt the user for a document path and load it into the editor."""
 
-        path = self._prompt_for_open_path()
+        path = self._document_session.prompt_for_open_path()
         if path is None:
             self.update_status("Open canceled")
             return
@@ -1981,21 +1306,21 @@ class MainWindow(QMainWindow):
         self._import_controller.handle_import()
 
     def _handle_new_tab_requested(self) -> None:
-        with self._suspend_snapshot_persistence():
+        with self._document_monitor.suspend_snapshot_persistence():
             tab = self._editor.create_tab()
         self._workspace.set_active_tab(tab.id)
-        self._current_document_path = None
-        self._sync_settings_workspace_state()
-        self._update_autosave_indicator(document=self._editor.to_document())
+        self._document_session.set_current_path(None)
+        self._document_session.sync_workspace_state()
+        self._document_monitor.update_autosave_indicator(document=self._editor.to_document())
         self.update_status("New tab created")
 
     def _create_import_tab(self, document: DocumentState, title: str) -> str:
         """Create a tab for imported content and return its identifier."""
 
-        with self._suspend_snapshot_persistence():
+        with self._document_monitor.suspend_snapshot_persistence():
             tab = self._editor.create_tab(document=document, title=title, make_active=True)
         self._workspace.set_active_tab(tab.id)
-        self._current_document_path = None
+        self._document_session.set_current_path(None)
         return tab.id
 
     def _handle_close_tab_requested(self) -> None:
@@ -2006,16 +1331,17 @@ class MainWindow(QMainWindow):
         closed = self._editor.close_active_tab()
         self._review_controller.mark_pending_session_orphaned(closed.id, reason="tab-closed")
         document = closed.document()
-        self._clear_unsaved_snapshot(path=document.metadata.path, tab_id=closed.id)
-        self._tabs_with_overlay.discard(closed.id)
+        self._document_monitor.clear_unsaved_snapshot(path=document.metadata.path, tab_id=closed.id)
+        if self._review_overlay_manager is not None:
+            self._review_overlay_manager.discard_overlay(closed.id)
         if self._workspace.tab_count() == 0:
             self._handle_new_tab_requested()
         else:
             new_active = self._workspace.active_tab
             if new_active is not None:
-                self._current_document_path = new_active.document().metadata.path
-        self._sync_settings_workspace_state()
-        self._update_autosave_indicator(document=self._editor.to_document())
+                self._document_session.set_current_path(new_active.document().metadata.path)
+        self._document_session.sync_workspace_state()
+        self._document_monitor.update_autosave_indicator(document=self._editor.to_document())
         self.update_status(f"Closed tab {closed.title}")
 
     def _handle_save_requested(self) -> None:
@@ -2057,15 +1383,15 @@ class MainWindow(QMainWindow):
         document = DocumentState(text=text, metadata=metadata)
         document.dirty = False
 
-        with self._suspend_snapshot_persistence():
+        with self._document_monitor.suspend_snapshot_persistence():
             self._editor.load_document(document)
 
-        self._current_document_path = path
-        self._clear_unsaved_snapshot(path=path)
+        self._document_session.set_current_path(path)
+        self._document_monitor.clear_unsaved_snapshot(path=path)
         self._refresh_window_title(document)
         self.update_status(f"Reverted {path.name}")
-        self._sync_settings_workspace_state()
-        self._update_autosave_indicator(document=document)
+        self._document_session.sync_workspace_state()
+        self._document_monitor.update_autosave_indicator(document=document)
 
     def _handle_settings_requested(self) -> None:
         """Show the settings dialog so users can configure integrations."""
@@ -2085,8 +1411,13 @@ class MainWindow(QMainWindow):
             return
 
         self._context.settings = result.settings
-        self._apply_runtime_settings(result.settings)
-        self._persist_settings(result.settings)
+        self._settings_runtime.apply_runtime_settings(
+            result.settings,
+            chat_panel_handler=self._apply_chat_panel_settings,
+            phase3_handler=self._apply_phase3_outline_setting,
+            plot_scaffolding_handler=self._apply_plot_scaffolding_setting,
+        )
+        self._document_session.persist_settings(result.settings)
         self.update_status("Settings updated")
 
     # ------------------------------------------------------------------
@@ -2113,6 +1444,48 @@ class MainWindow(QMainWindow):
     @_file_importer.setter
     def _file_importer(self, importer: FileImporter) -> None:
         self._import_controller.file_importer = importer
+
+    @property
+    def _outline_tool(self) -> Any | None:  # pragma: no cover - legacy shim for tests
+        provider = self._tool_provider
+        if provider is None:
+            return None
+        return provider.peek_outline_tool()
+
+    @_outline_tool.setter
+    def _outline_tool(self, tool: Any | None) -> None:  # pragma: no cover - legacy shim for tests
+        provider = self._tool_provider
+        if provider is None:
+            raise RuntimeError("Tool provider is not initialized")
+        setattr(provider, "_outline_tool", tool)
+
+    @property
+    def _find_sections_tool(self) -> Any | None:  # pragma: no cover - legacy shim for tests
+        provider = self._tool_provider
+        if provider is None:
+            return None
+        return getattr(provider, "_find_sections_tool", None)
+
+    @_find_sections_tool.setter
+    def _find_sections_tool(self, tool: Any | None) -> None:  # pragma: no cover - legacy shim for tests
+        provider = self._tool_provider
+        if provider is None:
+            raise RuntimeError("Tool provider is not initialized")
+        setattr(provider, "_find_sections_tool", tool)
+
+    @property
+    def _plot_state_tool(self) -> Any | None:  # pragma: no cover - legacy shim for tests
+        provider = self._tool_provider
+        if provider is None:
+            return None
+        return getattr(provider, "_plot_state_tool", None)
+
+    @_plot_state_tool.setter
+    def _plot_state_tool(self, tool: Any | None) -> None:  # pragma: no cover - legacy shim for tests
+        provider = self._tool_provider
+        if provider is None:
+            raise RuntimeError("Tool provider is not initialized")
+        setattr(provider, "_plot_state_tool", tool)
 
     @property
     def actions(self) -> Dict[str, WindowAction]:
@@ -2144,29 +1517,29 @@ class MainWindow(QMainWindow):
         document = DocumentState(text=text, metadata=metadata)
         document.dirty = False
 
-        with self._suspend_snapshot_persistence():
+        with self._document_monitor.suspend_snapshot_persistence():
             tab = self._editor.create_tab(document=document, path=target, title=target.name, make_active=True)
         self._workspace.set_active_tab(tab.id)
-        self._current_document_path = target
-        self._remember_recent_file(target)
-        if self._apply_pending_snapshot_for_path(target):
-            self._sync_settings_workspace_state()
-            self._update_autosave_indicator(document=self._editor.to_document())
+        self._document_session.set_current_path(target)
+        self._document_session.remember_recent_file(target)
+        if self._document_session.apply_pending_snapshot_for_path(target):
+            self._document_session.sync_workspace_state()
+            self._document_monitor.update_autosave_indicator(document=self._editor.to_document())
             return
         self.update_status(f"Loaded {target.name}")
-        self._sync_settings_workspace_state()
-        self._update_autosave_indicator(document=document)
+        self._document_session.sync_workspace_state()
+        self._document_monitor.update_autosave_indicator(document=document)
 
     def save_document(self, path: str | Path | None = None) -> Path:
         """Persist the current document to disk and return the saved path."""
 
         document = self._editor.to_document()
-        previous_path = document.metadata.path or self._current_document_path
+        previous_path = document.metadata.path or self._document_session.get_current_path()
         target_path: Path | None
         if path is not None:
             target_path = Path(path)
         else:
-            target_path = document.metadata.path or self._current_document_path
+            target_path = document.metadata.path or self._document_session.get_current_path()
 
         if target_path is None:
             target_path = self._prompt_for_save_path(document=document)
@@ -2178,18 +1551,18 @@ class MainWindow(QMainWindow):
         file_io.write_text(target_path, document.text)
         document.metadata.path = target_path
         document.dirty = False
-        self._current_document_path = target_path
-        self._remember_recent_file(target_path)
-        self._clear_unsaved_snapshot(path=target_path)
+        self._document_session.set_current_path(target_path)
+        self._document_session.remember_recent_file(target_path)
+        self._document_monitor.clear_unsaved_snapshot(path=target_path)
         active_tab = self._workspace.active_tab
         if previous_path is None:
-            self._clear_unsaved_snapshot(path=None, tab_id=active_tab.id if active_tab else None)
+            self._document_monitor.clear_unsaved_snapshot(path=None, tab_id=active_tab.id if active_tab else None)
         if active_tab is not None:
             self._editor.refresh_tab_title(active_tab.id)
         self.update_status(f"Saved {target_path.name}")
         self._refresh_window_title(document)
-        self._sync_settings_workspace_state()
-        self._update_autosave_indicator(document=document)
+        self._document_session.sync_workspace_state()
+        self._document_monitor.update_autosave_indicator(document=document)
         return target_path
 
     def update_status(self, message: str, *, timeout_ms: Optional[int] = None) -> None:
@@ -2221,440 +1594,24 @@ class MainWindow(QMainWindow):
             return "text"
         return "plain"
 
-    def _prompt_for_open_path(self) -> Path | None:
-        """Show the open-file dialog and return the selected path."""
-
-        start_dir = self._resolve_open_start_dir(self._context.settings)
-        try:
-            from tinkerbell.widgets.dialogs import open_file_dialog
-        except Exception as exc:  # pragma: no cover - depends on Qt availability
-            raise RuntimeError(
-                "File dialogs require the optional PySide6 dependency."
-            ) from exc
-
-        parent = self._qt_parent_widget()
-        token_budget = None
-        settings = self._context.settings
-        if settings is not None:
-            raw_budget = getattr(settings, "max_context_tokens", None)
-            if isinstance(raw_budget, int):
-                token_budget = raw_budget
-        return open_file_dialog(parent=parent, start_dir=start_dir, token_budget=token_budget)
-
     def _prompt_for_import_path(self) -> Path | None:
-        """Display the import dialog constrained to supported file types."""
+        """Delegate import dialog handling to the session service."""
 
-        start_dir = self._resolve_open_start_dir(self._context.settings)
-        try:
-            from tinkerbell.widgets.dialogs import open_file_dialog
-        except Exception as exc:  # pragma: no cover - depends on Qt availability
-            raise RuntimeError(
-                "File dialogs require the optional PySide6 dependency."
-            ) from exc
+        return self._document_session.prompt_for_import_path()
 
-        parent = self._qt_parent_widget()
-        file_filter = self._import_controller.dialog_filter()
-        token_budget = None
-        settings = self._context.settings
-        if settings is not None:
-            raw_budget = getattr(settings, "max_context_tokens", None)
-            if isinstance(raw_budget, int):
-                token_budget = raw_budget
-        return open_file_dialog(
-            parent=parent,
-            caption="Import File",
-            start_dir=start_dir,
-            file_filter=file_filter,
-            token_budget=token_budget,
-            enable_samples=False,
-        )
+    def _prompt_for_save_path(self, *, document: DocumentState | None = None) -> Path | None:
+        """Delegate save dialog handling to the session service."""
+
+        return self._document_session.prompt_for_save_path(document=document)
 
     def _resolve_active_document_path(self) -> Path | None:
         document = self._editor.to_document()
         if document.metadata.path is not None:
             return Path(document.metadata.path)
-        if self._current_document_path is not None:
-            return Path(self._current_document_path)
+        fallback = self._document_session.get_current_path()
+        if fallback is not None:
+            return Path(fallback)
         return None
-
-    def _prompt_for_save_path(self, *, document: DocumentState | None = None) -> Path | None:
-        """Show the save-file dialog and return the chosen path."""
-
-        start_dir = self._resolve_save_start_dir(self._context.settings)
-        try:
-            from tinkerbell.widgets.dialogs import save_file_dialog
-        except Exception as exc:  # pragma: no cover - depends on Qt availability
-            raise RuntimeError(
-                "File dialogs require the optional PySide6 dependency."
-            ) from exc
-
-        parent = self._qt_parent_widget()
-        token_budget = None
-        settings = self._context.settings
-        if settings is not None:
-            raw_budget = getattr(settings, "max_context_tokens", None)
-            if isinstance(raw_budget, int):
-                token_budget = raw_budget
-
-        document_text: str | None = None
-        selection_text: str | None = None
-        if document is not None:
-            document_text = document.text
-            selection = document.selection
-            if selection.end > selection.start:
-                text = document.text
-                start = max(0, min(len(text), selection.start))
-                end = max(start, min(len(text), selection.end))
-                selection_text = text[start:end]
-        return save_file_dialog(
-            parent=parent,
-            start_dir=start_dir,
-            document_text=document_text,
-            selection_text=selection_text,
-            token_budget=token_budget,
-        )
-
-    def _resolve_open_start_dir(self, settings: Optional[Settings]) -> Path | None:
-        if self._current_document_path is not None:
-            parent = self._current_document_path.parent
-            if parent.exists():
-                return parent
-        if settings:
-            for entry in settings.recent_files:
-                candidate = Path(entry).expanduser()
-                if candidate.is_dir():
-                    return candidate
-                if candidate.exists():
-                    return candidate.parent
-        return Path.home()
-
-    def _resolve_save_start_dir(self, settings: Optional[Settings]) -> Path | None:
-        return self._resolve_open_start_dir(settings)
-
-    def _remember_recent_file(self, path: Path) -> None:
-        settings = self._context.settings
-        if settings is None:
-            return
-
-        normalized = str(path.expanduser().resolve())
-        updated: list[str] = [normalized]
-        for existing in settings.recent_files:
-            existing_normalized = str(Path(existing).expanduser().resolve())
-            if existing_normalized == normalized:
-                continue
-            updated.append(existing)
-            if len(updated) >= 10:
-                break
-        settings.recent_files = updated
-        settings.last_open_file = normalized
-        self._persist_settings(settings)
-
-    def _restore_last_session_document(self) -> None:
-        settings = self._context.settings
-        if settings is None:
-            return
-
-        if self._restore_workspace_tabs(settings):
-            self._sync_settings_workspace_state(persist=False)
-            return
-
-        next_index = getattr(settings, "next_untitled_index", None)
-        if isinstance(next_index, int):
-            self._workspace.set_next_untitled_index(next_index)
-
-        if self._try_restore_last_file(settings):
-            self._sync_settings_workspace_state(persist=False)
-            return
-
-        self._restore_unsaved_snapshot(settings)
-        self._sync_settings_workspace_state(persist=False)
-
-    def _try_restore_last_file(self, settings: Settings) -> bool:
-        last_path = (settings.last_open_file or "").strip()
-        if not last_path:
-            return False
-
-        target = Path(last_path).expanduser()
-        if not target.exists() or target.is_dir():
-            self._handle_missing_last_file(settings)
-            return False
-
-        try:
-            self.open_document(target)
-            return True
-        except FileNotFoundError:
-            self._handle_missing_last_file(settings)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            _LOGGER.warning("Failed to restore last-open file %s: %s", target, exc)
-            self.update_status("Failed to restore last session file")
-        return False
-
-    def _restore_unsaved_snapshot(self, settings: Settings) -> bool:
-        snapshot = settings.unsaved_snapshot
-        if not isinstance(snapshot, dict) or "text" not in snapshot:
-            return False
-
-        tab = self._workspace.active_tab or self._workspace.ensure_tab()
-        self._load_snapshot_document(snapshot, path=None, tab_id=tab.id)
-        self.update_status("Restored unsaved draft")
-        return True
-
-    def _restore_workspace_tabs(self, settings: Settings) -> bool:
-        entries = [entry for entry in (settings.open_tabs or []) if isinstance(entry, dict)]
-        if not entries:
-            return False
-
-        self._restoring_workspace = True
-        self._tabs_with_overlay.clear()
-        try:
-            self._review_controller.abort_pending_review(
-                reason="workspace-restore",
-                status="AI edits discarded while restoring workspace",
-                clear_overlays=True,
-            )
-            for tab_id in list(self._workspace.tab_ids()):
-                self._review_controller.mark_pending_session_orphaned(tab_id, reason="workspace-restore")
-                try:
-                    self._editor.close_tab(tab_id)
-                except KeyError:  # pragma: no cover - defensive guard
-                    continue
-
-            restored_ids: list[str] = []
-            for entry in entries:
-                tab = self._create_tab_from_settings_entry(entry)
-                if tab is not None:
-                    restored_ids.append(tab.id)
-
-            if not restored_ids:
-                return False
-
-            active_id = settings.active_tab_id or restored_ids[-1]
-            if active_id not in self._workspace.tab_ids():
-                active_id = restored_ids[-1]
-            self._workspace.set_active_tab(active_id)
-            next_index = getattr(settings, "next_untitled_index", None)
-            if isinstance(next_index, int):
-                self._workspace.set_next_untitled_index(next_index)
-            return True
-        finally:
-            self._restoring_workspace = False
-
-    def _create_tab_from_settings_entry(self, entry: Mapping[str, Any]) -> DocumentTab | None:
-        title = str(entry.get("title") or UNTITLED_DOCUMENT_NAME)
-        path_value = entry.get("path")
-        path = Path(path_value).expanduser() if path_value else None
-        language = str(entry.get("language") or (self._infer_language(path) if path else "markdown"))
-        document = DocumentState(text="", metadata=DocumentMetadata(path=path, language=language))
-        document.dirty = bool(entry.get("dirty", False))
-
-        if path is not None:
-            try:
-                document.text = file_io.read_text(path)
-            except Exception as exc:  # pragma: no cover - defensive logging
-                _LOGGER.debug("Unable to restore %s from disk: %s", path, exc)
-                document.text = ""
-
-        raw_untitled_index = entry.get("untitled_index")
-        untitled_index_value: int | None = None
-        if raw_untitled_index is not None:
-            try:
-                untitled_index_value = int(raw_untitled_index)
-            except (TypeError, ValueError):
-                untitled_index_value = None
-
-        with self._suspend_snapshot_persistence():
-            tab = self._editor.create_tab(
-                document=document,
-                path=path,
-                title=title,
-                make_active=False,
-                tab_id=entry.get("tab_id"),
-                untitled_index=untitled_index_value,
-            )
-
-        if path is not None:
-            self._apply_pending_snapshot_for_path(path, tab_id=tab.id, silent=True)
-        else:
-            self._apply_untitled_snapshot(tab.id)
-
-        self._editor.refresh_tab_title(tab.id)
-        return tab
-
-    def _apply_pending_snapshot_for_path(
-        self,
-        path: Path | str,
-        *,
-        tab_id: str | None = None,
-        silent: bool = False,
-    ) -> bool:
-        settings = self._context.settings
-        if settings is None:
-            return False
-
-        normalized_key = self._snapshot_key(path)
-        snapshot = (settings.unsaved_snapshots or {}).get(normalized_key)
-        if not isinstance(snapshot, dict) or "text" not in snapshot:
-            return False
-
-        resolved_path = Path(normalized_key)
-        self._load_snapshot_document(snapshot, path=resolved_path, tab_id=tab_id)
-        if not silent:
-            self.update_status(f"Restored unsaved changes for {resolved_path.name}")
-        return True
-
-    def _apply_untitled_snapshot(self, tab_id: str) -> bool:
-        settings = self._context.settings
-        if settings is None:
-            return False
-
-        snapshot = None
-        if settings.untitled_snapshots:
-            snapshot = (settings.untitled_snapshots or {}).get(tab_id)
-        if snapshot is None:
-            snapshot = settings.unsaved_snapshot
-        if not isinstance(snapshot, dict) or "text" not in snapshot:
-            return False
-        self._load_snapshot_document(snapshot, path=None, tab_id=tab_id)
-        return True
-
-    def _load_snapshot_document(self, snapshot: dict[str, Any], *, path: Path | None, tab_id: str | None) -> None:
-        text = str(snapshot.get("text", ""))
-        language = str(
-            snapshot.get("language")
-            or (self._infer_language(path) if path is not None else "markdown")
-        )
-        selection_raw = snapshot.get("selection")
-        if isinstance(selection_raw, (tuple, list)) and len(selection_raw) == 2:
-            selection = SelectionRange(int(selection_raw[0]), int(selection_raw[1]))
-        else:
-            selection = SelectionRange()
-
-        document = DocumentState(
-            text=text,
-            metadata=DocumentMetadata(path=path, language=language),
-            selection=selection,
-            dirty=True,
-        )
-        with self._suspend_snapshot_persistence():
-            self._editor.load_document(document, tab_id=tab_id)
-
-        if tab_id is None or self._workspace.active_tab_id == tab_id:
-            self._current_document_path = path
-        digest_key = self._snapshot_key(path, tab_id=tab_id)
-        self._unsaved_snapshot_digests[digest_key] = file_io.compute_text_digest(text)
-        if tab_id is not None:
-            self._editor.refresh_tab_title(tab_id)
-        self._update_autosave_indicator(document=document)
-
-    @contextmanager
-    def _suspend_snapshot_persistence(self) -> Any:
-        self._snapshot_persistence_block += 1
-        try:
-            yield
-        finally:
-            self._snapshot_persistence_block = max(0, self._snapshot_persistence_block - 1)
-
-    def _handle_missing_last_file(self, settings: Settings) -> None:
-        if settings.last_open_file:
-            settings.last_open_file = None
-            self._persist_settings(settings)
-        self.update_status("Last session file missing")
-
-    def _persist_unsaved_snapshot(self, state: DocumentState | None = None) -> None:
-        settings = self._context.settings
-        if settings is None:
-            return
-
-        document = state or self._editor.to_document()
-        path = document.metadata.path or self._current_document_path
-        active_tab = self._workspace.active_tab
-        tab_id = active_tab.id if active_tab is not None else None
-        key = self._snapshot_key(path, tab_id=tab_id)
-
-        if not document.dirty:
-            self._clear_unsaved_snapshot(settings=settings, path=path, tab_id=tab_id)
-            return
-
-        snapshot = {
-            "text": document.text,
-            "language": document.metadata.language,
-            "selection": list(document.selection.as_tuple()),
-        }
-        digest = file_io.compute_text_digest(snapshot["text"])
-        if self._unsaved_snapshot_digests.get(key) == digest:
-            existing = self._get_snapshot_entry(settings, path=path, tab_id=tab_id)
-            if existing == snapshot:
-                return
-
-        if path is None:
-            if tab_id is not None:
-                snapshots = dict(settings.untitled_snapshots or {})
-                snapshots[tab_id] = snapshot
-                settings.untitled_snapshots = snapshots
-            else:
-                settings.unsaved_snapshot = snapshot
-        else:
-            snapshots = dict(settings.unsaved_snapshots or {})
-            snapshots[key] = snapshot
-            settings.unsaved_snapshots = snapshots
-
-        self._unsaved_snapshot_digests[key] = digest
-        self._sync_settings_workspace_state(persist=False)
-        self._persist_settings(settings)
-        self._update_autosave_indicator(autosaved=True, document=document)
-
-    def _clear_unsaved_snapshot(
-        self,
-        *,
-        settings: Settings | None = None,
-        path: Path | str | None = None,
-        tab_id: str | None = None,
-        persist: bool = True,
-    ) -> None:
-        key = self._snapshot_key(path, tab_id=tab_id)
-        target_settings = settings or self._context.settings
-        changed = False
-
-        if target_settings is not None:
-            if path is None and tab_id is not None:
-                snapshots = dict(target_settings.untitled_snapshots or {})
-                if snapshots.pop(tab_id, None) is not None:
-                    target_settings.untitled_snapshots = snapshots
-                    changed = True
-            elif path is None and tab_id is None:
-                if target_settings.unsaved_snapshot is not None:
-                    target_settings.unsaved_snapshot = None
-                    changed = True
-            else:
-                snapshots = dict(target_settings.unsaved_snapshots or {})
-                if snapshots.pop(key, None) is not None:
-                    target_settings.unsaved_snapshots = snapshots
-                    changed = True
-
-        self._unsaved_snapshot_digests.pop(key, None)
-        if changed and persist and target_settings is not None:
-            self._persist_settings(target_settings)
-
-    def _get_snapshot_entry(
-        self,
-        settings: Settings,
-        *,
-        path: Path | str | None,
-        tab_id: str | None,
-    ) -> dict[str, Any] | None:
-        if path is None:
-            if tab_id is not None:
-                return (settings.untitled_snapshots or {}).get(tab_id)
-            return settings.unsaved_snapshot
-        key = self._snapshot_key(path)
-        return (settings.unsaved_snapshots or {}).get(key)
-
-    def _snapshot_key(self, path: Path | str | None, *, tab_id: str | None = None) -> str:
-        if path is None:
-            if tab_id:
-                return f"{self._UNTITLED_SNAPSHOT_KEY}:{tab_id}"
-            return self._UNTITLED_SNAPSHOT_KEY
-        return str(Path(path).expanduser().resolve())
 
     def _qt_parent_widget(self) -> Any | None:
         try:
@@ -2677,49 +1634,19 @@ class MainWindow(QMainWindow):
         result = show_settings_dialog(parent=parent, settings=settings)
         return cast("SettingsDialogResult", result)
 
-    def _persist_settings(self, settings: Settings | None) -> None:
-        if settings is None:
-            return
-
-        store = self._context.settings_store
-        if store is None:
-            return
-
-        try:
-            store.save(settings)
-        except Exception as exc:  # pragma: no cover - disk write failures are rare
-            _LOGGER.warning("Failed to persist settings: %s", exc)
-
-    def _sync_settings_workspace_state(self, *, persist: bool = True) -> None:
-        if self._restoring_workspace:
-            return
-        settings = self._context.settings
-        if settings is None:
-            return
-
-        state = self._workspace.serialize_state()
-        settings.open_tabs = state.get("open_tabs", [])
-        settings.active_tab_id = state.get("active_tab_id")
-        untitled_counter = state.get("untitled_counter")
-        if isinstance(untitled_counter, int):
-            settings.next_untitled_index = untitled_counter
-        if persist:
-            self._persist_settings(settings)
-
     def _apply_embedding_metadata(self, snapshot: dict[str, Any]) -> None:
         self._embedding_controller.apply_snapshot_metadata(snapshot)
 
     def _resolve_embedding_cache_root(self) -> Path:
         return self._resolve_outline_cache_root().parent
 
-    def _apply_runtime_settings(self, settings: Settings) -> None:
-        self._apply_chat_panel_settings(settings)
-        self._apply_phase3_outline_setting(settings)
-        self._apply_plot_scaffolding_setting(settings)
-        self._apply_debug_logging_setting(settings)
-        self._apply_theme_setting(settings)
-        self._embedding_controller.refresh_runtime(settings)
-        self._refresh_ai_runtime(settings)
+    def _resolve_outline_cache_root(self) -> Path:
+        store = getattr(self._context, "settings_store", None)
+        if store is not None:
+            base_dir = store.path.parent
+        else:
+            base_dir = Path.home() / ".tinkerbell"
+        return base_dir / "cache" / "outline_builder"
 
     def _apply_phase3_outline_setting(self, settings: Settings) -> None:
         enabled = bool(getattr(settings, "phase3_outline_tools", False))
@@ -2728,19 +1655,22 @@ class MainWindow(QMainWindow):
 
         self._phase3_outline_enabled = enabled
         self._embedding_controller.set_phase3_outline_enabled(enabled)
+        if self._tool_provider is not None:
+            self._tool_provider.set_phase3_outline_enabled(enabled)
         if enabled:
-            self._outline_worker = self._outline_worker or self._create_outline_worker()
+            if self._outline_runtime is not None:
+                self._outline_runtime.ensure_started()
             self._embedding_controller.propagate_index_to_worker()
             if self._status_bar is not None:
                 self._status_bar.set_outline_status("")
             self._register_phase3_ai_tools()
             return
 
-        self._shutdown_outline_worker()
-        self._outline_worker = None
-        self._outline_tool = None
-        self._find_sections_tool = None
-        self._outline_digest_cache.clear()
+        if self._outline_runtime is not None:
+            self._outline_runtime.shutdown()
+        if self._tool_provider is not None:
+            self._tool_provider.reset_outline_tools()
+        self._document_monitor.reset_outline_digest_cache()
         if self._status_bar is not None:
             self._status_bar.set_outline_status("")
         self._unregister_phase3_ai_tools()
@@ -2750,11 +1680,14 @@ class MainWindow(QMainWindow):
         if enabled == self._plot_scaffolding_enabled:
             return
         self._plot_scaffolding_enabled = enabled
+        if self._tool_provider is not None:
+            self._tool_provider.set_plot_scaffolding_enabled(enabled)
         if enabled:
             self._register_plot_state_tool()
             return
         self._unregister_plot_state_tool()
-        self._plot_state_tool = None
+        if self._tool_provider is not None:
+            self._tool_provider.reset_plot_state_tool()
 
     def _apply_chat_panel_settings(self, settings: Settings) -> None:
         visible = bool(getattr(settings, "show_tool_activity_panel", False))
@@ -2762,250 +1695,15 @@ class MainWindow(QMainWindow):
         if callable(setter):
             setter(visible)
 
-    def _update_logging_configuration(self, debug_enabled: bool) -> None:
-        level = logging.DEBUG if debug_enabled else logging.INFO
-        try:
-            logging_utils.setup_logging(level, force=True)
-            _LOGGER.debug("Runtime logging level updated to %s", logging.getLevelName(level))
-        except Exception as exc:  # pragma: no cover - defensive logging
-            _LOGGER.warning("Unable to update logging configuration: %s", exc)
-
-    def _update_ai_debug_logging(self, debug_enabled: bool) -> None:
-        controller = self._context.ai_controller
-        if controller is None:
-            return
-        client = getattr(controller, "client", None)
-        if client is None:
-            return
-        client_settings = getattr(client, "settings", None)
-        if client_settings is None:
-            return
-        try:
-            client_settings.debug_logging = debug_enabled
-            _LOGGER.debug("AI client debug logging set to %s", debug_enabled)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            _LOGGER.debug("Unable to update AI client debug flag: %s", exc)
-
-    def _apply_max_tool_iterations(self, controller: Any, limit: int) -> None:
-        setter = getattr(controller, "set_max_tool_iterations", None)
-        if not callable(setter):
-            return
-        try:
-            setter(limit)
-        except Exception as exc:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to update max tool iterations: %s", exc)
-
-    def _apply_context_window_settings(self, controller: Any, settings: Settings) -> None:
-        configurator = getattr(controller, "configure_context_window", None)
-        if not callable(configurator):
-            return
-        try:
-            configurator(
-                max_context_tokens=getattr(settings, "max_context_tokens", 128_000),
-                response_token_reserve=getattr(settings, "response_token_reserve", 16_000),
-            )
-        except Exception as exc:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to update context window settings: %s", exc)
-
-    def _apply_context_policy_settings(self, controller: Any, settings: Settings) -> None:
-        builder = getattr(self, "_build_context_budget_policy", None)
-        if not callable(builder):
-            return
-        policy = builder(settings)
-        configurator = getattr(controller, "configure_budget_policy", None)
-        if callable(configurator):
-            try:
-                configurator(policy)
-            except Exception as exc:  # pragma: no cover - defensive guard
-                _LOGGER.debug("Unable to update context budget policy: %s", exc)
-        outline_tool = getattr(self, "_outline_tool", None)
-        if outline_tool is not None:
-            outline_tool.budget_policy = policy
-
-    def _build_context_budget_policy(self, settings: Settings):
-        try:
-            from .ai.services.context_policy import ContextBudgetPolicy
-        except Exception as exc:  # pragma: no cover - dependency guard
-            _LOGGER.debug("Context budget policy unavailable: %s", exc)
-            return None
-
-        policy_settings = getattr(settings, "context_policy", None)
-        max_context = getattr(settings, "max_context_tokens", 128_000)
-        reserve = getattr(settings, "response_token_reserve", 16_000)
-        model_name = getattr(settings, "model", None)
-        return ContextBudgetPolicy.from_settings(
-            policy_settings,
-            model_name=model_name,
-            max_context_tokens=max_context,
-            response_token_reserve=reserve,
-        )
-
-    def _build_subagent_runtime_config(self, settings: Settings) -> SubagentRuntimeConfig:
-        enabled = bool(getattr(settings, "enable_subagents", False))
-        return SubagentRuntimeConfig(
-            enabled=enabled,
-            plot_scaffolding_enabled=bool(getattr(settings, "enable_plot_scaffolding", False)),
-        )
-
-    @staticmethod
-    def _resolve_max_tool_iterations(settings: Settings | None) -> int:
-        raw = getattr(settings, "max_tool_iterations", 8) if settings else 8
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            value = 8
-        return max(1, min(value, 50))
-
-    def _apply_debug_logging_setting(self, settings: Settings) -> None:
-        new_debug = bool(getattr(settings, "debug_logging", False))
-        if new_debug != self._debug_logging_enabled:
-            self._update_logging_configuration(new_debug)
-            self._debug_logging_enabled = new_debug
-        self._update_ai_debug_logging(new_debug)
-
-    def _apply_subagent_runtime_config(self, controller: Any, settings: Settings) -> None:
-        configurator = getattr(controller, "configure_subagents", None)
-        if not callable(configurator):
-            return
-        config = self._build_subagent_runtime_config(settings)
-        try:
-            configurator(config)
-        except Exception as exc:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to update subagent runtime config: %s", exc)
-
-    def _apply_theme_setting(self, settings: Settings) -> None:
-        requested_name = (getattr(settings, "theme", "") or "default").strip() or "default"
-        normalized_request = requested_name.lower()
-        if normalized_request == self._active_theme_request:
-            return
-        self._active_theme_request = normalized_request
-        theme = load_theme(requested_name)
-        self._active_theme = theme.name
-        try:
-            self._editor.apply_theme(theme)
-        except Exception as exc:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to apply editor theme %s: %s", theme.name, exc)
-        theme_manager.apply_to_application(theme)
-
-    def _refresh_ai_runtime(self, settings: Settings) -> None:
-        new_subagent_flag = bool(getattr(settings, "enable_subagents", False))
-        self._telemetry_controller.set_subagent_enabled(new_subagent_flag)
-        if not self._ai_settings_ready(settings):
-            self._disable_ai_controller()
-            return
-
-        signature = self._ai_settings_signature(settings)
-        controller = self._context.ai_controller
-        iteration_limit = self._resolve_max_tool_iterations(settings)
-
-        if controller is None:
-            controller = self._build_ai_controller_from_settings(settings)
-            if controller is None:
-                return
-            self._context.ai_controller = controller
-            self._ai_client_signature = signature
-            self._register_default_ai_tools()
-        elif signature != self._ai_client_signature:
-            client = self._build_ai_client_from_settings(settings)
-            if client is None:
-                return
-            controller.update_client(client)
-            self._ai_client_signature = signature
-
-        if controller is not None:
-            self._apply_max_tool_iterations(controller, iteration_limit)
-            self._apply_context_window_settings(controller, settings)
-            self._apply_context_policy_settings(controller, settings)
-            self._apply_subagent_runtime_config(controller, settings)
-
-        self._update_ai_debug_logging(bool(getattr(settings, "debug_logging", False)))
-
-    def _ai_settings_ready(self, settings: Settings) -> bool:
-        return bool((settings.api_key or "").strip() and (settings.base_url or "").strip() and (settings.model or "").strip())
-
-    def _ai_settings_signature(self, settings: Settings | None) -> tuple[Any, ...] | None:
-        if settings is None:
-            return None
-        headers = tuple(sorted((settings.default_headers or {}).items()))
-        metadata = tuple(sorted((settings.metadata or {}).items()))
-        return (
-            settings.base_url,
-            settings.api_key,
-            settings.model,
-            settings.organization,
-            settings.request_timeout,
-            settings.max_retries,
-            settings.retry_min_seconds,
-            settings.retry_max_seconds,
-            headers,
-            metadata,
-        )
-
     def _build_ai_client_from_settings(self, settings: Settings):
-        try:
-            from .ai.client import AIClient, ClientSettings
-        except Exception as exc:  # pragma: no cover - dependency guard
-            _LOGGER.warning("AI client components unavailable: %s", exc)
-            return None
-
-        client_settings = ClientSettings(
-            base_url=settings.base_url,
-            api_key=settings.api_key,
-            model=settings.model,
-            organization=settings.organization,
-            request_timeout=settings.request_timeout,
-            max_retries=settings.max_retries,
-            retry_min_seconds=settings.retry_min_seconds,
-            retry_max_seconds=settings.retry_max_seconds,
-            default_headers=settings.default_headers or None,
-            metadata=settings.metadata or None,
-            debug_logging=bool(getattr(settings, "debug_logging", False)),
-        )
-        try:
-            return AIClient(client_settings)
-        except Exception as exc:
-            _LOGGER.warning("Failed to build AI client: %s", exc)
-            return None
+        return self._settings_runtime.build_ai_client_from_settings(settings)
 
     def _build_ai_controller_from_settings(self, settings: Settings):
-        client = self._build_ai_client_from_settings(settings)
-        if client is None:
-            return None
-        try:
-            from ..ai.orchestration import AIController
-        except Exception as exc:  # pragma: no cover - dependency guard
-            _LOGGER.warning("AI controller unavailable: %s", exc)
-            return None
+        return self._settings_runtime.build_ai_controller_from_settings(settings)
 
-        try:
-            limit = self._resolve_max_tool_iterations(settings)
-            policy = self._build_context_budget_policy(settings)
-            return AIController(
-                client=client,
-                max_tool_iterations=limit,
-                max_context_tokens=getattr(settings, "max_context_tokens", 128_000),
-                response_token_reserve=getattr(settings, "response_token_reserve", 16_000),
-                budget_policy=policy,
-                subagent_config=self._build_subagent_runtime_config(settings),
-            )
-        except Exception as exc:
-            _LOGGER.warning("Failed to initialize AI controller: %s", exc)
-            return None
-
-    def _disable_ai_controller(self) -> None:
-        controller = self._context.ai_controller
-        if controller is None and self._ai_client_signature is None:
-            return
-        if self._ai_task and not self._ai_task.done():
-            try:
-                self._ai_task.cancel()
-            except Exception:  # pragma: no cover - defensive guard
-                pass
-        self._context.ai_controller = None
-        self._ai_task = None
-        self._ai_stream_active = False
-        self._ai_client_signature = None
-        _LOGGER.info("AI controller disabled until settings are completed.")
+    @property
+    def _ai_client_signature(self) -> tuple[Any, ...] | None:
+        return self._settings_runtime.ai_client_signature
 
     def _refresh_window_title(self, state: Optional[DocumentState] = None) -> None:
         """Construct a descriptive window title for the active document."""
@@ -3014,10 +1712,8 @@ class MainWindow(QMainWindow):
         candidate_path: Optional[Path]
         if document.metadata.path is not None:
             candidate_path = Path(document.metadata.path)
-        elif self._current_document_path is not None:
-            candidate_path = Path(self._current_document_path)
         else:
-            candidate_path = None
+            candidate_path = self._document_session.get_current_path()
 
         if candidate_path is not None and candidate_path.name:
             filename = candidate_path.name

@@ -27,10 +27,13 @@
    - [x] Reassemble a slimmer `MainWindow` and backfill UI/unit coverage
       - Added `src/tinkerbell/ui/window_shell.py` to own splitter/menu/tool wiring, shrinking `MainWindow` by ~180 lines and confining Qt glue to a dedicated helper.
       - Updated `tests/test_main_window.py` (via existing suite) to validate the refactor; `pytest tests/test_main_window.py` passes post-change.
-- [ ] Tool registry error handling hardening
-  - [ ] Rework registration flow to scope exceptions per tool
-  - [ ] Aggregate/emit failures while continuing healthy registrations
-  - [ ] Extend tests to cover partial failure scenarios
+- [x] Tool registry error handling hardening
+  - [x] Rework registration flow to scope exceptions per tool
+     - Added `ToolRegistrationFailure` + `ToolRegistrationError`, wrapping each tool factory/register call so one failure no longer aborts the batch.
+  - [x] Aggregate/emit failures while continuing healthy registrations
+     - `MainWindow` now surfaces partial failures via status + chat notices while healthy tools keep working; registry raises aggregated errors for upstream telemetry/logging.
+  - [x] Extend tests to cover partial failure scenarios
+     - `tests/test_ai_tools.py` now exercises both the happy path and a partial-failure controller stub to ensure aggregation works.
 
 ---
 

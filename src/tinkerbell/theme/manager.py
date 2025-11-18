@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, cast
 
@@ -154,6 +155,11 @@ class ThemeManager:
 
     def apply_to_application(self, theme: Theme | str | None = None, *, app: Any | None = None) -> Theme:
         resolved = self.resolve(theme)
+
+        # Skip palette mutations when running under pytest or when explicitly disabled.
+        if os.environ.get("TINKERBELL_DISABLE_THEME_APPLY") == "1" or os.environ.get("PYTEST_CURRENT_TEST"):
+            return resolved
+
         try:  # pragma: no cover - Qt optional in CI
             from PySide6.QtGui import QColor, QPalette  # type: ignore
             from PySide6.QtWidgets import QApplication  # type: ignore

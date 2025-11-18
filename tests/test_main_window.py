@@ -166,7 +166,7 @@ def test_tool_traces_capture_compaction_metadata():
         "rehydrate_instructions": "run search",
     }
 
-    window._annotate_tool_traces_with_compaction([{"id": "call-xyz", "pointer": pointer}])
+    window._tool_trace_presenter.annotate_compaction([{"id": "call-xyz", "pointer": pointer}])
 
     assert trace.metadata.get("compacted") is True
     assert trace.output_summary == "summary"
@@ -615,8 +615,9 @@ def test_main_window_diff_overlay_helpers() -> None:
     window = _make_window()
     document = window.editor_widget.to_document()
     trace = ToolTrace(name="edit:patch", input_summary="", output_summary="Δ", metadata={"spans": [(0, 1)], "diff_preview": "@@"})
-
-    window._apply_diff_overlay(trace, document=document, range_hint=(0, 1))
+    manager = window._review_overlay_manager
+    assert manager is not None
+    manager.apply_diff_overlay(trace, document=document, range_hint=(0, 1))
 
     tab = window.editor_widget.workspace.active_tab
     assert tab is not None
@@ -887,7 +888,7 @@ def test_debug_logging_toggle_reconfigures_logging(
         captured["force"] = kwargs.get("force")
         return tmp_path / "log"
 
-    monkeypatch.setattr("tinkerbell.ui.main_window.logging_utils.setup_logging", _fake_setup)
+    monkeypatch.setattr("tinkerbell.ui.settings_runtime.logging_utils.setup_logging", _fake_setup)
 
     window._handle_settings_requested()
 
@@ -918,7 +919,7 @@ def test_debug_logging_disable_reconfigures_logging(
         captured["force"] = kwargs.get("force")
         return tmp_path / "log"
 
-    monkeypatch.setattr("tinkerbell.ui.main_window.logging_utils.setup_logging", _fake_setup)
+    monkeypatch.setattr("tinkerbell.ui.settings_runtime.logging_utils.setup_logging", _fake_setup)
 
     window._handle_settings_requested()
 
@@ -954,7 +955,7 @@ def test_ai_client_reconfigured_on_connection_change(monkeypatch: pytest.MonkeyP
     window = _make_window(controller, Settings(api_key="old-key"))
     updated = Settings(api_key="new-key", model="gpt-4.1-mini", base_url="https://example.com/v1")
     new_client = SimpleNamespace(settings=SimpleNamespace(debug_logging=False))
-    monkeypatch.setattr(window, "_build_ai_client_from_settings", lambda cfg: new_client)
+    monkeypatch.setattr(window._settings_runtime, "build_ai_client_from_settings", lambda cfg: new_client)
     monkeypatch.setattr(
         window,
         "_show_settings_dialog",
@@ -969,9 +970,9 @@ def test_ai_client_reconfigured_on_connection_change(monkeypatch: pytest.MonkeyP
 def test_ai_controller_created_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     window = _make_window(controller=None, settings=Settings(api_key="", base_url="https://api", model="gpt-4o-mini"))
     sentinel_controller = SimpleNamespace(client=SimpleNamespace(settings=SimpleNamespace(debug_logging=False)))
-    monkeypatch.setattr(window, "_build_ai_controller_from_settings", lambda cfg: sentinel_controller)
+    monkeypatch.setattr(window._settings_runtime, "build_ai_controller_from_settings", lambda cfg: sentinel_controller)
     called: dict[str, bool] = {}
-    monkeypatch.setattr(window, "_register_default_ai_tools", lambda: called.setdefault("wired", True))
+    monkeypatch.setattr(window._settings_runtime, "_register_default_ai_tools", lambda: called.setdefault("wired", True))
     updated = Settings(api_key="live-key", base_url="https://api", model="gpt-4o-mini")
     monkeypatch.setattr(
         window,
@@ -1042,12 +1043,12 @@ def test_accept_ai_changes_clears_overlays_and_drops_turn():
     _apply_fake_ai_edit(window, tab, "AI updated text", diff_label="Δ1")
     window._review_controller.finalize_pending_turn_review(success=True)
 
-    assert tab.id in window._tabs_with_overlay
+    assert tab.id in window._review_overlay_manager.overlay_tab_ids()
 
     window._handle_accept_ai_changes()
 
     assert window._review_controller.pending_turn_review is None
-    assert not window._tabs_with_overlay
+    assert window._review_overlay_manager.overlay_tab_ids() == ()
     assert window._status_bar.review_controls_visible is False
     assert "Accepted" in window.last_status_message
 
@@ -1081,7 +1082,7 @@ def test_reject_ai_changes_restores_documents_and_chat():
     assert secondary.document().text == base_secondary
     assert window.chat_panel.composer_text == prompt
     assert window._review_controller.pending_turn_review is None
-    assert not window._tabs_with_overlay
+    assert window._review_overlay_manager.overlay_tab_ids() == ()
     assert "Rejected" in window.last_status_message
 
 
@@ -1099,7 +1100,7 @@ def test_manual_edit_during_pending_review_aborts_envelope():
     window._maybe_clear_diff_overlay(tab.document())
 
     assert window._review_controller.pending_turn_review is None
-    assert not window._tabs_with_overlay
+    assert window._review_overlay_manager.overlay_tab_ids() == ()
     assert "discarded" in window.last_status_message.lower()
 
 
@@ -1158,7 +1159,7 @@ def test_cancel_active_ai_turn_restores_composer_and_drops_review():
     assert window._ai_task is None
     assert window._review_controller.pending_turn_review is None
     assert window.chat_panel.composer_text == prompt
-    assert not window._tabs_with_overlay
+    assert window._review_overlay_manager.overlay_tab_ids() == ()
     assert "Canceled AI request" in window.last_status_message
 
 
@@ -1530,7 +1531,7 @@ def test_tool_call_stream_events_coalesce_into_single_trace():
     ]
 
     for payload in events:
-        window._process_stream_event(payload)  # type: ignore[arg-type]
+        window._ai_turn_coordinator._process_stream_event(payload)  # type: ignore[arg-type]
 
     traces = getattr(window.chat_panel, "_tool_traces")
     assert len(traces) == 1
@@ -1538,7 +1539,7 @@ def test_tool_call_stream_events_coalesce_into_single_trace():
     assert trace.metadata["raw_input"] == arguments_text
     assert trace.metadata["raw_output"] == result_text
     assert trace.output_summary == result_text
-    assert window._pending_tool_traces == {}
+    assert window._tool_trace_presenter.pending_tool_traces == {}
 
 
 def test_tool_trace_completes_when_stream_events_lack_ids():
@@ -1568,12 +1569,12 @@ def test_tool_trace_completes_when_stream_events_lack_ids():
     ]
 
     for payload in events:
-        window._process_stream_event(payload)  # type: ignore[arg-type]
+        window._ai_turn_coordinator._process_stream_event(payload)  # type: ignore[arg-type]
 
     traces = getattr(window.chat_panel, "_tool_traces")
     assert traces
     assert traces[-1].output_summary == "Applied patch"
-    assert window._pending_tool_traces == {}
+    assert window._tool_trace_presenter.pending_tool_traces == {}
 
 
 def test_default_ai_tools_register_when_controller_available():
