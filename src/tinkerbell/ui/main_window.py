@@ -11,7 +11,6 @@ import os
 import time
 from copy import deepcopy
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING, cast
@@ -30,13 +29,11 @@ from ..editor.document_model import DocumentMetadata, DocumentState, SelectionRa
 from ..editor.editor_widget import DiffOverlayState
 from ..editor.workspace import DocumentTab
 from ..editor.tabbed_editor import TabbedEditorWidget
-from ..services import telemetry as telemetry_service
 from ..ai.ai_types import SubagentRuntimeConfig
-from ..ai.memory import EmbeddingProvider, DocumentEmbeddingIndex, LangChainEmbeddingProvider, OpenAIEmbeddingProvider
 from ..ai.memory.buffers import DocumentSummaryMemory
 from ..ai.services import OutlineBuilderWorker
 from ..services.bridge_router import WorkspaceBridgeRouter
-from ..services.importers import FileImporter, ImportResult, ImporterError
+from ..services.importers import FileImporter
 from ..services.settings import Settings, SettingsStore
 from ..utils import file_io, logging as logging_utils
 from ..widgets.status_bar import StatusBar
@@ -53,10 +50,19 @@ from ..ai.tools.registry import (
     unregister_plot_state_tool,
 )
 from ..theme import load_theme, theme_manager
+from .ai_review_controller import AIReviewController, EditSummary, PendingReviewSession, PendingTurnReview
+from .embedding_controller import EmbeddingController, EmbeddingRuntimeState
+from .import_controller import ImportController
+from .models.actions import MenuSpec, ToolbarSpec, WindowAction
+from .models.tool_traces import PendingToolTrace
+from .models.window_state import OutlineStatusInfo, WindowContext
+from .telemetry_controller import TelemetryController
+from .window_shell import WindowChrome
 
-if TYPE_CHECKING:  # pragma: no cover - import only for static analysis
+if TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from ..ai.orchestration import AIController
     from ..ai.client import AIStreamEvent
+    from ..ai.memory import DocumentEmbeddingIndex
     from ..ai.memory.plot_state import DocumentPlotStateStore
     from ..widgets.dialogs import SettingsDialogResult
 
@@ -66,12 +72,13 @@ QWidget: Any
 
 try:  # pragma: no cover - PySide6 optional in CI
     from PySide6.QtWidgets import QApplication as _QtQApplication, QMainWindow as _QtQMainWindow, QWidget as _QtQWidget
+
     QMainWindow = _QtQMainWindow
     QWidget = _QtQWidget
     QApplication = _QtQApplication
 except Exception:  # pragma: no cover - runtime stubs keep tests headless
 
-    class _StubQMainWindow:  # type: ignore
+    class _StubQMainWindow:  # type: ignore[misc]
         """Fallback placeholder when PySide6 is unavailable."""
 
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -103,7 +110,7 @@ except Exception:  # pragma: no cover - runtime stubs keep tests headless
             self._shown = True
 
 
-    class _StubQWidget:  # type: ignore
+    class _StubQWidget:  # type: ignore[misc]
         """Fallback placeholder when PySide6 is unavailable."""
 
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -112,8 +119,8 @@ except Exception:  # pragma: no cover - runtime stubs keep tests headless
 
     QMainWindow = _StubQMainWindow
     QWidget = _StubQWidget
-    
-    class _StubQApplication:  # type: ignore
+
+    class _StubQApplication:  # type: ignore[misc]
         """Minimal QApplication placeholder for headless tests."""
 
         @staticmethod
@@ -125,241 +132,10 @@ except Exception:  # pragma: no cover - runtime stubs keep tests headless
 
 _LOGGER = logging.getLogger(__name__)
 
-
 WINDOW_APP_NAME = "TinkerBell"
 UNTITLED_DOCUMENT_NAME = "Untitled"
 SUGGESTION_LOADING_LABEL = "Generating personalized suggestions…"
 OPENAI_API_BASE_URL = "https://api.openai.com/v1"
-
-
-@dataclass(slots=True)
-class WindowAction:
-    """Represents a high-level action exposed through menus/toolbars."""
-
-    name: str
-    text: str
-    shortcut: Optional[str] = None
-    status_tip: Optional[str] = None
-    callback: Optional[Callable[[], Any]] = None
-
-    def trigger(self) -> None:
-        """Invoke the registered callback, if available."""
-
-        if self.callback is not None:
-            self.callback()
-
-
-@dataclass(slots=True)
-class MenuSpec:
-    """Declarative menu definition used for headless + Qt builds."""
-
-    name: str
-    title: str
-    actions: tuple[str, ...]
-
-
-@dataclass(slots=True)
-class ToolbarSpec:
-    """Declarative toolbar definition mirroring the plan.md contract."""
-
-    name: str
-    actions: tuple[str, ...]
-
-
-@dataclass(slots=True)
-class SplitterState:
-    """Simple structure describing the editor/chat splitter layout."""
-
-    editor: Any
-    chat_panel: Any
-    orientation: str = "horizontal"
-    stretch_factors: tuple[int, int] = (3, 2)
-
-
-@dataclass(slots=True)
-class WindowContext:
-    """Shared context passed to the main window when constructing the UI."""
-
-    settings: Optional[Settings] = None
-    ai_controller: Optional["AIController"] = None
-    settings_store: Optional[SettingsStore] = None
-
-
-@dataclass(slots=True)
-class _PendingToolTrace:
-    """Bookkeeping for streaming tool call data before it is displayed."""
-
-    name: str
-    arguments_chunks: list[str] = field(default_factory=list)
-    raw_input: str | None = None
-    pending_output: str | None = None
-    pending_parsed: Any | None = None
-    trace: ToolTrace | None = None
-    started_at: float | None = None
-    tool_call_id: str | None = None
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-@dataclass(slots=True)
-class EditSummary:
-    """Tracks a single edit applied during an AI turn."""
-
-    directive: EditDirective
-    diff: str
-    spans: tuple[tuple[int, int], ...]
-    range_hint: tuple[int, int]
-    created_at: datetime = field(default_factory=_utcnow)
-
-
-@dataclass(slots=True)
-class PendingReviewSession:
-    """Per-tab session data for a pending AI turn review."""
-
-    tab_id: str
-    document_id: str
-    document_snapshot: DocumentState
-    previous_overlay: DiffOverlayState | None = None
-    applied_edits: list[EditSummary] = field(default_factory=list)
-    merged_spans: tuple[tuple[int, int], ...] = ()
-    last_overlay_label: str | None = None
-    orphaned: bool = False
-    latest_version_signature: str | None = None
-
-
-@dataclass(slots=True)
-class PendingTurnReview:
-    """Envelope capturing chat + document state for an AI turn."""
-
-    turn_id: str
-    prompt: str
-    prompt_metadata: dict[str, Any]
-    chat_snapshot: ChatTurnSnapshot
-    created_at: datetime = field(default_factory=_utcnow)
-    tab_sessions: dict[str, PendingReviewSession] = field(default_factory=dict)
-    total_edit_count: int = 0
-    total_tabs_affected: int = 0
-    ready_for_review: bool = False
-    completed: bool = False
-
-
-@dataclass(slots=True)
-class OutlineStatusInfo:
-    """Tracks outline freshness/latency metadata per document."""
-
-    status_label: str = ""
-    status_code: str = ""
-    tooltip: str = ""
-    version_id: int | None = None
-    outline_hash: str | None = None
-    latency_ms: float | None = None
-    completed_at: float | None = None
-    node_count: int | None = None
-    token_count: int | None = None
-    stale: bool = False
-    stale_since: float | None = None
-
-
-@dataclass(slots=True)
-class EmbeddingRuntimeState:
-    """Bookkeeping structure describing the active embedding backend."""
-
-    backend: str = "disabled"
-    model: str | None = None
-    provider_label: str | None = None
-    status: str = "disabled"
-    detail: str | None = None
-    error: str | None = None
-
-    @property
-    def label(self) -> str:
-        if self.status in {"disabled", "unavailable"}:
-            return "Off" if self.status == "disabled" else "Unavailable"
-        if self.status == "error":
-            return "Error"
-        return self.provider_label or self.backend.title()
-
-    def as_snapshot(self) -> dict[str, Any]:
-        return {
-            "embedding_backend": self.backend if self.backend != "disabled" else None,
-            "embedding_model": self.model,
-            "embedding_status": self.status,
-            "embedding_detail": self.detail or self.error,
-        }
-
-
-@dataclass(slots=True, frozen=True)
-class _LangChainProviderTemplate:
-    """Describes heuristics for provider-specific LangChain wiring."""
-
-    family: str
-    match_keywords: tuple[str, ...]
-    default_base_url: str | None = None
-    api_key_env: str | None = None
-    tokenizer: str | None = None
-    default_headers: Mapping[str, str] | None = None
-    dimensions: Mapping[str, int] = field(default_factory=dict)
-    extra_kwargs: Mapping[str, Any] = field(default_factory=dict)
-
-    def matches(self, model_name: str, *, forced_family: str | None = None) -> bool:
-        if forced_family:
-            return forced_family == self.family
-        if not self.match_keywords:
-            return True
-        lowered = model_name.lower()
-        return any(keyword in lowered for keyword in self.match_keywords)
-
-    def dimension_for(self, model_name: str) -> int | None:
-        lookup = self.dimensions or {}
-        if not lookup:
-            return None
-        return lookup.get(model_name.lower())
-
-
-_DEFAULT_LANGCHAIN_PROVIDER = _LangChainProviderTemplate(
-    family="openai",
-    match_keywords=("text-embedding", "openai", "ada"),
-    default_base_url=OPENAI_API_BASE_URL,
-    tokenizer="cl100k_base",
-    dimensions={
-        "text-embedding-3-large": 3072,
-        "text-embedding-3-small": 1536,
-        "text-embedding-ada-002": 1536,
-    },
-)
-
-_LANGCHAIN_PROVIDER_TEMPLATES: tuple[_LangChainProviderTemplate, ...] = (
-    _DEFAULT_LANGCHAIN_PROVIDER,
-    _LangChainProviderTemplate(
-        family="deepseek",
-        match_keywords=("deepseek",),
-        default_base_url="https://api.deepseek.com/v1",
-        api_key_env="DEEPSEEK_API_KEY",
-        tokenizer="cl100k_base",
-        dimensions={"deepseek-embedding": 1536},
-    ),
-    _LangChainProviderTemplate(
-        family="glm",
-        match_keywords=("glm", "zhipu"),
-        default_base_url="https://open.bigmodel.cn/api/paas/v4",
-        api_key_env="GLM_API_KEY",
-        tokenizer="cl100k_base",
-        dimensions={"glm-4-embed": 1024},
-    ),
-    _LangChainProviderTemplate(
-        family="moonshot",
-        match_keywords=("moonshot", "kimi"),
-        default_base_url="https://api.moonshot.cn/v1",
-        api_key_env="MOONSHOT_API_KEY",
-        tokenizer="cl100k_base",
-    ),
-)
-
-_LANGCHAIN_PROVIDER_ENV_VARS: tuple[str, ...] = tuple(
-    sorted({template.api_key_env for template in _LANGCHAIN_PROVIDER_TEMPLATES if template.api_key_env})
-)
 
 
 class MainWindow(QMainWindow):
@@ -377,17 +153,38 @@ class MainWindow(QMainWindow):
         show_tool_panel = bool(getattr(initial_settings, "show_tool_activity_panel", False))
         self._editor = TabbedEditorWidget()
         self._workspace = self._editor.workspace
-        self._file_importer = FileImporter()
         self._chat_panel = ChatPanel(show_tool_activity_panel=show_tool_panel)
         self._bridge = WorkspaceBridgeRouter(self._workspace)
         self._editor.add_tab_created_listener(self._bridge.track_tab)
         self._workspace.add_active_listener(self._handle_active_tab_changed)
         self._status_bar = StatusBar()
-        self._subagent_enabled = bool(getattr(initial_settings, "enable_subagents", False))
-        self._subagent_active_jobs: set[str] = set()
-        self._subagent_job_totals: dict[str, int] = {"completed": 0, "failed": 0, "skipped": 0}
-        self._subagent_last_event: str = ""
-        self._subagent_telemetry_registered = False
+        initial_subagent_enabled = bool(getattr(initial_settings, "enable_subagents", False))
+        self._telemetry_controller = TelemetryController(
+            status_bar=self._status_bar,
+            context=self._context,
+            initial_subagent_enabled=initial_subagent_enabled,
+        )
+        self._review_controller = AIReviewController(
+            status_bar=self._status_bar,
+            chat_panel=self._chat_panel,
+            workspace=self._workspace,
+            clear_diff_overlay=lambda tab_id=None: self._clear_diff_overlay(tab_id=tab_id),
+            update_status=self.update_status,
+            post_assistant_notice=self._post_assistant_notice,
+            accept_callback=self._handle_accept_ai_changes,
+            reject_callback=self._handle_reject_ai_changes,
+        )
+        file_importer = FileImporter()
+        self._import_controller = ImportController(
+            file_importer=file_importer,
+            prompt_for_path=lambda: self._prompt_for_import_path(),
+            new_tab_factory=self._create_import_tab,
+            status_updater=self.update_status,
+            remember_recent_file=self._remember_recent_file,
+            refresh_window_title=self._refresh_window_title,
+            sync_workspace_state=lambda: self._sync_settings_workspace_state(),
+            update_autosave_indicator=lambda document: self._update_autosave_indicator(document=document),
+        )
         self._splitter: Any = None
         self._actions: Dict[str, WindowAction] = {}
         self._menus: Dict[str, MenuSpec] = {}
@@ -398,13 +195,9 @@ class MainWindow(QMainWindow):
         self._current_document_path: Optional[Path] = None
         self._ai_task: asyncio.Task[Any] | None = None
         self._ai_stream_active = False
-        self._pending_turn_review: PendingTurnReview | None = None
-        self._pending_reviews_by_tab: dict[str, PendingReviewSession] = {}
-        self._turn_sequence = 0
         self._pending_turn_snapshot: ChatTurnSnapshot | None = None
-        self._pending_tool_traces: Dict[str, _PendingToolTrace] = {}
+        self._pending_tool_traces: Dict[str, PendingToolTrace] = {}
         self._tool_trace_index: Dict[str, ToolTrace] = {}
-        self._last_compaction_stats: dict[str, int] | None = None
         self._suggestion_task: asyncio.Task[Any] | None = None
         self._suggestion_request_id = 0
         self._suggestion_cache_key: str | None = None
@@ -421,27 +214,29 @@ class MainWindow(QMainWindow):
         self._restoring_workspace = False
         self._tabs_with_overlay: set[str] = set()
         self._last_autosave_at: datetime | None = None
-        self._last_review_summary: str | None = None
         self._suppress_cancel_abort = False
         self._outline_worker: OutlineBuilderWorker | None = None
         self._outline_tool: DocumentOutlineTool | None = None
         self._find_sections_tool: DocumentFindSectionsTool | None = None
         self._plot_state_tool: DocumentPlotStateTool | None = None
-        self._embedding_index: DocumentEmbeddingIndex | None = None
-        self._embedding_state = EmbeddingRuntimeState()
-        self._embedding_signature: tuple[Any, ...] | None = None
-        self._embedding_snapshot_metadata: dict[str, Any] = {}
-        self._embedding_resource: Any | None = None
+        self._embedding_controller = EmbeddingController(
+            status_bar=self._status_bar,
+            cache_root_resolver=self._resolve_embedding_cache_root,
+            outline_worker_resolver=lambda: self._outline_worker,
+            async_loop_resolver=self._resolve_async_loop,
+            background_task_runner=self._run_background_task,
+            phase3_outline_enabled=self._phase3_outline_enabled,
+        )
         self._last_outline_status: tuple[str, str] | None = None
         self._initialize_ui()
-        self._register_subagent_listeners()
-        self._update_subagent_indicator()
+        self._telemetry_controller.register_subagent_listeners()
+        self._telemetry_controller.update_subagent_indicator()
         if initial_settings is not None:
             self._apply_theme_setting(initial_settings)
-        self._refresh_embedding_runtime(initial_settings)
+        self._embedding_controller.refresh_runtime(initial_settings)
         if self._phase3_outline_enabled:
             self._outline_worker = self._create_outline_worker()
-            self._propagate_embedding_index_to_worker()
+            self._embedding_controller.propagate_index_to_worker()
 
     # ------------------------------------------------------------------
     # Qt lifecycle hooks
@@ -501,7 +296,7 @@ class MainWindow(QMainWindow):
         """Force the qasync loop to receive a stop signal if Qt skips it."""
 
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
             return
 
@@ -528,21 +323,42 @@ class MainWindow(QMainWindow):
         """Set up menus, toolbars, splitter layout, and status widgets."""
 
         self._refresh_window_title()
-        self._splitter = self._build_splitter()
-        self.setCentralWidget(self._splitter)
-        qt_status_bar = getattr(self._status_bar, "widget", lambda: None)()
-        self.setStatusBar(qt_status_bar or self._status_bar)  # type: ignore[arg-type]
-
-        self._actions = self._create_actions()
-        self._menus = self._create_menus()
-        self._toolbars = self._create_toolbars()
-        self._install_qt_menus()
+        chrome = WindowChrome(
+            window=self,
+            editor=self._editor,
+            chat_panel=self._chat_panel,
+            status_bar=self._status_bar,
+            action_callbacks=self._action_callbacks(),
+        )
+        chrome_state = chrome.assemble()
+        self._splitter = chrome_state.splitter
+        self._actions = chrome_state.actions
+        self._menus = chrome_state.menus
+        self._toolbars = chrome_state.toolbars
+        self._qt_actions = chrome_state.qt_actions
         self._wire_signals()
         self._register_default_ai_tools()
 
         self.update_status("Ready")
         self._restore_last_session_document()
         self._update_autosave_indicator(document=self._editor.to_document())
+
+    def _action_callbacks(self) -> Dict[str, Callable[[], Any]]:
+        """Return the callbacks wired into menu and toolbar actions."""
+
+        return {
+            "file_new_tab": self._handle_new_tab_requested,
+            "file_open": self._handle_open_requested,
+            "file_import": self._handle_import_requested,
+            "file_save": self._handle_save_requested,
+            "file_close_tab": self._handle_close_tab_requested,
+            "file_revert": self._handle_revert_requested,
+            "file_save_as": self._handle_save_as_requested,
+            "ai_snapshot": self._handle_snapshot_requested,
+            "ai_accept_changes": self._handle_accept_ai_changes,
+            "ai_reject_changes": self._handle_reject_ai_changes,
+            "settings_open": self._handle_settings_requested,
+        }
 
     def _create_outline_worker(self) -> OutlineBuilderWorker | None:
         loop = self._resolve_async_loop()
@@ -570,6 +386,7 @@ class MainWindow(QMainWindow):
             _LOGGER.debug("Outline worker unavailable; continuing without outlines.", exc_info=True)
             return None
         self._outline_worker = worker
+        self._embedding_controller.propagate_index_to_worker()
         return worker
 
     def _shutdown_outline_worker(self) -> None:
@@ -594,7 +411,7 @@ class MainWindow(QMainWindow):
         return getattr(worker, "memory", None)
 
     def _resolve_embedding_index(self) -> DocumentEmbeddingIndex | None:
-        return getattr(self, "_embedding_index", None)
+        return self._embedding_controller.resolve_index()
 
     def _safe_active_document(self) -> DocumentState | None:
         try:
@@ -652,209 +469,6 @@ class MainWindow(QMainWindow):
         else:
             base_dir = Path.home() / ".tinkerbell"
         return base_dir / "cache" / "outline_builder"
-
-    def _build_splitter(self) -> Any:
-        """Create the editor/chat splitter, falling back to a lightweight state."""
-
-        try:
-            from PySide6.QtCore import Qt
-            from PySide6.QtWidgets import QApplication, QSplitter
-
-            if QApplication.instance() is None:
-                raise RuntimeError("QApplication must exist before constructing widgets")
-
-            splitter = QSplitter()
-            orientation = getattr(Qt, "Horizontal", None)
-            if orientation is None:
-                orientation = getattr(getattr(Qt, "Orientation", object), "Horizontal", None)
-            if orientation is not None:
-                try:
-                    splitter.setOrientation(orientation)  # type: ignore[arg-type]
-                except Exception:  # pragma: no cover - defensive fallback
-                    pass
-            splitter.addWidget(self._editor)  # type: ignore[arg-type]
-            splitter.addWidget(self._chat_panel)  # type: ignore[arg-type]
-            splitter.setStretchFactor(0, 3)
-            splitter.setStretchFactor(1, 2)
-            return splitter
-        except Exception:  # pragma: no cover - executed in headless tests
-            return SplitterState(editor=self._editor, chat_panel=self._chat_panel)
-
-    def _create_actions(self) -> Dict[str, WindowAction]:
-        """Instantiate all menu/toolbar actions defined in the plan."""
-
-        return {
-            "file_new_tab": self._build_action(
-                name="file_new_tab",
-                text="New Tab",
-                shortcut="Ctrl+N",
-                status_tip="Create a new untitled tab",
-                callback=self._handle_new_tab_requested,
-            ),
-            "file_open": self._build_action(
-                name="file_open",
-                text="Open…",
-                shortcut="Ctrl+O",
-                status_tip="Open a document from disk",
-                callback=self._handle_open_requested,
-            ),
-            "file_import": self._build_action(
-                name="file_import",
-                text="Import…",
-                shortcut="Ctrl+Shift+I",
-                status_tip="Convert PDFs and other formats into editable text",
-                callback=self._handle_import_requested,
-            ),
-            "file_save": self._build_action(
-                name="file_save",
-                text="Save",
-                shortcut="Ctrl+S",
-                status_tip="Save the current document",
-                callback=self._handle_save_requested,
-            ),
-            "file_close_tab": self._build_action(
-                name="file_close_tab",
-                text="Close Tab",
-                shortcut="Ctrl+W",
-                status_tip="Close the active tab",
-                callback=self._handle_close_tab_requested,
-            ),
-            "file_revert": self._build_action(
-                name="file_revert",
-                text="Revert",
-                shortcut=None,
-                status_tip="Discard unsaved changes and reload the file from disk",
-                callback=self._handle_revert_requested,
-            ),
-            "file_save_as": self._build_action(
-                name="file_save_as",
-                text="Save As…",
-                shortcut="Ctrl+Shift+S",
-                status_tip="Save the document to a new location",
-                callback=self._handle_save_as_requested,
-            ),
-            "ai_snapshot": self._build_action(
-                name="ai_snapshot",
-                text="Refresh Snapshot",
-                shortcut="Ctrl+Shift+R",
-                status_tip="Capture the latest editor snapshot for the AI agent",
-                callback=self._handle_snapshot_requested,
-            ),
-            "ai_accept_changes": self._build_action(
-                name="ai_accept_changes",
-                text="Accept AI Changes",
-                shortcut="Ctrl+Shift+Enter",
-                status_tip="Accept all pending AI edits across tabs",
-                callback=self._handle_accept_ai_changes,
-            ),
-            "ai_reject_changes": self._build_action(
-                name="ai_reject_changes",
-                text="Reject AI Changes",
-                shortcut="Ctrl+Shift+Backspace",
-                status_tip="Reject the pending AI turn and restore prior state",
-                callback=self._handle_reject_ai_changes,
-            ),
-            "settings_open": self._build_action(
-                name="settings_open",
-                text="Preferences…",
-                shortcut="Ctrl+Comma",
-                status_tip="Configure AI and editor preferences",
-                callback=self._handle_settings_requested,
-            ),
-        }
-
-    def _create_menus(self) -> Dict[str, MenuSpec]:
-        """Return declarative menu metadata used by future Qt wiring."""
-
-        return {
-            "file": MenuSpec(
-                name="file",
-                title="&File",
-                actions=("file_new_tab", "file_open", "file_import", "file_save", "file_save_as", "file_close_tab", "file_revert"),
-            ),
-            "settings": MenuSpec(name="settings", title="&Settings", actions=("settings_open",)),
-            "ai": MenuSpec(
-                name="ai",
-                title="&AI",
-                actions=("ai_snapshot", "ai_accept_changes", "ai_reject_changes"),
-            ),
-        }
-
-    def _create_toolbars(self) -> Dict[str, ToolbarSpec]:
-        """Return declarative toolbar metadata used by future Qt wiring."""
-
-        return {
-            "file": ToolbarSpec(name="file", actions=("file_new_tab", "file_open", "file_save", "file_close_tab")),
-            "ai": ToolbarSpec(name="ai", actions=("ai_snapshot",)),
-        }
-
-    def _install_qt_menus(self) -> None:
-        """Create a QMenuBar with bound Qt actions when PySide6 is available."""
-
-        try:
-            from PySide6.QtGui import QAction
-            from PySide6.QtWidgets import QMenuBar
-        except Exception:  # pragma: no cover - PySide6 optional for tests
-            self._qt_actions.clear()
-            return
-
-        menubar: Any
-        menubar_factory = getattr(self, "menuBar", None)
-        menubar = menubar_factory() if callable(menubar_factory) else None
-        if menubar is None:
-            menubar = QMenuBar(self)
-        else:
-            try:
-                menubar.clear()
-            except Exception:  # pragma: no cover - extremely defensive
-                menubar = QMenuBar(self)
-
-        self._qt_actions.clear()
-        for action in self._actions.values():
-            qt_action = QAction(action.text, self)
-            if action.shortcut:
-                try:
-                    qt_action.setShortcut(action.shortcut)  # type: ignore[arg-type]
-                except Exception:  # pragma: no cover - shortcut parsing varies
-                    pass
-            if action.status_tip:
-                qt_action.setStatusTip(action.status_tip)
-            try:
-                qt_action.triggered.connect(action.trigger)  # type: ignore[attr-defined]
-            except Exception:  # pragma: no cover - Qt stubs during tests
-                pass
-            self._qt_actions[action.name] = qt_action
-
-        for menu_spec in self.menu_specs():
-            menu = menubar.addMenu(menu_spec.title)
-            for action_name in menu_spec.actions:
-                qt_action = self._qt_actions.get(action_name)
-                if qt_action is None:
-                    continue
-                menu.addAction(qt_action)
-
-        setter = getattr(self, "setMenuBar", None)
-        if callable(setter):
-            setter(menubar)
-
-    def _build_action(
-        self,
-        *,
-        name: str,
-        text: str,
-        shortcut: Optional[str],
-        status_tip: Optional[str],
-        callback: Optional[Callable[[], Any]],
-    ) -> WindowAction:
-        """Create an action descriptor and register it inside the window."""
-
-        return WindowAction(
-            name=name,
-            text=text,
-            shortcut=shortcut,
-            status_tip=status_tip,
-            callback=callback,
-        )
 
     def _wire_signals(self) -> None:
         """Connect editor/chat events required for AI coordination."""
@@ -984,188 +598,6 @@ class MainWindow(QMainWindow):
         )
         return schema
 
-    # ------------------------------------------------------------------
-    # AI coordination
-    # ------------------------------------------------------------------
-    def _drop_pending_turn_review(self, *, reason: str | None = None) -> None:
-        if self._pending_turn_review is None:
-            return
-        turn_id = self._pending_turn_review.turn_id
-        self._pending_turn_review = None
-        self._pending_reviews_by_tab = {}
-        self._clear_review_controls()
-        if reason:
-            _LOGGER.debug("Dropped pending turn review turn_id=%s reason=%s", turn_id, reason)
-        else:
-            _LOGGER.debug("Dropped pending turn review turn_id=%s", turn_id)
-
-    def _restore_composer_prompt(self, turn: PendingTurnReview) -> None:
-        snapshot = turn.chat_snapshot
-        composer_text = turn.prompt
-        composer_context = None
-        if snapshot is not None:
-            composer_text = snapshot.composer_text or composer_text
-            composer_context = snapshot.composer_context
-        context_copy = deepcopy(composer_context) if composer_context is not None else None
-        try:
-            self._chat_panel.set_composer_text(composer_text or "", context=context_copy)
-        except Exception:
-            _LOGGER.debug("Unable to restore composer prompt", exc_info=True)
-
-    def _clear_pending_review_overlays(self, turn: PendingTurnReview) -> None:
-        for session in turn.tab_sessions.values():
-            tab_id = session.tab_id
-            if not tab_id:
-                continue
-            try:
-                self._workspace.get_tab(tab_id)
-            except KeyError:
-                continue
-            self._clear_diff_overlay(tab_id=tab_id)
-
-    def _mark_pending_session_orphaned(self, tab_id: str, *, reason: str) -> None:
-        if not tab_id:
-            return
-        session = self._pending_reviews_by_tab.get(tab_id)
-        if session is None:
-            return
-        if session.orphaned:
-            return
-        session.orphaned = True
-        _LOGGER.debug("Marked tab %s orphaned during pending review (%s)", tab_id, reason)
-
-    def _abort_pending_review(
-        self,
-        *,
-        reason: str,
-        status: str | None = None,
-        notice: str | None = None,
-        restore_composer: bool = False,
-        clear_overlays: bool = False,
-    ) -> None:
-        turn = self._pending_turn_review
-        if turn is None:
-            return
-        if clear_overlays:
-            self._clear_pending_review_overlays(turn)
-        if restore_composer:
-            self._restore_composer_prompt(turn)
-        self._drop_pending_turn_review(reason=reason)
-        if status:
-            self.update_status(status)
-        if notice:
-            self._post_assistant_notice(notice)
-
-    def _auto_accept_pending_review(self, *, reason: str = "new-turn") -> None:
-        if not self._pending_turn_review:
-            return
-        _LOGGER.debug(
-            "Auto-accepting pending review turn_id=%s reason=%s",
-            self._pending_turn_review.turn_id,
-            reason,
-        )
-        self._drop_pending_turn_review(reason=reason)
-
-    def _begin_pending_turn_review(
-        self,
-        *,
-        prompt: str,
-        prompt_metadata: Mapping[str, Any] | None,
-        chat_snapshot: ChatTurnSnapshot,
-    ) -> PendingTurnReview:
-        self._turn_sequence += 1
-        turn_id = f"turn-{self._turn_sequence}"
-        metadata_copy: dict[str, Any] = {}
-        if prompt_metadata:
-            metadata_copy = dict(prompt_metadata)
-        envelope = PendingTurnReview(
-            turn_id=turn_id,
-            prompt=prompt,
-            prompt_metadata=metadata_copy,
-            chat_snapshot=chat_snapshot,
-        )
-        self._pending_turn_review = envelope
-        self._pending_reviews_by_tab = envelope.tab_sessions
-        self._clear_review_controls()
-        return envelope
-
-    def _ensure_pending_review_session(
-        self,
-        *,
-        tab_id: str,
-        document_snapshot: DocumentState,
-        tab: DocumentTab | None = None,
-    ) -> PendingReviewSession | None:
-        turn = self._pending_turn_review
-        if turn is None:
-            return None
-        session = self._pending_reviews_by_tab.get(tab_id)
-        if session is not None:
-            return session
-        actual_tab = tab
-        if actual_tab is None:
-            try:
-                actual_tab = self._workspace.get_tab(tab_id)
-            except KeyError:
-                _LOGGER.debug("Unable to create review session; tab %s missing", tab_id)
-                return None
-        snapshot_copy = deepcopy(document_snapshot)
-        existing_overlay = actual_tab.editor.diff_overlay
-        prior_overlay = deepcopy(existing_overlay) if existing_overlay is not None else None
-        session = PendingReviewSession(
-            tab_id=tab_id,
-            document_id=document_snapshot.document_id,
-            document_snapshot=snapshot_copy,
-            previous_overlay=prior_overlay,
-        )
-        self._pending_reviews_by_tab[tab_id] = session
-        turn.total_tabs_affected = len(self._pending_reviews_by_tab)
-        return session
-
-    def _finalize_pending_turn_review(self, *, success: bool) -> None:
-        turn = self._pending_turn_review
-        if turn is None:
-            return
-        turn.completed = True
-        if not success:
-            self._drop_pending_turn_review(reason="turn-failed")
-            return
-        if turn.total_edit_count <= 0:
-            self._drop_pending_turn_review(reason="no-edits")
-            return
-        turn.ready_for_review = True
-        self._show_review_controls()
-
-    def _format_review_summary(self, turn: PendingTurnReview) -> str:
-        edits = max(int(turn.total_edit_count), 0)
-        tabs = max(int(turn.total_tabs_affected), 1)
-        edit_label = "edit" if edits == 1 else "edits"
-        tab_label = "tab" if tabs == 1 else "tabs"
-        return f"{edits} {edit_label} across {tabs} {tab_label}"
-
-    def _show_review_controls(self) -> None:
-        turn = self._pending_turn_review
-        if turn is None or not turn.ready_for_review:
-            self._clear_review_controls()
-            return
-        summary = self._format_review_summary(turn)
-        self._last_review_summary = summary
-        try:
-            self._status_bar.set_review_state(
-                summary,
-                accept_callback=self._handle_accept_ai_changes,
-                reject_callback=self._handle_reject_ai_changes,
-            )
-        except Exception:
-            _LOGGER.debug("Unable to display review controls", exc_info=True)
-
-    def _clear_review_controls(self) -> None:
-        self._last_review_summary = None
-        try:
-            self._status_bar.clear_review_state()
-        except Exception:
-            pass
-
     def _handle_chat_request(self, prompt: str, metadata: dict[str, Any]) -> None:
         try:
             manual_request = parse_manual_command(prompt)
@@ -1191,8 +623,8 @@ class MainWindow(QMainWindow):
             self._chat_panel.set_ai_running(False)
             return
 
-        self._auto_accept_pending_review(reason="new-turn")
-        self._begin_pending_turn_review(
+        self._review_controller.auto_accept_pending_review(reason="new-turn")
+        self._review_controller.begin_pending_turn_review(
             prompt=prompt,
             prompt_metadata=metadata,
             chat_snapshot=snapshot,
@@ -1579,21 +1011,21 @@ class MainWindow(QMainWindow):
                 on_event=self._handle_ai_stream_event,
             )
         except Exception as exc:  # pragma: no cover - runtime safety
-            self._finalize_pending_turn_review(success=False)
+            self._review_controller.finalize_pending_turn_review(success=False)
             self._handle_ai_failure(exc)
             return
 
         payload = result or {}
         tool_records = payload.get("tool_calls")
         self._annotate_tool_traces_with_compaction(tool_records)
-        self._last_compaction_stats = payload.get("trace_compaction")
+        self._telemetry_controller.set_compaction_stats(payload.get("trace_compaction"))
         response_text = payload.get("response", "").strip()
         if not response_text:
             response_text = "The AI did not return any content."
         self._finalize_ai_response(response_text)
-        self._update_context_usage_status()
+        self._telemetry_controller.refresh_context_usage_status()
         self.update_status("AI response ready")
-        self._finalize_pending_turn_review(success=True)
+        self._review_controller.finalize_pending_turn_review(success=True)
 
     async def _handle_ai_stream_event(self, event: "AIStreamEvent") -> None:
         self._process_stream_event(event)
@@ -1640,7 +1072,7 @@ class MainWindow(QMainWindow):
             return
         state = self._pending_tool_traces.get(key)
         if state is None:
-            state = _PendingToolTrace(name=self._normalize_tool_name(event))
+            state = PendingToolTrace(name=self._normalize_tool_name(event))
             self._pending_tool_traces[key] = state
         state.tool_call_id = key
         delta = getattr(event, "arguments_delta", None) or getattr(event, "tool_arguments", None)
@@ -1653,7 +1085,7 @@ class MainWindow(QMainWindow):
             return
         state = self._pending_tool_traces.get(key)
         if state is None:
-            state = _PendingToolTrace(name=self._normalize_tool_name(event))
+            state = PendingToolTrace(name=self._normalize_tool_name(event))
             self._pending_tool_traces[key] = state
         state.tool_call_id = key
         arguments_text = getattr(event, "tool_arguments", None)
@@ -1675,201 +1107,7 @@ class MainWindow(QMainWindow):
         if state.pending_output is not None:
             self._apply_tool_result_to_trace(key, state)
 
-    def _update_context_usage_status(self) -> None:
-        controller = self._context.ai_controller
-        settings = self._context.settings
-        if controller is None or settings is None:
-            return
-        debug_settings = getattr(settings, "debug", None)
-        if not getattr(debug_settings, "token_logging_enabled", False):
-            return
-        limit = getattr(debug_settings, "token_log_limit", 1)
-        try:
-            limit_value = max(1, int(limit))
-        except (TypeError, ValueError):
-            limit_value = 1
-        events = controller.get_recent_context_events(limit=limit_value)
-        dashboard = telemetry_service.build_usage_dashboard(events)
-        if dashboard is None:
-            return
-        summary_text = dashboard.summary_text
-        compaction_stats = self._last_compaction_stats
-        if isinstance(compaction_stats, Mapping):
-            compactions = int(compaction_stats.get("total_compactions", 0))
-            tokens_saved = int(compaction_stats.get("tokens_saved", 0))
-            if compactions or tokens_saved:
-                stats_bits = f"Compactions {compactions}"
-                if tokens_saved:
-                    stats_bits = f"{stats_bits} (saved {tokens_saved:,})"
-                summary_text = f"{summary_text} · {stats_bits}" if summary_text else stats_bits
-        budget_snapshot = None
-        getter = getattr(controller, "get_budget_status", None)
-        if callable(getter):
-            budget_snapshot = getter()
-        if isinstance(budget_snapshot, Mapping):
-            budget_text = str(budget_snapshot.get("summary_text") or "").strip()
-            if budget_text:
-                summary_text = f"{summary_text} · {budget_text}"
-        self._status_bar.set_memory_usage(
-            summary_text,
-            totals=dashboard.totals_text,
-            last_tool=dashboard.summary.last_tool,
-        )
-
-    def _register_subagent_listeners(self) -> None:
-        if self._subagent_telemetry_registered:
-            return
-        for event_name in (
-            "subagent.job_started",
-            "subagent.job_completed",
-            "subagent.job_failed",
-            "subagent.job_skipped",
-        ):
-            telemetry_service.register_event_listener(event_name, self._handle_subagent_telemetry)
-        self._subagent_telemetry_registered = True
-
-    def _handle_subagent_telemetry(self, payload: Mapping[str, Any] | None) -> None:
-        if not isinstance(payload, Mapping):
-            return
-        event_name = str(payload.get("event") or "")
-        if not event_name.startswith("subagent."):
-            return
-        handler_map = {
-            "subagent.job_started": self._record_subagent_job_started,
-            "subagent.job_completed": self._record_subagent_job_completed,
-            "subagent.job_failed": self._record_subagent_job_failed,
-            "subagent.job_skipped": self._record_subagent_job_skipped,
-        }
-        handler = handler_map.get(event_name)
-        if handler is None:
-            return
-        handler(payload)
-        self._update_subagent_indicator()
-
-    def _record_subagent_job_started(self, payload: Mapping[str, Any]) -> None:
-        job_id = self._coerce_subagent_job_id(payload)
-        if job_id:
-            self._subagent_active_jobs.add(job_id)
-        chunk_id = payload.get("chunk_id") or payload.get("document_id")
-        estimate = payload.get("token_estimate") or payload.get("prompt_tokens")
-        bits = []
-        if chunk_id:
-            bits.append(f"chunk {chunk_id}")
-        if estimate:
-            bits.append(f"~{estimate:,} tokens")
-        self._subagent_last_event = self._format_subagent_event_detail("Job started", job_id, bits)
-
-    def _record_subagent_job_completed(self, payload: Mapping[str, Any]) -> None:
-        job_id = self._coerce_subagent_job_id(payload)
-        if job_id:
-            self._subagent_active_jobs.discard(job_id)
-        self._increment_subagent_total("completed")
-        chunk_id = payload.get("chunk_id") or payload.get("document_id")
-        latency = payload.get("latency_ms")
-        tokens = payload.get("tokens_used")
-        bits = []
-        if chunk_id:
-            bits.append(f"chunk {chunk_id}")
-        if latency is not None:
-            bits.append(f"{float(latency):.0f} ms")
-        if tokens is not None:
-            bits.append(f"{int(tokens):,} tokens")
-        self._subagent_last_event = self._format_subagent_event_detail("Job completed", job_id, bits)
-
-    def _record_subagent_job_failed(self, payload: Mapping[str, Any]) -> None:
-        job_id = self._coerce_subagent_job_id(payload)
-        if job_id:
-            self._subagent_active_jobs.discard(job_id)
-        self._increment_subagent_total("failed")
-        reason = str(payload.get("error") or payload.get("details") or "Failed")
-        chunk_id = payload.get("chunk_id") or payload.get("document_id")
-        bits = [reason[:160]]
-        if chunk_id:
-            bits.insert(0, f"chunk {chunk_id}")
-        self._subagent_last_event = self._format_subagent_event_detail("Job failed", job_id, bits)
-
-    def _record_subagent_job_skipped(self, payload: Mapping[str, Any]) -> None:
-        job_id = self._coerce_subagent_job_id(payload)
-        if job_id:
-            self._subagent_active_jobs.discard(job_id)
-        self._increment_subagent_total("skipped")
-        reason = str(payload.get("reason") or payload.get("details") or "Skipped")
-        chunk_id = payload.get("chunk_id") or payload.get("document_id")
-        bits = [reason[:160]]
-        if chunk_id:
-            bits.insert(0, f"chunk {chunk_id}")
-        self._subagent_last_event = self._format_subagent_event_detail("Job skipped", job_id, bits)
-
-    def _increment_subagent_total(self, key: str) -> None:
-        current = self._subagent_job_totals.get(key, 0)
-        self._subagent_job_totals[key] = current + 1
-
-    def _coerce_subagent_job_id(self, payload: Mapping[str, Any]) -> str:
-        job_id = payload.get("job_id") or payload.get("subagent_job_id") or payload.get("id")
-        if not job_id:
-            return ""
-        return str(job_id)
-
-    def _format_subagent_event_detail(
-        self,
-        prefix: str,
-        job_id: str | None,
-        segments: Iterable[str] | None = None,
-    ) -> str:
-        bits: list[str] = [prefix]
-        if job_id:
-            bits.append(f"#{job_id}")
-        if segments:
-            for segment in segments:
-                if segment is None:
-                    continue
-                text = str(segment).strip()
-                if text:
-                    bits.append(text)
-        return " – ".join(bits)
-
-    def _format_subagent_totals(self) -> str:
-        labels = {
-            "completed": "Done",
-            "failed": "Failed",
-            "skipped": "Skipped",
-        }
-        parts = []
-        for key, label in labels.items():
-            count = int(self._subagent_job_totals.get(key, 0))
-            if count:
-                parts.append(f"{label} {count}")
-        return " · ".join(parts)
-
-    def _update_subagent_indicator(self) -> None:
-        status_bar = getattr(self, "_status_bar", None)
-        if status_bar is None:
-            return
-        enabled = bool(self._subagent_enabled)
-        if not enabled:
-            detail = "Enable Phase 4 subagents in Settings to capture chunk-level scouts."
-            try:
-                status_bar.set_subagent_status("Off", detail=detail)
-            except Exception:
-                pass
-            return
-
-        active_jobs = len(self._subagent_active_jobs)
-        status = f"Running ({active_jobs})" if active_jobs else "Idle"
-        detail_parts: list[str] = []
-        if active_jobs:
-            detail_parts.append(f"{active_jobs} active job{'s' if active_jobs != 1 else ''}")
-        totals_text = self._format_subagent_totals()
-        if totals_text:
-            detail_parts.append(totals_text)
-        event_text = (self._subagent_last_event or "").strip()
-        if event_text:
-            detail_parts.append(event_text)
-        detail = " · ".join(detail_parts) or "No subagent telemetry yet."
-        try:
-            status_bar.set_subagent_status(status, detail=detail)
-        except Exception:
-            pass
+    
 
     def _update_autosave_indicator(
         self,
@@ -1917,7 +1155,7 @@ class MainWindow(QMainWindow):
             return
         state = self._pending_tool_traces.get(key)
         if state is None:
-            state = _PendingToolTrace(name=self._normalize_tool_name(event))
+            state = PendingToolTrace(name=self._normalize_tool_name(event))
             self._pending_tool_traces[key] = state
         state.tool_call_id = key
         content = getattr(event, "content", None) or getattr(event, "tool_arguments", None) or ""
@@ -1925,7 +1163,7 @@ class MainWindow(QMainWindow):
         state.pending_parsed = getattr(event, "parsed", None)
         self._apply_tool_result_to_trace(key, state)
 
-    def _apply_tool_result_to_trace(self, key: str, state: _PendingToolTrace) -> None:
+    def _apply_tool_result_to_trace(self, key: str, state: PendingToolTrace) -> None:
         trace = state.trace
         if trace is None or state.pending_output is None:
             return
@@ -2038,7 +1276,7 @@ class MainWindow(QMainWindow):
         self._post_assistant_notice(f"AI request failed: {exc}")
         self.update_status("AI error – pending edits discarded")
         self._chat_panel.set_ai_running(False)
-        self._abort_pending_review(
+        self._review_controller.abort_pending_review(
             reason="ai-failure",
             restore_composer=True,
             clear_overlays=True,
@@ -2081,7 +1319,7 @@ class MainWindow(QMainWindow):
         self._chat_panel.set_ai_running(False)
         if self._suppress_cancel_abort:
             return
-        self._abort_pending_review(
+        self._review_controller.abort_pending_review(
             reason="ai-canceled",
             status="Canceled AI request; pending edits discarded",
             restore_composer=True,
@@ -2093,7 +1331,7 @@ class MainWindow(QMainWindow):
         self._cancel_dynamic_suggestions()
         self._clear_suggestion_cache()
         self._tool_trace_index.clear()
-        self._last_compaction_stats = None
+        self._telemetry_controller.set_compaction_stats(None)
         self._refresh_chat_suggestions()
         self.update_status("Chat reset")
 
@@ -2280,9 +1518,9 @@ class MainWindow(QMainWindow):
                 tab = None
         current_document = tab.document() if tab is not None else None
 
-        turn = self._pending_turn_review
+        turn = self._review_controller.pending_turn_review
         if turn is not None and tab_id:
-            session = self._ensure_pending_review_session(
+            session = self._review_controller.ensure_pending_review_session(
                 tab_id=tab_id,
                 document_snapshot=_state,
                 tab=tab,
@@ -2416,8 +1654,8 @@ class MainWindow(QMainWindow):
         change_source = getattr(tab.editor, "last_change_source", "")
         if change_source != "user":
             return
-        if self._pending_turn_review is not None:
-            self._abort_pending_review(
+        if self._review_controller.pending_turn_review is not None:
+            self._review_controller.abort_pending_review(
                 reason="manual-edit",
                 status="AI edits discarded after manual edit",
                 notice="Pending AI edits were cleared because you modified the document.",
@@ -2495,8 +1733,9 @@ class MainWindow(QMainWindow):
         self._refresh_chat_suggestions(state=document)
         self._update_autosave_indicator(document=document)
         self._sync_settings_workspace_state()
-        if self._pending_turn_review and self._pending_turn_review.ready_for_review:
-            self._show_review_controls()
+        pending_turn = self._review_controller.pending_turn_review
+        if pending_turn and pending_turn.ready_for_review:
+            self._review_controller.show_review_controls()
 
     def _refresh_chat_suggestions(
         self,
@@ -2587,7 +1826,7 @@ class MainWindow(QMainWindow):
         self.update_status("Snapshot refreshed")
 
     def _handle_accept_ai_changes(self) -> None:
-        turn = self._pending_turn_review
+        turn = self._review_controller.pending_turn_review
         if turn is None:
             self.update_status("No AI edits pending review")
             return
@@ -2618,24 +1857,24 @@ class MainWindow(QMainWindow):
                 ", ".join(skipped_tabs),
             )
 
-        summary = self._format_review_summary(turn)
+        summary = self._review_controller.format_review_summary(turn)
         notice = f"Accepted {summary}"
         if skipped_tabs:
             suffix = "tab" if len(skipped_tabs) == 1 else "tabs"
             notice = f"{notice} (skipped {len(skipped_tabs)} closed {suffix})"
-        self._drop_pending_turn_review(reason="accepted")
+        self._review_controller.drop_pending_turn_review(reason="accepted")
         self.update_status(notice)
         self._post_assistant_notice(notice)
 
     def _handle_reject_ai_changes(self) -> None:
-        turn = self._pending_turn_review
+        turn = self._review_controller.pending_turn_review
         if not turn or not turn.ready_for_review:
             self.update_status("No AI edits pending review")
             return
         sessions = list(turn.tab_sessions.values())
         if not sessions:
             self.update_status("No AI edits pending review")
-            self._drop_pending_turn_review(reason="empty-review")
+            self._review_controller.drop_pending_turn_review(reason="empty-review")
             return
 
         skipped_tabs: list[str] = []
@@ -2713,12 +1952,12 @@ class MainWindow(QMainWindow):
                 _LOGGER.debug("Unable to restore chat snapshot during reject", exc_info=True)
 
         self._sync_settings_workspace_state()
-        summary = self._format_review_summary(turn)
+        summary = self._review_controller.format_review_summary(turn)
         notice = f"Rejected {summary}"
         if skipped_tabs:
             suffix = "tab" if len(skipped_tabs) == 1 else "tabs"
             notice = f"{notice} (skipped {len(skipped_tabs)} closed {suffix})"
-        self._drop_pending_turn_review(reason="rejected")
+        self._review_controller.drop_pending_turn_review(reason="rejected")
         self.update_status(notice)
         self._post_assistant_notice(notice)
 
@@ -2739,27 +1978,7 @@ class MainWindow(QMainWindow):
     def _handle_import_requested(self) -> None:
         """Import a non-native file format by converting it to plain text."""
 
-        try:
-            path = self._prompt_for_import_path()
-        except RuntimeError:
-            self.update_status("Import dialog unavailable")
-            return
-
-        if path is None:
-            self.update_status("Import canceled")
-            return
-
-        try:
-            result = self._file_importer.import_file(path)
-        except FileNotFoundError:
-            self.update_status(f"File not found: {path}")
-            return
-        except ImporterError as exc:
-            message = str(exc).strip() or f"Unable to import {path.name}"
-            self.update_status(message)
-            return
-
-        self._open_import_result(result, source_path=path)
+        self._import_controller.handle_import()
 
     def _handle_new_tab_requested(self) -> None:
         with self._suspend_snapshot_persistence():
@@ -2770,13 +1989,22 @@ class MainWindow(QMainWindow):
         self._update_autosave_indicator(document=self._editor.to_document())
         self.update_status("New tab created")
 
+    def _create_import_tab(self, document: DocumentState, title: str) -> str:
+        """Create a tab for imported content and return its identifier."""
+
+        with self._suspend_snapshot_persistence():
+            tab = self._editor.create_tab(document=document, title=title, make_active=True)
+        self._workspace.set_active_tab(tab.id)
+        self._current_document_path = None
+        return tab.id
+
     def _handle_close_tab_requested(self) -> None:
         active_tab = self._workspace.active_tab
         if active_tab is None:
             self.update_status("No tab to close")
             return
         closed = self._editor.close_active_tab()
-        self._mark_pending_session_orphaned(closed.id, reason="tab-closed")
+        self._review_controller.mark_pending_session_orphaned(closed.id, reason="tab-closed")
         document = closed.document()
         self._clear_unsaved_snapshot(path=document.metadata.path, tab_id=closed.id)
         self._tabs_with_overlay.discard(closed.id)
@@ -2875,6 +2103,16 @@ class MainWindow(QMainWindow):
         """Return the chat panel instance."""
 
         return self._chat_panel
+
+    @property
+    def _file_importer(self) -> FileImporter:
+        """Backwards-compatible access to the importer facade (tests)."""
+
+        return self._import_controller.file_importer
+
+    @_file_importer.setter
+    def _file_importer(self, importer: FileImporter) -> None:
+        self._import_controller.file_importer = importer
 
     @property
     def actions(self) -> Dict[str, WindowAction]:
@@ -2988,7 +2226,7 @@ class MainWindow(QMainWindow):
 
         start_dir = self._resolve_open_start_dir(self._context.settings)
         try:
-            from .widgets.dialogs import open_file_dialog
+            from tinkerbell.widgets.dialogs import open_file_dialog
         except Exception as exc:  # pragma: no cover - depends on Qt availability
             raise RuntimeError(
                 "File dialogs require the optional PySide6 dependency."
@@ -3008,14 +2246,14 @@ class MainWindow(QMainWindow):
 
         start_dir = self._resolve_open_start_dir(self._context.settings)
         try:
-            from .widgets.dialogs import open_file_dialog
+            from tinkerbell.widgets.dialogs import open_file_dialog
         except Exception as exc:  # pragma: no cover - depends on Qt availability
             raise RuntimeError(
                 "File dialogs require the optional PySide6 dependency."
             ) from exc
 
         parent = self._qt_parent_widget()
-        file_filter = self._file_importer.dialog_filter()
+        file_filter = self._import_controller.dialog_filter()
         token_budget = None
         settings = self._context.settings
         if settings is not None:
@@ -3044,7 +2282,7 @@ class MainWindow(QMainWindow):
 
         start_dir = self._resolve_save_start_dir(self._context.settings)
         try:
-            from .widgets.dialogs import save_file_dialog
+            from tinkerbell.widgets.dialogs import save_file_dialog
         except Exception as exc:  # pragma: no cover - depends on Qt availability
             raise RuntimeError(
                 "File dialogs require the optional PySide6 dependency."
@@ -3075,27 +2313,6 @@ class MainWindow(QMainWindow):
             selection_text=selection_text,
             token_budget=token_budget,
         )
-
-    def _open_import_result(self, result: ImportResult, *, source_path: Path) -> None:
-        """Create a new tab populated with imported text."""
-
-        language = (result.language or "text").strip() or "text"
-        document = DocumentState(text=result.text, metadata=DocumentMetadata(language=language))
-        document.dirty = True
-        title = (result.title or source_path.stem or "Imported Document").strip() or "Imported Document"
-
-        with self._suspend_snapshot_persistence():
-            tab = self._editor.create_tab(document=document, title=title, make_active=True)
-        self._workspace.set_active_tab(tab.id)
-        self._current_document_path = None
-        self._remember_recent_file(source_path)
-        self._refresh_window_title(document)
-        self._sync_settings_workspace_state()
-        self._update_autosave_indicator(document=document)
-        status = f"Imported {source_path.name}"
-        if result.notes:
-            status = f"{status} – {result.notes}"
-        self.update_status(status)
 
     def _resolve_open_start_dir(self, settings: Optional[Settings]) -> Path | None:
         if self._current_document_path is not None:
@@ -3190,13 +2407,13 @@ class MainWindow(QMainWindow):
         self._restoring_workspace = True
         self._tabs_with_overlay.clear()
         try:
-            self._abort_pending_review(
+            self._review_controller.abort_pending_review(
                 reason="workspace-restore",
                 status="AI edits discarded while restoring workspace",
                 clear_overlays=True,
             )
             for tab_id in list(self._workspace.tab_ids()):
-                self._mark_pending_session_orphaned(tab_id, reason="workspace-restore")
+                self._review_controller.mark_pending_session_orphaned(tab_id, reason="workspace-restore")
                 try:
                     self._editor.close_tab(tab_id)
                 except KeyError:  # pragma: no cover - defensive guard
@@ -3448,7 +2665,7 @@ class MainWindow(QMainWindow):
 
     def _show_settings_dialog(self, settings: Settings) -> "SettingsDialogResult":
         try:
-            module = importlib.import_module(".widgets.dialogs", __package__)
+            module = importlib.import_module("tinkerbell.widgets.dialogs")
         except Exception as exc:  # pragma: no cover - depends on Qt availability
             raise RuntimeError("Settings dialog requires the PySide6 dependency.") from exc
 
@@ -3489,354 +2706,8 @@ class MainWindow(QMainWindow):
         if persist:
             self._persist_settings(settings)
 
-    def _refresh_embedding_runtime(self, settings: Settings | None) -> None:
-        if settings is None or not self._phase3_outline_enabled:
-            self._teardown_embedding_runtime(reason="Phase 3 tools disabled", hide_status=not self._phase3_outline_enabled)
-            return
-
-        backend = (getattr(settings, "embedding_backend", "auto") or "auto").strip().lower()
-        if backend in {"", "auto"}:
-            backend = "openai"
-        if backend == "disabled":
-            self._teardown_embedding_runtime(reason="Embeddings disabled in settings")
-            return
-
-        model_name = (getattr(settings, "embedding_model_name", "") or "").strip() or "text-embedding-3-large"
-        signature = self._embedding_settings_signature(settings, backend, model_name)
-        if signature == self._embedding_signature and self._embedding_index is not None:
-            self._set_embedding_state(self._embedding_state)
-            return
-
-        self._teardown_embedding_runtime(reason="Reinitializing embedding backend", keep_status=True)
-
-        provider, provider_state = self._build_embedding_provider(backend, model_name, settings)
-        if provider is None:
-            self._set_embedding_state(provider_state)
-            return
-
-        cache_root = self._resolve_embedding_cache_root()
-        index = self._create_embedding_index(provider, storage_dir=cache_root)
-        if index is None:
-            error_state = EmbeddingRuntimeState(
-                backend=backend,
-                model=model_name,
-                provider_label=provider_state.provider_label,
-                status="error",
-                error=f"Unable to initialize embedding cache under {cache_root}",
-            )
-            self._set_embedding_state(error_state)
-            return
-
-        self._embedding_index = index
-        self._embedding_signature = signature
-        self._set_embedding_state(provider_state)
-        self._propagate_embedding_index_to_worker()
-
-    def _embedding_settings_signature(self, settings: Settings, backend: str, model: str) -> tuple[Any, ...]:
-        metadata = getattr(settings, "metadata", {}) or {}
-        class_override = metadata.get("langchain_embeddings_class")
-        kwargs_payload = metadata.get("langchain_embeddings_kwargs")
-        provider_hint = metadata.get("langchain_provider_family")
-        env_class = os.environ.get("TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS")
-        env_kwargs = os.environ.get("TINKERBELL_LANGCHAIN_EMBEDDINGS_KWARGS")
-        env_provider_family = os.environ.get("TINKERBELL_LANGCHAIN_PROVIDER_FAMILY")
-        provider_env_secrets = tuple(os.environ.get(var) for var in _LANGCHAIN_PROVIDER_ENV_VARS)
-        return (
-            backend,
-            model,
-            getattr(settings, "base_url", None),
-            getattr(settings, "api_key", None),
-            getattr(settings, "organization", None),
-            class_override,
-            kwargs_payload,
-            env_class,
-            env_kwargs,
-            provider_hint,
-            env_provider_family,
-            provider_env_secrets,
-        )
-
-    def _build_embedding_provider(
-        self,
-        backend: str,
-        model_name: str,
-        settings: Settings,
-    ) -> tuple[EmbeddingProvider | None, EmbeddingRuntimeState]:
-        if backend == "openai":
-            return self._build_openai_embedding_provider(model_name, settings)
-        if backend == "langchain":
-            return self._build_langchain_embedding_provider(model_name, settings)
-        state = EmbeddingRuntimeState(backend=backend, model=model_name, status="error", error=f"Unknown backend '{backend}'")
-        return None, state
-
-    def _build_openai_embedding_provider(
-        self,
-        model_name: str,
-        settings: Settings,
-    ) -> tuple[EmbeddingProvider | None, EmbeddingRuntimeState]:
-        state = EmbeddingRuntimeState(backend="openai", model=model_name, provider_label="OpenAI", status="error")
-        api_key = (getattr(settings, "api_key", "") or "").strip()
-        base_url = (getattr(settings, "base_url", "") or "").strip() or OPENAI_API_BASE_URL
-        if not api_key:
-            state.error = "API key required for OpenAI embeddings"
-            return None, state
-        try:
-            from openai import AsyncOpenAI
-        except Exception as exc:  # pragma: no cover - optional dependency
-            state.error = f"openai package unavailable: {exc}"
-            return None, state
-
-        try:
-            client = AsyncOpenAI(
-                api_key=api_key,
-                base_url=base_url,
-                organization=getattr(settings, "organization", None),
-                timeout=getattr(settings, "request_timeout", 90.0),
-            )
-            provider = OpenAIEmbeddingProvider(client=client, model=model_name)
-        except Exception as exc:
-            state.error = f"Failed to initialize OpenAI embeddings: {exc}"
-            return None, state
-
-        state.status = "ready"
-        state.detail = model_name
-        self._embedding_resource = client
-        return provider, state
-
-    def _build_langchain_embedding_provider(
-        self,
-        model_name: str,
-        settings: Settings,
-    ) -> tuple[EmbeddingProvider | None, EmbeddingRuntimeState]:
-        state = EmbeddingRuntimeState(backend="langchain", model=model_name, provider_label="LangChain")
-        try:
-            embeddings, provider_template = self._instantiate_langchain_embeddings(model_name, settings)
-        except Exception as exc:
-            state.status = "error"
-            state.error = str(exc)
-            return None, state
-        provider = LangChainEmbeddingProvider(embeddings=embeddings)
-        label = getattr(embeddings, "__class__", type(embeddings)).__name__
-        template_label = provider_template.family.title() if provider_template else label
-        state.provider_label = f"LangChain/{template_label}"
-        model_detail = getattr(embeddings, "model", None) or getattr(embeddings, "model_name", None)
-        state.detail = str(model_detail or model_name)
-        state.status = "ready"
-        return provider, state
-
-    def _instantiate_langchain_embeddings(self, model_name: str, settings: Settings) -> tuple[Any, _LangChainProviderTemplate]:
-        metadata = getattr(settings, "metadata", {}) or {}
-        class_override = metadata.get("langchain_embeddings_class") or os.environ.get("TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS")
-        raw_kwargs = metadata.get("langchain_embeddings_kwargs") or os.environ.get("TINKERBELL_LANGCHAIN_EMBEDDINGS_KWARGS")
-        extra_kwargs = self._parse_langchain_kwargs(raw_kwargs)
-        provider_template = self._detect_langchain_provider_template(model_name, metadata)
-        params = dict(extra_kwargs)
-        params.setdefault("model", model_name)
-        self._apply_langchain_provider_template(params, provider_template, model_name, settings, metadata)
-        if class_override:
-            module_name, _, attr_name = class_override.rpartition(".")
-            if not module_name or not attr_name:
-                raise RuntimeError("LangChain embeddings class override must include module path, e.g., 'langchain_openai.OpenAIEmbeddings'")
-            module = importlib.import_module(module_name)
-            factory = getattr(module, attr_name)
-            embeddings = factory(**params)
-            return embeddings, provider_template
-        try:
-            from langchain_openai import OpenAIEmbeddings  # type: ignore[import-not-found]
-        except Exception as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError(
-                "langchain-openai package is required for the LangChain embedding backend. "
-                "Install it or set metadata['langchain_embeddings_class'] to a custom implementation."
-            ) from exc
-
-        embeddings = OpenAIEmbeddings(**params)
-        return embeddings, provider_template
-
-    def _detect_langchain_provider_template(
-        self,
-        model_name: str,
-        metadata: Mapping[str, Any],
-    ) -> _LangChainProviderTemplate:
-        forced = str(
-            metadata.get("langchain_provider_family")
-            or os.environ.get("TINKERBELL_LANGCHAIN_PROVIDER_FAMILY")
-            or ""
-        ).strip().lower()
-        forced_family = forced or None
-        for template in _LANGCHAIN_PROVIDER_TEMPLATES:
-            if template.matches(model_name, forced_family=forced_family):
-                return template
-        return _DEFAULT_LANGCHAIN_PROVIDER
-
-    def _apply_langchain_provider_template(
-        self,
-        params: dict[str, Any],
-        template: _LangChainProviderTemplate,
-        model_name: str,
-        settings: Settings,
-        metadata: Mapping[str, Any],
-    ) -> None:
-        metadata_base_override = str(metadata.get(f"{template.family}_base_url") or "").strip()
-        configured_base_url = metadata_base_override or (getattr(settings, "base_url", "") or "").strip()
-        if template.family != "openai" and template.default_base_url:
-            if self._should_override_base_url(configured_base_url, template.default_base_url):
-                params.setdefault("base_url", template.default_base_url)
-            elif configured_base_url:
-                params.setdefault("base_url", configured_base_url)
-            else:
-                params.setdefault("base_url", template.default_base_url)
-        else:
-            if configured_base_url:
-                params.setdefault("base_url", configured_base_url)
-            elif template.default_base_url:
-                params.setdefault("base_url", template.default_base_url)
-
-        metadata_key = metadata.get(f"{template.family}_api_key")
-        api_key = str(metadata_key).strip() if isinstance(metadata_key, str) else ""
-        if not api_key:
-            api_key = (getattr(settings, "api_key", "") or "").strip()
-        if not api_key and template.api_key_env:
-            api_key = (os.environ.get(template.api_key_env, "") or "").strip()
-        if api_key:
-            params.setdefault("api_key", api_key)
-
-        organization = getattr(settings, "organization", None)
-        if organization:
-            params.setdefault("organization", organization)
-
-        headers: dict[str, str] = {}
-        if template.default_headers:
-            headers.update(template.default_headers)
-        user_headers = getattr(settings, "default_headers", None) or {}
-        headers.update({str(k): str(v) for k, v in user_headers.items()})
-        if headers:
-            params.setdefault("default_headers", headers)
-
-        if template.tokenizer:
-            params.setdefault("tiktoken_model_name", template.tokenizer)
-
-        dimension_override = template.dimension_for(model_name)
-        if dimension_override:
-            params.setdefault("dimensions", dimension_override)
-
-        for key, value in (template.extra_kwargs or {}).items():
-            params.setdefault(key, value)
-
-    @staticmethod
-    def _should_override_base_url(current: str, candidate: str) -> bool:
-        normalized_current = (current or "").strip().lower()
-        normalized_candidate = (candidate or "").strip().lower()
-        if not normalized_candidate:
-            return False
-        if not normalized_current:
-            return True
-        openai_default = OPENAI_API_BASE_URL.lower()
-        return normalized_current == openai_default and normalized_candidate != openai_default
-
-    @staticmethod
-    def _parse_langchain_kwargs(payload: object) -> dict[str, Any]:
-        if not payload:
-            return {}
-        if isinstance(payload, Mapping):
-            return dict(payload)
-        if isinstance(payload, str):
-            text = payload.strip()
-            if not text:
-                return {}
-            try:
-                data = json.loads(text)
-            except json.JSONDecodeError:
-                return {}
-            return data if isinstance(data, dict) else {}
-        return {}
-
-    def _create_embedding_index(self, provider: EmbeddingProvider, *, storage_dir: Path) -> DocumentEmbeddingIndex | None:
-        try:
-            loop = self._resolve_async_loop()
-            if loop is not None:
-                return DocumentEmbeddingIndex(storage_dir=storage_dir, provider=provider, loop=loop)
-            return DocumentEmbeddingIndex(storage_dir=storage_dir, provider=provider)
-        except Exception as exc:
-            _LOGGER.warning("Failed to initialize embedding index: %s", exc)
-            return None
-
-    def _teardown_embedding_runtime(
-        self,
-        *,
-        reason: str,
-        hide_status: bool = False,
-        keep_status: bool = False,
-    ) -> None:
-        if self._embedding_index is not None:
-            self._close_embedding_index(self._embedding_index)
-        self._embedding_index = None
-        self._embedding_signature = None
-        self._embedding_snapshot_metadata = {}
-        self._propagate_embedding_index_to_worker()
-        self._dispose_embedding_resource()
-        if keep_status:
-            return
-        fallback_backend = "disabled" if self._phase3_outline_enabled else "unavailable"
-        state = EmbeddingRuntimeState(
-            backend=fallback_backend,
-            model=None,
-            status=fallback_backend if fallback_backend != "unavailable" else "unavailable",
-            detail=reason,
-        )
-        self._set_embedding_state(state, hide_status=hide_status)
-
-    def _close_embedding_index(self, index: DocumentEmbeddingIndex) -> None:
-        async_close = cast(Callable[[], Coroutine[Any, Any, Any]], index.aclose)
-        self._run_background_task(async_close)
-
-    def _dispose_embedding_resource(self) -> None:
-        resource = self._embedding_resource
-        self._embedding_resource = None
-        if resource is None:
-            return
-        close = getattr(resource, "aclose", None)
-        if callable(close):
-            try:
-                async_close = cast(Callable[[], Coroutine[Any, Any, Any]], close)
-                self._run_background_task(async_close)
-            except Exception:
-                _LOGGER.debug("Failed to dispose async embedding resource", exc_info=True)
-            return
-        close = getattr(resource, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
-
-    def _set_embedding_state(self, state: EmbeddingRuntimeState, *, hide_status: bool = False) -> None:
-        self._embedding_state = state
-        snapshot = {k: v for k, v in state.as_snapshot().items() if v not in (None, "")}
-        self._embedding_snapshot_metadata = snapshot
-        label = "" if hide_status else state.label
-        detail = state.detail or state.error or ""
-        try:
-            self._status_bar.set_embedding_status(label, detail=detail)
-        except Exception:  # pragma: no cover - defensive guard
-            pass
-
-    def _propagate_embedding_index_to_worker(self) -> None:
-        worker = getattr(self, "_outline_worker", None)
-        if worker is None:
-            return
-        updater = getattr(worker, "update_embedding_index", None)
-        if callable(updater):
-            try:
-                updater(self._embedding_index)
-            except Exception:
-                _LOGGER.debug("Failed to propagate embedding index to worker", exc_info=True)
-
     def _apply_embedding_metadata(self, snapshot: dict[str, Any]) -> None:
-        if not self._embedding_snapshot_metadata:
-            for field in ("embedding_backend", "embedding_model", "embedding_status", "embedding_detail"):
-                snapshot.pop(field, None)
-            return
-        snapshot.update(self._embedding_snapshot_metadata)
+        self._embedding_controller.apply_snapshot_metadata(snapshot)
 
     def _resolve_embedding_cache_root(self) -> Path:
         return self._resolve_outline_cache_root().parent
@@ -3847,7 +2718,7 @@ class MainWindow(QMainWindow):
         self._apply_plot_scaffolding_setting(settings)
         self._apply_debug_logging_setting(settings)
         self._apply_theme_setting(settings)
-        self._refresh_embedding_runtime(settings)
+        self._embedding_controller.refresh_runtime(settings)
         self._refresh_ai_runtime(settings)
 
     def _apply_phase3_outline_setting(self, settings: Settings) -> None:
@@ -3856,8 +2727,10 @@ class MainWindow(QMainWindow):
             return
 
         self._phase3_outline_enabled = enabled
+        self._embedding_controller.set_phase3_outline_enabled(enabled)
         if enabled:
             self._outline_worker = self._outline_worker or self._create_outline_worker()
+            self._embedding_controller.propagate_index_to_worker()
             if self._status_bar is not None:
                 self._status_bar.set_outline_status("")
             self._register_phase3_ai_tools()
@@ -4016,10 +2889,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_ai_runtime(self, settings: Settings) -> None:
         new_subagent_flag = bool(getattr(settings, "enable_subagents", False))
-        self._subagent_enabled = new_subagent_flag
-        if not new_subagent_flag:
-            self._subagent_active_jobs.clear()
-        self._update_subagent_indicator()
+        self._telemetry_controller.set_subagent_enabled(new_subagent_flag)
         if not self._ai_settings_ready(settings):
             self._disable_ai_controller()
             return

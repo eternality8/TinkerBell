@@ -153,6 +153,48 @@ def test_ai_controller_tracks_registered_tools(sample_snapshot):
     assert result["tool_calls"] == []
 
 
+def test_register_tools_batches_rebuilds(monkeypatch):
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="done")])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    rebuilds = 0
+    original = AIController._rebuild_graph
+
+    def wrapped(self: AIController) -> None:
+        nonlocal rebuilds
+        rebuilds += 1
+        original(self)
+
+    monkeypatch.setattr(AIController, "_rebuild_graph", wrapped)
+
+    controller.register_tools({"first": object(), "second": object()})
+
+    assert rebuilds == 1
+    assert set(controller.available_tools()) == {"first", "second"}
+
+
+def test_suspend_graph_rebuilds_defers_until_exit(monkeypatch):
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="done")])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    rebuilds = 0
+    original = AIController._rebuild_graph
+
+    def wrapped(self: AIController) -> None:
+        nonlocal rebuilds
+        rebuilds += 1
+        original(self)
+
+    monkeypatch.setattr(AIController, "_rebuild_graph", wrapped)
+
+    with controller.suspend_graph_rebuilds():
+        controller.register_tool("one", object())
+        controller.register_tool("two", object())
+
+    assert rebuilds == 1
+    assert set(controller.available_tools()) == {"one", "two"}
+
+
 def test_ai_controller_limits_history_and_reserves_completion_tokens(sample_snapshot):
     stub_client = _StubClient([AIStreamEvent(type="content.done", content="ok")])
     controller = AIController(

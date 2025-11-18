@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, cast
 
 from ...chat.commands import DIRECTIVE_SCHEMA
 from .diff_builder import DiffBuilderTool
@@ -53,153 +54,154 @@ def register_default_tools(
         return
 
     try:
-        snapshot_tool = DocumentSnapshotTool(
-            provider=context.bridge,
-            outline_digest_resolver=context.outline_digest_resolver,
-        )
-        register(
-            "document_snapshot",
-            snapshot_tool,
-            description=(
-                "Return the freshest document snapshot (text, metadata, diff summaries) for the active or specified tab."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "delta_only": {
-                        "type": "boolean",
-                        "description": "When true, include only the selection and surrounding context instead of the full document.",
+        with _graph_batch_guard(controller):
+            snapshot_tool = DocumentSnapshotTool(
+                provider=context.bridge,
+                outline_digest_resolver=context.outline_digest_resolver,
+            )
+            register(
+                "document_snapshot",
+                snapshot_tool,
+                description=(
+                    "Return the freshest document snapshot (text, metadata, diff summaries) for the active or specified tab."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "delta_only": {
+                            "type": "boolean",
+                            "description": "When true, include only the selection and surrounding context instead of the full document.",
+                        },
+                        "include_diff": {
+                            "type": "boolean",
+                            "description": "Attach the most recent diff summary when available (default true).",
+                        },
+                        "tab_id": {
+                            "type": "string",
+                            "description": "Target a specific tab instead of the active document.",
+                        },
+                        "source_tab_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of additional tab snapshots to gather alongside the active document.",
+                        },
+                        "include_open_documents": {
+                            "type": "boolean",
+                            "description": "When true, include a summary of all open documents in the snapshot payload.",
+                        },
                     },
-                    "include_diff": {
-                        "type": "boolean",
-                        "description": "Attach the most recent diff summary when available (default true).",
-                    },
-                    "tab_id": {
-                        "type": "string",
-                        "description": "Target a specific tab instead of the active document.",
-                    },
-                    "source_tab_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional list of additional tab snapshots to gather alongside the active document.",
-                    },
-                    "include_open_documents": {
-                        "type": "boolean",
-                        "description": "When true, include a summary of all open documents in the snapshot payload.",
-                    },
+                    "additionalProperties": False,
                 },
-                "additionalProperties": False,
-            },
-        )
+            )
 
-        registered = ["document_snapshot"]
-        if context.phase3_outline_enabled:
-            registered.extend(register_phase3_tools(context, register_fn=register))
-        if context.plot_scaffolding_enabled:
-            registered.extend(register_plot_state_tool(context, register_fn=register))
+            registered = ["document_snapshot"]
+            if context.phase3_outline_enabled:
+                registered.extend(register_phase3_tools(context, register_fn=register))
+            if context.plot_scaffolding_enabled:
+                registered.extend(register_plot_state_tool(context, register_fn=register))
 
-        edit_tool = DocumentEditTool(bridge=context.bridge, patch_only=True)
-        register(
-            "document_edit",
-            edit_tool,
-            description=(
-                "Apply a structured edit directive (insert, replace, annotate, or unified diff patch) against the active document."
-            ),
-            parameters=context.directive_schema_provider(),
-        )
+            edit_tool = DocumentEditTool(bridge=context.bridge, patch_only=True)
+            register(
+                "document_edit",
+                edit_tool,
+                description=(
+                    "Apply a structured edit directive (insert, replace, annotate, or unified diff patch) against the active document."
+                ),
+                parameters=context.directive_schema_provider(),
+            )
 
-        apply_patch_tool = DocumentApplyPatchTool(bridge=context.bridge, edit_tool=edit_tool)
-        if context.auto_patch_consumer is not None:
-            context.auto_patch_consumer(apply_patch_tool)
-        register(
-            "document_apply_patch",
-            apply_patch_tool,
-            description=(
-                "Replace a target_range with new content by automatically building and applying a unified diff."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "content": {
-                        "type": "string",
-                        "description": "Replacement text that should occupy the specified target_range.",
+            apply_patch_tool = DocumentApplyPatchTool(bridge=context.bridge, edit_tool=edit_tool)
+            if context.auto_patch_consumer is not None:
+                context.auto_patch_consumer(apply_patch_tool)
+            register(
+                "document_apply_patch",
+                apply_patch_tool,
+                description=(
+                    "Replace a target_range with new content by automatically building and applying a unified diff."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "Replacement text that should occupy the specified target_range.",
+                        },
+                        "target_range": DIRECTIVE_SCHEMA["properties"]["target_range"],
+                        "document_version": {
+                            "type": "string",
+                            "description": "Document snapshot version captured before drafting the edit.",
+                        },
+                        "rationale": {
+                            "type": "string",
+                            "description": "Optional explanation stored alongside the edit directive.",
+                        },
+                        "context_lines": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Override the number of context lines included in the generated diff.",
+                        },
+                        "tab_id": {
+                            "type": "string",
+                            "description": "Optional tab identifier; defaults to the active tab when omitted.",
+                        },
                     },
-                    "target_range": DIRECTIVE_SCHEMA["properties"]["target_range"],
-                    "document_version": {
-                        "type": "string",
-                        "description": "Document snapshot version captured before drafting the edit.",
-                    },
-                    "rationale": {
-                        "type": "string",
-                        "description": "Optional explanation stored alongside the edit directive.",
-                    },
-                    "context_lines": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Override the number of context lines included in the generated diff.",
-                    },
-                    "tab_id": {
-                        "type": "string",
-                        "description": "Optional tab identifier; defaults to the active tab when omitted.",
-                    },
+                    "required": ["content"],
+                    "additionalProperties": False,
                 },
-                "required": ["content"],
-                "additionalProperties": False,
-            },
-        )
+            )
 
-        tab_listing_tool = ListTabsTool(provider=context.bridge)
-        register(
-            "list_tabs",
-            tab_listing_tool,
-            description="Enumerate the open tabs (tab_id, title, path, dirty) so agents can target specific documents.",
-            parameters={
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False,
-            },
-        )
-
-        diff_tool = DiffBuilderTool()
-        register(
-            "diff_builder",
-            diff_tool,
-            description=(
-                "Return a unified diff given original and updated text snippets to drive patch directives."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "original": {
-                        "type": "string",
-                        "description": "The prior version of the text block.",
-                    },
-                    "updated": {
-                        "type": "string",
-                        "description": "The revised text block.",
-                    },
-                    "filename": {
-                        "type": "string",
-                        "description": "Optional virtual filename used in diff headers.",
-                    },
-                    "context": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Number of context lines to include in the diff (default 3).",
-                    },
+            tab_listing_tool = ListTabsTool(provider=context.bridge)
+            register(
+                "list_tabs",
+                tab_listing_tool,
+                description="Enumerate the open tabs (tab_id, title, path, dirty) so agents can target specific documents.",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
                 },
-                "required": ["original", "updated"],
-                "additionalProperties": False,
-            },
-        )
+            )
 
-        search_tool = SearchReplaceTool(bridge=context.bridge)
-        register(
-            "search_replace",
-            search_tool,
-            description=(
-                "Search the current document or selection and optionally apply replacements with regex/literal matching."
-            ),
+            diff_tool = DiffBuilderTool()
+            register(
+                "diff_builder",
+                diff_tool,
+                description=(
+                    "Return a unified diff given original and updated text snippets to drive patch directives."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "original": {
+                            "type": "string",
+                            "description": "The prior version of the text block.",
+                        },
+                        "updated": {
+                            "type": "string",
+                            "description": "The revised text block.",
+                        },
+                        "filename": {
+                            "type": "string",
+                            "description": "Optional virtual filename used in diff headers.",
+                        },
+                        "context": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Number of context lines to include in the diff (default 3).",
+                        },
+                    },
+                    "required": ["original", "updated"],
+                    "additionalProperties": False,
+                },
+            )
+
+            search_tool = SearchReplaceTool(bridge=context.bridge)
+            register(
+                "search_replace",
+                search_tool,
+                description=(
+                    "Search the current document or selection and optionally apply replacements with regex/literal matching."
+                ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -487,6 +489,13 @@ def unregister_plot_state_tool(controller: Any) -> None:
         unregister("document_plot_state")
     except Exception:  # pragma: no cover - defensive
         LOGGER.debug("Failed to unregister document_plot_state", exc_info=True)
+
+
+def _graph_batch_guard(controller: Any) -> AbstractContextManager[None]:
+    suspend = getattr(controller, "suspend_graph_rebuilds", None)
+    if callable(suspend):
+        return cast(AbstractContextManager[None], suspend())
+    return nullcontext()
 
 
 __all__ = [

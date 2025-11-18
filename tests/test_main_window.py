@@ -123,7 +123,7 @@ def test_close_event_stops_asyncio_loop(monkeypatch: pytest.MonkeyPatch) -> None
         stop=_fake_stop,
         call_soon=_fake_call_soon,
     )
-    monkeypatch.setattr(main_window_module.asyncio, "get_event_loop", lambda: fake_loop)
+    monkeypatch.setattr(main_window_module.asyncio, "get_running_loop", lambda: fake_loop)
 
     window.closeEvent(SimpleNamespace(accept=lambda: None))
 
@@ -246,7 +246,8 @@ def test_suggestion_panel_with_history_requests_ai_suggestions():
 
 def test_apply_embedding_metadata_updates_snapshot():
     window = _make_window()
-    window._embedding_snapshot_metadata = {
+    controller = window._embedding_controller
+    controller._embedding_snapshot_metadata = {
         "embedding_backend": "langchain",
         "embedding_model": "deepseek-embedding",
         "embedding_status": "ready",
@@ -261,7 +262,7 @@ def test_apply_embedding_metadata_updates_snapshot():
     assert snapshot["embedding_status"] == "ready"
     assert snapshot["embedding_detail"] == "LangChain/DeepSeek"
 
-    window._embedding_snapshot_metadata = {}
+    controller._embedding_snapshot_metadata = {}
     snapshot = {
         "embedding_backend": "old",
         "embedding_model": "legacy",
@@ -277,12 +278,13 @@ def test_apply_embedding_metadata_updates_snapshot():
 
 def test_langchain_autodetects_deepseek_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     window = _make_window()
+    controller = window._embedding_controller
     settings = Settings()
     sink: dict[str, Any] = {}
     _install_fake_langchain_module(monkeypatch, sink)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-deepseek")
 
-    embeddings, template = window._instantiate_langchain_embeddings("deepseek-embedding", settings)
+    embeddings, template = controller._instantiate_langchain_embeddings("deepseek-embedding", settings)
 
     assert embeddings is not None
     assert template.family == "deepseek"
@@ -295,11 +297,12 @@ def test_langchain_autodetects_deepseek_defaults(monkeypatch: pytest.MonkeyPatch
 
 def test_langchain_autodetect_respects_custom_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
     window = _make_window()
+    controller = window._embedding_controller
     settings = Settings(base_url="https://api.custom.example/v1", api_key="glm-key")
     sink: dict[str, Any] = {}
     _install_fake_langchain_module(monkeypatch, sink)
 
-    embeddings, template = window._instantiate_langchain_embeddings("glm-4-embed", settings)
+    embeddings, template = controller._instantiate_langchain_embeddings("glm-4-embed", settings)
 
     assert embeddings is not None
     assert template.family == "glm"
@@ -310,13 +313,14 @@ def test_langchain_autodetect_respects_custom_base_url(monkeypatch: pytest.Monke
 
 def test_langchain_provider_forced_via_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     window = _make_window()
+    controller = window._embedding_controller
     settings = Settings()
     settings.metadata["langchain_provider_family"] = "moonshot"
     sink: dict[str, Any] = {}
     _install_fake_langchain_module(monkeypatch, sink)
     monkeypatch.setenv("MOONSHOT_API_KEY", "moon-key")
 
-    embeddings, template = window._instantiate_langchain_embeddings("custom-provider-model", settings)
+    embeddings, template = controller._instantiate_langchain_embeddings("custom-provider-model", settings)
 
     assert embeddings is not None
     assert template.family == "moonshot"
@@ -364,9 +368,10 @@ def test_context_usage_status_includes_compaction_stats():
     settings = Settings()
     settings.debug.token_logging_enabled = True
     window = _make_window(controller=controller, settings=settings)
-    window._last_compaction_stats = {"total_compactions": 2, "tokens_saved": 500}
+    telemetry = window._telemetry_controller
+    telemetry.set_compaction_stats({"total_compactions": 2, "tokens_saved": 500})
 
-    window._update_context_usage_status()
+    telemetry.refresh_context_usage_status()
 
     assert "Compactions 2" in window._status_bar.memory_usage
 
@@ -387,7 +392,9 @@ def test_subagent_indicator_updates_from_telemetry_events() -> None:
     assert status == "Idle"
     assert "telemetry" in detail.lower()
 
-    window._handle_subagent_telemetry(
+    telemetry = window._telemetry_controller
+
+    telemetry.handle_subagent_telemetry(
         {
             "event": "subagent.job_started",
             "job_id": "job-1",
@@ -400,7 +407,7 @@ def test_subagent_indicator_updates_from_telemetry_events() -> None:
     assert status == "Running (1)"
     assert "job-1" in detail
 
-    window._handle_subagent_telemetry(
+    telemetry.handle_subagent_telemetry(
         {
             "event": "subagent.job_completed",
             "job_id": "job-1",
@@ -1033,13 +1040,13 @@ def test_accept_ai_changes_clears_overlays_and_drops_turn():
 
     _begin_test_review(window)
     _apply_fake_ai_edit(window, tab, "AI updated text", diff_label="Δ1")
-    window._finalize_pending_turn_review(success=True)
+    window._review_controller.finalize_pending_turn_review(success=True)
 
     assert tab.id in window._tabs_with_overlay
 
     window._handle_accept_ai_changes()
 
-    assert window._pending_turn_review is None
+    assert window._review_controller.pending_turn_review is None
     assert not window._tabs_with_overlay
     assert window._status_bar.review_controls_visible is False
     assert "Accepted" in window.last_status_message
@@ -1065,7 +1072,7 @@ def test_reject_ai_changes_restores_documents_and_chat():
 
     _apply_fake_ai_edit(window, primary, "AI primary", diff_label="ΔP")
     _apply_fake_ai_edit(window, secondary, "AI secondary", diff_label="ΔS")
-    window._finalize_pending_turn_review(success=True)
+    window._review_controller.finalize_pending_turn_review(success=True)
     window.chat_panel.set_composer_text("post-AI")
 
     window._handle_reject_ai_changes()
@@ -1073,7 +1080,7 @@ def test_reject_ai_changes_restores_documents_and_chat():
     assert primary.document().text == base_primary
     assert secondary.document().text == base_secondary
     assert window.chat_panel.composer_text == prompt
-    assert window._pending_turn_review is None
+    assert window._review_controller.pending_turn_review is None
     assert not window._tabs_with_overlay
     assert "Rejected" in window.last_status_message
 
@@ -1086,12 +1093,12 @@ def test_manual_edit_during_pending_review_aborts_envelope():
 
     _begin_test_review(window)
     _apply_fake_ai_edit(window, tab, "AI variant", diff_label="Δdraft")
-    window._finalize_pending_turn_review(success=True)
+    window._review_controller.finalize_pending_turn_review(success=True)
 
     tab.editor._mark_change_source("user")
     window._maybe_clear_diff_overlay(tab.document())
 
-    assert window._pending_turn_review is None
+    assert window._review_controller.pending_turn_review is None
     assert not window._tabs_with_overlay
     assert "discarded" in window.last_status_message.lower()
 
@@ -1104,8 +1111,8 @@ def test_closed_tab_marked_orphaned_and_skipped_on_accept():
 
     _begin_test_review(window)
     _apply_fake_ai_edit(window, tab, "AI version", diff_label="Δold")
-    window._finalize_pending_turn_review(success=True)
-    pending = window._pending_turn_review
+    window._review_controller.finalize_pending_turn_review(success=True)
+    pending = window._review_controller.pending_turn_review
     assert pending is not None
 
     window._handle_close_tab_requested()
@@ -1115,7 +1122,7 @@ def test_closed_tab_marked_orphaned_and_skipped_on_accept():
 
     window._handle_accept_ai_changes()
 
-    assert window._pending_turn_review is None
+    assert window._review_controller.pending_turn_review is None
     assert "skipped 1 closed tab" in window.last_status_message
 
 
@@ -1149,7 +1156,7 @@ def test_cancel_active_ai_turn_restores_composer_and_drops_review():
     assert controller.cancelled is True
     assert task.cancelled is True
     assert window._ai_task is None
-    assert window._pending_turn_review is None
+    assert window._review_controller.pending_turn_review is None
     assert window.chat_panel.composer_text == prompt
     assert not window._tabs_with_overlay
     assert "Canceled AI request" in window.last_status_message
@@ -1229,7 +1236,11 @@ class _StubAIController:
 def _begin_test_review(window: MainWindow, prompt: str = "Revise the document") -> None:
     window.chat_panel.set_composer_text(prompt)
     snapshot = window.chat_panel.capture_state()
-    window._begin_pending_turn_review(prompt=prompt, prompt_metadata={}, chat_snapshot=snapshot)
+    window._review_controller.begin_pending_turn_review(
+        prompt=prompt,
+        prompt_metadata={},
+        chat_snapshot=snapshot,
+    )
 
 
 def _apply_fake_ai_edit(

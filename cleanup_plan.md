@@ -1,16 +1,32 @@
 # Cleanup Implementation Plan
 
 ## Tasklist
-- [ ] AI controller modularization & batch rebuild
-  - [ ] Baseline coverage for budgeting, telemetry, and subagent policies
-  - [ ] Extract helper services and wire through dependency injection
-  - [ ] Introduce batch registration API and update call sites
-  - [ ] Add regression tests for graph rebuild counts and controller behaviors
-- [ ] Main window decomposition
-  - [ ] Capture current widget wiring and signal flows
-  - [ ] Extract controllers/services for telemetry, embeddings, AI review, importer handling
-  - [ ] Move dataclasses into dedicated modules with tests
-  - [ ] Reassemble a slimmer `MainWindow` and backfill UI/unit coverage
+- [x] AI controller modularization & batch rebuild
+   - [x] Baseline coverage for budgeting, telemetry, and subagent policies
+   - [x] Extract helper services and wire through dependency injection
+   - [x] Introduce batch registration API and update call sites
+   - [x] Add regression tests for graph rebuild counts and controller behaviors
+- [x] Main window decomposition
+   - [x] Capture current widget wiring and signal flows
+      - Documented emitter/handler pairs, controller ownership, and tool wiring in `docs/operations/main_window_wiring.md` so future refactors have an authoritative map.
+   - [ ] Extract controllers/services for telemetry, embeddings, AI review, importer handling
+      - [x] Embeddings controller extracted (`src/tinkerbell/ui/embedding_controller.py`) and wired into `MainWindow`
+      - [x] Telemetry overlay/controller
+         - Delivered via `src/tinkerbell/ui/telemetry_controller.py`, which now owns status-bar memory updates, compaction stats, and subagent telemetry wiring; `MainWindow` delegates to it and tests cover the controller surface.
+         - Follow-up: keep extending controller as future telemetry widgets emerge (e.g., budget HUD tweaks) to prevent logic from slipping back into the window class.
+      - [x] AI review flow controller
+         - Delivered via `src/tinkerbell/ui/ai_review_controller.py`, which now owns pending-turn envelopes, session bookkeeping, composer restoration, overlay clearing, and status-bar review controls.
+         - `MainWindow` delegates begin/finalize/abort paths, active-tab orphan tracking, and accept/reject handlers to controller APIs; the window no longer mutates `_pending_turn_review` or review UI state directly.
+         - Updated `tests/test_main_window.py` to exercise the controller via `window._review_controller` helpers.
+      - [x] Importer handling controller
+         - Delivered via `src/tinkerbell/ui/import_controller.py`, encapsulating dialog prompts, error/status handling, tab creation, and workspace persistence for imports.
+         - `MainWindow` delegates import actions and exposes a compatibility shim so tests can still swap the underlying `FileImporter` facade.
+   - [x] Move dataclasses into dedicated modules with tests
+      - Introduced `src/tinkerbell/ui/models/actions.py`, `window_state.py`, and `tool_traces.py`, updating `tinkerbell.ui` exports plus `MainWindow` and dependent controllers to import from the new modules.
+      - TODO follow-up: add focused unit coverage for the extracted models (hash/serialization helpers, pending trace accumulation) once the broader migration settles.
+   - [x] Reassemble a slimmer `MainWindow` and backfill UI/unit coverage
+      - Added `src/tinkerbell/ui/window_shell.py` to own splitter/menu/tool wiring, shrinking `MainWindow` by ~180 lines and confining Qt glue to a dedicated helper.
+      - Updated `tests/test_main_window.py` (via existing suite) to validate the refactor; `pytest tests/test_main_window.py` passes post-change.
 - [ ] Tool registry error handling hardening
   - [ ] Rework registration flow to scope exceptions per tool
   - [ ] Aggregate/emit failures while continuing healthy registrations
@@ -19,6 +35,12 @@
 ---
 
 ## 1. AI Controller Monolith & Rebuild Cost (`src/tinkerbell/ai/orchestration/controller.py`)
+
+### Status (Nov 18, 2025)
+- Extracted `BudgetManager`, `TelemetryManager`, and `SubagentRuntimeManager` helpers plus supporting modules under `src/tinkerbell/ai/orchestration/`, slimming the controller to primarily coordinate orchestration and lifecycle.
+- Added `register_tools()` and the `suspend_graph_rebuilds()` context manager so LangGraph rebuilds occur once per batch; `register_default_tools()` now uses the suspension guard to avoid repeated compilation.
+- Refreshed tests in `tests/test_agent.py` to cover batched registration rebuild counts and controller behaviors, and ran `pytest tests/test_agent.py` to validate the refactor.
+- Telemetry and budget enforcement now run through the extracted managers, improving isolation and enabling future focused unit coverage.
 
 ### Current Pain Points
 - ~2.3k-line `AIController` mixes budgeting, telemetry, LangGraph orchestration, subagent plumbing, and tool registry CRUD, making the class untestable and risky to change.

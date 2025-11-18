@@ -29,19 +29,15 @@ from ..ai_types import (
 )
 from ..client import AIClient, AIStreamEvent
 from ..memory.plot_state import DocumentPlotStateStore
-from ..memory.result_cache import SubagentResultCache
 from ..services import ToolPayload, build_pointer, summarize_tool_content, telemetry as telemetry_service
 from ..services.trace_compactor import TraceCompactor
 from ...chat.message_model import ToolPointerMessage
 from ..services.context_policy import BudgetDecision, ContextBudgetPolicy
-from ..services.telemetry import (
-    ContextUsageEvent,
-    PersistentTelemetrySink,
-    TelemetrySink,
-    default_telemetry_path,
-)
+from ..services.telemetry import ContextUsageEvent, TelemetrySink
 from ..agents.graph import build_agent_graph
-from ..agents.subagents import SubagentManager
+from .budget_manager import BudgetManager, ContextBudgetExceeded
+from .subagent_runtime import SubagentRuntimeManager
+from .telemetry_manager import TelemetryManager
 
 LOGGER = logging.getLogger(__name__)
 _PROMPT_HEADROOM = 4_096
@@ -120,15 +116,6 @@ class _MessagePlan:
     completion_budget: int | None
     prompt_tokens: int
 
-
-class ContextBudgetExceeded(RuntimeError):
-    """Raised when the context budget policy rejects a prompt."""
-
-    def __init__(self, decision: BudgetDecision):
-        super().__init__(f"Context budget exceeded: {decision.reason}")
-        self.decision = decision
-
-
 @dataclass(slots=True)
 class ToolRegistration:
     """Metadata stored for each registered tool."""
@@ -192,13 +179,13 @@ class AIController:
     _graph: Dict[str, Any] = field(init=False, repr=False)
     _active_task: asyncio.Task[dict] | None = field(default=None, init=False, repr=False)
     _task_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
-    _telemetry_sink: TelemetrySink | None = field(default=None, init=False, repr=False)
-    _last_budget_decision: BudgetDecision | None = field(default=None, init=False, repr=False)
+    _budget_manager: BudgetManager = field(default_factory=BudgetManager, init=False, repr=False)
+    _telemetry_manager: TelemetryManager = field(default_factory=TelemetryManager, init=False, repr=False)
     _trace_compactor: TraceCompactor | None = field(default=None, init=False, repr=False)
     _outline_digest_cache: dict[str, str] = field(default_factory=dict, init=False, repr=False)
-    _subagent_manager: SubagentManager | None = field(default=None, init=False, repr=False)
-    _subagent_cache: SubagentResultCache | None = field(default=None, init=False, repr=False)
-    _plot_state_store: DocumentPlotStateStore | None = field(default=None, init=False, repr=False)
+    _subagent_runtime: SubagentRuntimeManager | None = field(default=None, init=False, repr=False)
+    _graph_rebuild_suspensions: int = field(default=0, init=False, repr=False)
+    _graph_dirty: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.tools:
@@ -214,6 +201,7 @@ class AIController:
         self.agent_config = config.clamp()
         self.max_tool_iterations = self.agent_config.max_iterations
         self._rebuild_graph()
+        self._subagent_runtime = SubagentRuntimeManager(tool_resolver=self._tool_registry_snapshot)
         self.configure_context_window(
             max_context_tokens=self.max_context_tokens,
             response_token_reserve=self.response_token_reserve,
@@ -236,7 +224,8 @@ class AIController:
     def plot_state_store(self) -> DocumentPlotStateStore | None:
         """Return the active plot/entity memory store (when enabled)."""
 
-        return self._plot_state_store
+        runtime = self._subagent_runtime
+        return runtime.plot_state_store if runtime else None
 
     def register_tool(
         self,
@@ -250,12 +239,54 @@ class AIController:
     ) -> None:
         """Register (or replace) a tool available to the agent."""
 
+        registration = self._build_tool_registration(
+            name,
+            tool,
+            description=description,
+            parameters=parameters,
+            strict=strict,
+            summarizable=summarizable,
+        )
+        self._store_tool_registration(registration)
+
+    def register_tools(self, tools: Mapping[str, Any]) -> None:
+        """Register many tools while deferring graph rebuilds."""
+
+        if not tools:
+            return
+        with self.suspend_graph_rebuilds():
+            for name, tool in tools.items():
+                registration = self._coerce_registration(name, tool)
+                self._store_tool_registration(registration)
+
+    @contextlib.contextmanager
+    def suspend_graph_rebuilds(self) -> Iterable[None]:
+        """Temporarily suppress graph rebuilds until the context exits."""
+
+        self._graph_rebuild_suspensions += 1
+        try:
+            yield
+        finally:
+            self._graph_rebuild_suspensions = max(0, self._graph_rebuild_suspensions - 1)
+            if self._graph_rebuild_suspensions == 0:
+                self._flush_graph_rebuilds()
+
+    def _build_tool_registration(
+        self,
+        name: str,
+        tool: Any,
+        *,
+        description: str | None = None,
+        parameters: Mapping[str, Any] | None = None,
+        strict: bool | None = None,
+        summarizable: bool | None = None,
+    ) -> ToolRegistration:
         if summarizable is None:
             attr_flag = getattr(tool, "summarizable", None)
             summarizable_flag = True if attr_flag is None else bool(attr_flag)
         else:
             summarizable_flag = bool(summarizable)
-        registration = ToolRegistration(
+        return ToolRegistration(
             name=name,
             impl=tool,
             description=description,
@@ -263,9 +294,31 @@ class AIController:
             strict=True if strict is None else bool(strict),
             summarizable=summarizable_flag,
         )
-        self.tools[name] = registration
-        LOGGER.debug("Registered tool: %s", name)
-        self._rebuild_graph()
+
+    def _coerce_registration(self, name: str, spec: Any) -> ToolRegistration:
+        if isinstance(spec, ToolRegistration):
+            return spec
+        if isinstance(spec, Mapping):
+            candidate = dict(spec)
+            impl = candidate.get("impl")
+            if impl is None:
+                impl = candidate.get("tool")
+            if impl is None:
+                raise ValueError(f"Tool '{name}' mapping must include an 'impl' entry")
+            return self._build_tool_registration(
+                name,
+                impl,
+                description=candidate.get("description"),
+                parameters=candidate.get("parameters"),
+                strict=candidate.get("strict"),
+                summarizable=candidate.get("summarizable"),
+            )
+        return self._build_tool_registration(name, spec)
+
+    def _store_tool_registration(self, registration: ToolRegistration) -> None:
+        self.tools[registration.name] = registration
+        LOGGER.debug("Registered tool: %s", registration.name)
+        self._schedule_graph_rebuild()
 
     def set_max_tool_iterations(self, iterations: int) -> None:
         """Update the maximum allowed tool iterations and rebuild the graph if needed."""
@@ -277,7 +330,7 @@ class AIController:
         config.max_iterations = normalized
         self.agent_config = config
         self.max_tool_iterations = normalized
-        self._rebuild_graph()
+        self._schedule_graph_rebuild()
 
     def configure_context_window(
         self,
@@ -300,48 +353,28 @@ class AIController:
         """Update (or initialize) the active budget policy."""
 
         model_name = getattr(getattr(self.client, "settings", None), "model", None)
-        if policy is None:
-            policy = ContextBudgetPolicy.disabled(
-                model_name=model_name,
-                max_context_tokens=self.max_context_tokens,
-            )
-        self.budget_policy = policy
-        if self._subagent_manager is not None:
-            self._subagent_manager.update_budget_policy(policy)
+        self.budget_policy = self._budget_manager.configure_policy(
+            policy,
+            model_name=model_name,
+            max_context_tokens=self.max_context_tokens,
+        )
+        runtime = self._subagent_runtime
+        if runtime and runtime.manager is not None:
+            runtime.manager.update_budget_policy(self.budget_policy)
 
     def configure_subagents(self, config: SubagentRuntimeConfig | None) -> None:
         """Enable or disable the subagent sandbox at runtime."""
 
-        runtime = (config or SubagentRuntimeConfig()).clamp()
+        runtime_manager = self._subagent_runtime
+        if runtime_manager is None:
+            runtime_manager = SubagentRuntimeManager(tool_resolver=self._tool_registry_snapshot)
+            self._subagent_runtime = runtime_manager
+        runtime = runtime_manager.configure(
+            client=self.client,
+            config=config,
+            budget_policy=self.budget_policy,
+        )
         self.subagent_config = runtime
-        if not runtime.enabled:
-            self._subagent_manager = None
-            return
-
-        if self._subagent_cache is None:
-            self._subagent_cache = SubagentResultCache()
-
-        if self._subagent_manager is None:
-            self._subagent_manager = SubagentManager(
-                self.client,
-                tool_resolver=self._tool_registry_snapshot,
-                config=runtime,
-                budget_policy=self.budget_policy,
-                result_cache=self._subagent_cache,
-            )
-        else:
-            self._subagent_manager.update_client(self.client)
-            self._subagent_manager.update_config(runtime)
-            self._subagent_manager.update_budget_policy(self.budget_policy)
-            self._subagent_manager.update_cache(self._subagent_cache)
-
-        self._ensure_plot_state_store(runtime)
-
-    def _ensure_plot_state_store(self, runtime: SubagentRuntimeConfig) -> None:
-        if not runtime.plot_scaffolding_enabled:
-            return
-        if self._plot_state_store is None:
-            self._plot_state_store = DocumentPlotStateStore()
 
     def unregister_tool(self, name: str) -> None:
         """Remove a tool and rebuild the agent graph."""
@@ -349,14 +382,14 @@ class AIController:
         if name in self.tools:
             self.tools.pop(name)
             LOGGER.debug("Unregistered tool: %s", name)
-            self._rebuild_graph()
+            self._schedule_graph_rebuild()
 
     def update_client(self, client: AIClient) -> None:
         """Swap the underlying AI client (e.g., when settings change)."""
 
         self.client = client
-        if self._subagent_manager is not None:
-            self._subagent_manager.update_client(client)
+        if self._subagent_runtime is not None:
+            self._subagent_runtime.update_client(client)
 
     async def run_chat(
         self,
@@ -419,7 +452,8 @@ class AIController:
             )
             subagent_jobs: list[SubagentJob] = []
             subagent_messages: list[dict[str, str]] = []
-            if self._subagent_manager is not None and self.subagent_config.enabled:
+            runtime = self._subagent_runtime
+            if runtime is not None and runtime.manager is not None and self.subagent_config.enabled:
                 try:
                     subagent_jobs, subagent_messages = await self._run_subagent_pipeline(
                         prompt=prompt,
@@ -669,23 +703,12 @@ class AIController:
     def get_recent_context_events(self, limit: int | None = None) -> list[ContextUsageEvent]:
         """Return the most recent context usage events from the active sink."""
 
-        sink = self._telemetry_sink
-        if sink is None:
-            return []
-        if hasattr(sink, "tail"):
-            tail = getattr(sink, "tail")
-            try:
-                return list(tail(limit))  # type: ignore[misc]
-            except TypeError:
-                return list(tail())  # type: ignore[misc]
-        return []
+        return self._telemetry_manager.get_recent_events(limit)
 
     def get_budget_status(self) -> dict[str, object] | None:
         """Expose the most recent context budget policy decision."""
 
-        if self.budget_policy is None:
-            return None
-        return self.budget_policy.status_snapshot()
+        return self._budget_manager.status_snapshot()
 
     async def aclose(self) -> None:
         """Cancel any active work and close the underlying AI client."""
@@ -712,18 +735,24 @@ class AIController:
             tools={name: registration.impl for name, registration in self.tools.items()},
             config=self.agent_config,
         )
+        self._graph_dirty = False
+
+    def _schedule_graph_rebuild(self) -> None:
+        if self._graph_rebuild_suspensions > 0:
+            self._graph_dirty = True
+            return
+        self._rebuild_graph()
+
+    def _flush_graph_rebuilds(self) -> None:
+        if self._graph_dirty:
+            self._rebuild_graph()
 
     def _configure_telemetry_sink(self) -> None:
-        limit = self.telemetry_limit
-        try:
-            limit = int(limit)
-        except (TypeError, ValueError):
-            limit = 200
-        limit = max(20, min(limit, 10_000))
-        if self.telemetry_sink is None:
-            self._telemetry_sink = PersistentTelemetrySink(path=default_telemetry_path(), capacity=limit)
-        else:
-            self._telemetry_sink = self.telemetry_sink
+        self._telemetry_manager.configure(
+            enabled=self.telemetry_enabled,
+            limit=self.telemetry_limit,
+            sink=self.telemetry_sink,
+        )
 
     def _build_suggestion_messages(
         self,
@@ -1250,22 +1279,13 @@ class AIController:
         pending_tool_tokens: int = 0,
         suppress_telemetry: bool = False,
     ) -> BudgetDecision | None:
-        policy = self.budget_policy
-        if policy is None:
-            return None
-        decision = policy.tokens_available(
+        return self._budget_manager.evaluate(
             prompt_tokens=prompt_tokens,
             response_reserve=response_reserve,
-            pending_tool_tokens=pending_tool_tokens,
             document_id=self._resolve_document_id(snapshot),
+            pending_tool_tokens=pending_tool_tokens,
+            suppress_telemetry=suppress_telemetry,
         )
-        self._last_budget_decision = decision
-        emitter = getattr(telemetry_service, "emit", None)
-        if not suppress_telemetry and callable(emitter):
-            emitter("context_budget_decision", decision.as_payload())
-        if decision.verdict == "reject" and not decision.dry_run:
-            raise ContextBudgetExceeded(decision)
-        return decision
 
     def _record_budget_usage(
         self,
@@ -1274,62 +1294,18 @@ class AIController:
         prompt_tokens: int,
         response_reserve: int | None,
     ) -> None:
-        policy = self.budget_policy
-        if policy is None:
-            return
-        policy.record_usage(
-            run_id,
+        self._budget_manager.record_usage(
+            run_id=run_id,
             prompt_tokens=prompt_tokens,
             response_reserve=response_reserve,
         )
 
     def _emit_context_usage(self, context: dict[str, Any]) -> None:
-        if not self.telemetry_enabled or self._telemetry_sink is None:
+        if not self.telemetry_enabled:
             return
-        tool_names = context.get("tool_names")
-        if isinstance(tool_names, set):
-            tool_names_tuple = tuple(sorted(tool_names))
-        else:
-            tool_names_tuple = ()
-        event = ContextUsageEvent(
-            document_id=context.get("document_id"),
-            model=str(context.get("model") or "unknown"),
-            prompt_tokens=int(context.get("prompt_tokens", 0)),
-            tool_tokens=int(context.get("tool_tokens", 0)),
-            response_reserve=context.get("response_reserve"),
-            timestamp=float(context.get("timestamp", time.time())),
-            conversation_length=int(context.get("conversation_length", 0)),
-            tool_names=tool_names_tuple,
-            run_id=str(context.get("run_id") or uuid.uuid4().hex),
-            embedding_backend=self._coerce_optional_str(context.get("embedding_backend")),
-            embedding_model=self._coerce_optional_str(context.get("embedding_model")),
-            embedding_status=self._coerce_optional_str(context.get("embedding_status")),
-            embedding_detail=self._coerce_optional_str(context.get("embedding_detail")),
-            outline_digest=self._coerce_optional_str(context.get("outline_digest")),
-            outline_status=self._coerce_optional_str(context.get("outline_status")),
-            outline_version_id=self._coerce_optional_int(context.get("outline_version_id")),
-            outline_latency_ms=self._coerce_optional_float(context.get("outline_latency_ms")),
-            outline_node_count=self._coerce_optional_int(context.get("outline_node_count")),
-            outline_token_count=self._coerce_optional_int(context.get("outline_token_count")),
-            outline_trimmed=context.get("outline_trimmed"),
-            outline_is_stale=context.get("outline_is_stale"),
-            outline_age_seconds=self._coerce_optional_float(context.get("outline_age_seconds")),
-            retrieval_status=self._coerce_optional_str(context.get("retrieval_status")),
-            retrieval_strategy=self._coerce_optional_str(context.get("retrieval_strategy")),
-            retrieval_latency_ms=self._coerce_optional_float(context.get("retrieval_latency_ms")),
-            retrieval_pointer_count=self._coerce_optional_int(context.get("retrieval_pointer_count")),
-        )
-        try:
-            self._telemetry_sink.record(event)
-        except Exception:  # pragma: no cover - sink errors should not break chat
-            LOGGER.debug("Telemetry sink rejected event", exc_info=True)
-        else:
-            LOGGER.debug(
-                "Telemetry event recorded (document=%s, prompt=%s tokens, tools=%s tokens)",
-                event.document_id,
-                event.prompt_tokens,
-                event.tool_tokens,
-            )
+        context.setdefault("timestamp", context.get("timestamp", time.time()))
+        context.setdefault("run_id", context.get("run_id") or uuid.uuid4().hex)
+        self._telemetry_manager.emit_context_usage(context)
 
     @staticmethod
     def _resolve_document_id(snapshot: Mapping[str, Any]) -> str | None:
@@ -1449,7 +1425,8 @@ class AIController:
         snapshot: Mapping[str, Any],
         turn_context: dict[str, Any],
     ) -> tuple[list[SubagentJob], list[dict[str, str]]]:
-        manager = self._subagent_manager
+        runtime = self._subagent_runtime
+        manager = runtime.manager if runtime else None
         if manager is None or not self.subagent_config.enabled:
             return [], []
 
@@ -1610,10 +1587,10 @@ class AIController:
     ) -> str | None:
         if not jobs or not self.subagent_config.plot_scaffolding_enabled:
             return None
-        store = self._plot_state_store
-        if store is None:
-            store = DocumentPlotStateStore()
-            self._plot_state_store = store
+        runtime = self._subagent_runtime
+        if runtime is None:
+            return None
+        store = runtime.ensure_plot_state_store()
 
         document_id = self._resolve_document_id(snapshot)
         ingested = 0
