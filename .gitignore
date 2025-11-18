@@ -1,0 +1,68 @@
+# OS-specific junk
+.DS_Store
+Thumbs.db
+
+# Editors and workspace configs
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*~
+
+# Python cache/built files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments & interpreter metadata
+.venv/
+venv/
+.env/
+env/
+.python-version
+
+# Packaging / distribution artifacts
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+*.spec
+
+# Testing & coverage
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+hypothesis/
+.cache/
+
+# Type checker caches
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# Logs & profiling
+*.log
+*.prof
+
+# Databases and local scratch data
+*.sqlite3
+*.db
+
+# Node / web tooling (in case front-end assets are built locally)
+node_modules/
+
+# Qt / IDE generated files
+*.user
+*.qmlc
+*.jsc
+
+# Backup/patch intermediates
+*.orig
+*.rej
