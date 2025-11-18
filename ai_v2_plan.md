@@ -126,45 +126,49 @@ With observability, diff safety, and UI affordances in place, Phase 2 can concen
 - **Complexity creep:** keep subagent feature flagged until earlier phases prove stable.
 
 ## Phase 5 – Chunk-first editing & concordance automation (planned)
-**Goal:** Ship the remaining large-document deliverables from `improvement_ideas.md`: windowed snapshots, dedicated chunk tooling, streaming diff safety, prompt guardrails, character/storyline orchestration, and the preflight analysis layer that guides tool selection.
+**Goal:** Graduate the remaining large-document backlog (chunked IO, streaming diff safety, concordance + storyline orchestration, and preflight analysis) on top of the Phase 0–4 runtime that now includes deterministic token policy, outline/retrieval guardrails, and the subagent/plot scaffolding stack.
 
 ### Work items
-1. **Chunk-aware `DocumentSnapshot` (Idea #1)**
-   - Extend `DocumentBridge.generate_snapshot` and `DocumentSnapshotTool` with `window`, `max_tokens`, `include_text`, and `delta_only` options.
-   - Return selection-scoped text plus chunk descriptors (offsets, hashes) so the agent knows what portion it holds.
-   - Update prompt contracts (`prompts.py`, controller metadata) so slim snapshots become the default while keeping full snapshots available via opt-in flag.
-2. **`DocumentChunkTool` + hashed segment cache (Idea #2)**
-   - Maintain a rolling chunk index (structure-aware boundaries, overlap, lineage metadata) per document version.
-   - Implement a chunk-fetch tool that serves single slices or iterator handles under 2K tokens, backed by a cache in `AIController` to reuse recent pulls.
-   - Surface chunk profiles (code/notes/prose presets) in settings and telemetry for observability.
-3. **Streaming diff builder for mega-edits (Idea #7)**
-   - Introduce range-based diff helpers that operate on chunk streams instead of the entire buffer to cut memory usage.
-   - Allow `DocumentApplyPatchTool` to accept multiple disjoint ranges, merging them server-side before applying patches.
-   - Add regression tests that edit large fixtures without duplicating the full document in memory.
-4. **Prompt + telemetry guardrails for selective reads (Idea #8)**
-   - Refresh system prompts to instruct agents to start with delta-only snapshots, then chunk/outline fetches.
-   - Emit telemetry warnings when a tool payload exceeds thresholds and surface UI hints nudging chunk-based retries.
-   - Document the new usage guidelines in README + docs so users understand the slimmer default flows.
-5. **Character/entity concordance toolchain (Idea #10)**
-   - Finish the entity index pipeline with alias tracking, concordance browsing, and a `CharacterMapTool` returning chunk IDs + exemplar quotes.
-   - Pair with a `CharacterEditPlanner` helper (powered by the subagent sandbox) that iterates affected chunks and records completion state in `DocumentPlotStateStore`.
-6. **Storyline consistency orchestration (Idea #11)**
-   - Promote the plot state scaffolding into a `PlotStateMemory` module with beat/timeline graphs and dependency tracking.
-   - Add tools for fetching/updating plot beats (`PlotOutlineTool`, `PlotStateUpdateTool`) and enforce a loop in controller prompts: read plot state → edit chunk → update state.
-7. **Preflight analysis & tool recommendations (Idea #12)**
-   - Build an `AnalysisAgent` or rule-based analyzer under `ai/analysis` that inspects doc metadata and suggests tool plans (chunk profile, retrieval/concordance usage, caution flags).
-   - Inject analyzer output into the system prompt metadata and expose it via UI so users see why certain tools were chosen.
-   - Provide a `ToolUsageAdvisorTool` so the main agent can re-evaluate mid-run when document conditions shift.
+1. **Windowed snapshots + chunk manifests**
+   - Extend `tinkerbell.services.bridge.DocumentBridge.generate_snapshot` and `tinkerbell.ai.tools.document_snapshot.DocumentSnapshotTool` with `window`, `max_tokens`, `chunk_profile`, `include_text`, and `delta_only` combinations so slim snapshots become the default path.
+   - Return selection-scoped text plus chunk descriptors (offsets, hashes, outline pointer IDs) so `AIController` and LangGraph tools know exactly which portion of the document they own; cache manifests inside `_outline_digest_cache` for reuse.
+   - Update prompt contracts in `tinkerbell.ai.prompts`, chat command schemas, and existing tests to ensure the agent requests windowed snapshots first and escalates to full buffers only behind an explicit flag.
+2. **Chunk registry + `DocumentChunkTool`**
+   - Introduce `tinkerbell.ai.memory.chunk_index` subscribing to the `DocumentCacheBus` so every document version maintains hashed, semantic-aware chunk descriptors with selectable profiles (code/notes/prose) and overlap controls.
+   - Implement `DocumentChunkTool` under `tinkerbell.ai.tools.document_chunk` that serves sub-2K token slices or iterator handles, streaming chunks through `AIController`/`SubagentRuntimeManager` with per-tab caches and telemetry (`chunk_cache.hit/miss`).
+   - Surface chunk profile selectors in settings + status bar telemetry so operators can confirm when the assistant stays on the chunk-first path.
+3. **Streaming diff + multi-range patch flow**
+   - Add a `StreamedDiffBuilder` to `tinkerbell.ai.tools.diff_builder` that consumes chunk iterators instead of whole-document strings, emitting multi-range diffs keyed by chunk hashes.
+   - Teach `DocumentApplyPatchTool` and `tinkerbell.services.bridge.DocumentBridge.queue_edit` to accept those multi-range payloads, merge them server-side, and publish span metadata back onto the cache bus for downstream invalidation.
+   - Extend `editor.patches` and `tests/test_patches.py` to cover overlapping range resolution plus conflict detection without requiring the entire buffer in memory.
+4. **Prompt + telemetry guardrails for selective reads**
+   - Refresh the system/assistant prompts (`prompts.py`) and controller hints so the LangGraph planner explicitly prefers `delta_only` snapshots + chunk/outline/tool combos, using retrieval/plot state only when analysis says so.
+   - Emit new telemetry events (`chunk_flow.requested`, `chunk_flow.escaped_full_snapshot`) inside `tinkerbell.ai.services.telemetry` and surface UI nudges (status bar + chat badges) when oversized payloads force fallback to full snapshots.
+   - Document the new flow in `README.md`, `docs/ai_v2.md`, and guardrail runbooks so human operators know how to recover when the agent ignores chunk guidance.
+5. **Character/entity concordance automation**
+   - Build a `CharacterMapStore` under `tinkerbell.ai.memory` that layers alias tracking, pronoun resolution, and exemplar quotes on top of the existing `DocumentPlotStateStore`, with cache-bus evictions keyed by chunk hash.
+   - Ship `CharacterMapTool` plus a `CharacterEditPlannerTool` that run inside the subagent sandbox, walking each chunk returned by the new chunk tool and recording completion state in plot/character memory.
+   - Provide UI affordances (chat suggestions + optional dialog) so users can inspect concordance output, and surface telemetry counters (`concordance.entities`, `planner.chunks_touched`).
+6. **Storyline continuity orchestration**
+   - Promote the plot scaffolding into a full `PlotStateMemory` module (timeline graphs + dependency map) with tools `PlotOutlineTool` and `PlotStateUpdateTool` that the manager agent must call before and after chunk edits.
+   - Extend `SubagentRuntimeManager` and `AIController` to enforce the loop (read plot state → fetch chunk → edit → update plot state) and pointerize plot-state payloads via `TraceCompactor` when necessary.
+   - Persist optional human-authored overrides (saved per document profile) so operators can seed arcs before handing the flow back to the AI.
+7. **Preflight analysis & tool recommendations**
+   - Create `tinkerbell.ai.analysis` with a rule-driven `AnalysisAgent` that inspects document metadata (size, active guardrails, outline freshness, plot/concordance caches) and outputs a structured plan injected into `AIController._build_messages`.
+   - Add a `ToolUsageAdvisorTool` so the main agent can request another analysis mid-run when conditions change (e.g., budget pressure or stale caches), and surface analyzer decisions in the chat UI for transparency.
+   - Cache analyzer results per `document_version` and expose telemetry so we can measure adoption and latency overhead before making the layer mandatory.
 
 ### Validation
-- Expand pytest coverage for the new snapshot/chunk APIs, streaming diff builder, concordance + plot-state tools, and analysis layer integration points (`tests/test_ai_tools.py`, `test_agent.py`, `test_document_chunk_tool.py`, `test_plot_state.py`, etc.).
-- Add large-fixture regression scripts that measure token savings vs. full snapshots (`benchmarks/measure_chunk_latency.py`) and publish results alongside existing benchmark docs.
-- Run guardrail/prompt smoke tests to ensure the agent prefers chunked flows and respects analyzer recommendations before promoting the feature flag.
+- Extend `tests/test_ai_tools.py`, `tests/test_agent.py`, `tests/test_document_snapshot.py` (new), and `tests/test_document_chunk_tool.py` to cover windowed snapshots, chunk fetch semantics, cache-bus invalidation, and analyzer injection paths.
+- Add regression suites for streaming diffs + multi-range patches by expanding `tests/test_patches.py`, `tests/test_diff_builder.py` (new), and `tests/test_document_apply_patch.py` (new) plus large-fixture smoke tests under `test_data/`.
+- Grow the concordance + storyline coverage via `tests/test_character_map_tool.py`, `tests/test_plot_state.py`, and `tests/test_subagent_manager.py` to ensure planners honor the new loop and telemetry counters stay deterministic.
+- Publish a new benchmark helper (`benchmarks/measure_chunk_latency.py`) comparing full snapshots vs. windowed flows, and record concordance/planner throughput in `benchmarks/large_doc_report.md`.
 
 ### Risks & mitigations
-- **Chunk boundary accuracy:** invest in semantic boundary detection and allow requesters to expand/overlap chunks; provide quick fallback to byte-based slicing if structure heuristics fail.
-- **Entity/plot extraction noise:** gate concordance + storyline tooling behind validation telemetry, surface confidence scores, and allow manual overrides or refreshes from the UI.
-- **Analyzer overhead:** cap preflight cost via caching per document version and allow users to disable the layer if latency is critical, while still logging recommendations for diagnostics.
+- **Chunk manifest drift:** Integrate the chunk index with the cache bus (already used by outline/retrieval) so edits trigger targeted rebuilds; fall back to byte windows when semantic boundaries fail.
+- **Planner/token overhead:** Strictly cap analyzer + planner prompts (cached per version) and gate optional features behind settings until telemetry shows negligible latency impact.
+- **Entity/plot extraction noise:** Keep concordance + storyline tooling behind confidence-scored telemetry, allow manual refresh/override in the UI, and ensure agents always cite pointer IDs so humans can audit questionable suggestions.
+- **Streaming diff regressions:** Ship guarded feature flags plus exhaustive fixture-based tests before defaulting to streamed diffs; retain the legacy diff builder for rollback until mega-edit paths burn in.
 
 ## Cross-cutting deliverables
 - **Docs:** Update `README.md` and add `docs/ai_v2.md` walkthrough after each major phase.
