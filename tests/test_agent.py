@@ -9,8 +9,8 @@ from typing import Any, AsyncIterator, Iterable, List, cast
 
 import pytest
 
-import tinkerbell.ai.agents.executor as agent_executor
-from tinkerbell.ai.agents.executor import AIController
+import tinkerbell.ai.orchestration.controller as orchestration_controller
+from tinkerbell.ai.orchestration import AIController
 from tinkerbell.ai.ai_types import (
     ChunkReference,
     SubagentBudget,
@@ -788,7 +788,7 @@ def test_ai_controller_emits_budget_decision(monkeypatch, sample_snapshot):
     def _emit(name: str, payload: dict[str, object] | None = None) -> None:
         captured.append((name, payload))
 
-    monkeypatch.setattr(agent_executor.telemetry_service, "emit", _emit)
+    monkeypatch.setattr(orchestration_controller.telemetry_service, "emit", _emit)
 
     controller = AIController(client=cast(AIClient, stub_client), budget_policy=policy)
 
@@ -799,7 +799,9 @@ def test_ai_controller_emits_budget_decision(monkeypatch, sample_snapshot):
     assert captured
     name, payload = captured[-1]
     assert name == "context_budget_decision"
-    assert payload and payload.get("verdict") == "ok"
+    # Base system prompt length now exceeds the small 1.5k-token budget, so the
+    # policy reports "needs_summary" while still emitting telemetry.
+    assert payload and payload.get("verdict") == "needs_summary"
 
 
 def test_ai_controller_includes_history_before_latest_prompt(sample_snapshot):

@@ -90,7 +90,7 @@ Future iterations may add richer arc detection, manual editing UI, or persistenc
 ## 2. Context usage instrumentation
 
 - **Event schema** – `ContextUsageEvent` (in `tinkerbell.ai.services.telemetry`) captures `document_id`, `model`, `prompt_tokens`, `tool_tokens`, `response_reserve`, `conversation_length`, `tool_names`, a monotonic timestamp, and the active embedding backend/model/status tuple so downstream dashboards can segment runs.
-- **Collection points** – `AIController` (`ai.agents.executor.AIController`) emits an event per turn and aggregates tool invocations. Tool payload sizes are counted via the new token registry so metrics stay consistent.
+- **Collection points** – `AIController` (`ai.orchestration.AIController`) emits an event per turn and aggregates tool invocations. Tool payload sizes are counted via the new token registry so metrics stay consistent.
 - **Settings & UI** – The Settings dialog now exposes **Debug → Token logging enabled** and **Token log limit**. When enabled, the status bar shows running totals and the in-memory sink keeps the last *N* events for inspection/test assertions.
 - **Programmatic access** – `AIController.get_recent_context_events()` exposes the rolling buffer for tests or external dashboards. Additional sinks can be registered via `TelemetrySink` to stream events elsewhere.
 - **Export script** – `uv run python -m tinkerbell.scripts.export_context_usage --format csv --limit 50` dumps the persisted buffer (JSON/CSV) from `~/.tinkerbell/telemetry/context_usage.json` for audits or support bundles.
@@ -149,7 +149,7 @@ Phase 2 Sprint 2 builds on the dry-run budget policy by actually compacting ov
   - Pointer text explains why the payload shrank, includes key metadata (tool name, document/version IDs, diff stats), and always ends with explicit rehydration instructions for LangGraph agents.
   - Raw payloads are still preserved inside `executed_tool_calls` for UI expansion, export scripts, and audits.
 
-3. **Controller + prompt integration** (`tinkerbell.ai.agents.executor.AIController` & `ai/prompts.py`)
+3. **Controller + prompt integration** (`tinkerbell.ai.orchestration.AIController` & `ai/prompts.py`)
   - `_handle_tool_calls` records per-tool `summarizable` flags, feeds payloads to the summarizer, and caches pointer instructions alongside tool traces.
   - `_compact_tool_messages` retries the budget calculation after each summarization while suppressing duplicate telemetry so dashboards stay readable.
   - Prompt templates now brief the agent on pointer semantics (“If you see a pointer message, rerun the referenced tool with the provided parameters to fetch the full data”).

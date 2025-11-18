@@ -1,6 +1,6 @@
 import asyncio
 import json
-from tinkerbell.ai.agents.executor import AIController
+from tinkerbell.ai.orchestration import AIController
 from tinkerbell.ai.client import AIStreamEvent
 from types import SimpleNamespace
 

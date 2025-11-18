@@ -11,11 +11,11 @@ from types import SimpleNamespace
 
 import pytest
 
-import tinkerbell.main_window as main_window_module
+import tinkerbell.ui.main_window as main_window_module
 from tinkerbell.chat.chat_panel import ChatTurnSnapshot
 from tinkerbell.chat.message_model import ChatMessage, EditDirective, ToolTrace
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
-from tinkerbell.main_window import MainWindow, WindowContext
+from tinkerbell.ui.main_window import MainWindow, WindowContext
 from tinkerbell.services.importers import FileImporter, ImportResult, ImporterError
 from tinkerbell.services.settings import Settings, SettingsStore
 from tinkerbell.services.telemetry import ContextUsageEvent
@@ -880,7 +880,7 @@ def test_debug_logging_toggle_reconfigures_logging(
         captured["force"] = kwargs.get("force")
         return tmp_path / "log"
 
-    monkeypatch.setattr("tinkerbell.main_window.logging_utils.setup_logging", _fake_setup)
+    monkeypatch.setattr("tinkerbell.ui.main_window.logging_utils.setup_logging", _fake_setup)
 
     window._handle_settings_requested()
 
@@ -911,7 +911,7 @@ def test_debug_logging_disable_reconfigures_logging(
         captured["force"] = kwargs.get("force")
         return tmp_path / "log"
 
-    monkeypatch.setattr("tinkerbell.main_window.logging_utils.setup_logging", _fake_setup)
+    monkeypatch.setattr("tinkerbell.ui.main_window.logging_utils.setup_logging", _fake_setup)
 
     window._handle_settings_requested()
 

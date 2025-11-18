@@ -16,8 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING, cast
 
-from .chat.chat_panel import ChatPanel, ChatTurnSnapshot
-from .chat.commands import (
+from ..chat.chat_panel import ChatPanel, ChatTurnSnapshot
+from ..chat.commands import (
     ActionType,
     DIRECTIVE_SCHEMA,
     ManualCommandRequest,
@@ -25,38 +25,40 @@ from .chat.commands import (
     parse_manual_command,
     resolve_tab_reference,
 )
-from .chat.message_model import ChatMessage, EditDirective, ToolTrace
-from .editor.document_model import DocumentMetadata, DocumentState, SelectionRange
-from .editor.editor_widget import DiffOverlayState
-from .editor.workspace import DocumentTab
-from .editor.tabbed_editor import TabbedEditorWidget
-from .services import telemetry as telemetry_service
-from .ai.ai_types import SubagentRuntimeConfig
-from .ai.memory import EmbeddingProvider, DocumentEmbeddingIndex, LangChainEmbeddingProvider, OpenAIEmbeddingProvider
-from .ai.memory.buffers import DocumentSummaryMemory
-from .ai.services import OutlineBuilderWorker
-from .services.bridge_router import WorkspaceBridgeRouter
-from .services.importers import FileImporter, ImportResult, ImporterError
-from .services.settings import Settings, SettingsStore
-from .utils import file_io, logging as logging_utils
-from .widgets.status_bar import StatusBar
-from .ai.tools.diff_builder import DiffBuilderTool
-from .ai.tools.document_snapshot import DocumentSnapshotTool
-from .ai.tools.document_edit import DocumentEditTool
-from .ai.tools.document_apply_patch import DocumentApplyPatchTool
-from .ai.tools.document_find_sections import DocumentFindSectionsTool
-from .ai.tools.document_outline import DocumentOutlineTool
-from .ai.tools.document_plot_state import DocumentPlotStateTool
-from .ai.tools.list_tabs import ListTabsTool
-from .ai.tools.search_replace import SearchReplaceTool
-from .ai.tools.validation import validate_snippet
-from .theme import load_theme, theme_manager
+from ..chat.message_model import ChatMessage, EditDirective, ToolTrace
+from ..editor.document_model import DocumentMetadata, DocumentState, SelectionRange
+from ..editor.editor_widget import DiffOverlayState
+from ..editor.workspace import DocumentTab
+from ..editor.tabbed_editor import TabbedEditorWidget
+from ..services import telemetry as telemetry_service
+from ..ai.ai_types import SubagentRuntimeConfig
+from ..ai.memory import EmbeddingProvider, DocumentEmbeddingIndex, LangChainEmbeddingProvider, OpenAIEmbeddingProvider
+from ..ai.memory.buffers import DocumentSummaryMemory
+from ..ai.services import OutlineBuilderWorker
+from ..services.bridge_router import WorkspaceBridgeRouter
+from ..services.importers import FileImporter, ImportResult, ImporterError
+from ..services.settings import Settings, SettingsStore
+from ..utils import file_io, logging as logging_utils
+from ..widgets.status_bar import StatusBar
+from ..ai.tools.document_apply_patch import DocumentApplyPatchTool
+from ..ai.tools.document_find_sections import DocumentFindSectionsTool
+from ..ai.tools.document_outline import DocumentOutlineTool
+from ..ai.tools.document_plot_state import DocumentPlotStateTool
+from ..ai.tools.registry import (
+    ToolRegistryContext,
+    register_default_tools,
+    register_phase3_tools,
+    register_plot_state_tool,
+    unregister_phase3_tools,
+    unregister_plot_state_tool,
+)
+from ..theme import load_theme, theme_manager
 
 if TYPE_CHECKING:  # pragma: no cover - import only for static analysis
-    from .ai.orchestration import AIController
-    from .ai.client import AIStreamEvent
-    from .ai.memory.plot_state import DocumentPlotStateStore
-    from .widgets.dialogs import SettingsDialogResult
+    from ..ai.orchestration import AIController
+    from ..ai.client import AIStreamEvent
+    from ..ai.memory.plot_state import DocumentPlotStateStore
+    from ..widgets.dialogs import SettingsDialogResult
 
 QApplication: Any
 QMainWindow: Any
@@ -871,416 +873,41 @@ class MainWindow(QMainWindow):
     def _register_default_ai_tools(self) -> None:
         """Register the default document-aware tools with the AI controller."""
 
-        controller = self._context.ai_controller
-        if controller is None:
-            return
+        context = self._tool_registry_context()
+        register_default_tools(context)
 
-        register = getattr(controller, "register_tool", None)
-        if not callable(register):
-            _LOGGER.debug("AI controller does not expose register_tool; skipping tool wiring.")
-            return
+    def _tool_registry_context(self) -> ToolRegistryContext:
+        """Build the dependency bundle passed into the tool registry."""
 
-        try:
-            snapshot_tool = DocumentSnapshotTool(
-                provider=self._bridge,
-                outline_digest_resolver=self._resolve_outline_digest,
-            )
-            register(
-                "document_snapshot",
-                snapshot_tool,
-                description=(
-                    "Return the freshest document snapshot (text, metadata, diff summaries) for the active or specified tab."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "delta_only": {
-                            "type": "boolean",
-                            "description": "When true, include only the selection and surrounding context instead of the full document.",
-                        },
-                        "include_diff": {
-                            "type": "boolean",
-                            "description": "Attach the most recent diff summary when available (default true).",
-                        },
-                        "tab_id": {
-                            "type": "string",
-                            "description": "Target a specific tab instead of the active document.",
-                        },
-                        "source_tab_ids": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional list of additional tab snapshots to gather alongside the active document.",
-                        },
-                        "include_open_documents": {
-                            "type": "boolean",
-                            "description": "When true, include a summary of all open documents in the snapshot payload.",
-                        },
-                    },
-                    "additionalProperties": False,
-                },
-            )
+        return ToolRegistryContext(
+            controller=self._context.ai_controller,
+            bridge=self._bridge,
+            outline_digest_resolver=self._resolve_outline_digest,
+            directive_schema_provider=self._directive_parameters_schema,
+            phase3_outline_enabled=self._phase3_outline_enabled,
+            plot_scaffolding_enabled=self._plot_scaffolding_enabled,
+            ensure_outline_tool=self._ensure_outline_tool,
+            ensure_find_sections_tool=self._ensure_find_sections_tool,
+            ensure_plot_state_tool=self._ensure_plot_state_tool,
+            auto_patch_consumer=self._set_auto_patch_tool,
+        )
 
-            self._register_phase3_ai_tools(register_fn=register)
-            self._register_plot_state_tool(register_fn=register)
-
-            edit_tool = DocumentEditTool(bridge=self._bridge, patch_only=True)
-            register(
-                "document_edit",
-                edit_tool,
-                description=(
-                    "Apply a structured edit directive (insert, replace, annotate, or unified diff patch) against the active document."
-                ),
-                parameters=self._directive_parameters_schema(),
-            )
-
-            apply_patch_tool = DocumentApplyPatchTool(bridge=self._bridge, edit_tool=edit_tool)
-            self._auto_patch_tool = apply_patch_tool
-            register(
-                "document_apply_patch",
-                apply_patch_tool,
-                description=(
-                    "Replace a target_range with new content by automatically building and applying a unified diff."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "Replacement text that should occupy the specified target_range.",
-                        },
-                        "target_range": DIRECTIVE_SCHEMA["properties"]["target_range"],
-                        "document_version": {
-                            "type": "string",
-                            "description": "Document snapshot version captured before drafting the edit.",
-                        },
-                        "rationale": {
-                            "type": "string",
-                            "description": "Optional explanation stored alongside the edit directive.",
-                        },
-                        "context_lines": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "description": "Override the number of context lines included in the generated diff.",
-                        },
-                        "tab_id": {
-                            "type": "string",
-                            "description": "Optional tab identifier; defaults to the active tab when omitted.",
-                        },
-                    },
-                    "required": ["content"],
-                    "additionalProperties": False,
-                },
-            )
-
-            tab_listing_tool = ListTabsTool(provider=self._bridge)
-            register(
-                "list_tabs",
-                tab_listing_tool,
-                description="Enumerate the open tabs (tab_id, title, path, dirty) so agents can target specific documents.",
-                parameters={
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-            )
-
-            diff_tool = DiffBuilderTool()
-            register(
-                "diff_builder",
-                diff_tool,
-                description=(
-                    "Return a unified diff given original and updated text snippets to drive patch directives."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "original": {
-                            "type": "string",
-                            "description": "The prior version of the text block.",
-                        },
-                        "updated": {
-                            "type": "string",
-                            "description": "The revised text block.",
-                        },
-                        "filename": {
-                            "type": "string",
-                            "description": "Optional virtual filename used in diff headers.",
-                        },
-                        "context": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "description": "Number of context lines to include in the diff (default 3).",
-                        },
-                    },
-                    "required": ["original", "updated"],
-                    "additionalProperties": False,
-                },
-            )
-
-            search_tool = SearchReplaceTool(bridge=self._bridge)
-            register(
-                "search_replace",
-                search_tool,
-                description=(
-                    "Search the current document or selection and optionally apply replacements with regex/literal matching."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": "Text or regex pattern to find.",
-                        },
-                        "replacement": {
-                            "type": "string",
-                            "description": "Content that will replace each match.",
-                        },
-                        "is_regex": {
-                            "type": "boolean",
-                            "description": "Interpret the pattern as a regular expression.",
-                        },
-                        "scope": {
-                            "type": "string",
-                            "enum": ["document", "selection"],
-                            "description": "Limit replacements to the entire document or just the current selection.",
-                        },
-                        "dry_run": {
-                            "type": "boolean",
-                            "description": "When true, do not apply edits—only preview the outcome.",
-                        },
-                        "max_replacements": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "description": "Optional cap on the number of replacements to perform.",
-                        },
-                        "match_case": {
-                            "type": "boolean",
-                            "description": "Respect character casing when matching (defaults to true).",
-                        },
-                        "whole_word": {
-                            "type": "boolean",
-                            "description": "Only match full words when true.",
-                        },
-                    },
-                    "required": ["pattern", "replacement"],
-                    "additionalProperties": False,
-                },
-            )
-
-            register(
-                "validate_snippet",
-                validate_snippet,
-                description="Validate YAML/JSON snippets before inserting them into the document.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "Snippet contents that should be validated.",
-                        },
-                        "fmt": {
-                            "type": "string",
-                            "description": "Declared format of the snippet.",
-                            "enum": ["yaml", "yml", "json", "markdown", "md"],
-                        },
-                    },
-                    "required": ["text", "fmt"],
-                    "additionalProperties": False,
-                },
-            )
-
-            registered = [
-                "document_snapshot",
-                "document_edit",
-                "document_apply_patch",
-                "diff_builder",
-                "search_replace",
-                "validate_snippet",
-                "list_tabs",
-            ]
-            if self._phase3_outline_enabled:
-                registered.insert(1, "document_outline")
-                registered.insert(2, "document_find_sections")
-            if self._plot_scaffolding_enabled:
-                registered.append("document_plot_state")
-            _LOGGER.debug("Default AI tools registered: %s", ", ".join(registered))
-        except Exception as exc:  # pragma: no cover - defensive logging
-            _LOGGER.warning("Failed to register default AI tools: %s", exc)
+    def _set_auto_patch_tool(self, tool: DocumentApplyPatchTool) -> None:
+        self._auto_patch_tool = tool
 
     def _register_phase3_ai_tools(self, *, register_fn: Callable[..., Any] | None = None) -> None:
-        if not self._phase3_outline_enabled:
-            return
-
-        controller = self._context.ai_controller
-        if controller is None:
-            return
-
-        register = register_fn or getattr(controller, "register_tool", None)
-        if not callable(register):
-            _LOGGER.debug("AI controller does not expose register_tool; skipping phase3 tool wiring.")
-            return
-
-        outline_tool = self._ensure_outline_tool()
-        if outline_tool is not None:
-            register(
-                "document_outline",
-                outline_tool,
-                description=(
-                    "Return the most recent outline for the active document, including pointer IDs, blurbs, and staleness metadata."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "document_id": {
-                            "type": "string",
-                            "description": "Optional explicit document identifier; defaults to the active tab.",
-                        },
-                        "desired_levels": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "description": "Limit the outline depth to this heading level before budgeting.",
-                        },
-                        "include_blurbs": {
-                            "type": "boolean",
-                            "description": "When false, omit excerpt blurbs to conserve tokens.",
-                        },
-                        "max_nodes": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 1000,
-                            "description": "Cap the number of nodes returned prior to budget enforcement.",
-                        },
-                    },
-                    "additionalProperties": False,
-                },
-            )
-
-        find_sections_tool = self._ensure_find_sections_tool()
-        if find_sections_tool is not None:
-            register(
-                "document_find_sections",
-                find_sections_tool,
-                description=(
-                    "Return the best-matching document chunks for a natural language query using embeddings or fallback heuristics."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "document_id": {
-                            "type": "string",
-                            "description": "Optional target document identifier; defaults to the active document.",
-                        },
-                        "query": {
-                            "type": "string",
-                            "minLength": 1,
-                            "description": "Natural-language description of the section(s) to find.",
-                        },
-                        "top_k": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 12,
-                            "description": "Maximum number of pointers to return.",
-                        },
-                        "min_confidence": {
-                            "type": "number",
-                            "minimum": 0.0,
-                            "maximum": 1.0,
-                            "description": "Minimum embedding match score before falling back to heuristics.",
-                        },
-                        "filters": {
-                            "type": "object",
-                            "description": "Optional additional filtering hints understood by custom index providers.",
-                        },
-                        "include_outline_context": {
-                            "type": "boolean",
-                            "description": "When true, include nearby outline headings for each pointer.",
-                        },
-                    },
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
-            )
+        context = self._tool_registry_context()
+        register_phase3_tools(context, register_fn=register_fn)
 
     def _unregister_phase3_ai_tools(self) -> None:
-        controller = self._context.ai_controller
-        if controller is None:
-            return
-        unregister = getattr(controller, "unregister_tool", None)
-        if not callable(unregister):
-            return
-        for name in ("document_outline", "document_find_sections"):
-            try:
-                unregister(name)
-            except Exception:  # pragma: no cover - defensive
-                _LOGGER.debug("Failed to unregister tool %s", name, exc_info=True)
+        unregister_phase3_tools(self._context.ai_controller)
 
     def _register_plot_state_tool(self, *, register_fn: Callable[..., Any] | None = None) -> None:
-        if not self._plot_scaffolding_enabled:
-            return
-        controller = self._context.ai_controller
-        if controller is None:
-            return
-        register = register_fn or getattr(controller, "register_tool", None)
-        if not callable(register):
-            _LOGGER.debug("AI controller does not expose register_tool; skipping plot-state wiring.")
-            return
-
-        tool = self._ensure_plot_state_tool()
-        if tool is None:
-            return
-
-        try:
-            register(
-                "document_plot_state",
-                tool,
-                description=(
-                    "Return cached character/entity scaffolding and plot arcs extracted from recent subagent runs."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "document_id": {
-                            "type": "string",
-                            "description": "Optional explicit target; defaults to the active document.",
-                        },
-                        "include_entities": {
-                            "type": "boolean",
-                            "description": "When false, omit entity payloads to conserve tokens.",
-                        },
-                        "include_arcs": {
-                            "type": "boolean",
-                            "description": "When false, omit plot arc beats from the response.",
-                        },
-                        "max_entities": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 50,
-                            "description": "Limit the number of entities returned before budgeting.",
-                        },
-                        "max_beats": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 50,
-                            "description": "Limit the number of beats returned per arc before budgeting.",
-                        },
-                    },
-                    "additionalProperties": False,
-                },
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            _LOGGER.warning("Failed to register DocumentPlotStateTool: %s", exc)
+        context = self._tool_registry_context()
+        register_plot_state_tool(context, register_fn=register_fn)
 
     def _unregister_plot_state_tool(self) -> None:
-        controller = self._context.ai_controller
-        if controller is None:
-            return
-        unregister = getattr(controller, "unregister_tool", None)
-        if not callable(unregister):
-            return
-        try:
-            unregister("document_plot_state")
-        except Exception:  # pragma: no cover - defensive
-            _LOGGER.debug("Failed to unregister document_plot_state", exc_info=True)
+        unregister_plot_state_tool(self._context.ai_controller)
 
     def _ensure_plot_state_tool(self) -> DocumentPlotStateTool | None:
         if self._plot_state_tool is not None:
@@ -4475,7 +4102,7 @@ class MainWindow(QMainWindow):
         if client is None:
             return None
         try:
-            from .ai.orchestration import AIController
+            from ..ai.orchestration import AIController
         except Exception as exc:  # pragma: no cover - dependency guard
             _LOGGER.warning("AI controller unavailable: %s", exc)
             return None

@@ -18,7 +18,7 @@ TinkerBell pairs a PySide6 editor with a full LangChain/LangGraph tool stack so 
 
 ## Highlights
 
-- **Dual-pane UX** – A splitter-based main window (`tinkerbell.main_window.MainWindow`) keeps the editor and chat panes in sync with status indicators, toolbars, and autosave messaging.
+- **Dual-pane UX** – A splitter-based main window (`tinkerbell.ui.main_window.MainWindow`) keeps the editor and chat panes in sync with status indicators, toolbars, and autosave messaging.
 - **AI-native editing** – The chat panel streams OpenAI-compatible responses, shows tool traces, and forwards structured commands (`EditDirective`) to the editor bridge.
 - **Diff-based edits by default** – Agents fetch snapshots, build unified diffs, and submit `action="patch"` directives so every change is reproducible and undo-friendly.
 - **Structured safety rails** – All AI edits flow through `DocumentBridge` where schema validation, document-version checks, and diff summaries prevent stale or destructive operations.

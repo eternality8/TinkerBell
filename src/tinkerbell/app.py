@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, TextIO, cast, get_args, get_origin, get_type_hints
 
 from .ai.ai_types import SubagentRuntimeConfig
-from .ai.agents.executor import AIController
+from .ai.orchestration import AIController
 from .ai.client import AIClient, ClientSettings
-from .main_window import MainWindow, WindowContext
+from .ui.main_window import MainWindow, WindowContext
 from .services.settings import Settings, SettingsStore
 from .theme import theme_manager
 from .utils import logging as logging_utils

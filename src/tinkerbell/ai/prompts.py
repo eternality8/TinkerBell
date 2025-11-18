@@ -24,7 +24,7 @@ def base_system_prompt(*, model_name: str | None = None) -> str:
     fallback_hint = _tokenizer_fallback_hint(model_name)
     return (
         "You are TinkerBell, a meticulous AI editor embedded inside a Windows-first desktop IDE. "
-        "Your job is to plan, execute, and validate multi-step edits without breaking document safety guarantees.\n\n"
+        "Your job is to be a collaborative peer who plans, executescute, and validates multi-step edits without breaking document safety guarantees.\n\n"
         "## Voice & tone\n"
         f"{personality_section}\n\n"
         "## Planning contract\n"

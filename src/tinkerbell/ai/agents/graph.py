@@ -253,7 +253,7 @@ def build_agent_graph(*, tools: Mapping[str, Any], config: AgentConfig | None = 
     ----------
     tools:
         Mapping of tool name → tool implementation as registered by
-        :class:`~tinkerbell.ai.agents.executor.AIController`.
+        :class:`~tinkerbell.ai.orchestration.AIController`.
     max_iterations:
         Safety guard limiting how many times the planner can loop through the
         tool invocation cycle before forcing a final response.

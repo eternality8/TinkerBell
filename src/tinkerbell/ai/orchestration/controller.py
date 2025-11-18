@@ -40,8 +40,8 @@ from ..services.telemetry import (
     TelemetrySink,
     default_telemetry_path,
 )
-from .graph import build_agent_graph
-from .subagents import SubagentManager
+from ..agents.graph import build_agent_graph
+from ..agents.subagents import SubagentManager
 
 LOGGER = logging.getLogger(__name__)
 _PROMPT_HEADROOM = 4_096
