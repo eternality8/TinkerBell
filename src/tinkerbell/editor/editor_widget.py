@@ -263,6 +263,8 @@ class EditorWidget(QWidgetBase):
         if action == "insert":
             self.insert_text(directive.content, position=start)
         elif action == "replace":
+            if start == end:
+                raise ValueError("Replace directives must target a non-empty range; use action='insert' for caret edits")
             self.replace_range(start, end, directive.content)
         elif action == "annotate":
             annotation = f"\n[AI Note]: {directive.content.strip()}\n"

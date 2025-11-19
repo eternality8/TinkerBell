@@ -37,6 +37,9 @@ class AITurnCoordinator:
         controller = self.controller_resolver()
         if controller is None:
             return
+        reset_chunk_flow = getattr(self.telemetry_controller, "reset_chunk_flow_state", None)
+        if callable(reset_chunk_flow):
+            reset_chunk_flow()
         self._ai_stream_active = False
         self.stream_state_setter(False)
         self.tool_trace_presenter.reset()
@@ -62,6 +65,18 @@ class AITurnCoordinator:
         response_text = payload.get("response", "").strip() or "The AI did not return any content."
         self.response_finalizer(response_text)
         self.telemetry_controller.refresh_context_usage_status()
+        document_id = snapshot.get("document_id") if isinstance(snapshot, Mapping) else None
+        document_label = None
+        if isinstance(snapshot, Mapping):
+            label_source = snapshot.get("path") or snapshot.get("tab_title")
+            if label_source:
+                document_label = str(label_source)
+        refresh_analysis = getattr(self.telemetry_controller, "refresh_analysis_state", None)
+        if callable(refresh_analysis):
+            refresh_analysis(
+                document_id=str(document_id) if document_id else None,
+                document_label=document_label,
+            )
         self.status_updater("AI response ready")
         self.review_controller.finalize_pending_turn_review(success=True)
 

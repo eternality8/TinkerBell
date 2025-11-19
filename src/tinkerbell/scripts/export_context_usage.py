@@ -40,7 +40,25 @@ _FIELDNAMES = [
     "retrieval_strategy",
     "retrieval_latency_ms",
     "retrieval_pointer_count",
+    "analysis_chunk_profile",
+    "analysis_required_tools",
+    "analysis_optional_tools",
+    "analysis_must_refresh_outline",
+    "analysis_plot_state_status",
+    "analysis_concordance_status",
+    "analysis_warning_codes",
+    "analysis_cache_state",
+    "analysis_generated_at",
+    "analysis_rule_trace",
 ]
+
+_MULTIVALUE_FIELDS = {
+    "tool_names",
+    "analysis_required_tools",
+    "analysis_optional_tools",
+    "analysis_warning_codes",
+    "analysis_rule_trace",
+}
 
 
 def _event_to_dict(event: ContextUsageEvent) -> dict:
@@ -64,9 +82,9 @@ def _write_csv(events: Sequence[ContextUsageEvent], destination) -> None:
             if field == "timestamp":
                 row[field] = f"{event.timestamp:.6f}"
                 continue
-            if field == "tool_names":
-                names = payload.get("tool_names") or []
-                row[field] = ",".join(names)
+            if field in _MULTIVALUE_FIELDS:
+                items = payload.get(field) or []
+                row[field] = ",".join(items)
                 continue
             row[field] = _stringify(payload.get(field))
         writer.writerow(row)

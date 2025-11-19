@@ -12,6 +12,7 @@ from .cache_bus import (
 	get_document_cache_bus,
 	set_document_cache_bus,
 )
+from .chunk_index import ChunkIndex, ChunkIndexEntry, ChunkManifestRecord
 from .embeddings import (
 	ChunkEmbeddingRecord,
 	DocumentEmbeddingIndex,
@@ -24,6 +25,8 @@ from .embeddings import (
 	OpenAIEmbeddingProvider,
 )
 from .plot_state import DocumentPlotState, DocumentPlotStateStore, PlotArc, PlotBeat, PlotEntity
+from .plot_memory import PlotDependency, PlotOverride, PlotOverrideStore, PlotStateMemory
+from .character_map import CharacterMapStore, CharacterMapDocument, CharacterRecord, CharacterMention
 from .result_cache import SubagentResultCache
 
 __all__ = [
@@ -32,11 +35,22 @@ __all__ = [
 	"MemoryStore",
 	"OutlineCacheStore",
 	"OutlineNode",
+	"ChunkIndex",
+	"ChunkIndexEntry",
+	"ChunkManifestRecord",
 	"DocumentPlotState",
 	"DocumentPlotStateStore",
 	"PlotArc",
 	"PlotBeat",
 	"PlotEntity",
+	"PlotDependency",
+	"PlotOverride",
+	"PlotOverrideStore",
+	"PlotStateMemory",
+	"CharacterMapStore",
+	"CharacterMapDocument",
+	"CharacterRecord",
+	"CharacterMention",
 	"SubagentResultCache",
 	"ChunkEmbeddingRecord",
 	"DocumentEmbeddingIndex",

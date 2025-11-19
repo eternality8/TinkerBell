@@ -68,6 +68,31 @@ def test_main_window_registers_default_actions():
     assert window.last_status_message == "Ready"
 
 
+def test_command_palette_action_includes_document_status(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, Any] = {}
+
+    class _StubPalette:
+        def __init__(self, *, parent: Any | None = None, enable_qt: bool | None = None) -> None:
+            captured["instance"] = self
+            self.entries: list[Any] = []
+            self.shown = False
+
+        def set_entries(self, entries: Sequence[Any]) -> None:
+            self.entries = list(entries)
+
+        def show(self) -> None:
+            self.shown = True
+
+    monkeypatch.setattr(main_window_module, "CommandPaletteDialog", _StubPalette)
+    window = _make_window()
+
+    window.actions["command_palette"].trigger()
+
+    palette = captured["instance"]
+    assert palette.shown is True
+    assert any(entry.command_id == "view_document_status" for entry in palette.entries)
+
+
 def test_close_event_requests_application_quit(monkeypatch: pytest.MonkeyPatch):
     window = _make_window()
     quit_calls = {"count": 0}

@@ -146,6 +146,23 @@ def test_parse_manual_find_requires_query() -> None:
         parse_manual_command("!find --doc tab-a")
 
 
+def test_parse_manual_status_command_with_flags() -> None:
+    request = parse_manual_command("/status --doc Tab 2 --json")
+
+    assert request is not None
+    assert request.command is ManualCommandType.STATUS
+    assert request.args["document_id"] == "Tab 2"
+    assert request.args["as_json"] is True
+
+
+def test_parse_manual_status_command_accepts_positional_reference() -> None:
+    request = parse_manual_command("!status README.md")
+
+    assert request is not None
+    assert request.command is ManualCommandType.STATUS
+    assert request.args["document_id"] == "README.md"
+
+
 def test_parse_manual_command_ignored_without_prefix() -> None:
     assert parse_manual_command("outline please") is None
 

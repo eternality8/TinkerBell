@@ -29,6 +29,7 @@ def _make_provider(*, phase3: bool = True, plot: bool = True) -> ToolProvider:
         outline_digest_resolver=lambda doc_id: f"digest:{doc_id}" if doc_id else None,
         directive_schema_provider=lambda: {"type": "object"},
         plot_state_store_resolver=lambda: cast(Any, {"store": True}),
+        character_map_store_resolver=lambda: cast(Any, {"characters": True}),
         phase3_outline_enabled=phase3,
         plot_scaffolding_enabled=plot,
     )
@@ -48,6 +49,18 @@ def test_build_tool_context_exposes_current_state() -> None:
     plot_factory = cast(MethodType, context.ensure_plot_state_tool)
     assert plot_factory.__self__ is provider
     assert plot_factory.__func__ is provider.ensure_plot_state_tool.__func__
+
+    concordance_factory = cast(MethodType, context.ensure_character_map_tool)
+    assert concordance_factory.__self__ is provider
+    assert concordance_factory.__func__ is provider.ensure_character_map_tool.__func__
+
+    planner_factory = cast(MethodType, context.ensure_character_planner_tool)
+    assert planner_factory.__self__ is provider
+    assert planner_factory.__func__ is provider.ensure_character_planner_tool.__func__
+
+    update_factory = cast(MethodType, context.ensure_plot_state_update_tool)
+    assert update_factory.__self__ is provider
+    assert update_factory.__func__ is provider.ensure_plot_state_update_tool.__func__
 
 
 def test_ensure_outline_tool_memoizes_and_resets(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -107,3 +120,69 @@ def test_plot_state_tool_respects_feature_flag(monkeypatch: pytest.MonkeyPatch) 
 
     provider.set_plot_scaffolding_enabled(False)
     assert provider.ensure_plot_state_tool() is None
+
+
+def test_plot_state_update_tool_respects_feature_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    created = []
+
+    class _UpdateStub:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+    monkeypatch.setattr(provider_module, "PlotStateUpdateTool", _UpdateStub)
+    provider = _make_provider(plot=False)
+
+    assert provider.ensure_plot_state_update_tool() is None
+    assert created == []
+
+    provider.set_plot_scaffolding_enabled(True)
+    tool = provider.ensure_plot_state_update_tool()
+    assert tool is not None
+    assert len(created) == 1
+
+    provider.set_plot_scaffolding_enabled(False)
+    assert provider.ensure_plot_state_update_tool() is None
+
+
+def test_character_map_tool_respects_feature_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    created = []
+
+    class _CharacterMapStub:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+    monkeypatch.setattr(provider_module, "CharacterMapTool", _CharacterMapStub)
+    provider = _make_provider(plot=False)
+
+    assert provider.ensure_character_map_tool() is None
+    assert created == []
+
+    provider.set_plot_scaffolding_enabled(True)
+    tool = provider.ensure_character_map_tool()
+    assert tool is not None
+    assert len(created) == 1
+
+    provider.set_plot_scaffolding_enabled(False)
+    assert provider.ensure_character_map_tool() is None
+
+
+def test_character_planner_tool_respects_feature_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    created = []
+
+    class _PlannerStub:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+    monkeypatch.setattr(provider_module, "CharacterEditPlannerTool", _PlannerStub)
+    provider = _make_provider(plot=False)
+
+    assert provider.ensure_character_planner_tool() is None
+    assert created == []
+
+    provider.set_plot_scaffolding_enabled(True)
+    tool = provider.ensure_character_planner_tool()
+    assert tool is not None
+    assert len(created) == 1
+
+    provider.set_plot_scaffolding_enabled(False)
+    assert provider.ensure_character_planner_tool() is None

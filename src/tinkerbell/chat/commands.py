@@ -31,6 +31,8 @@ class ManualCommandType(str, Enum):
 
     OUTLINE = "outline"
     FIND_SECTIONS = "find_sections"
+    ANALYZE = "analyze"
+    STATUS = "status"
 
 
 @dataclass(slots=True)
@@ -88,6 +90,27 @@ _FIND_FLAG_ALIASES = {
     "--query": "query",
     "-q": "query",
 }
+_ANALYZE_FLAG_ALIASES = {
+    "--doc": "document_id",
+    "--document": "document_id",
+    "--tab": "document_id",
+    "--start": "selection_start",
+    "--end": "selection_end",
+    "--reason": "reason",
+}
+_ANALYZE_BOOLEAN_FLAGS = {
+    "--refresh": True,
+    "--force-refresh": True,
+}
+_STATUS_FLAG_ALIASES = {
+    "--doc": "document_id",
+    "--document": "document_id",
+    "--tab": "document_id",
+}
+_STATUS_BOOLEAN_FLAGS = {
+    "--json": True,
+    "--as-json": True,
+}
 _MANUAL_COMMAND_ALIASES = {
     "outline": ManualCommandType.OUTLINE,
     "out": ManualCommandType.OUTLINE,
@@ -97,6 +120,10 @@ _MANUAL_COMMAND_ALIASES = {
     "sections": ManualCommandType.FIND_SECTIONS,
     "retrieve": ManualCommandType.FIND_SECTIONS,
     "retrieval": ManualCommandType.FIND_SECTIONS,
+    "analyze": ManualCommandType.ANALYZE,
+    "analysis": ManualCommandType.ANALYZE,
+    "status": ManualCommandType.STATUS,
+    "stat": ManualCommandType.STATUS,
 }
 _OUTLINE_BOOLEAN_FLAGS = {
     "--blurbs": True,
@@ -146,6 +173,10 @@ def parse_manual_command(text: str) -> ManualCommandRequest | None:
         raise ValueError(f"Unknown manual command '{command_token}'. Try /outline or /find.")
     if command is ManualCommandType.OUTLINE:
         args = _parse_outline_command(tokens)
+    elif command is ManualCommandType.ANALYZE:
+        args = _parse_analyze_command(tokens)
+    elif command is ManualCommandType.STATUS:
+        args = _parse_status_command(tokens)
     else:
         args = _parse_find_sections_command(tokens)
     return ManualCommandRequest(command=command, args=args, raw=normalized)
@@ -250,6 +281,75 @@ def _parse_find_sections_command(tokens: deque[str]) -> dict[str, Any]:
     if not query_text:
         raise ValueError("Find sections command requires a query, e.g., /find introduction paragraph")
     args["query"] = query_text
+    return args
+
+
+def _parse_analyze_command(tokens: deque[str]) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    positional: list[str] = []
+    while tokens:
+        token = tokens.popleft()
+        if token == "--":
+            positional.extend(tokens)
+            tokens.clear()
+            break
+        if _is_flag_token(token):
+            flag, inline_value = _split_flag_value(token)
+            if flag in _ANALYZE_BOOLEAN_FLAGS:
+                args["force_refresh"] = _ANALYZE_BOOLEAN_FLAGS[flag]
+                continue
+            normalized = _ANALYZE_FLAG_ALIASES.get(flag)
+            if normalized is None:
+                raise ValueError(f"Unknown analyze flag '{token}'")
+            value = inline_value if inline_value is not None else _pop_flag_value(tokens, token)
+            cleaned = value.strip()
+            if not cleaned:
+                raise ValueError(f"Flag '{token}' requires a value")
+            if normalized in {"selection_start", "selection_end"}:
+                args[normalized] = _coerce_int_flag(cleaned, token, minimum=0)
+            else:
+                if inline_value is None and normalized == "document_id":
+                    cleaned = _collect_reference_value(cleaned, tokens)
+                args[normalized] = cleaned
+            continue
+        positional.append(token)
+    if positional and "document_id" not in args:
+        reference = " ".join(positional).strip()
+        if reference:
+            args["document_id"] = reference
+    return args
+
+
+def _parse_status_command(tokens: deque[str]) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    positional: list[str] = []
+    while tokens:
+        token = tokens.popleft()
+        if token == "--":
+            positional.extend(tokens)
+            tokens.clear()
+            break
+        if _is_flag_token(token):
+            flag, inline_value = _split_flag_value(token)
+            if flag in _STATUS_BOOLEAN_FLAGS:
+                args["as_json"] = True
+                continue
+            normalized = _STATUS_FLAG_ALIASES.get(flag)
+            if normalized is None:
+                raise ValueError(f"Unknown status flag '{token}'")
+            value = inline_value if inline_value is not None else _pop_flag_value(tokens, token)
+            cleaned = value.strip()
+            if inline_value is None and normalized == "document_id":
+                cleaned = _collect_reference_value(cleaned, tokens)
+            if not cleaned:
+                raise ValueError(f"Flag '{token}' requires a value")
+            args[normalized] = cleaned
+            continue
+        positional.append(token)
+    if positional and "document_id" not in args:
+        reference = " ".join(positional).strip()
+        if reference:
+            args["document_id"] = reference
     return args
 
 
@@ -366,13 +466,34 @@ DIRECTIVE_SCHEMA: Dict[str, Any] = {
         "metadata": {"type": "object"},
         "tab_id": {"type": "string", "minLength": 1},
         "selection_fingerprint": {"type": "string", "minLength": 1},
+        "match_text": {"type": "string"},
+        "expected_text": {"type": "string"},
+        "ranges": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "integer", "minimum": 0},
+                    "end": {"type": "integer", "minimum": 0},
+                    "replacement": {"type": "string"},
+                    "match_text": {"type": "string"},
+                    "chunk_id": {"type": "string"},
+                    "chunk_hash": {"type": "string"},
+                },
+                "required": ["start", "end", "replacement", "match_text"],
+                "additionalProperties": False,
+            },
+        },
     },
     "additionalProperties": True,
     "allOf": [
         {
             "if": {"properties": {"action": {"const": ActionType.PATCH.value}}},
             "then": {
-                "required": ["diff"],
+                "anyOf": [
+                    {"required": ["diff"]},
+                    {"required": ["ranges"]},
+                ],
                 "not": {
                     "anyOf": [
                         {"required": ["content"]},
@@ -418,8 +539,11 @@ def validate_directive(payload: Mapping[str, Any]) -> ValidationResult:
     action = candidate.get("action")
     if action == ActionType.PATCH.value:
         diff = candidate.get("diff")
-        if not isinstance(diff, str) or not diff.strip():
-            return ValidationResult(ok=False, message="diff must not be empty for patch directives")
+        ranges = candidate.get("ranges")
+        has_diff = isinstance(diff, str) and diff.strip()
+        has_ranges = isinstance(ranges, Sequence) and len(ranges) > 0
+        if not has_diff and not has_ranges:
+            return ValidationResult(ok=False, message="patch directives require a diff or ranges payload")
         version_token = _extract_version_token(candidate)
         if not version_token:
             return ValidationResult(ok=False, message="patch directives require a document_version token")

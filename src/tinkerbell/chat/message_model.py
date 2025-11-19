@@ -94,3 +94,5 @@ class EditDirective:
     rationale: Optional[str] = None
     diff: Optional[str] = None
     selection_fingerprint: Optional[str] = None
+    match_text: Optional[str] = None
+    expected_text: Optional[str] = None

@@ -42,6 +42,20 @@ def test_tool_activity_visibility_toggle():
     assert panel.tool_activity_visible is False
 
 
+def test_guardrail_indicator_tracks_state():
+    panel = _make_panel()
+
+    assert panel.guardrail_state == ("", "")
+
+    panel.set_guardrail_state("Warning", detail="Doc fetched full snapshot")
+
+    assert panel.guardrail_state == ("Warning", "Doc fetched full snapshot")
+
+    panel.set_guardrail_state(None)
+
+    assert panel.guardrail_state == ("", "")
+
+
 def test_chat_panel_appends_user_and_ai_messages():
     panel = _make_panel()
     panel.append_user_message("Hello", selection_summary="lines 1-2")

@@ -100,6 +100,10 @@ class Settings:
     phase3_outline_tools: bool = False
     enable_subagents: bool = False
     enable_plot_scaffolding: bool = False
+    chunk_profile: str = "auto"
+    chunk_overlap_chars: int = 256
+    chunk_max_inline_tokens: int = 1_800
+    chunk_iterator_limit: int = 4
     debug: DebugSettings = field(default_factory=DebugSettings)
     context_policy: ContextPolicySettings = field(default_factory=ContextPolicySettings)
 

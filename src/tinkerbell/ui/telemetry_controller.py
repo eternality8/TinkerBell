@@ -5,9 +5,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, Mapping
 
+from ..ai.analysis import AnalysisAdvice
 from ..services import telemetry as telemetry_service
 from ..widgets.status_bar import StatusBar
 from .models.window_state import WindowContext
+from ..chat.chat_panel import ChatPanel
 
 LOGGER = logging.getLogger(__name__)
 
@@ -21,6 +23,7 @@ class TelemetryController:
         status_bar: StatusBar | None,
         context: WindowContext,
         initial_subagent_enabled: bool = False,
+        chat_panel: ChatPanel | None = None,
     ) -> None:
         self._status_bar = status_bar
         self._context = context
@@ -30,6 +33,12 @@ class TelemetryController:
         self._subagent_job_totals: dict[str, int] = {"completed": 0, "failed": 0, "skipped": 0}
         self._subagent_last_event = ""
         self._subagent_telemetry_registered = False
+        self._chat_panel = chat_panel
+        self._chunk_flow_registered = False
+        self._chunk_flow_warning_active = False
+        self._chunk_flow_status_text: str = ""
+        self._chunk_flow_detail_text: str = ""
+        self._analysis_indicator: dict[str, str] | None = None
 
     # ------------------------------------------------------------------
     # Context usage dashboard helpers
@@ -97,6 +106,17 @@ class TelemetryController:
             telemetry_service.register_event_listener(event_name, self.handle_subagent_telemetry)
         self._subagent_telemetry_registered = True
 
+    def register_chunk_flow_listeners(self) -> None:
+        if self._chunk_flow_registered:
+            return
+        for event_name in (
+            "chunk_flow.requested",
+            "chunk_flow.escaped_full_snapshot",
+            "chunk_flow.retry_success",
+        ):
+            telemetry_service.register_event_listener(event_name, self.handle_chunk_flow_event)
+        self._chunk_flow_registered = True
+
     def handle_subagent_telemetry(self, payload: Mapping[str, Any] | None) -> None:
         if not isinstance(payload, Mapping):
             return
@@ -114,6 +134,61 @@ class TelemetryController:
             return
         handler(payload)
         self.update_subagent_indicator()
+
+    def handle_chunk_flow_event(self, payload: Mapping[str, Any] | None) -> None:
+        if not isinstance(payload, Mapping):
+            return
+        event_name = str(payload.get("event") or "")
+        if event_name == "chunk_flow.escaped_full_snapshot":
+            detail = self._format_chunk_flow_warning(payload)
+            self._chunk_flow_warning_active = True
+            self._set_chunk_flow_indicator("Chunk Flow Warning", detail)
+            return
+        if event_name == "chunk_flow.retry_success":
+            detail = self._format_chunk_flow_recovery(payload)
+            self._chunk_flow_warning_active = False
+            self._set_chunk_flow_indicator("Chunk Flow Recovered", detail)
+            return
+        if event_name == "chunk_flow.requested" and not self._chunk_flow_warning_active:
+            self.reset_chunk_flow_state()
+
+    def reset_chunk_flow_state(self) -> None:
+        self._chunk_flow_warning_active = False
+        self._set_chunk_flow_indicator(None)
+
+    def refresh_analysis_state(self, document_id: str | None, *, document_label: str | None = None) -> None:
+        controller = getattr(self._context, "ai_controller", None)
+        if controller is None or not document_id:
+            self._set_analysis_indicator(None)
+            return
+        getter = getattr(controller, "get_latest_analysis_advice", None)
+        if not callable(getter):
+            self._set_analysis_indicator(None)
+            return
+        advice = getter(document_id)
+        if advice is None:
+            self._set_analysis_indicator(None)
+            return
+        self._set_analysis_indicator(advice, document_label=document_label or document_id)
+
+    def chunk_flow_snapshot(self) -> Mapping[str, str] | None:
+        if not self._chunk_flow_status_text:
+            return None
+        return {"status": self._chunk_flow_status_text, "detail": self._chunk_flow_detail_text}
+
+    def analysis_snapshot(self) -> Mapping[str, str] | None:
+        if self._analysis_indicator is None:
+            return None
+        return dict(self._analysis_indicator)
+
+    def describe_analysis_indicator(
+        self,
+        advice: AnalysisAdvice,
+        *,
+        document_label: str | None = None,
+    ) -> dict[str, str]:
+        status_text, badge_text, detail_text = self._format_analysis_indicator(advice, document_label)
+        return {"status": status_text, "badge": badge_text, "detail": detail_text}
 
     def set_subagent_enabled(self, enabled: bool) -> None:
         normalized = bool(enabled)
@@ -255,6 +330,109 @@ class TelemetryController:
             if count:
                 parts.append(f"{label} {count}")
         return " · ".join(parts)
+
+    def _set_chunk_flow_indicator(self, status: str | None, detail: str | None = None) -> None:
+        status_bar = self._status_bar
+        chat_panel = self._chat_panel
+        if status:
+            self._chunk_flow_status_text = status.strip()
+            self._chunk_flow_detail_text = (detail or "").strip()
+        else:
+            self._chunk_flow_status_text = ""
+            self._chunk_flow_detail_text = ""
+        if status_bar is not None:
+            status_bar.set_chunk_flow_state(status, detail=detail)
+        if chat_panel is not None:
+            setter = getattr(chat_panel, "set_guardrail_state", None)
+            if callable(setter):
+                setter(status, detail=detail)
+
+    def _set_analysis_indicator(self, advice: AnalysisAdvice | None, *, document_label: str | None = None) -> None:
+        status_bar = self._status_bar
+        chat_panel = self._chat_panel
+        if advice is None:
+            self._analysis_indicator = None
+            if status_bar is not None:
+                status_bar.set_analysis_state(None)
+            if chat_panel is not None:
+                badge_setter = getattr(chat_panel, "set_analysis_badge", None)
+                if callable(badge_setter):
+                    badge_setter(None)
+            return
+        overview = self.describe_analysis_indicator(advice, document_label=document_label)
+        self._analysis_indicator = dict(overview)
+        if status_bar is not None:
+            status_bar.set_analysis_state(overview["status"], detail=overview["detail"])
+        if chat_panel is not None:
+            badge_setter = getattr(chat_panel, "set_analysis_badge", None)
+            if callable(badge_setter):
+                badge_setter(overview["badge"], detail=overview["detail"])
+
+    def _format_analysis_indicator(
+        self,
+        advice: AnalysisAdvice,
+        document_label: str | None,
+    ) -> tuple[str, str, str]:
+        doc_label = document_label or advice.document_id or "document"
+        required = ", ".join(advice.required_tools) if advice.required_tools else "none"
+        optional = ", ".join(advice.optional_tools) if advice.optional_tools else "none"
+        warning_count = len(advice.warnings)
+        summary_bits: list[str] = []
+        if advice.must_refresh_outline:
+            summary_bits.append("Refresh outline")
+        if advice.required_tools:
+            summary_bits.append(f"Tools {', '.join(advice.required_tools)}")
+        elif advice.optional_tools:
+            summary_bits.append(f"Optional {optional}")
+        if warning_count:
+            summary_bits.append(f"{warning_count} warning{'s' if warning_count != 1 else ''}")
+        summary_bits.append(f"Profile {advice.chunk_profile}")
+        summary = " · ".join(summary_bits[:3])
+        status_text = summary or "Ready"
+        badge_text = f"Preflight: {status_text}" if summary else "Preflight: Ready"
+        detail_lines = [
+            f"Document: {doc_label}",
+            f"Chunk profile: {advice.chunk_profile}",
+            f"Required tools: {required}",
+        ]
+        if advice.optional_tools:
+            detail_lines.append(f"Optional tools: {optional}")
+        detail_lines.append(f"Outline refresh required: {'yes' if advice.must_refresh_outline else 'no'}")
+        if advice.plot_state_status:
+            detail_lines.append(f"Plot state: {advice.plot_state_status}")
+        if advice.concordance_status:
+            detail_lines.append(f"Concordance: {advice.concordance_status}")
+        if warning_count:
+            detail_lines.append("Warnings:")
+            for warning in advice.warnings:
+                detail_lines.append(f"- ({warning.severity}) {warning.code}: {warning.message}")
+        detail_text = "\n".join(detail_lines)
+        return status_text, badge_text, detail_text
+
+    @staticmethod
+    def _format_chunk_flow_warning(payload: Mapping[str, Any]) -> str:
+        document_id = str(payload.get("document_id") or "this document")
+        reason = str(payload.get("reason") or "full snapshot").replace("_", " ")
+        doc_length = TelemetryController._coerce_int(payload.get("document_length"))
+        approx = f" (~{doc_length:,} chars)" if doc_length else ""
+        window_kind = str(payload.get("window_kind") or "").strip()
+        window_hint = f" via {window_kind}" if window_kind else ""
+        return f"{document_id}: {reason}{window_hint}{approx}".strip()
+
+    @staticmethod
+    def _format_chunk_flow_recovery(payload: Mapping[str, Any]) -> str:
+        document_id = str(payload.get("document_id") or "this document")
+        recovered_via = str(payload.get("recovered_via") or payload.get("source") or "DocumentChunkTool")
+        return f"{document_id}: recovered via {recovered_via}"
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:  # pragma: no cover - helper mirrors controller logic
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
 
 __all__ = ["TelemetryController"]

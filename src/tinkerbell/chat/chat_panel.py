@@ -168,6 +168,10 @@ class ChatPanel(QWidgetBase):
         self._session_reset_listeners: list[SessionResetListener] = []
         self._suggestion_panel_listeners: list[SuggestionPanelListener] = []
         self._tool_activity_visible = bool(show_tool_activity_panel)
+        self._guardrail_state: str = ""
+        self._guardrail_detail: str = ""
+        self._analysis_badge: str = ""
+        self._analysis_detail: str = ""
 
         # Qt widgets (optional; None when headless)
         self._history_widget: Any = None
@@ -178,6 +182,8 @@ class ChatPanel(QWidgetBase):
         self._suggestion_toggle: Any = None
         self._tool_trace_widget: Any = None
         self._tool_trace_label: Any = None
+        self._guardrail_label: Any = None
+        self._analysis_label: Any = None
         self._suggestion_panel_open = False
         self._last_copied_text: Optional[str] = None
         self._stop_ai_callback: Optional[Callable[[], None]] = None
@@ -197,6 +203,46 @@ class ChatPanel(QWidgetBase):
         """Return a copy of the recorded chat history."""
 
         return list(self._messages)
+
+    @property
+    def guardrail_state(self) -> tuple[str, str]:
+        """Expose the guardrail badge text/detail for tests and UI."""
+
+        return (self._guardrail_state, self._guardrail_detail)
+
+    def set_guardrail_state(self, status: Optional[str], *, detail: Optional[str] = None) -> None:
+        """Update the chunk-flow guardrail badge shown above the tool traces."""
+
+        normalized = (status or "").strip()
+        detail_text = (detail or "").strip()
+        self._guardrail_state = normalized
+        self._guardrail_detail = detail_text
+        label = self._guardrail_label
+        if label is None:
+            return
+        try:
+            label.setText(self._format_guardrail_text())
+            label.setToolTip(detail_text or normalized)
+            label.setVisible(bool(normalized))
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+
+    def set_analysis_badge(self, text: Optional[str], *, detail: Optional[str] = None) -> None:
+        """Update the preflight analysis badge."""
+
+        normalized = (text or "").strip()
+        detail_text = (detail or "").strip()
+        self._analysis_badge = normalized
+        self._analysis_detail = detail_text
+        label = self._analysis_label
+        if label is None:
+            return
+        try:
+            label.setText(normalized)
+            label.setToolTip(detail_text or normalized)
+            label.setVisible(bool(normalized))
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
 
     # ------------------------------------------------------------------
     # Snapshot helpers
@@ -702,6 +748,19 @@ class ChatPanel(QWidgetBase):
 
         layout.addWidget(composer_frame, 0)
 
+        if QLabel is not None:
+            analysis_label = QLabel("", self)
+            analysis_label.setObjectName("tb-chat-analysis")
+            analysis_label.setVisible(False)
+            layout.addWidget(analysis_label)
+            self._analysis_label = analysis_label
+
+            guardrail_label = QLabel("", self)
+            guardrail_label.setObjectName("tb-chat-guardrail")
+            guardrail_label.setVisible(False)
+            layout.addWidget(guardrail_label)
+            self._guardrail_label = guardrail_label
+
         if QLabel is not None and QListWidget is not None:
             trace_label = QLabel("Tool Activity", self)
             self._tool_trace_label = trace_label
@@ -1002,6 +1061,11 @@ class ChatPanel(QWidgetBase):
                 return ""
             return str(value)
         return ""
+
+    def _format_guardrail_text(self) -> str:
+        if not self._guardrail_state:
+            return ""
+        return f"Chunk Flow: {self._guardrail_state}"
 
     def _configure_tool_trace_widget(self) -> None:
         widget = self._tool_trace_widget

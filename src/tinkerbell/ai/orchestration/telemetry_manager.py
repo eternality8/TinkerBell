@@ -63,6 +63,16 @@ class TelemetryManager:
             retrieval_strategy=self._coerce_optional_str(context.get("retrieval_strategy")),
             retrieval_latency_ms=self._coerce_optional_float(context.get("retrieval_latency_ms")),
             retrieval_pointer_count=self._coerce_optional_int(context.get("retrieval_pointer_count")),
+            analysis_chunk_profile=self._coerce_optional_str(context.get("analysis_chunk_profile")),
+            analysis_required_tools=self._normalize_string_tuple(context.get("analysis_required_tools")),
+            analysis_optional_tools=self._normalize_string_tuple(context.get("analysis_optional_tools")),
+            analysis_must_refresh_outline=self._coerce_optional_bool(context.get("analysis_must_refresh_outline")),
+            analysis_plot_state_status=self._coerce_optional_str(context.get("analysis_plot_state_status")),
+            analysis_concordance_status=self._coerce_optional_str(context.get("analysis_concordance_status")),
+            analysis_warning_codes=self._normalize_string_tuple(context.get("analysis_warning_codes")),
+            analysis_cache_state=self._coerce_optional_str(context.get("analysis_cache_state")),
+            analysis_generated_at=self._coerce_optional_float(context.get("analysis_generated_at")),
+            analysis_rule_trace=self._normalize_string_tuple(context.get("analysis_rule_trace")),
         )
         try:
             self.sink.record(event)
@@ -91,11 +101,29 @@ class TelemetryManager:
 
     @staticmethod
     def _normalize_tool_names(tool_names: Any) -> tuple[str, ...]:
-        if isinstance(tool_names, set):
-            return tuple(sorted(tool_names))
-        if isinstance(tool_names, (list, tuple)):
-            return tuple(str(name) for name in tool_names)
-        return ()
+        return TelemetryManager._normalize_string_tuple(tool_names)
+
+    @staticmethod
+    def _normalize_string_tuple(value: Any) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, set):
+            items = sorted(value)
+        elif isinstance(value, (list, tuple)):
+            items = value
+        elif isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return ()
+            return (stripped,)
+        else:
+            return ()
+        normalized: list[str] = []
+        for item in items:
+            text = str(item).strip()
+            if text:
+                normalized.append(text)
+        return tuple(normalized)
 
     @staticmethod
     def _coerce_optional_int(value: Any) -> int | None:
@@ -121,3 +149,19 @@ class TelemetryManager:
             return None
         text = str(value).strip()
         return text or None
+
+    @staticmethod
+    def _coerce_optional_bool(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "y"}:
+                return True
+            if lowered in {"false", "0", "no", "n"}:
+                return False
+        return None

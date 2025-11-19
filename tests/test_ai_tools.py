@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 from contextlib import contextmanager
 from typing import Any, Mapping
 
 import pytest
 
+from tinkerbell.ai.memory.chunk_index import ChunkIndex
+from tinkerbell.ai.analysis.models import AnalysisAdvice
+from tinkerbell.ai.tools import document_apply_patch as document_apply_patch_module
+from tinkerbell.ai.tools import document_edit as document_edit_module
 from tinkerbell.ai.tools.registry import (
     ToolRegistrationError,
     ToolRegistryContext,
@@ -18,6 +23,7 @@ from tinkerbell.ai.tools.document_edit import DocumentEditTool
 from tinkerbell.ai.tools.document_snapshot import DocumentSnapshotTool
 from tinkerbell.ai.tools.list_tabs import ListTabsTool
 from tinkerbell.ai.tools.search_replace import SearchReplaceTool
+from tinkerbell.ai.tools.tool_usage_advisor import ToolUsageAdvisorTool
 from tinkerbell.ai.tools.validation import validate_snippet
 from tinkerbell.chat.commands import DIRECTIVE_SCHEMA
 from tinkerbell.editor.syntax import yaml_json
@@ -48,12 +54,43 @@ class _EditBridgeStub:
         delta_only: bool = False,
         tab_id: str | None = None,
         include_open_documents: bool = False,
+        window=None,
+        chunk_profile: str | None = None,
+        max_tokens: int | None = None,
+        include_text: bool = True,
     ):
         self.snapshot_requests.append(
-            {"delta_only": delta_only, "tab_id": tab_id, "include_open_documents": include_open_documents}
+            {
+                "delta_only": delta_only,
+                "tab_id": tab_id,
+                "include_open_documents": include_open_documents,
+                "window": window,
+                "chunk_profile": chunk_profile,
+                "max_tokens": max_tokens,
+                "include_text": include_text,
+            }
         )
         assert delta_only is False
-        return dict(self.snapshot)
+        snapshot = dict(self.snapshot)
+        text = snapshot.get("text", "")
+        doc_text = text if isinstance(text, str) else ""
+        doc_length = len(doc_text)
+        snapshot["length"] = doc_length
+        if isinstance(window, Mapping):
+            start = max(0, min(int(window.get("start", 0)), doc_length))
+            end = max(start, min(int(window.get("end", doc_length)), doc_length))
+            snapshot["window"] = {"start": start, "end": end}
+            snapshot["text_range"] = {"start": start, "end": end}
+            if include_text:
+                snapshot["text"] = doc_text[start:end]
+            else:
+                snapshot["text"] = ""
+        elif not include_text:
+            snapshot["text"] = ""
+        else:
+            snapshot.setdefault("window", {"start": 0, "end": doc_length})
+            snapshot.setdefault("text_range", {"start": 0, "end": doc_length})
+        return snapshot
 
     def get_last_diff_summary(self, tab_id: str | None = None) -> str | None:  # noqa: ARG002 - unused
         return self.last_diff_summary
@@ -81,6 +118,7 @@ class _SnapshotProviderStub:
         delta_only: bool = False,
         tab_id: str | None = None,
         include_open_documents: bool = False,
+        **_: Any,
     ):
         self.delta_only_calls.append(delta_only)
         return dict(self.snapshot)
@@ -124,6 +162,7 @@ class _ControllerStub:
     def __init__(self, *, fail_on: set[str] | None = None) -> None:
         self.fail_on = fail_on or set()
         self.registered: list[str] = []
+        self._chunk_index = ChunkIndex()
 
     def register_tool(self, name: str, tool: Any, **_: Any) -> None:
         if name in self.fail_on:
@@ -133,6 +172,17 @@ class _ControllerStub:
     @contextmanager
     def suspend_graph_rebuilds(self):
         yield
+
+    def ensure_chunk_index(self) -> ChunkIndex:
+        return self._chunk_index
+
+    def get_chunking_config(self) -> dict[str, Any]:
+        return {
+            "default_profile": "auto",
+            "overlap_chars": 256,
+            "max_inline_tokens": 1_800,
+            "iterator_limit": 4,
+        }
 
 
 def _registry_context(controller: _ControllerStub) -> ToolRegistryContext:
@@ -310,6 +360,96 @@ def test_document_edit_tool_auto_converts_replace_when_patch_only_enabled():
     assert "digest-42" in status
 
 
+def test_document_edit_tool_auto_convert_emits_anchor_success_event(monkeypatch: pytest.MonkeyPatch):
+    bridge = _PatchBridgeStub(text="Alpha BETA", selection=(0, 5), version="digest-edit-anchor")
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(document_edit_module, "telemetry_emit", _emit)
+
+    tool.run(action="replace", content="beta", target_range=(0, 5), match_text="BETA")
+
+    event = next((payload for name, payload in captured if name == "patch.anchor"), None)
+    assert event is not None
+    assert event["status"] == "success"
+    assert event["source"] == "document_edit.auto_patch"
+
+
+def test_document_edit_tool_auto_convert_emits_anchor_failure_event(monkeypatch: pytest.MonkeyPatch):
+    bridge = _PatchBridgeStub(text="Alpha beta", selection=(0, 5), version="digest-edit-anchor-fail")
+    bridge.snapshot["selection_text"] = "Alpha"
+    bridge.snapshot["selection_hash"] = hashlib.sha1(b"Alpha").hexdigest()
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(document_edit_module, "telemetry_emit", _emit)
+
+    with pytest.raises(ValueError):
+        tool.run(
+            action="replace",
+            content="ALPHA",
+            target_range=(0, 5),
+            selection_fingerprint="deadbeef",
+        )
+
+    event = next((payload for name, payload in captured if name == "patch.anchor"), None)
+    assert event is not None
+    assert event["status"] == "reject"
+    assert event["phase"] == "alignment"
+
+
+def test_document_edit_tool_requires_range_or_anchor_for_replace_when_selection_unknown():
+    bridge = _PatchBridgeStub(text="Hello world", selection=(0, 0), version="digest-43")
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+
+    with pytest.raises(ValueError, match="target_range or match_text"):
+        tool.run(action="replace", content="Hi there")
+
+
+def test_document_edit_tool_realigns_with_match_text_during_auto_convert():
+    bridge = _PatchBridgeStub(text="Alpha BETA Gamma", selection=(0, 5), version="digest-44")
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+
+    status = tool.run(action="replace", content="beta", target_range=(0, 5), match_text="BETA")
+
+    assert "digest-44" in status
+    payload = bridge.calls[-1]
+    ranges = payload["ranges"]
+    assert ranges[0]["start"] == 6
+    assert ranges[0]["match_text"] == "BETA"
+
+
+def test_document_edit_tool_rejects_selection_fingerprint_mismatch():
+    bridge = _PatchBridgeStub(text="Alpha beta", selection=(0, 5), version="digest-45")
+    bridge.snapshot["selection_text"] = "Alpha"
+    bridge.snapshot["selection_hash"] = hashlib.sha1(b"Alpha").hexdigest()
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+
+    with pytest.raises(ValueError, match="selection_fingerprint"):
+        tool.run(
+            action="replace",
+            content="ALPHA",
+            target_range=(0, 5),
+            selection_fingerprint="mismatch",
+        )
+
+
+def test_document_edit_tool_blocks_caret_replace_without_insert_action():
+    bridge = _PatchBridgeStub(text="Hello world", selection=(5, 5), version="digest-46")
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+
+    with pytest.raises(ValueError, match="Caret inserts"):
+        tool.run(action="replace", content="X", target_range=(5, 5))
+
+
 def test_document_edit_tool_allows_patches_when_patch_only_enabled():
     bridge = _EditBridgeStub()
     bridge.last_diff_summary = "patch"
@@ -366,12 +506,54 @@ def test_document_apply_patch_tool_skips_noop_edits():
     assert bridge.calls == []
 
 
+def test_document_apply_patch_tool_emits_anchor_success_event(monkeypatch: pytest.MonkeyPatch):
+    bridge = _PatchBridgeStub(text="Alpha beta", selection=(0, 5), version="digest-anchor")
+    edit_tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(document_apply_patch_module, "telemetry_emit", _emit)
+
+    tool.run(content="ALPHA", target_range=(0, 5), match_text="Alpha")
+
+    event = next((payload for name, payload in captured if name == "patch.anchor"), None)
+    assert event is not None
+    assert event["status"] == "success"
+    assert event["source"] == "document_apply_patch"
+    assert event["anchor_source"] == "match_text"
+
+
+def test_document_apply_patch_tool_emits_anchor_failure_event(monkeypatch: pytest.MonkeyPatch):
+    bridge = _PatchBridgeStub(text="Alpha beta", selection=(0, 0), version="digest-anchor-fail")
+    edit_tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(document_apply_patch_module, "telemetry_emit", _emit)
+
+    with pytest.raises(ValueError):
+        tool.run(content="ALPHA")
+
+    event = next((payload for name, payload in captured if name == "patch.anchor"), None)
+    assert event is not None
+    assert event["status"] == "reject"
+    assert event["phase"] == "requirements"
+
+
 def test_document_apply_patch_tool_handles_missing_rationale():
     bridge = _PatchBridgeStub(text="", selection=(0, 0), version="digest-9")
     edit_tool = DocumentEditTool(bridge=bridge)
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
-    status = tool.run(content="Hello world")
+    status = tool.run(content="Hello world", target_range=(0, 0))
 
     assert bridge.calls and bridge.calls[-1]["action"] == "patch"
     assert "digest-9" in status
@@ -384,7 +566,13 @@ def test_register_default_tools_succeeds_when_controller_accepts_all():
     register_default_tools(context)
 
     registered = set(controller.registered)
-    assert {"document_snapshot", "document_edit", "document_apply_patch", "list_tabs"}.issubset(registered)
+    assert {
+        "document_snapshot",
+        "document_chunk",
+        "document_edit",
+        "document_apply_patch",
+        "list_tabs",
+    }.issubset(registered)
 
 
 def test_register_default_tools_aggregates_failures_without_stopping_others():
@@ -448,6 +636,20 @@ def test_document_snapshot_tool_attaches_outline_digest_when_resolver_present():
 
     assert snapshot["outline_digest"] == "outline-hash"
     assert calls == ["doc-stub"]
+
+
+def test_tool_usage_advisor_tool_returns_serialized_advice():
+    captured: dict[str, object] = {}
+
+    def _advisor(**kwargs):
+        captured.update(kwargs)
+        return AnalysisAdvice(document_id="doc-1", document_version="v1", required_tools=("document_chunk",))
+
+    tool = ToolUsageAdvisorTool(_advisor)
+    response = tool.run(document_id="doc-1", selection_start=5, selection_end=25, force_refresh=True)
+    assert response["status"] == "ok"
+    assert response["advice"]["document_id"] == "doc-1"
+    assert captured["force_refresh"] is True
 
 
 def test_document_snapshot_tool_uses_tab_identifier_when_document_id_missing():

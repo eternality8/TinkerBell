@@ -134,7 +134,7 @@ class SettingsRuntime:
         try:
             limit = self._resolve_max_tool_iterations(settings)
             policy = self._build_context_budget_policy(settings)
-            return AIController(
+            controller = AIController(
                 client=client,
                 max_tool_iterations=limit,
                 max_context_tokens=getattr(settings, "max_context_tokens", 128_000),
@@ -142,6 +142,13 @@ class SettingsRuntime:
                 budget_policy=policy,
                 subagent_config=self._build_subagent_runtime_config(settings),
             )
+            controller.configure_chunking(
+                default_profile=getattr(settings, "chunk_profile", "auto"),
+                overlap_chars=getattr(settings, "chunk_overlap_chars", 256),
+                max_inline_tokens=getattr(settings, "chunk_max_inline_tokens", 1_800),
+                iterator_limit=getattr(settings, "chunk_iterator_limit", 4),
+            )
+            return controller
         except Exception as exc:
             _LOGGER.warning("Failed to initialize AI controller: %s", exc)
             return None
@@ -212,6 +219,7 @@ class SettingsRuntime:
             self._apply_context_window_settings(controller, settings)
             self._apply_context_policy_settings(controller, settings)
             self._apply_subagent_runtime_config(controller, settings)
+            self._apply_chunking_settings(controller, settings)
 
         self._update_ai_debug_logging(bool(getattr(settings, "debug_logging", False)))
 
@@ -311,6 +319,20 @@ class SettingsRuntime:
             configurator(config)
         except Exception as exc:  # pragma: no cover - defensive guard
             _LOGGER.debug("Unable to update subagent runtime config: %s", exc)
+
+    def _apply_chunking_settings(self, controller: Any, settings: Settings) -> None:
+        configurator = getattr(controller, "configure_chunking", None)
+        if not callable(configurator):
+            return
+        try:
+            configurator(
+                default_profile=getattr(settings, "chunk_profile", "auto"),
+                overlap_chars=getattr(settings, "chunk_overlap_chars", 256),
+                max_inline_tokens=getattr(settings, "chunk_max_inline_tokens", 1_800),
+                iterator_limit=getattr(settings, "chunk_iterator_limit", 4),
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to update chunking settings: %s", exc)
 
     def _disable_ai_controller(self) -> None:
         controller = self._context.ai_controller

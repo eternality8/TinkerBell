@@ -1,6 +1,6 @@
-# AI v2 Phase 4 release notes
+# AI v2 Phase 4–5 release notes
 
-_Last updated: 17 Nov 2025_
+_Last updated: 19 Nov 2025_
 
 ## Highlights
 
@@ -8,6 +8,8 @@ _Last updated: 17 Nov 2025_
 - **Subagent result cache (Phase 4.2)** – Deterministic keying, cache-bus eviction, and telemetry surfaced through the diagnostics sink.
 - **Character & plot scaffolding (Phase 4.3)** – Document-scoped entity memory (`DocumentPlotStateTool` + operator guide) gated behind the experimental plot toggle.
 - **Integration, telemetry, hardening (Phase 4.4)** – Sequential multi-job smoke tests, cache-hit telemetry, TraceCompactor coverage for helper summaries, and a repeatable latency benchmark (`benchmarks/subagent_latency.md`).
+- **Storyline continuity orchestration (Phase 5.1)** – `PlotStateMemory`, `PlotOutlineTool`, and `PlotStateUpdateTool` now enforce the “outline → edit → update” loop with guardrail hints, persistence for operator overrides, and `plot_state.*` telemetry.
+- **Preflight analysis & tool recommendations (Phase 5.2)** – Rule-based analyzer feeds proactive tool hints into the controller, status bar/chat badges, manual `/analyze`, ContextUsage exports, and telemetry (`analysis.advisor_tool.*`, `analysis.ui_override.*`).
 
 ## Feature flags
 
@@ -18,7 +20,7 @@ Both the subagent sandbox and plot scaffolding remain **off by default**. Enable
 | Settings UI → AI → “Enable experimental subagents” | Persists to the profile config file. |
 | Environment: `TINKERBELL_ENABLE_SUBAGENTS=1` | Forces subagents on for the current session. |
 | CLI: `tinkerbell.exe --enable-subagents` | Useful for portable builds and CI. |
-| Plot scaffolding: `TINKERBELL_ENABLE_PLOT_SCAFFOLDING=1` or `--enable-plot-scaffolding` | Enables the entity/plot store, guardrailed tools, and operator hints. |
+| Plot scaffolding: `TINKERBELL_ENABLE_PLOT_SCAFFOLDING=1` or `--enable-plot-scaffolding` | Enables the entity/plot store, guardrailed tools, and (as of Phase 5) the PlotStateMemory + enforced edit loop. |
 
 If the flags are left off, the runtime behaves identically to Phase 3.
 
@@ -31,6 +33,26 @@ If the flags are left off, the runtime behaves identically to Phase 3.
 | Tests | New coverage under `tests/test_subagent_manager.py` (sequential execution and budget enforcement) plus `tests/test_agent.py::test_ai_controller_registers_subagent_messages_in_trace_compactor`. Plot-state tooling already covered in `tests/test_plot_state.py` and `tests/test_document_plot_state_tool.py`. |
 | Benchmarks | `benchmarks/measure_subagent_latency.py` plus the accompanying write-up (`benchmarks/subagent_latency.md`) quantify orchestration overhead before engaging real models. |
 | Docs | README quickstart, `docs/ai_v2.md` Phase 4 notes, operator runbook, and this release-note all reference the new toggles and telemetry behaviors. |
+
+## Phase 5.1 additions – Storyline continuity orchestration
+
+| Area | Details |
+| --- | --- |
+| PlotStateMemory | `PlotStateMemory` supersedes the transient plot store with dependency tracking, version metadata, and operator overrides persisted to `~/.tinkerbell/plot_overrides.json`. Cache-bus events still wipe stale documents automatically. |
+| Tools | `PlotOutlineTool` (alias `DocumentPlotStateTool`) now surfaces overrides/dependencies, while `PlotStateUpdateTool` lets agents log manual adjustments. Both register through `ui.tools.provider`/`ai.tools.registry` and emit telemetry. |
+| Controller guardrail | `_PlotLoopTracker` blocks `document_edit`/`document_apply_patch` until an outline tool runs, then reminds the agent to call `plot_state_update` after each edit. Tool traces label `plot_loop_blocked` runs so operators can spot violations immediately. |
+| Telemetry | `plot_state.read` and `plot_state.write` events include `document_id`, entity/arc counts, override totals, and persistence status for dashboards. |
+| Tests & docs | `tests/test_plot_state.py`, `tests/test_document_plot_state_tool.py`, `tests/test_tool_provider.py`, and new `tests/test_agent.py` guardrail cases cover the memory and enforcement flow. `docs/ai_v2.md` documents the new workflow and telemetry fields. |
+
+## Phase 5.2 additions – Preflight analysis & tool recommendations
+
+| Area | Details |
+| --- | --- |
+| Analyzer | `tinkerbell.ai.analysis.AnalysisAgent` consumes controller snapshots (chunk manifest hints, outline/plot/concordance freshness, chunk-flow flags) and emits `AnalysisAdvice` (chunk profile, required/optional tools, outline refresh flag, warnings, rule traces). Advice is cached with a TTL and invalidated automatically whenever the document bus publishes `DocumentChangedEvent`/`DocumentClosedEvent`. |
+| UI & commands | The status bar now shows a **Preflight** badge, the chat panel mirrors it with hover detail, and `/analyze` lets operators rerun the analyzer with optional document/selection overrides plus a `--reason` note. Successful runs post a formatted notice back into chat and refresh the UI badges. |
+| Tooling | `ToolUsageAdvisorTool` exposes `_advisor_tool_entrypoint()` to the agent graph so LangGraph flows can request advice mid-turn. Controller telemetry records every tool invocation via `analysis.advisor_tool.invoked`. |
+| Telemetry & exports | Manual overrides emit `analysis.ui_override.requested/completed/failed` (document/selection info, force-refresh flag, cache state, tool lists, warning codes). ContextUsage exports now include analysis columns (chunk profile, required/optional tools, warnings, cache state, rule trace timestamps) so dashboards can track analyzer coverage. |
+| Tests & docs | `tests/test_agent.py` asserts cache invalidation and telemetry emission, while `docs/ai_v2.md` documents the end-to-end workflow plus the new telemetry events. Release notes (this section) highlight the operator workflow so support can reference it quickly. |
 
 ## Validation matrix
 

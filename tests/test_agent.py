@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
-from typing import Any, AsyncIterator, Iterable, List, cast
+from typing import Any, AsyncIterator, Iterable, List, Mapping, Sequence, cast
 
 import pytest
 
 import tinkerbell.ai.orchestration.controller as orchestration_controller
 from tinkerbell.ai.orchestration import AIController
+from tinkerbell.ai.analysis import AnalysisAdvice
 from tinkerbell.ai.ai_types import (
     ChunkReference,
     SubagentBudget,
@@ -22,7 +23,11 @@ from tinkerbell.ai.ai_types import (
 from tinkerbell.ai.client import AIClient, AIStreamEvent
 from tinkerbell.ai.services.context_policy import BudgetDecision, ContextBudgetPolicy
 from tinkerbell.ai import prompts
+from tinkerbell.ai.tools.document_chunk import DocumentChunkTool
+from tinkerbell.ai.tools.tool_usage_advisor import ToolUsageAdvisorTool
+from tinkerbell.ai.memory.cache_bus import DocumentChangedEvent
 from tinkerbell.services.settings import ContextPolicySettings
+from tinkerbell.services import telemetry
 
 
 class _StubClient:
@@ -92,6 +97,82 @@ class _StubBudgetPolicy:
         return {"verdict": verdict}
 
 
+class _ChunkBridgeStub:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def generate_snapshot(  # type: ignore[override]
+        self,
+        *,
+        delta_only: bool = False,
+        tab_id: str | None = None,
+        include_open_documents: bool = False,
+        window: Mapping[str, Any] | None = None,
+        **_: Any,
+    ) -> Mapping[str, Any]:
+        del delta_only, tab_id, include_open_documents
+        start = 0
+        end = len(self.text)
+        if isinstance(window, Mapping):
+            start = int(window.get("start", start))
+            end = int(window.get("end", end))
+        start = max(0, min(start, len(self.text)))
+        end = max(start, min(end, len(self.text)))
+        return {"text": self.text[start:end]}
+
+    def get_last_diff_summary(self, tab_id: str | None = None) -> str | None:  # noqa: ARG002 - unused
+        return None
+
+    def get_last_snapshot_version(self, tab_id: str | None = None) -> str | None:  # noqa: ARG002 - unused
+        return None
+
+
+def _build_chunk_manifest(
+    document_id: str,
+    spans: Sequence[tuple[int, int]],
+    *,
+    cache_key: str = "chunk-cache",
+) -> dict[str, Any]:
+    if not spans:
+        raise ValueError("spans are required")
+    chunk_entries: list[dict[str, Any]] = []
+    for idx, (start, end) in enumerate(spans):
+        chunk_entries.append(
+            {
+                "id": f"chunk:{document_id}:{start}:{end}",
+                "start": start,
+                "end": end,
+                "length": end - start,
+                "hash": f"hash-{idx}",
+                "selection_overlap": True,
+                "outline_pointer_id": f"outline:{document_id}:{idx}",
+            }
+        )
+    window_start = spans[0][0]
+    window_end = spans[-1][1]
+    chunk_chars = max(end - start for start, end in spans)
+    return {
+        "document_id": document_id,
+        "chunk_profile": "auto",
+        "chunk_chars": chunk_chars,
+        "chunk_overlap": 256,
+        "window": {
+            "start": window_start,
+            "end": window_end,
+            "length": window_end - window_start,
+            "selection": {
+                "start": window_start,
+                "end": min(window_end, window_start + 1),
+            },
+        },
+        "chunks": chunk_entries,
+        "cache_key": cache_key,
+        "version": f"{document_id}:1:hash",
+        "content_hash": "hash",
+        "generated_at": 1.0,
+    }
+
+
 def test_ai_controller_collects_streamed_response(sample_snapshot):
     stub_client = _StubClient(
         [
@@ -121,6 +202,90 @@ def test_ai_controller_collects_streamed_response(sample_snapshot):
     ]
     assert graph["tools"] == []
     assert stub_client.calls[0]["metadata"] == {"tab": "notes"}
+
+
+def test_preflight_analysis_hint_injected_when_document_known(sample_snapshot):
+    stub_client = _StubClient(
+        [
+            [
+                AIStreamEvent(type="content.delta", content="Analysis"),
+                AIStreamEvent(type="content.done", content=" complete"),
+            ]
+        ]
+    )
+    controller = AIController(client=cast(AIClient, stub_client))
+    snapshot = dict(sample_snapshot)
+    snapshot.update(
+        {
+            "document_id": "doc-analysis",
+            "version": "v1",
+            "length": 75_000,
+            "outline_age_seconds": 1_200,
+        }
+    )
+
+    async def run() -> dict:
+        return await controller.run_chat("hello", snapshot, metadata=None)
+
+    asyncio.run(run())
+    messages = stub_client.calls[0]["messages"]
+    assert any(
+        message["role"] == "system" and "Preflight analysis summary" in message["content"]
+        for message in messages
+    )
+
+
+def test_analysis_cache_invalidation_on_document_change():
+    stub_client = _StubClient([[]])
+    controller = AIController(client=cast(AIClient, stub_client))
+    controller._analysis_advice_cache["doc"] = AnalysisAdvice(document_id="doc", document_version="v1")
+    controller._latest_snapshot_cache["doc"] = {"document_id": "doc"}
+
+    class _FakeAgent:
+        def __init__(self) -> None:
+            self.invalidated: list[str] = []
+
+        def invalidate_document(self, document_id: str) -> None:
+            self.invalidated.append(document_id)
+
+    fake_agent = _FakeAgent()
+    controller._analysis_agent = fake_agent  # type: ignore[assignment]
+
+    controller._handle_document_cache_event(
+        DocumentChangedEvent(document_id="doc", version_id=1, content_hash="hash")
+    )
+
+    assert "doc" not in controller._analysis_advice_cache
+    assert "doc" not in controller._latest_snapshot_cache
+    assert fake_agent.invalidated == ["doc"]
+
+
+def test_tool_usage_advisor_emits_telemetry(sample_snapshot):
+    captured: list[dict[str, object]] = []
+
+    def listener(payload: dict[str, object]) -> None:
+        captured.append(payload)
+
+    telemetry.register_event_listener("analysis.advisor_tool.invoked", listener)
+    try:
+        stub_client = _StubClient([[]])
+        controller = AIController(client=cast(AIClient, stub_client))
+        snapshot = dict(sample_snapshot)
+        snapshot.update({"document_id": "doc-telemetry", "version": "v1"})
+        tool = ToolUsageAdvisorTool(controller._advisor_tool_entrypoint)
+        result = tool.run(snapshot=snapshot, force_refresh=True, reason="manual test")
+
+        assert result["status"] == "ok"
+        assert captured, "Telemetry listener did not receive advisor invocation event"
+        event = captured[-1]
+        assert event["event"] == "analysis.advisor_tool.invoked"
+        assert event["document_id"] == "doc-telemetry"
+        assert event["force_refresh"] is True
+        assert event["reason"] == "manual test"
+    finally:
+        listeners = telemetry._EVENT_LISTENERS.get("analysis.advisor_tool.invoked", [])
+        if listener in listeners:
+            listeners.remove(listener)
 
 
 def test_ai_controller_updates_max_tool_iterations():
@@ -322,6 +487,119 @@ def test_ai_controller_registers_subagent_messages_in_trace_compactor(sample_sna
     assert compactor is not None
     ledger = compactor.ledger_snapshot()
     assert any(entry.record.get("pointer_kind") == "subagent_summary" for entry in ledger)
+
+
+def test_ai_controller_updates_character_map_store() -> None:
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="ok")])
+    runtime_config = SubagentRuntimeConfig(enabled=True, plot_scaffolding_enabled=True)
+    controller = AIController(client=cast(AIClient, stub_client), subagent_config=runtime_config)
+
+    chunk = ChunkReference(
+        document_id="doc-concordance",
+        chunk_id="selection:0-20",
+        version_id="v1",
+        pointer_id="outline:doc-concordance",
+        char_range=(0, 20),
+        token_estimate=120,
+        chunk_hash="chunk-concordance",
+        preview="Example text",
+    )
+    job = SubagentJob(
+        job_id="job-concordance",
+        parent_run_id="run-concordance",
+        instructions="Analyze",
+        chunk_ref=chunk,
+        allowed_tools=(),
+        budget=SubagentBudget(max_prompt_tokens=400, max_completion_tokens=200, max_runtime_seconds=15.0),
+    )
+    job.state = SubagentJobState.SUCCEEDED
+    job.result = SubagentJobResult(
+        status="ok",
+        summary="Lena meets Ezra near the harbor.",
+        tokens_used=10,
+        latency_ms=2.5,
+    )
+
+    hint = controller._maybe_update_character_map({"document_id": "doc-concordance"}, [job])
+
+    assert hint is not None
+    assert "Character concordance" in hint
+    store = controller.character_map_store
+    assert store is not None
+    snapshot = store.snapshot("doc-concordance")
+    assert snapshot is not None
+    assert snapshot["entity_count"] >= 1
+    mention = snapshot["entities"][0]["mentions"][0]
+    assert mention["chunk_id"] == "selection:0-20"
+
+
+def test_ai_controller_ingests_chunk_manifest_on_run():
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="ok")])
+    controller = AIController(client=cast(AIClient, stub_client))
+
+    manifest = _build_chunk_manifest("doc-ingest", [(0, 32)])
+    snapshot = {
+        "document_id": "doc-ingest",
+        "text": "Hello world",
+        "selection": {"start": 0, "end": 5},
+        "length": 32,
+        "chunk_manifest": manifest,
+    }
+
+    async def run() -> dict:
+        return await controller.run_chat("ingest", snapshot)
+
+    asyncio.run(run())
+
+    index = controller.ensure_chunk_index()
+    chunk_id = manifest["chunks"][0]["id"]
+    entry = index.get_chunk(chunk_id, document_id="doc-ingest", cache_key=manifest["cache_key"])
+    assert entry is not None
+    assert entry.chunk_id == chunk_id
+
+
+def test_subagent_jobs_use_chunk_manifest_outside_window():
+    stub_client = _StubClient([AIStreamEvent(type="content.done", content="ok")])
+    runtime_config = SubagentRuntimeConfig(enabled=True, selection_min_chars=10, chunk_preview_chars=32)
+    controller = AIController(client=cast(AIClient, stub_client), subagent_config=runtime_config)
+    controller.configure_subagents(runtime_config)
+
+    doc_text = ("abcdefghijklmnopqrstuvwxyz" * 3)[:78]
+    manifest = _build_chunk_manifest("doc-chunk", [(0, 24), (24, 56), (56, len(doc_text))], cache_key="chunk-cache")
+    chunk_index = controller.ensure_chunk_index()
+    chunk_index.ingest_manifest(manifest)
+    bridge = _ChunkBridgeStub(doc_text)
+    chunk_tool = DocumentChunkTool(
+        bridge=bridge,
+        chunk_index=chunk_index,
+        chunk_config_resolver=controller.get_chunking_config,
+    )
+    controller.register_tool(
+        "document_chunk",
+        chunk_tool,
+        description="Chunk fetcher",
+        parameters={"type": "object", "properties": {"chunk_id": {"type": "string"}}},
+    )
+
+    snapshot = {
+        "document_id": "doc-chunk",
+        "text": doc_text[:16],
+        "text_range": {"start": 0, "end": 16},
+        "selection": {"start": 30, "end": 50},
+        "length": len(doc_text),
+        "chunk_manifest": manifest,
+    }
+    controller._ingest_snapshot_manifest(snapshot)
+
+    jobs = controller._plan_subagent_jobs("analyze", snapshot, {"run_id": "run-chunk"})
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job.chunk_ref.document_id == "doc-chunk"
+    assert job.chunk_ref.chunk_id == "chunk:doc-chunk:24:56"
+    assert job.chunk_ref.char_range == (24, 56)
+    assert job.chunk_ref.pointer_id == "outline:doc-chunk:1"
+    assert job.dedup_hash == "hash-1"
+    assert job.chunk_ref.preview.startswith(doc_text[24:56][: runtime_config.chunk_preview_chars].strip())
 
 
 def test_ai_controller_executes_tool_and_continues(sample_snapshot):
@@ -996,6 +1274,138 @@ def test_ai_controller_prompts_until_document_edit_runs(sample_snapshot):
     reminder_payload = stub_client.calls[2]
     assert reminder_payload["messages"][-1]["role"] == "system"
     assert "document_edit" in reminder_payload["messages"][-1]["content"]
+
+
+def _build_tool_call_event(name: str, arguments: Mapping[str, Any]) -> AIStreamEvent:
+    return AIStreamEvent(
+        type="tool_calls.function.arguments.done",
+        tool_name=name,
+        tool_index=0,
+        tool_arguments=json.dumps(arguments, ensure_ascii=False),
+        parsed=dict(arguments),
+    )
+
+
+def test_plot_loop_blocks_edit_without_outline(sample_snapshot):
+    edit_turn = [_build_tool_call_event("document_edit", {"action": "insert", "position": 0, "content": "Plot move"})]
+    final_turn = [AIStreamEvent(type="content.done", content="Returning summary")]  # Model stops after guardrail reminder
+    stub_client = _StubClient([edit_turn, final_turn])
+    config = SubagentRuntimeConfig(enabled=False, plot_scaffolding_enabled=True)
+    controller = AIController(client=cast(AIClient, stub_client), subagent_config=config)
+
+    edit_calls: list[dict[str, Any]] = []
+
+    class _EditTool:
+        def run(self, action: str, position: int, content: str) -> dict[str, Any]:
+            edit_calls.append({"action": action, "position": position, "content": content})
+            return {"status": "ok"}
+
+    controller.register_tool("document_edit", _EditTool())
+
+    snapshot = dict(sample_snapshot)
+    snapshot["document_id"] = "doc-plot-block"
+
+    result = asyncio.run(controller.run_chat("draft scene", snapshot))
+
+    assert edit_calls == []
+    assert result["tool_calls"][0]["name"] == "document_edit"
+    assert "Plot loop guardrail" in result["tool_calls"][0]["result"]
+
+
+def test_plot_loop_respects_flag_disabled(sample_snapshot):
+    edit_turn = [_build_tool_call_event("document_edit", {"action": "insert", "position": 0, "content": "Flag off"})]
+    final_turn = [AIStreamEvent(type="content.done", content="Applied")]
+    stub_client = _StubClient([edit_turn, final_turn])
+    config = SubagentRuntimeConfig(enabled=False, plot_scaffolding_enabled=False)
+    controller = AIController(client=cast(AIClient, stub_client), subagent_config=config)
+
+    edit_calls: list[dict[str, Any]] = []
+
+    class _EditTool:
+        def run(self, action: str, position: int, content: str) -> dict[str, Any]:
+            edit_calls.append({"action": action, "position": position, "content": content})
+            return {"status": "ok"}
+
+    controller.register_tool("document_edit", _EditTool())
+
+    snapshot = dict(sample_snapshot)
+    snapshot["document_id"] = "doc-plot-off"
+
+    result = asyncio.run(controller.run_chat("draft scene", snapshot))
+
+    assert len(edit_calls) == 1
+    assert result["tool_calls"][0]["status"] == "ok"
+
+
+def test_plot_loop_allows_edit_after_outline_and_requires_update(sample_snapshot):
+    outline_turn = [_build_tool_call_event("plot_outline", {})]
+    edit_turn = [_build_tool_call_event("document_edit", {"action": "insert", "position": 0, "content": "Keep arcs aligned"})]
+    update_turn = [
+        _build_tool_call_event(
+            "plot_state_update",
+            {
+                "overrides": [
+                    {
+                        "override_id": "manual",
+                        "summary": "Recorded manual adjustment",
+                    }
+                ]
+            },
+        )
+    ]
+    final_turn = [AIStreamEvent(type="content.done", content="All synced")]
+    stub_client = _StubClient([outline_turn, edit_turn, update_turn, final_turn])
+    config = SubagentRuntimeConfig(enabled=False, plot_scaffolding_enabled=True)
+    controller = AIController(client=cast(AIClient, stub_client), subagent_config=config)
+
+    outline_calls: list[dict[str, Any]] = []
+    edit_calls: list[dict[str, Any]] = []
+    update_calls: list[dict[str, Any]] = []
+
+    class _OutlineTool:
+        def run(self) -> dict[str, Any]:
+            outline_calls.append({"status": "ok"})
+            return {"status": "ok", "document_id": "doc-plot"}
+
+    class _EditTool:
+        def run(self, action: str, position: int, content: str) -> dict[str, Any]:
+            edit_calls.append({"action": action, "position": position, "content": content})
+            return {"status": "ok"}
+
+    class _UpdateTool:
+        def run(self, overrides: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+            update_calls.append({"overrides": overrides or []})
+            return {"status": "ok"}
+
+    controller.register_tools(
+        {
+            "plot_outline": _OutlineTool(),
+            "document_edit": _EditTool(),
+            "plot_state_update": _UpdateTool(),
+        }
+    )
+
+    snapshot = dict(sample_snapshot)
+    snapshot["document_id"] = "doc-plot"
+
+    result = asyncio.run(controller.run_chat("keep plot aligned", snapshot))
+
+    assert len(outline_calls) == 1
+    assert len(edit_calls) == 1
+    assert len(update_calls) == 1
+
+    recorded_names = [entry["name"] for entry in result["tool_calls"][:3]]
+    assert recorded_names == ["plot_outline", "document_edit", "plot_state_update"]
+
+    reminder_messages = [
+        entry
+        for entry in stub_client.calls[2]["messages"]
+        if entry.get("role") == "system" and "PlotStateUpdateTool" in str(entry.get("content", ""))
+    ]
+    assert reminder_messages
+
+    update_trace = [entry for entry in result["tool_calls"] if entry["name"] == "plot_state_update"]
+    assert update_trace and json.loads(update_trace[0]["result"])["status"] == "ok"
 
 
 def test_ai_controller_compacts_tool_output_with_pointer(sample_snapshot):

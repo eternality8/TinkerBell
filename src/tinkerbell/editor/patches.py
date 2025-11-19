@@ -49,6 +49,16 @@ class PatchResult:
 
 
 @dataclass(slots=True)
+class RangePatch:
+    """Structured replacement descriptor for streamed multi-range patches."""
+
+    start: int
+    end: int
+    replacement: str
+    match_text: str
+
+
+@dataclass(slots=True)
 class _HunkLine:
     op: str
     text: str
@@ -121,6 +131,43 @@ def apply_unified_diff(original_text: str, diff: str) -> PatchResult:
     spans = _compute_spans(original_text, patched_text)
     summary = _summarize_patch(original_text, patched_text)
     return PatchResult(text=patched_text, spans=spans, summary=summary)
+
+
+def apply_streamed_ranges(original_text: str, ranges: Sequence[RangePatch]) -> PatchResult:
+    """Apply range-based replacements without constructing a unified diff."""
+
+    if not ranges:
+        raise PatchApplyError("Range patches require at least one entry", reason="empty_range_patch")
+
+    normalized = tuple(sorted(ranges, key=lambda item: (item.start, item.end)))
+    _ensure_non_overlapping(normalized)
+
+    updated_text = original_text
+    for entry in reversed(normalized):
+        start = max(0, entry.start)
+        end = max(0, entry.end)
+        if end < start:
+            start, end = end, start
+        if end > len(updated_text):
+            raise PatchApplyError(
+                "Patch range exceeds document length",
+                reason="range_overflow",
+                expected=entry.match_text,
+                actual=None,
+            )
+        current_slice = updated_text[start:end]
+        if current_slice != entry.match_text:
+            raise PatchApplyError(
+                "Streamed patch range content mismatch",
+                reason="range_mismatch",
+                expected=entry.match_text,
+                actual=current_slice,
+            )
+        updated_text = updated_text[:start] + entry.replacement + updated_text[end:]
+
+    spans = _compute_spans(original_text, updated_text)
+    summary = _summarize_patch(original_text, updated_text)
+    return PatchResult(text=updated_text, spans=spans, summary=summary)
 
 
 def _assert_line_matches(entry: _HunkLine, lines: Sequence[str], index: int, header: str) -> None:
@@ -329,8 +376,22 @@ def _parse_hunk(lines: Sequence[str], start_index: int) -> tuple[_Hunk, int, boo
     return hunk, index, trailing_newline_hint
 
 
+def _ensure_non_overlapping(ranges: Sequence[RangePatch]) -> None:
+    previous_end = -1
+    for entry in ranges:
+        start = max(0, entry.start)
+        end = max(0, entry.end)
+        if end < start:
+            start, end = end, start
+        if start < previous_end:
+            raise PatchApplyError("Range patches may not overlap", reason="range_overlap")
+        previous_end = max(previous_end, end)
+
+
 __all__ = [
     "PatchApplyError",
     "PatchResult",
     "apply_unified_diff",
+    "apply_streamed_ranges",
+    "RangePatch",
 ]

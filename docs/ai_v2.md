@@ -25,9 +25,6 @@ Phase 3 layers guardrail-aware outline/retrieval tooling on top of the Phase 0
 | File | Purpose | Suggested prompt |
 | --- | --- | --- |
 | `stacked_outline_demo.md` | Deeply nested headings for outline/retrieval smoke tests. | “Summarize the Control Plane goals and cite pointer IDs.” |
-| `guardrail_scenarios.md` | Step-by-step guardrail reproductions referencing other large fixtures. | “Walk me through the pending outline scenario.” |
-| `firmware_dump.bin` | Tiny binary placeholder that forces `status="unsupported_format"`. | “Generate an outline for this firmware dump.” |
-
 Open a sample, ask the agent to outline or retrieve, and observe the tool payload plus guardrail hint that follows. The existing megabyte-scale fixtures (`5MB.json`, `War and Peace.txt`, `1MB.json`) remain useful for large-document depth limiting and pending rebuild tests.
 
 ### Guardrail & troubleshooting matrix
@@ -35,8 +32,6 @@ Open a sample, ask the agent to outline or retrieve, and observe the tool payloa
 | Tool status / hint | What it means | Next step |
 | --- | --- | --- |
 | `guardrails[].type = "huge_document"`, `trimmed_reason = token_budget` | Outline capped depth/size. | Work pointer-by-pointer (DocumentFindSectionsTool + DocumentSnapshot) and mention the guardrail in your reasoning. |
-| `status = "pending"`, `retry_after_ms` present | Worker is rebuilding the outline after rapid edits. | Wait the suggested delay or keep working off DocumentSnapshot until the rebuild completes. |
-| `status = "unsupported_format"` / `reason = binary_*` | File detected as binary/unsupported (e.g., `.bin`). | Convert to Markdown/YAML/JSON/plain text or skip the tool entirely. |
 | `status = "offline_fallback"`, `offline_mode = true` | Embedding provider is offline, retrieval switched to heuristics. | Treat previews as hints, rehydrate via DocumentSnapshot before editing, and restore connectivity/backend when possible. |
 | `is_stale = true` | Cached outline digest no longer matches the current document version. | Trigger a rebuild (wait or poke the worker) and avoid committing edits that rely solely on stale headings. |
 
@@ -48,35 +43,64 @@ Phase 4.3 adds an opt-in memory layer that captures lightweight character/entit
 
 ### Components
 
-- **`DocumentPlotStateStore`** (`tinkerbell.ai.memory.plot_state`) keeps an in-memory map of `{document_id → DocumentPlotState}` with capped entity/beat counts (24 each by default). It subscribes to the shared cache bus so edits/closed tabs purge stale entries immediately. Entities are detected via conservative proper-noun heuristics; beats are appended to a primary arc along with metadata (chunk hash, pointer ID, timing).
-- **Controller ingestion** – When `SubagentRuntimeConfig.plot_scaffolding_enabled` is true the `AIController` instantiates the store, and every successful subagent job calls `store.ingest_chunk_summary(...)`. After ingests the controller emits a short system hint (“Plot scaffolding refreshed…”) so prompt templates can remind the agent to call the new tool.
-- **Tooling surface** – `DocumentPlotStateTool` exposes the cached payload via `document_plot_state`. It is marked `summarizable=False` to prevent the compactor from stripping entities/beats mid-turn. Responses include diagnostic statuses: `plot_state_disabled` (flag off), `plot_state_unavailable` (store missing), `no_document`, `no_plot_state`, or `status="ok"` with entity/arc arrays and metadata.
-- **Settings & overrides** – The feature is disabled by default. Enable it via **Settings → Experimental → Plot scaffolding**, CLI flags (`--enable-plot-scaffolding` / `--disable-plot-scaffolding`), or the environment variable `TINKERBELL_ENABLE_PLOT_SCAFFOLDING`. Because ingestion relies on subagent summaries, the best experience pairs the flag with `enable_subagents=True`, but the tool remains callable even when no jobs have run (it will simply report `status="no_plot_state"`).
 
 ### Usage & limitations
 
 1. Enable Phase 4 subagents and plot scaffolding in the settings dialog (or via CLI/env overrides) and restart the controller if it was already running.
 2. Trigger a chat turn that causes the controller to spawn a subagent job (e.g., select >400 chars and ask for a scoped analysis). After the helper finishes, watch for the injected hint acknowledging that scaffolding refreshed for the document.
 3. Within the same turn, the agent can call `document_plot_state` to retrieve the cached roster before drafting edits. The tool accepts `document_id`, `include_entities`, `include_arcs`, `max_entities`, and `max_beats` arguments to trim payloads when token budgets are tight.
-4. No data is persisted between sessions. Closing a document or emitting a `DocumentChanged`/`DocumentClosed` event wipes its entry. This keeps the feature investigatory while the UX for human-authored plot data is still out-of-scope.
+4. In Phase 4 the store was transient—closing a document or emitting a `DocumentChanged`/`DocumentClosed` event wiped its entry. Phase 5 (see below) introduces optional persistence for operator overrides.
+
+## Phase 5 – Storyline continuity orchestration (experimental)
+
+Phase 5 builds on the same plot scaffolding flag to keep long-form edits narratively coherent. When the flag is enabled, the controller enforces a `plot_outline → document_edit/document_apply_patch → plot_state_update` loop before it allows the agent to wrap a turn.
+
+### PlotStateMemory, overrides, and persistence
+
+- `PlotStateMemory` replaces the transient store with dependency tracking, version metadata, and operator overrides. It subscribes to `DocumentCacheBus` events so stale documents are purged automatically.
+- Manual overrides and dependency notes persist to `~/.tinkerbell/plot_overrides.json`. Each entry records `override_id`, summary text, optional `arc_id`/`beat_id`, author, and timestamps so human continuity decisions survive restarts.
+- `PlotOutlineTool` (alias `DocumentPlotStateTool`) now hydrates enriched snapshots from `PlotStateMemory.snapshot_enriched()` including overrides, dependencies, and `version_metadata`.
+
+### Enforced plot loop
+
+1. **Read** – `_PlotLoopTracker` blocks `document_edit`/`document_apply_patch` if the agent has not called `plot_outline`/`document_plot_state` first, returning a guardrail hint that explains how to recover.
+2. **Edit** – Successful edit calls mark the document as “pending update”. The very next planner request injects a system reminder instructing the agent to run `plot_state_update` before it can finish the turn.
+3. **Update** – Once `plot_state_update` succeeds, the tracker clears the pending flag and emits a confirmation hint so operators know the continuity metadata is back in sync.
+
+Disable the plot scaffolding flag to bypass this enforcement entirely (useful for smoketests or legacy sessions).
+
+### Telemetry & observability
+
+- `plot_state.read` fires whenever `PlotOutlineTool` runs, reporting `document_id`, entity/arc counts, override totals, and dependency totals.
+- `plot_state.write` records every `PlotStateUpdateTool` call with deltas plus the persistence status for `plot_overrides.json`.
+- Tool traces include `plot_loop_blocked` outcomes, and the chat panel mirrors the guardrail hints so operators can see when the agent skipped the enforced loop.
 
 ### Validation
 
-- Unit tests in `tests/test_plot_state.py` validate entity heuristics, beat limits, cache-bus evictions, and telemetry stats.
-- Tool tests in `tests/test_document_plot_state_tool.py` assert resolver fallbacks, feature-flag behavior, and response schemas for both populated and empty stores.
-- Controller tests (`tests/test_agent.py`, `tests/test_ai_tools.py`) gained coverage for the runtime flag plumbing and the injected “plot scaffolding refreshed” hint to ensure the end-to-end flow remains guarded.
 
-Future iterations may add richer arc detection, manual editing UI, or persistence hooks, but for Phase 4 the emphasis stays on advisory context that surfaces only when explicitly enabled.
+## Phase 5 – Preflight analysis & tool recommendations
+
+Phase 5.2 layers a rule-based analyzer (`tinkerbell.ai.analysis`) on top of the chunk/plot/concordance metadata so the controller can select the right tool mix before each turn.
+
+### Analyzer + cache lifecycle
+
+- `AnalysisAgent` ingests `AnalysisInput` snapshots generated by `AIController._build_analysis_input()` and emits structured `AnalysisAdvice` records (chunk profile, required/optional tools, outline refresh flag, warnings, trace metadata, cache state).
+- Advice now travels with every chat turn (`AIController._analysis_hint_message`), manual `/analyze` command, and telemetry export via `TelemetryManager.emit_context_usage()` (`analysis_chunk_profile`, `analysis_required_tools`, `analysis_warning_codes`, etc.).
+- The TTL cache subscribes to `DocumentCacheBus` events, so `DocumentChangedEvent`/`DocumentClosedEvent` immediately invalidate cached advice and drop stale snapshots; manual edits no longer reuse outdated recommendations.
+
+### Operator interactions
+
+- The status bar exposes a dedicated **Preflight** badge that summarizes the latest advice, while the chat panel mirrors it with hover text (chunk profile, required tools, warnings).
+- Operators can run `/analyze [--doc ...] [--start N --end M] [--force-refresh] [--reason note]` to rerun the analyzer on demand. The helper leverages `AIController.request_analysis_advice()`, posts a formatted notice, refreshes badges, and records the run via `analysis.ui_override.*` telemetry.
+- LangGraph planners call `ToolUsageAdvisorTool` when they need fresh guidance mid-turn; the tool bridges into `_advisor_tool_entrypoint()` and returns the serialized advice payload.
+
+### Telemetry & exports
+
+- `analysis.advisor_tool.invoked` fires whenever the tool surface runs, capturing `document_id`, selection overrides, force-refresh flag, and whether a cached snapshot was reused.
+- `analysis.ui_override.requested/completed/failed` events trace manual `/analyze` executions along with reasons, cache states, and resulting tool lists so dashboards can flag repeated operator overrides.
+- `scripts/export_context_usage.py` now prints the analysis columns alongside the existing outline/retrieval metrics, so CSV exports include chunk profile, tool lists, warnings, cache state, and rule traces for each turn.
 
 ### Phase 4.4 – Integration, telemetry, hardening
-
-- **TraceCompactor coverage** – Subagent scouting reports now register ledger entries with `TraceCompactor`, so when later tool calls exceed the budget their summaries compact into pointers that explain how to rebuild the cached context (“rerun the helper or call `DocumentPlotStateTool`”).
-- **Turn-level telemetry** – `SubagentManager` emits `subagent.turn_summary` after every run, reporting requested/scheduled jobs, cache hits, skipped or failed jobs, cumulative latency, and tokens consumed. Diagnostics UI widgets (and the persistent telemetry sink) pick these up automatically.
-- **Sequential execution smoke tests** – `tests/test_subagent_manager.py` verifies multi-job queues stay strictly sequential and that budget-policy rejections skip work rather than touching the AI client. `tests/test_agent.py::test_ai_controller_registers_subagent_messages_in_trace_compactor` ensures the controller ledger captures helper summaries.
-- **Benchmarks & docs** – `benchmarks/measure_subagent_latency.py` plus the published snapshot in `benchmarks/subagent_latency.md` quantify scheduling overhead (<4 ms/job on a 6 ms simulated helper). Release management details, toggles, and rollout guidance live in `docs/ai_v2_release_notes.md`.
-- **Flags remain opt-in** – Even with the telemetry + testing guardrails, both `enable_subagents` and `plot_scaffolding_enabled` default to `False`. Keep them disabled outside staging until the new telemetry stays green for at least two weeks.
-
-## 1. Tokenizer parity layer
 
 - **Registry + protocols** – `TokenCounterRegistry` and `TokenCounterProtocol` live in `tinkerbell.ai.client` / `tinkerbell.ai.ai_types`. Every `AIClient` registers a counter for its active model and falls back to a deterministic byte estimator when no backend is available.
 - **Backends** – `TiktokenCounter` is used when the optional [`ai_tokenizers`](../pyproject.toml) extra (`tiktoken>=0.12,<0.13`) can be installed. Otherwise `ApproxByteCounter` provides a predictable bytes-per-token approximation so counts are still monotonic and reproducible.
@@ -101,6 +125,51 @@ Future iterations may add richer arc detection, manual editing UI, or persistenc
 - **Document metadata** – `DocumentState` now tracks `document_id`, `version_id`, and `content_hash`; `document.snapshot()` and `DocumentBridge.generate_snapshot()` always include these fields along with a `version` token of the form `"{document_id}:{version_id}:{content_hash}"`.
 - **Bridge enforcement** – `DocumentBridge.queue_edit()` rejects stale directives (raising `DocumentVersionMismatchError`) and annotates edits with selection hashes so callers must refresh snapshots when conflicts arise.
 - **Tools** – `DocumentApplyPatchTool` insists on the current `document_version` before routing diffs through `DocumentEditTool`. Tests in `tests/test_bridge.py` and `tests/test_ai_tools.py` cover both the happy path and mismatch errors.
+
+## 3b. Snapshot-anchored editing guardrails (Phase 5)
+
+Phase 5 hardens diff tooling so every edit is anchored to an explicit snapshot slice. The goal is to stop legacy inline edits from duplicating paragraphs or inserting mid-word glitches when the document shifts between tool calls.
+
+### Tool & schema changes
+
+- `DocumentSnapshot` always exposes `selection_text` and `selection_hash` (SHA-1 of the selected text) so agents can round-trip anchors without recomputing hashes.
+- `DocumentApplyPatchTool` and `DocumentEditTool` accept `match_text`, `expected_text`, and `selection_fingerprint` parameters. `selection_fingerprint` is compared against the snapshot `selection_hash`, while `match_text`/`expected_text` are used to relocate the edit if the offsets drift.
+- The tool manifest plus system prompts (`src/tinkerbell/ai/prompts.py`) now instruct agents to copy these fields from `document_snapshot` before calling diff/edit tools.
+
+### Recommended workflow
+
+1. Call `document_snapshot` with `include_text=true` and capture `selection_text`, `selection_hash`, `document_version`, and the exact `target_range` you plan to edit.
+2. When building a patch, include at least one of `target_range` or `match_text`. Prefer to send both so the bridge can double-check offsets.
+3. Copy `selection_hash` into the `selection_fingerprint` field and copy the literal snippet into `match_text` (and `expected_text` if the schema requires it for your caller).
+4. If the snapshot slice no longer matches the document, let the tools raise their guardrail errors and immediately refresh the snapshot instead of guessing offsets.
+5. Reserve caret inserts (`target_range` start == end) for explicit `action="insert"` directives. Replace operations now require anchors or a non-empty target range.
+
+### Error handling quick reference
+
+| Message fragment | Meaning | Next step |
+| --- | --- | --- |
+| `Edits must include target_range or match_text` | The edit lacked both a range and an anchor. | Re-run `document_snapshot` and send either the captured range or `match_text`/`selection_fingerprint` bundle. |
+| `selection_fingerprint does not match the latest snapshot` | The hash no longer matches the live document. | Refresh the snapshot and rebuild the patch from the new selection window. |
+| `Snapshot selection_text no longer matches document content` | The auto-anchor pulled from the snapshot was stale. | Provide explicit `match_text` from the user-visible context or fetch a new snapshot. |
+| `match_text matched multiple ranges` | Anchoring text was ambiguous in the current document. | Narrow the selection and resend the edit with a more specific snippet. |
+| `match_text did not match any content` | The document drifted beyond the provided snippet. | Refresh the snapshot before retrying the edit. |
+
+### Telemetry & dashboards
+
+- `patch.anchor` – emitted whenever `DocumentApplyPatchTool` or the inline `DocumentEdit` auto-convert path validates anchors. Payload highlights `status` (`success` or `reject`), `phase` (`requirements`, `alignment`, etc.), `anchor_source` (`match_text`, `selection_text`, `fingerprint`, or `range_only`), plus document/tab identifiers. Use this to trend anchor mismatch rates after rollout.
+- `patch.apply` – emitted by `DocumentBridge` when a patch succeeds, conflicts, or arrives stale. Includes the duration in milliseconds, `range_count` (for streamed diffs), diff summary, and whether the bridge had to fall back because of a conflict. Dashboards can now plot success/conflict ratios directly from telemetry instead of scraping logs.
+
+These events piggyback on the existing telemetry bus, so the status bar debug widgets and `scripts/export_context_usage.py` will surface them automatically once the sinks are subscribed.
+
+## 3c. Chunk-first selective read guardrails (Phase 5)
+
+Phase 5 tightens the read flow so the agent stays on the "selection snapshot → chunk tool → outline/retrieval" path before touching edits.
+
+- **Controller tracking** – `_ChunkFlowTracker` (inside `ai/orchestration/controller.py`) watches every `DocumentSnapshot`/`DocumentChunk` call. When the agent grabs a full snapshot without chunk hydration, it injects `Guardrail hint (Chunk Flow …)` system messages and emits telemetry.
+- **Telemetry events** – New events `chunk_flow.requested`, `chunk_flow.escaped_full_snapshot`, and `chunk_flow.retry_success` ride the telemetry bus. Dashboards (or the status bar debug widgets) can subscribe to those names to trend how often the guardrail fires and how quickly agents recover.
+- **UI badges** – The chat panel shows a `Chunk Flow` banner whenever a warning or recovery fires, mirroring the system hint. The status bar adds a matching badge so operators can monitor long-running sessions without scrolling through the transcript.
+- **Recovery workflow** – When the badge reports `Chunk Flow Warning`, follow the guardrail hint: re-run `DocumentSnapshot` with a selection window or hydrate the manifest via `DocumentChunkTool`. Once the controller sees a chunk hydrate succeed, the badge flips to `Chunk Flow Recovered` until the next turn.
+- **Testing** – `tests/test_chat_panel.py`, `tests/test_widgets_status_bar.py`, and `tests/test_telemetry_controller.py` cover the UI + telemetry plumbing, while the existing controller tests assert the hint injection logic.
 
 ## 4. Cache registry & invalidation bus
 

@@ -6,6 +6,7 @@ from typing import cast
 import pytest
 
 from tinkerbell.ai.agents.subagents.manager import SubagentExecutor, SubagentManager
+from tinkerbell.ai.orchestration.subagent_runtime import SubagentRuntimeManager
 from tinkerbell.ai.ai_types import (
     ChunkReference,
     SubagentBudget,
@@ -128,3 +129,17 @@ async def test_subagent_manager_respects_budget_policy(monkeypatch: pytest.Monke
     assert results[0].result is not None
     assert results[0].result.status == "skipped"
     assert "context budget" in results[0].result.summary.lower()
+
+    # New test for SubagentRuntimeManager
+
+def test_subagent_runtime_manager_exposes_character_map_store() -> None:
+    runtime = SubagentRuntimeManager(tool_resolver=lambda: {})
+    runtime.configure(
+        client=cast(AIClient, _DummyClient()),
+        config=SubagentRuntimeConfig(enabled=True, plot_scaffolding_enabled=True),
+        budget_policy=None,
+    )
+
+    store = runtime.ensure_character_map_store()
+
+    assert store is runtime.character_map_store

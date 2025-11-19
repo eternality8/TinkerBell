@@ -35,6 +35,16 @@ def test_editor_widget_applies_ai_edit_insert_and_replace():
     assert widget.to_document().text == "hi world"
 
 
+def test_editor_widget_rejects_zero_length_replace():
+    widget = EditorWidget()
+    widget.load_document(DocumentState(text="alpha beta"))
+
+    directive = EditDirective(action="replace", target_range=(3, 3), content="-")
+
+    with pytest.raises(ValueError, match="non-empty"):
+        widget.apply_ai_edit(directive)
+
+
 def test_editor_widget_preview_snapshot_contains_html():
     widget = EditorWidget()
     widget.load_document(DocumentState(text="# Title"))

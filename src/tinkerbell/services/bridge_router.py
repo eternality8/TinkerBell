@@ -53,9 +53,19 @@ class WorkspaceBridgeRouter:
         delta_only: bool = False,
         tab_id: str | None = None,
         include_open_documents: bool = False,
+        window: Mapping[str, Any] | str | None = None,
+        chunk_profile: str | None = None,
+        max_tokens: int | None = None,
+        include_text: bool = True,
     ) -> dict:
         tab = self._resolve_tab(tab_id)
-        snapshot = tab.bridge.generate_snapshot(delta_only=delta_only)
+        snapshot = tab.bridge.generate_snapshot(
+            delta_only=delta_only,
+            window=window,
+            max_tokens=max_tokens,
+            chunk_profile=chunk_profile,
+            include_text=include_text,
+        )
         return self._augment_snapshot(tab, snapshot, include_open_documents=include_open_documents)
 
     def generate_snapshots(
@@ -64,12 +74,20 @@ class WorkspaceBridgeRouter:
         *,
         delta_only: bool = False,
         include_open_documents: bool = False,
+        window: Mapping[str, Any] | str | None = None,
+        chunk_profile: str | None = None,
+        max_tokens: int | None = None,
+        include_text: bool = True,
     ) -> list[dict[str, Any]]:
         return [
             self.generate_snapshot(
                 delta_only=delta_only,
                 tab_id=tab_id,
                 include_open_documents=include_open_documents,
+                window=window,
+                chunk_profile=chunk_profile,
+                max_tokens=max_tokens,
+                include_text=include_text,
             )
             for tab_id in tab_ids
         ]

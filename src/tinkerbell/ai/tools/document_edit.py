@@ -8,6 +8,7 @@ from typing import Any, Callable, ClassVar, Iterable, Mapping, Protocol, Sequenc
 
 from ...chat.commands import ActionType, extract_tab_reference, parse_agent_payload, resolve_tab_reference
 from ...chat.message_model import EditDirective
+from ...services.telemetry import emit as telemetry_emit
 from .diff_builder import DiffBuilderTool
 
 
@@ -25,7 +26,7 @@ class Bridge(Protocol):
     def last_snapshot_version(self) -> str | None:
         ...
 
-    def generate_snapshot(self, *, delta_only: bool = False) -> Mapping[str, Any]:
+    def generate_snapshot(self, *, delta_only: bool = False, **_: Any) -> Mapping[str, Any]:
         ...
 
 
@@ -41,6 +42,7 @@ class DocumentEditTool:
     allow_inline_edits: bool = False
     diff_builder: DiffBuilderTool = field(default_factory=DiffBuilderTool)
     diff_context_lines: int = 5
+    anchor_event: str = "patch.anchor"
     summarizable: ClassVar[bool] = False
 
     def run(self, directive: DirectiveInput | None = None, *, tab_id: str | None = None, **fields: Any) -> str:
@@ -107,8 +109,11 @@ class DocumentEditTool:
         elif isinstance(payload, Mapping):
             mapping = dict(payload)
             diff_text = str(mapping.get("diff", "") or "").strip()
-            if not diff_text:
-                raise ValueError("Patch directives require a diff string")
+            ranges = self._normalize_patch_ranges(mapping.get("ranges"))
+            if not diff_text and not ranges:
+                raise ValueError("Patch directives require either a diff string or a ranges payload")
+            if ranges:
+                mapping["ranges"] = ranges
             if mapping.get("content"):
                 raise ValueError("Patch directives cannot include raw content")
             if mapping.get("target_range") not in (None, (0, 0)):
@@ -128,6 +133,35 @@ class DocumentEditTool:
             raise ValueError("Patch directives must include the content_hash from the originating snapshot.")
 
         return mapping_payload
+
+    @staticmethod
+    def _normalize_patch_ranges(ranges: Any) -> list[dict[str, Any]]:
+        if ranges is None:
+            return []
+        if not isinstance(ranges, Sequence):
+            raise ValueError("Patch ranges must be an array of objects")
+        normalized: list[dict[str, Any]] = []
+        for entry in ranges:
+            if not isinstance(entry, Mapping):
+                raise ValueError("Patch ranges must be objects with start/end indexes")
+            if "start" not in entry or "end" not in entry:
+                raise ValueError("Patch ranges require 'start' and 'end' keys")
+            replacement = entry.get("replacement") or entry.get("content") or entry.get("text")
+            if replacement is None:
+                raise ValueError("Patch ranges must include replacement text")
+            match_text = entry.get("match_text")
+            if match_text is None:
+                raise ValueError("Patch ranges must include match_text for validation")
+            normalized.append(
+                {
+                    "start": int(entry["start"]),
+                    "end": int(entry["end"]),
+                    "replacement": str(replacement),
+                    "match_text": str(match_text),
+                    **{key: entry[key] for key in ("chunk_id", "chunk_hash") if key in entry},
+                }
+            )
+        return normalized
 
     @staticmethod
     def _extract_version_token(payload: Mapping[str, Any]) -> str | None:
@@ -194,7 +228,79 @@ class DocumentEditTool:
             raise ValueError("Content edits must include a string 'content' field")
 
         selection = snapshot.get("selection") or (0, 0)
-        start, end = self._resolve_range(mapping_payload.get("target_range"), selection, len(base_text))
+        action_type = str(mapping_payload.get("action") or "").lower()
+        anchor_text, anchor_from_user = self._normalize_anchor_text(
+            mapping_payload.get("match_text"),
+            mapping_payload.get("expected_text"),
+        )
+        selection_fingerprint = mapping_payload.get("selection_fingerprint")
+        selection_text = self._resolve_snapshot_selection_text(snapshot)
+        selection_hash = self._resolve_selection_hash(snapshot, selection_text)
+        anchor_present = bool(anchor_text) or bool(selection_text) or bool(selection_fingerprint)
+        selection_span = self._selection_span(selection)
+        anchor_source = self._anchor_source(anchor_text, selection_text, selection_fingerprint)
+        target_range = mapping_payload.get("target_range")
+        try:
+            self._enforce_range_requirements(action_type, target_range, selection, anchor_present)
+        except ValueError as exc:
+            self._emit_anchor_event(
+                snapshot=snapshot,
+                tab_id=tab_id,
+                status="reject",
+                phase="requirements",
+                anchor_source=anchor_source,
+                selection_span=selection_span,
+                range_provided=target_range is not None,
+                reason=str(exc),
+            )
+            raise
+        start, end = self._resolve_range(target_range, selection, len(base_text))
+        try:
+            start, end = self._align_range_with_snapshot(
+                base_text,
+                start,
+                end,
+                selection_text=selection_text,
+                anchor_text=anchor_text,
+                anchor_from_user=anchor_from_user,
+                selection_fingerprint=selection_fingerprint,
+                selection_hash=selection_hash,
+            )
+        except ValueError as exc:
+            self._emit_anchor_event(
+                snapshot=snapshot,
+                tab_id=tab_id,
+                status="reject",
+                phase="alignment",
+                anchor_source=anchor_source,
+                selection_span=selection_span,
+                range_provided=target_range is not None,
+                reason=str(exc),
+            )
+            raise
+        self._emit_anchor_event(
+            snapshot=snapshot,
+            tab_id=tab_id,
+            status="success",
+            phase="alignment",
+            anchor_source=anchor_source,
+            selection_span=selection_span,
+            range_provided=target_range is not None,
+            resolved_range=(start, end),
+        )
+        if action_type != ActionType.INSERT.value and start == end:
+            self._emit_anchor_event(
+                snapshot=snapshot,
+                tab_id=tab_id,
+                status="reject",
+                phase="caret-guard",
+                anchor_source=anchor_source,
+                selection_span=selection_span,
+                range_provided=target_range is not None,
+                reason="Replace directives require a non-empty target_range",
+            )
+            raise ValueError("Caret inserts must use the 'insert' action or include an explicit intent flag")
+        match_text_payload = base_text[start:end]
         updated_text = base_text[:start] + content + base_text[end:]
         if updated_text == base_text:
             raise ValueError("Content already matches document; nothing to patch")
@@ -219,6 +325,14 @@ class DocumentEditTool:
             "diff": diff,
             "document_version": str(version),
             "content_hash": str(content_hash),
+            "ranges": [
+                {
+                    "start": start,
+                    "end": end,
+                    "replacement": content,
+                    "match_text": match_text_payload,
+                }
+            ],
         }
         rationale = mapping_payload.get("rationale")
         if rationale is not None:
@@ -235,7 +349,172 @@ class DocumentEditTool:
             "target_range": payload.target_range,
             "rationale": payload.rationale,
             "selection_fingerprint": payload.selection_fingerprint,
+            "match_text": getattr(payload, "match_text", None),
+            "expected_text": getattr(payload, "expected_text", None),
         }
+
+    @staticmethod
+    def _normalize_anchor_text(match_text: Any, expected_text: Any) -> tuple[str | None, bool]:
+        values = [value for value in (match_text, expected_text) if value is not None]
+        if not values:
+            return None, False
+        first = str(values[0])
+        for candidate in values[1:]:
+            if str(candidate) != first:
+                raise ValueError("match_text and expected_text must match when both are provided")
+        return first, True
+
+    @staticmethod
+    def _resolve_snapshot_selection_text(snapshot: Mapping[str, Any]) -> str | None:
+        selection_text = snapshot.get("selection_text")
+        return selection_text if isinstance(selection_text, str) else None
+
+    def _resolve_selection_hash(self, snapshot: Mapping[str, Any], selection_text: str | None) -> str | None:
+        token = snapshot.get("selection_hash")
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+        if selection_text:
+            return self._hash_text(selection_text)
+        return None
+
+    def _enforce_range_requirements(
+        self,
+        action: str,
+        target_range: Any,
+        selection: Sequence[int],
+        anchor_present: bool,
+    ) -> None:
+        if action == ActionType.INSERT.value:
+            return
+        if target_range is not None:
+            return
+        if len(selection) == 2:
+            try:
+                sel_start = int(selection[0])
+                sel_end = int(selection[1])
+            except (TypeError, ValueError):
+                sel_start = sel_end = 0
+            if (sel_start, sel_end) != (0, 0):
+                return
+        if anchor_present:
+            return
+        raise ValueError(
+            "Replace edits must include target_range or match_text; call document_snapshot and provide the selected region."
+        )
+
+    def _align_range_with_snapshot(
+        self,
+        base_text: str,
+        start: int,
+        end: int,
+        *,
+        selection_text: str | None,
+        anchor_text: str | None,
+        anchor_from_user: bool,
+        selection_fingerprint: Any,
+        selection_hash: str | None,
+    ) -> tuple[int, int]:
+        fingerprint = str(selection_fingerprint).strip() if isinstance(selection_fingerprint, str) else None
+        if fingerprint:
+            if not selection_hash:
+                raise ValueError("Snapshot did not include selection_text; refresh document_snapshot with include_text=true")
+            if fingerprint != selection_hash:
+                raise ValueError(
+                    "selection_fingerprint does not match the latest snapshot; refresh document_snapshot before editing"
+                )
+
+        anchor_candidate = anchor_text
+        from_snapshot = False
+        if anchor_candidate is None and selection_text is not None:
+            anchor_candidate = selection_text
+            from_snapshot = True
+
+        if anchor_candidate is None or anchor_candidate == "":
+            return start, end
+
+        selection_slice = base_text[start:end]
+        if selection_slice == anchor_candidate:
+            return start, end
+
+        if from_snapshot and not anchor_from_user:
+            raise ValueError(
+                "Snapshot selection_text no longer matches the document; provide match_text or refresh document_snapshot."
+            )
+
+        relocated = self._locate_unique_anchor(base_text, anchor_candidate)
+        if relocated is None:
+            raise ValueError("match_text did not match current content; refresh document_snapshot before editing")
+        return relocated
+
+    @staticmethod
+    def _locate_unique_anchor(base_text: str, anchor: str) -> tuple[int, int] | None:
+        position = base_text.find(anchor)
+        if position < 0:
+            return None
+        duplicate = base_text.find(anchor, position + 1)
+        if duplicate >= 0:
+            raise ValueError("match_text matched multiple ranges; narrow the selection or provide explicit offsets")
+        return position, position + len(anchor)
+
+    def _emit_anchor_event(
+        self,
+        *,
+        snapshot: Mapping[str, Any],
+        tab_id: str | None,
+        status: str,
+        phase: str,
+        anchor_source: str,
+        selection_span: tuple[int, int] | None,
+        range_provided: bool,
+        resolved_range: tuple[int, int] | None = None,
+        reason: str | None = None,
+    ) -> None:
+        if not self.anchor_event:
+            return
+        payload: dict[str, Any] = {
+            "document_id": snapshot.get("document_id"),
+            "tab_id": tab_id,
+            "status": status,
+            "phase": phase,
+            "source": "document_edit.auto_patch",
+            "anchor_source": anchor_source,
+            "range_provided": range_provided,
+        }
+        if selection_span is not None:
+            payload["selection_span"] = {"start": selection_span[0], "end": selection_span[1]}
+        if resolved_range is not None:
+            payload["resolved_range"] = {"start": resolved_range[0], "end": resolved_range[1]}
+        if reason:
+            payload["reason"] = reason
+        telemetry_emit(self.anchor_event, payload)
+
+    @staticmethod
+    def _selection_span(selection: Sequence[int]) -> tuple[int, int] | None:
+        if len(selection) != 2:
+            return None
+        try:
+            start = int(selection[0])
+            end = int(selection[1])
+        except (TypeError, ValueError):
+            return None
+        if end < start:
+            start, end = end, start
+        return (start, end)
+
+    @staticmethod
+    def _anchor_source(
+        anchor_text: str | None,
+        selection_text: str | None,
+        selection_fingerprint: Any,
+    ) -> str:
+        fingerprint = str(selection_fingerprint).strip() if isinstance(selection_fingerprint, str) else None
+        if fingerprint:
+            return "fingerprint"
+        if anchor_text:
+            return "match_text"
+        if selection_text:
+            return "selection_text"
+        return "range_only"
 
     @staticmethod
     def _resolve_range(

@@ -181,6 +181,69 @@ class DiffReviewControls:
         return self._visible
 
 
+class DocumentStatusIndicator:
+    """Clickable badge reflecting document readiness."""
+
+    def __init__(self) -> None:
+        self._button: Any | None = None
+        self._callback: Callable[[], None] | None = None
+        self._text: str = ""
+        self._detail: str = ""
+        self._severity: str = ""
+
+    def install(self, status_bar: Any | None) -> None:
+        if status_bar is None or QPushButton is None:
+            return
+        if self._button is not None:
+            return
+        try:
+            button = QPushButton("Doc Status")
+            button.setObjectName("tb-status-doc")
+            button.setVisible(False)
+            button.clicked.connect(self._handle_clicked)  # type: ignore[attr-defined]
+            status_bar.addPermanentWidget(button)
+        except Exception:
+            return
+        self._button = button
+        self._refresh()
+
+    def set_state(self, text: str, detail: str | None = None, *, severity: str | None = None) -> None:
+        self._text = text.strip()
+        self._detail = (detail or "").strip()
+        self._severity = (severity or "").strip()
+        self._refresh()
+
+    def set_callback(self, callback: Callable[[], None] | None) -> None:
+        self._callback = callback
+
+    def _refresh(self) -> None:
+        if self._button is None:
+            return
+        visible = bool(self._text)
+        try:
+            self._button.setVisible(visible)
+            if visible:
+                self._button.setText(self._text)
+                self._button.setToolTip(self._detail)
+                self._button.setProperty("data-severity", self._severity)
+                style = getattr(self._button, "style", None)
+                if callable(getattr(style, "unpolish", None)) and callable(getattr(style, "polish", None)):
+                    try:
+                        style.unpolish(self._button)
+                        style.polish(self._button)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _handle_clicked(self) -> None:
+        if self._callback is None:
+            return
+        try:
+            self._callback()
+        except Exception:
+            pass
+
 class StatusBar:
     """Status bar that mirrors the plan.md contract yet stays test friendly."""
 
@@ -200,7 +263,15 @@ class StatusBar:
         self._review_controls = DiffReviewControls()
         self._subagent_status: str = ""
         self._subagent_detail: str = ""
+        self._chunk_flow_status: str = ""
+        self._chunk_flow_detail: str = ""
+        self._analysis_status: str = ""
+        self._analysis_detail: str = ""
         self._context_widget = ContextUsageWidget()
+        self._document_status_text: str = ""
+        self._document_status_detail: str = ""
+        self._document_status_severity: str = ""
+        self._document_status_indicator = DocumentStatusIndicator()
 
         self._qt_bar = self._build_qt_status_bar(parent)
         self._cursor_label: Any = None
@@ -210,6 +281,8 @@ class StatusBar:
         self._embedding_label: Any = None
         self._autosave_label: Any = None
         self._subagent_label: Any = None
+        self._chunk_flow_label: Any = None
+        self._analysis_label: Any = None
 
         if self._qt_bar is not None:
             self._init_widgets()
@@ -308,6 +381,61 @@ class StatusBar:
             except Exception:
                 pass
 
+    def set_chunk_flow_state(self, status: str | None, *, detail: str | None = None) -> None:
+        """Reflect whether the AI stayed on the chunk-first path this turn."""
+
+        self._chunk_flow_status = (status or "").strip()
+        self._chunk_flow_detail = (detail or "").strip()
+        label = self._chunk_flow_label
+        if label is None:
+            return
+        self._update_label(label, self._format_chunk_flow_text())
+        visible = bool(self._chunk_flow_status)
+        try:
+            label.setToolTip(self._chunk_flow_detail or self._chunk_flow_status)
+            label.setVisible(visible)
+        except Exception:
+            pass
+
+    def set_analysis_state(self, status: str | None, *, detail: str | None = None) -> None:
+        """Display the latest preflight analysis summary."""
+
+        self._analysis_status = (status or "").strip()
+        self._analysis_detail = (detail or "").strip()
+        label = self._analysis_label
+        if label is None:
+            return
+        self._update_label(label, self._format_analysis_text())
+        visible = bool(self._analysis_status)
+        try:
+            label.setToolTip(self._analysis_detail or self._analysis_status)
+            label.setVisible(visible)
+        except Exception:
+            pass
+
+    def set_document_status_badge(
+        self,
+        status: str | None,
+        *,
+        detail: str | None = None,
+        severity: str | None = None,
+    ) -> None:
+        """Update the document status badge text."""
+
+        self._document_status_text = (status or "").strip()
+        self._document_status_detail = (detail or "").strip()
+        self._document_status_severity = (severity or "").strip()
+        self._document_status_indicator.set_state(
+            self._document_status_text,
+            self._document_status_detail,
+            severity=self._document_status_severity,
+        )
+
+    def set_document_status_callback(self, callback: Callable[[], None] | None) -> None:
+        """Register a handler invoked when the status badge is clicked."""
+
+        self._document_status_indicator.set_callback(callback)
+
     def set_review_state(
         self,
         summary: str | None,
@@ -375,12 +503,28 @@ class StatusBar:
         return (self._subagent_status, self._subagent_detail)
 
     @property
+    def chunk_flow_state(self) -> tuple[str, str]:
+        return (self._chunk_flow_status, self._chunk_flow_detail)
+
+    @property
+    def analysis_state(self) -> tuple[str, str]:
+        return (self._analysis_status, self._analysis_detail)
+
+    @property
     def review_summary(self) -> str:
         return self._review_controls.summary_text
 
     @property
     def review_controls_visible(self) -> bool:
         return self._review_controls.visible
+
+    @property
+    def document_status_badge(self) -> tuple[str, str]:
+        return (self._document_status_text, self._document_status_detail)
+
+    @property
+    def document_status_severity(self) -> str:
+        return self._document_status_severity
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -403,6 +547,12 @@ class StatusBar:
         self._autosave_label.setObjectName("tb-status-autosave")
         self._subagent_label = QLabel(self._format_subagent_text())
         self._subagent_label.setObjectName("tb-status-subagents")
+        self._chunk_flow_label = QLabel(self._format_chunk_flow_text())
+        self._chunk_flow_label.setObjectName("tb-status-chunk-flow")
+        self._chunk_flow_label.setVisible(False)
+        self._analysis_label = QLabel(self._format_analysis_text())
+        self._analysis_label.setObjectName("tb-status-analysis")
+        self._analysis_label.setVisible(False)
 
         for label in (
             self._cursor_label,
@@ -412,6 +562,8 @@ class StatusBar:
             self._embedding_label,
             self._autosave_label,
             self._subagent_label,
+            self._chunk_flow_label,
+            self._analysis_label,
         ):
             label.setContentsMargins(8, 0, 8, 0)
             try:
@@ -421,6 +573,7 @@ class StatusBar:
 
         self._review_controls.install(self._qt_bar)
         self._context_widget.install(self._qt_bar)
+        self._document_status_indicator.install(self._qt_bar)
 
     def _update_label(self, label: Any, text: str) -> None:
         if label is None:
@@ -447,6 +600,12 @@ class StatusBar:
 
     def _format_subagent_text(self) -> str:
         return f"Subagents: {self._subagent_status}" if self._subagent_status else ""
+
+    def _format_chunk_flow_text(self) -> str:
+        return f"Chunk Flow: {self._chunk_flow_status}" if self._chunk_flow_status else ""
+
+    def _format_analysis_text(self) -> str:
+        return f"Analysis: {self._analysis_status}" if self._analysis_status else ""
 
     @staticmethod
     def _coerce_state(state: str | Enum) -> str:
@@ -487,5 +646,5 @@ class StatusBar:
         return bar
 
 
-__all__ = ["StatusBar", "ContextUsageWidget", "DiffReviewControls"]
+__all__ = ["StatusBar", "ContextUsageWidget", "DiffReviewControls", "DocumentStatusIndicator"]
 

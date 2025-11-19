@@ -8,15 +8,20 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence, cast
 
 from ...chat.commands import DIRECTIVE_SCHEMA
+from .character_edit_planner import CharacterEditPlannerTool
+from .character_map import CharacterMapTool
 from .diff_builder import DiffBuilderTool
 from .document_apply_patch import DocumentApplyPatchTool
+from .document_chunk import DocumentChunkTool
 from .document_edit import DocumentEditTool
 from .document_find_sections import DocumentFindSectionsTool
 from .document_outline import DocumentOutlineTool
-from .document_plot_state import DocumentPlotStateTool
+from .document_plot_state import DocumentPlotStateTool, PlotOutlineTool
 from .document_snapshot import DocumentSnapshotTool
 from .list_tabs import ListTabsTool
+from .plot_state_update import PlotStateUpdateTool
 from .search_replace import SearchReplaceTool
+from .tool_usage_advisor import ToolUsageAdvisorTool
 from .validation import validate_snippet
 
 LOGGER = logging.getLogger(__name__)
@@ -50,7 +55,11 @@ class ToolRegistryContext:
     plot_scaffolding_enabled: bool = False
     ensure_outline_tool: Callable[[], DocumentOutlineTool | None] | None = None
     ensure_find_sections_tool: Callable[[], DocumentFindSectionsTool | None] | None = None
-    ensure_plot_state_tool: Callable[[], DocumentPlotStateTool | None] | None = None
+    ensure_plot_state_tool: Callable[[], PlotOutlineTool | None] | None = None
+    ensure_plot_outline_tool: Callable[[], PlotOutlineTool | None] | None = None
+    ensure_plot_state_update_tool: Callable[[], PlotStateUpdateTool | None] | None = None
+    ensure_character_map_tool: Callable[[], CharacterMapTool | None] | None = None
+    ensure_character_planner_tool: Callable[[], CharacterEditPlannerTool | None] | None = None
     auto_patch_consumer: Callable[[DocumentApplyPatchTool], None] | None = None
 
 
@@ -72,6 +81,17 @@ def register_default_tools(
     failures: list[ToolRegistrationFailure] = []
     registered: list[str] = []
 
+    chunk_index_instance = None
+    chunk_settings_resolver = getattr(controller, "get_chunking_config", None)
+    if not callable(chunk_settings_resolver):
+        chunk_settings_resolver = None
+    ensure_chunk_index = getattr(controller, "ensure_chunk_index", None)
+    if callable(ensure_chunk_index):
+        try:
+            chunk_index_instance = ensure_chunk_index()
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Unable to initialize chunk index", exc_info=True)
+
     def _record_failure(name: str, exc: Exception) -> None:
         failures.append(ToolRegistrationFailure(name=name, error=exc))
         LOGGER.warning("Failed to register tool %s: %s", name, exc, exc_info=True)
@@ -89,6 +109,7 @@ def register_default_tools(
             snapshot_tool = DocumentSnapshotTool(
                 provider=context.bridge,
                 outline_digest_resolver=context.outline_digest_resolver,
+                chunk_index=chunk_index_instance,
             )
         except Exception as exc:  # pragma: no cover - rare failure constructing tool
             _record_failure("document_snapshot", exc)
@@ -123,10 +144,123 @@ def register_default_tools(
                             "type": "boolean",
                             "description": "When true, include a summary of all open documents in the snapshot payload.",
                         },
+                        "window": {
+                            "description": (
+                                "Controls which portion of the document is returned. Defaults to a selection-centered window; set to 'document' to request the full text."
+                            ),
+                            "anyOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": {"type": "string"},
+                                        "padding": {"type": "integer", "minimum": 0},
+                                        "max_chars": {"type": "integer", "minimum": 256},
+                                        "max_tokens": {"type": "integer", "minimum": 256},
+                                        "start": {"type": "integer", "minimum": 0},
+                                        "end": {"type": "integer", "minimum": 0},
+                                    },
+                                    "additionalProperties": False,
+                                },
+                            ],
+                        },
+                        "chunk_profile": {
+                            "type": "string",
+                            "enum": ["auto", "prose", "code", "notes"],
+                            "description": "Hint for chunk manifest sizing. Defaults to 'auto'.",
+                        },
+                        "max_tokens": {
+                            "type": "integer",
+                            "minimum": 256,
+                            "description": "Approximate token budget for the returned window; helps keep snapshots slim.",
+                        },
+                        "include_text": {
+                            "type": "boolean",
+                            "description": "Set false to omit the text body and request only metadata + chunk manifests.",
+                        },
                     },
                     "additionalProperties": False,
                 },
             )
+
+        if chunk_index_instance is not None:
+            try:
+                chunk_tool = DocumentChunkTool(
+                    bridge=context.bridge,
+                    chunk_index=chunk_index_instance,
+                    chunk_config_resolver=chunk_settings_resolver,
+                )
+            except Exception as exc:  # pragma: no cover - defensive guard
+                _record_failure("document_chunk", exc)
+            else:
+                _safe_register(
+                    "document_chunk",
+                    chunk_tool,
+                    description=(
+                        "Return a specific chunk (or iterator) referenced by document_snapshot manifests, enforcing inline token caps."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "chunk_id": {
+                                "type": "string",
+                                "description": "Chunk identifier returned by document_snapshot.chunk_manifest[].id.",
+                            },
+                            "document_id": {
+                                "type": "string",
+                                "description": "Document identifier associated with the manifest entry.",
+                            },
+                            "cache_key": {
+                                "type": "string",
+                                "description": "Chunk manifest cache key; ensures the request matches the cached window.",
+                            },
+                            "version": {
+                                "type": "string",
+                                "description": "Optional version token (document_id:version_id:hash) for freshness checks.",
+                            },
+                            "include_text": {
+                                "type": "boolean",
+                                "description": "Set false to fetch only metadata/pointers without inline text.",
+                            },
+                            "max_tokens": {
+                                "type": "integer",
+                                "minimum": 256,
+                                "description": "Override the inline token cap for this request (defaults to runtime setting).",
+                            },
+                            "iterator": {
+                                "type": "object",
+                                "description": "Iterate sequential chunks using a manifest cache key.",
+                                "properties": {
+                                    "cache_key": {
+                                        "type": "string",
+                                        "description": "Manifest cache key to iterate over (chunk_manifest.cache_key).",
+                                    },
+                                    "document_id": {
+                                        "type": "string",
+                                        "description": "Optional document identifier to disambiguate cache keys.",
+                                    },
+                                    "start_chunk_id": {
+                                        "type": "string",
+                                        "description": "Chunk ID to start from; omit to begin at the first chunk.",
+                                    },
+                                    "limit": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 16,
+                                        "description": "Maximum number of chunks to return in this batch (bounded by runtime settings).",
+                                    },
+                                },
+                                "required": ["cache_key"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "anyOf": [
+                            {"required": ["chunk_id"]},
+                            {"required": ["iterator"]},
+                        ],
+                        "additionalProperties": False,
+                    },
+                )
 
         if context.phase3_outline_enabled:
             registered.extend(
@@ -134,7 +268,13 @@ def register_default_tools(
             )
         if context.plot_scaffolding_enabled:
             registered.extend(
-                register_plot_state_tool(context, register_fn=register, failures=failures)
+                register_plot_memory_tools(context, register_fn=register, failures=failures)
+            )
+            registered.extend(
+                register_character_map_tool(context, register_fn=register, failures=failures)
+            )
+            registered.extend(
+                register_character_planner_tool(context, register_fn=register, failures=failures)
             )
 
         try:
@@ -307,6 +447,53 @@ def register_default_tools(
                     "additionalProperties": False,
                 },
             )
+
+        advisor_runner = getattr(controller, "_advisor_tool_entrypoint", None)
+        if callable(advisor_runner):
+            try:
+                advisor_tool = ToolUsageAdvisorTool(advisor_runner)
+            except Exception as exc:  # pragma: no cover - defensive
+                _record_failure("tool_usage_advisor", exc)
+            else:
+                _safe_register(
+                    "tool_usage_advisor",
+                    advisor_tool,
+                    description=(
+                        "Re-run the preflight analysis pipeline to retrieve up-to-date tool recommendations and warnings."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "document_id": {
+                                "type": "string",
+                                "description": "Optional explicit target document identifier; defaults to the active tab.",
+                            },
+                            "selection_start": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Override the selection start used when building analysis inputs.",
+                            },
+                            "selection_end": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Override the selection end used when building analysis inputs.",
+                            },
+                            "force_refresh": {
+                                "type": "boolean",
+                                "description": "Bypass cached advice and recompute from scratch when true.",
+                            },
+                            "snapshot": {
+                                "type": "object",
+                                "description": "Optional snapshot payload previously returned by DocumentSnapshotTool.",
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Operator-provided note recorded with telemetry for this analysis run.",
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                )
 
         _safe_register(
             "validate_snippet",
@@ -485,13 +672,13 @@ def unregister_phase3_tools(controller: Any) -> None:
             LOGGER.debug("Failed to unregister tool %s", name, exc_info=True)
 
 
-def register_plot_state_tool(
+def register_plot_memory_tools(
     context: ToolRegistryContext,
     *,
     register_fn: Callable[..., Any] | None = None,
     failures: list[ToolRegistrationFailure] | None = None,
 ) -> list[str]:
-    """Register the plot state tool when the feature flag is enabled."""
+    """Register plot outline + state update tools when plot scaffolding is enabled."""
 
     if not context.plot_scaffolding_enabled:
         return []
@@ -501,10 +688,235 @@ def register_plot_state_tool(
         return []
     register = register_fn or getattr(controller, "register_tool", None)
     if not callable(register):
-        LOGGER.debug("AI controller does not expose register_tool; skipping plot-state wiring.")
+        LOGGER.debug("AI controller does not expose register_tool; skipping plot-memory wiring.")
         return []
 
-    tool_factory = context.ensure_plot_state_tool
+    registered: list[str] = []
+    outline_factory = context.ensure_plot_outline_tool or context.ensure_plot_state_tool
+    update_factory = context.ensure_plot_state_update_tool
+
+    outline_schema = {
+        "type": "object",
+        "properties": {
+            "document_id": {
+                "type": "string",
+                "description": "Optional explicit target; defaults to the active document.",
+            },
+            "include_entities": {
+                "type": "boolean",
+                "description": "When false, omit entity payloads to conserve tokens.",
+            },
+            "include_arcs": {
+                "type": "boolean",
+                "description": "When false, omit plot arc beats from the response.",
+            },
+            "include_overrides": {
+                "type": "boolean",
+                "description": "When false, omit persisted overrides to save tokens.",
+            },
+            "include_dependencies": {
+                "type": "boolean",
+                "description": "When false, omit dependency records to save tokens.",
+            },
+            "max_entities": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Limit the number of entities returned before budgeting.",
+            },
+            "max_beats": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Limit the number of beats returned per arc before budgeting.",
+            },
+            "max_overrides": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Limit how many overrides are returned before budgeting.",
+            },
+            "max_dependencies": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Limit how many dependency entries are returned before budgeting.",
+            },
+        },
+        "additionalProperties": False,
+    }
+
+    arc_schema = {
+        "type": "object",
+        "properties": {
+            "arc_id": {"type": "string", "description": "Stable arc identifier (slug)."},
+            "name": {"type": "string", "description": "Human-readable arc label."},
+            "summary": {"type": "string", "description": "Short description of the arc state."},
+            "beats": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "beat_id": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "pointer_id": {"type": "string"},
+                        "chunk_hash": {"type": "string"},
+                        "metadata": {"type": "object"},
+                    },
+                    "required": ["summary"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["summary"],
+        "additionalProperties": False,
+    }
+
+    override_schema = {
+        "type": "object",
+        "properties": {
+            "override_id": {"type": "string"},
+            "summary": {"type": "string"},
+            "arc_id": {"type": "string"},
+            "beat_id": {"type": "string"},
+            "author": {"type": "string"},
+            "metadata": {"type": "object"},
+        },
+        "required": ["summary"],
+        "additionalProperties": False,
+    }
+
+    dependency_schema = {
+        "type": "object",
+        "properties": {
+            "source_arc_id": {"type": "string"},
+            "target_arc_id": {"type": "string"},
+            "kind": {"type": "string"},
+            "summary": {"type": "string"},
+            "metadata": {"type": "object"},
+        },
+        "required": ["source_arc_id", "target_arc_id"],
+        "additionalProperties": False,
+    }
+
+    update_schema = {
+        "type": "object",
+        "properties": {
+            "document_id": {
+                "type": "string",
+                "description": "Optional explicit target; defaults to the active document.",
+            },
+            "version_id": {"type": "string", "description": "Document version identifier for bookkeeping."},
+            "arcs": {"type": "array", "items": arc_schema},
+            "overrides": {"type": "array", "items": override_schema},
+            "dependencies": {"type": "array", "items": dependency_schema},
+            "remove_override_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of override IDs to delete before returning the summary.",
+            },
+            "note": {
+                "type": "string",
+                "description": "Optional free-form note persisted with version metadata.",
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Additional metadata stored alongside the version record.",
+            },
+        },
+        "additionalProperties": False,
+    }
+
+    def _record_failure(name: str, exc: Exception) -> None:
+        if failures is not None:
+            failures.append(ToolRegistrationFailure(name=name, error=exc))
+        LOGGER.warning("Failed to register plot tool %s: %s", name, exc, exc_info=True)
+
+    if outline_factory is not None:
+        try:
+            outline_tool = outline_factory()
+        except Exception as exc:
+            _record_failure("plot_outline", exc)
+            outline_tool = None
+        if outline_tool is not None:
+            for name in ("plot_outline", "document_plot_state"):
+                try:
+                    register(
+                        name,
+                        outline_tool,
+                        description=(
+                            "Return cached character/entity scaffolding, arcs, overrides, and dependencies built from plot scouting runs."
+                        ),
+                        parameters=outline_schema,
+                    )
+                except Exception as exc:
+                    _record_failure(name, exc)
+                else:
+                    registered.append(name)
+
+    if update_factory is not None:
+        try:
+            update_tool = update_factory()
+        except Exception as exc:
+            _record_failure("plot_state_update", exc)
+            update_tool = None
+        if update_tool is not None:
+            try:
+                register(
+                    "plot_state_update",
+                    update_tool,
+                    description=(
+                        "Persist arc/beat adjustments, overrides, and dependencies so plot scaffolding stays in sync after edits."
+                    ),
+                    parameters=update_schema,
+                )
+            except Exception as exc:
+                _record_failure("plot_state_update", exc)
+            else:
+                registered.append("plot_state_update")
+
+    return registered
+
+
+def unregister_plot_state_tool(controller: Any) -> None:
+    """Remove plot-memory tools when the feature flag is disabled."""
+
+    if controller is None:
+        return
+    unregister = getattr(controller, "unregister_tool", None)
+    if not callable(unregister):
+        return
+    for name in ("plot_outline", "document_plot_state", "plot_state_update"):
+        try:
+            unregister(name)
+        except Exception:  # pragma: no cover - defensive
+            LOGGER.debug("Failed to unregister %s", name, exc_info=True)
+
+
+# Backwards-compatible aliases for legacy import sites.
+register_plot_state_tool = register_plot_memory_tools
+
+
+def register_character_map_tool(
+    context: ToolRegistryContext,
+    *,
+    register_fn: Callable[..., Any] | None = None,
+    failures: list[ToolRegistrationFailure] | None = None,
+) -> list[str]:
+    """Register the character map tool when concordance is enabled."""
+
+    if not context.plot_scaffolding_enabled:
+        return []
+
+    controller = context.controller
+    if controller is None:
+        return []
+    register = register_fn or getattr(controller, "register_tool", None)
+    if not callable(register):
+        LOGGER.debug("AI controller does not expose register_tool; skipping character-map wiring.")
+        return []
+
+    tool_factory = context.ensure_character_map_tool
     if tool_factory is None:
         return []
 
@@ -512,8 +924,8 @@ def register_plot_state_tool(
         tool = tool_factory()
     except Exception as exc:
         if failures is not None:
-            failures.append(ToolRegistrationFailure(name="document_plot_state", error=exc))
-        LOGGER.warning("Failed to build DocumentPlotStateTool: %s", exc, exc_info=True)
+            failures.append(ToolRegistrationFailure(name="character_map", error=exc))
+        LOGGER.warning("Failed to build CharacterMapTool: %s", exc, exc_info=True)
         return []
 
     if tool is None:
@@ -521,10 +933,11 @@ def register_plot_state_tool(
 
     try:
         register(
-            "document_plot_state",
+            "character_map",
             tool,
             description=(
-                "Return cached character/entity scaffolding and plot arcs extracted from recent subagent runs."
+                "Return cached character/entity concordance data—aliases, pronouns, and mention snippets—"
+                "built from recent chunk summaries."
             ),
             parameters={
                 "type": "object",
@@ -533,25 +946,25 @@ def register_plot_state_tool(
                         "type": "string",
                         "description": "Optional explicit target; defaults to the active document.",
                     },
-                    "include_entities": {
+                    "include_mentions": {
                         "type": "boolean",
-                        "description": "When false, omit entity payloads to conserve tokens.",
+                        "description": "When false, omit mention snippets to conserve tokens.",
                     },
-                    "include_arcs": {
+                    "include_stats": {
                         "type": "boolean",
-                        "description": "When false, omit plot arc beats from the response.",
+                        "description": "Include ingestion counters and cache metadata in the response.",
                     },
                     "max_entities": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 50,
-                        "description": "Limit the number of entities returned before budgeting.",
+                        "description": "Limit how many entities are returned before budgeting.",
                     },
-                    "max_beats": {
+                    "max_mentions": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 50,
-                        "description": "Limit the number of beats returned per arc before budgeting.",
+                        "maximum": 25,
+                        "description": "Limit the number of mention entries per entity.",
                     },
                 },
                 "additionalProperties": False,
@@ -559,15 +972,15 @@ def register_plot_state_tool(
         )
     except Exception as exc:  # pragma: no cover - defensive
         if failures is not None:
-            failures.append(ToolRegistrationFailure(name="document_plot_state", error=exc))
-        LOGGER.warning("Failed to register DocumentPlotStateTool: %s", exc, exc_info=True)
+            failures.append(ToolRegistrationFailure(name="character_map", error=exc))
+        LOGGER.warning("Failed to register CharacterMapTool: %s", exc, exc_info=True)
         return []
 
-    return ["document_plot_state"]
+    return ["character_map"]
 
 
-def unregister_plot_state_tool(controller: Any) -> None:
-    """Remove the plot-state tool when the feature flag is turned off."""
+def unregister_character_map_tool(controller: Any) -> None:
+    """Remove the character map tool when the feature flag is disabled."""
 
     if controller is None:
         return
@@ -575,9 +988,121 @@ def unregister_plot_state_tool(controller: Any) -> None:
     if not callable(unregister):
         return
     try:
-        unregister("document_plot_state")
+        unregister("character_map")
     except Exception:  # pragma: no cover - defensive
-        LOGGER.debug("Failed to unregister document_plot_state", exc_info=True)
+        LOGGER.debug("Failed to unregister character_map", exc_info=True)
+
+
+def register_character_planner_tool(
+    context: ToolRegistryContext,
+    *,
+    register_fn: Callable[..., Any] | None = None,
+    failures: list[ToolRegistrationFailure] | None = None,
+) -> list[str]:
+    """Register the character edit planner when concordance is enabled."""
+
+    if not context.plot_scaffolding_enabled:
+        return []
+
+    controller = context.controller
+    if controller is None:
+        return []
+    register = register_fn or getattr(controller, "register_tool", None)
+    if not callable(register):
+        LOGGER.debug("AI controller does not expose register_tool; skipping character-planner wiring.")
+        return []
+
+    tool_factory = context.ensure_character_planner_tool
+    if tool_factory is None:
+        return []
+
+    try:
+        tool = tool_factory()
+    except Exception as exc:
+        if failures is not None:
+            failures.append(ToolRegistrationFailure(name="character_edit_planner", error=exc))
+        LOGGER.warning("Failed to build CharacterEditPlannerTool: %s", exc, exc_info=True)
+        return []
+
+    if tool is None:
+        return []
+
+    try:
+        register(
+            "character_edit_planner",
+            tool,
+            description=(
+                "Plan document-wide character edits by listing unresolved mentions and marking tasks complete as chunks are updated."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "document_id": {
+                        "type": "string",
+                        "description": "Optional explicit target; defaults to the active document.",
+                    },
+                    "targets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict the planner to specific entity_ids or alias/canonical names.",
+                    },
+                    "completed_task_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Mark these task identifiers as completed before returning the refreshed plan.",
+                    },
+                    "notes": {
+                        "type": "object",
+                        "description": "Optional map of task_id to completion note stored with planner progress.",
+                        "additionalProperties": {"type": "string"},
+                    },
+                    "include_completed": {
+                        "type": "boolean",
+                        "description": "When false, omit completed tasks from the response payload.",
+                    },
+                    "max_entities": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Clamp how many entities are inspected before budgeting.",
+                    },
+                    "max_mentions": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 25,
+                        "description": "Limit the number of mentions scanned per entity before budgeting.",
+                    },
+                    "max_tasks": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "Limit the number of tasks returned per invocation.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        if failures is not None:
+            failures.append(ToolRegistrationFailure(name="character_edit_planner", error=exc))
+        LOGGER.warning("Failed to register CharacterEditPlannerTool: %s", exc, exc_info=True)
+        return []
+
+    return ["character_edit_planner"]
+
+
+def unregister_character_planner_tool(controller: Any) -> None:
+    """Remove the character planner tool when the feature flag is disabled."""
+
+    if controller is None:
+        return
+    unregister = getattr(controller, "unregister_tool", None)
+    if not callable(unregister):
+        return
+    try:
+        unregister("character_edit_planner")
+    except Exception:  # pragma: no cover - defensive
+        LOGGER.debug("Failed to unregister character_edit_planner", exc_info=True)
 
 
 def _graph_batch_guard(controller: Any) -> AbstractContextManager[None]:
@@ -594,6 +1119,11 @@ __all__ = [
     "register_default_tools",
     "register_phase3_tools",
     "unregister_phase3_tools",
+    "register_plot_memory_tools",
     "register_plot_state_tool",
     "unregister_plot_state_tool",
+    "register_character_map_tool",
+    "unregister_character_map_tool",
+    "register_character_planner_tool",
+    "unregister_character_planner_tool",
 ]

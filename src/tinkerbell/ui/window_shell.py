@@ -99,6 +99,18 @@ _ACTION_DEFINITIONS: Tuple[_ActionDefinition, ...] = (
         shortcut="Ctrl+Comma",
         status_tip="Configure AI and editor preferences",
     ),
+    _ActionDefinition(
+        name="command_palette",
+        text="Command Palette…",
+        shortcut="Ctrl+Shift+P",
+        status_tip="Search for any command or action",
+    ),
+    _ActionDefinition(
+        name="view_document_status",
+        text="Document Status…",
+        shortcut="Ctrl+Shift+D",
+        status_tip="Inspect document readiness (chunks, outline, telemetry)",
+    ),
 )
 
 
@@ -116,6 +128,7 @@ _DEFAULT_MENUS: Tuple[MenuSpec, ...] = (
             "file_revert",
         ),
     ),
+    MenuSpec(name="view", title="&View", actions=("command_palette", "view_document_status")),
     MenuSpec(name="settings", title="&Settings", actions=("settings_open",)),
     MenuSpec(name="ai", title="&AI", actions=("ai_snapshot", "ai_accept_changes", "ai_reject_changes")),
 )

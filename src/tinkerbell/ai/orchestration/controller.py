@@ -19,6 +19,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, Mapping, MutableMap
 from openai.types.chat import ChatCompletionToolParam
 
 from .. import prompts
+from ..analysis import AnalysisAgent, AnalysisAdvice, AnalysisInput
 from ..ai_types import (
     AgentConfig,
     ChunkReference,
@@ -28,7 +29,16 @@ from ..ai_types import (
     SubagentRuntimeConfig,
 )
 from ..client import AIClient, AIStreamEvent
+from ..memory.cache_bus import (
+    DocumentCacheBus,
+    DocumentCacheEvent,
+    DocumentChangedEvent,
+    DocumentClosedEvent,
+    get_document_cache_bus,
+)
+from ..memory.chunk_index import ChunkIndex
 from ..memory.plot_state import DocumentPlotStateStore
+from ..memory.character_map import CharacterMapStore
 from ..services import ToolPayload, build_pointer, summarize_tool_content, telemetry as telemetry_service
 from ..services.trace_compactor import TraceCompactor
 from ...chat.message_model import ToolPointerMessage
@@ -116,6 +126,263 @@ class _MessagePlan:
     completion_budget: int | None
     prompt_tokens: int
 
+
+@dataclass(slots=True)
+class _ChunkContext:
+    """Resolved chunk metadata pulled from a manifest for subagent planning."""
+
+    chunk_id: str
+    document_id: str
+    char_range: tuple[int, int]
+    chunk_hash: str | None = None
+    pointer_id: str | None = None
+    text: str | None = None
+
+
+@dataclass(slots=True)
+class _ChunkFlowTracker:
+    """Tracks whether the agent stays on the chunk-first path during a run."""
+
+    document_id: str | None
+    warning_active: bool = False
+    last_reason: str | None = None
+
+    def observe_tool(self, record: Mapping[str, Any], payload: Mapping[str, Any] | None) -> list[str] | None:
+        name = str(record.get("name") or "").lower()
+        if name == "document_snapshot":
+            return self._handle_snapshot(record, payload)
+        if name == "document_chunk":
+            self._handle_chunk_tool(payload)
+        return None
+
+    # ------------------------------------------------------------------
+    # Snapshot handling
+    # ------------------------------------------------------------------
+    def _handle_snapshot(self, record: Mapping[str, Any], payload: Mapping[str, Any] | None) -> list[str] | None:
+        if not isinstance(payload, Mapping):
+            return None
+        window = payload.get("window") if isinstance(payload.get("window"), Mapping) else None
+        if window is None:
+            window = {}
+        includes_full = bool(window.get("includes_full_document"))
+        doc_length = self._coerce_int(payload.get("length"))
+        window_span = self._window_span(window, payload)
+        selection_span = self._selection_span(window, payload)
+        manifest = payload.get("chunk_manifest") if isinstance(payload.get("chunk_manifest"), Mapping) else None
+        metadata: dict[str, Any] = {
+            "document_id": payload.get("document_id") or self.document_id,
+            "document_length": doc_length,
+            "window_span": window_span,
+            "selection_span": selection_span,
+            "window_kind": str(window.get("kind") or ""),
+            "requested_window": str(window.get("requested_kind") or ""),
+            "defaulted": bool(window.get("defaulted")),
+            "source": "document_snapshot",
+        }
+        if manifest:
+            chunks = manifest.get("chunks")
+            if isinstance(chunks, Sequence):
+                metadata["chunk_count"] = len(chunks)
+            cache_hit = manifest.get("cache_hit")
+            if cache_hit is not None:
+                metadata["cache_hit"] = bool(cache_hit)
+        threshold_triggered = self._is_large_window(doc_length, window_span)
+        if includes_full and threshold_triggered:
+            metadata["reason"] = self._snapshot_reason(record, metadata)
+            return self._emit_warning(metadata)
+        self._emit_request(metadata)
+        if self.warning_active:
+            recovery = dict(metadata)
+            recovery["recovered_via"] = "document_snapshot"
+            self._emit_recovery(recovery)
+        return None
+
+    def _snapshot_reason(self, record: Mapping[str, Any], metadata: Mapping[str, Any]) -> str:
+        resolved = record.get("resolved_arguments") if isinstance(record.get("resolved_arguments"), Mapping) else None
+        if resolved:
+            window_arg = resolved.get("window")
+            if isinstance(window_arg, str) and window_arg.strip():
+                return f"window:{window_arg.strip().lower()}"
+            if isinstance(window_arg, Mapping):
+                kind = window_arg.get("kind") or window_arg.get("requested_kind")
+                if isinstance(kind, str) and kind.strip():
+                    return f"window:{kind.strip().lower()}"
+        if metadata.get("defaulted"):
+            return "default_window_full"
+        return "full_window_range"
+
+    def _window_span(self, window: Mapping[str, Any], payload: Mapping[str, Any]) -> int | None:
+        start = self._coerce_int(window.get("start"))
+        end = self._coerce_int(window.get("end"))
+        if start is not None and end is not None:
+            return max(0, end - start)
+        text_range = payload.get("text_range")
+        if isinstance(text_range, Mapping):
+            range_start = self._coerce_int(text_range.get("start"))
+            range_end = self._coerce_int(text_range.get("end"))
+            if range_start is not None and range_end is not None:
+                return max(0, range_end - range_start)
+        return None
+
+    @staticmethod
+    def _selection_span(window: Mapping[str, Any], payload: Mapping[str, Any]) -> int | None:
+        selection = window.get("selection")
+        if not isinstance(selection, Mapping):
+            selection = payload.get("selection") if isinstance(payload.get("selection"), Mapping) else None
+        if not isinstance(selection, Mapping):
+            return None
+        start = _ChunkFlowTracker._coerce_int(selection.get("start"))
+        end = _ChunkFlowTracker._coerce_int(selection.get("end"))
+        if start is None or end is None:
+            return None
+        return max(0, end - start)
+
+    @staticmethod
+    def _is_large_window(doc_length: int | None, window_span: int | None) -> bool:
+        span = window_span if window_span is not None else doc_length
+        if span is None:
+            return False
+        return span >= prompts.LARGE_DOC_CHAR_THRESHOLD
+
+    # ------------------------------------------------------------------
+    # Chunk tool handling
+    # ------------------------------------------------------------------
+    def _handle_chunk_tool(self, payload: Mapping[str, Any] | None) -> None:
+        if not isinstance(payload, Mapping):
+            return
+        chunk = payload.get("chunk")
+        if not isinstance(chunk, Mapping):
+            return
+        start = self._coerce_int(chunk.get("start"))
+        end = self._coerce_int(chunk.get("end"))
+        length = chunk.get("length")
+        if not isinstance(length, int) and start is not None and end is not None:
+            length = max(0, end - start)
+        metadata = {
+            "document_id": chunk.get("document_id") or self.document_id,
+            "chunk_id": chunk.get("chunk_id"),
+            "chunk_length": length,
+            "window_start": start,
+            "window_end": end,
+            "pointerized": bool(chunk.get("pointer")),
+            "source": "document_chunk",
+        }
+        self._emit_request(metadata)
+        if self.warning_active:
+            recovery = dict(metadata)
+            recovery["recovered_via"] = "document_chunk"
+            self._emit_recovery(recovery)
+
+    # ------------------------------------------------------------------
+    # Telemetry helpers
+    # ------------------------------------------------------------------
+    def _emit_request(self, metadata: Mapping[str, Any]) -> None:
+        telemetry_service.emit("chunk_flow.requested", self._clean_payload(metadata))
+
+    def _emit_warning(self, metadata: Mapping[str, Any]) -> list[str]:
+        payload = dict(metadata)
+        if self.warning_active:
+            payload["repeat"] = True
+        telemetry_service.emit("chunk_flow.escaped_full_snapshot", self._clean_payload(payload))
+        self.warning_active = True
+        self.last_reason = str(metadata.get("reason") or "full_snapshot")
+        doc_length = self._coerce_int(metadata.get("document_length"))
+        approx = f" (~{doc_length:,} chars)" if doc_length else ""
+        return [
+            f"DocumentSnapshot fetched the entire document{approx}.",
+            "Request a selection-scoped snapshot or hydrate a chunk via DocumentChunkTool before editing.",
+            "If a full snapshot is unavoidable, explain the fallback to the user and immediately return to chunked context.",
+        ]
+
+    def _emit_recovery(self, metadata: Mapping[str, Any]) -> None:
+        if not self.warning_active:
+            return
+        telemetry_service.emit("chunk_flow.retry_success", self._clean_payload(metadata))
+        self.warning_active = False
+        self.last_reason = None
+
+    @staticmethod
+    def _clean_payload(metadata: Mapping[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in metadata.items() if value not in (None, "")}
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+
+@dataclass(slots=True)
+class _PlotLoopTracker:
+    """Ensures the agent follows the plot-outline → edit → update contract."""
+
+    document_id: str | None
+    outline_called: bool = False
+    pending_update: bool = False
+    blocked_edits: int = 0
+
+    def before_tool(self, tool_name: str | None) -> str | None:
+        name = (tool_name or "").strip().lower()
+        if name in {"document_apply_patch", "document_edit"} and not self.outline_called:
+            self.blocked_edits += 1
+            return (
+                "Plot loop guardrail: call PlotOutlineTool for continuity context before applying edits."
+            )
+        return None
+
+    def observe_tool(self, record: Mapping[str, Any], payload: Mapping[str, Any] | None) -> list[str] | None:
+        name = str(record.get("name") or "").lower()
+        status = str(record.get("status") or "ok").lower()
+        succeeded = status == "ok"
+        if name in {"plot_outline", "document_plot_state"} and succeeded:
+            self.outline_called = True
+            return None
+        if name == "plot_state_update":
+            if succeeded and self.pending_update:
+                self.pending_update = False
+                return [
+                    "PlotStateUpdateTool received your changes. You may proceed to the next edit after reading the outline if needed.",
+                ]
+            if succeeded:
+                self.pending_update = False
+            return None
+        if name in {"document_apply_patch", "document_edit"} and succeeded:
+            self.pending_update = True
+            return [
+                "Plot loop reminder: call PlotStateUpdateTool to log the changes you just applied so downstream agents stay in sync.",
+            ]
+        return None
+
+    def needs_update_prompt(self) -> bool:
+        return self.pending_update
+
+    def update_prompt(self) -> str:
+        target = self.document_id or "this document"
+        return (
+            f"Plot loop requirement: run PlotStateUpdateTool for {target} before finishing this turn so plot scaffolding reflects your edits."
+        )
+
+
+@dataclass(slots=True)
+class ChunkingRuntimeConfig:
+    """Settings governing chunk manifest preferences and tool caps."""
+
+    default_profile: str = "auto"
+    overlap_chars: int = 256
+    max_inline_tokens: int = 1_800
+    iterator_limit: int = 4
+
+
+@dataclass(slots=True)
+class AnalysisRuntimeConfig:
+    """Toggles for the preflight analysis agent."""
+
+    enabled: bool = True
+    ttl_seconds: float = 120.0
+
 @dataclass(slots=True)
 class ToolRegistration:
     """Metadata stored for each registered tool."""
@@ -176,6 +443,7 @@ class AIController:
     agent_config: AgentConfig | None = None
     budget_policy: ContextBudgetPolicy | None = None
     subagent_config: SubagentRuntimeConfig = field(default_factory=SubagentRuntimeConfig)
+    analysis_config: AnalysisRuntimeConfig = field(default_factory=AnalysisRuntimeConfig)
     _graph: Dict[str, Any] = field(init=False, repr=False)
     _active_task: asyncio.Task[dict] | None = field(default=None, init=False, repr=False)
     _task_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
@@ -186,6 +454,14 @@ class AIController:
     _subagent_runtime: SubagentRuntimeManager | None = field(default=None, init=False, repr=False)
     _graph_rebuild_suspensions: int = field(default=0, init=False, repr=False)
     _graph_dirty: bool = field(default=False, init=False, repr=False)
+    _chunk_config: ChunkingRuntimeConfig = field(default_factory=ChunkingRuntimeConfig, init=False, repr=False)
+    _chunk_index: ChunkIndex | None = field(default=None, init=False, repr=False)
+    _chunk_flow_tracker: _ChunkFlowTracker | None = field(default=None, init=False, repr=False)
+    _plot_loop_tracker: _PlotLoopTracker | None = field(default=None, init=False, repr=False)
+    _analysis_agent: AnalysisAgent | None = field(default=None, init=False, repr=False)
+    _analysis_advice_cache: dict[str, AnalysisAdvice] = field(default_factory=dict, init=False, repr=False)
+    _latest_snapshot_cache: dict[str, Mapping[str, Any]] = field(default_factory=dict, init=False, repr=False)
+    _cache_bus: DocumentCacheBus | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.tools:
@@ -209,6 +485,8 @@ class AIController:
         self._configure_telemetry_sink()
         self.configure_budget_policy(self.budget_policy)
         self.configure_subagents(self.subagent_config)
+        self.configure_analysis(self.analysis_config)
+        self._subscribe_document_cache_bus()
         self._trace_compactor = TraceCompactor(
             pointer_builder=self._build_tool_pointer,
             estimate_message_tokens=self._estimate_message_tokens,
@@ -226,6 +504,13 @@ class AIController:
 
         runtime = self._subagent_runtime
         return runtime.plot_state_store if runtime else None
+
+    @property
+    def character_map_store(self) -> CharacterMapStore | None:
+        """Return the active character/entity concordance store (when enabled)."""
+
+        runtime = self._subagent_runtime
+        return runtime.character_map_store if runtime else None
 
     def register_tool(
         self,
@@ -349,6 +634,502 @@ class AIController:
         else:
             self.response_token_reserve = self._normalize_response_reserve(self.response_token_reserve)
 
+    def configure_chunking(
+        self,
+        *,
+        default_profile: str | None = None,
+        overlap_chars: int | None = None,
+        max_inline_tokens: int | None = None,
+        iterator_limit: int | None = None,
+    ) -> None:
+        """Update runtime chunking preferences for manifest + chunk tools."""
+
+        config = self._chunk_config
+        if default_profile is not None:
+            normalized = str(default_profile).strip().lower()
+            if normalized not in {"auto", "prose", "code", "notes"}:
+                normalized = "auto"
+            config.default_profile = normalized
+        if overlap_chars is not None:
+            try:
+                config.overlap_chars = max(0, int(overlap_chars))
+            except (TypeError, ValueError):
+                pass
+        if max_inline_tokens is not None:
+            try:
+                config.max_inline_tokens = max(256, int(max_inline_tokens))
+            except (TypeError, ValueError):
+                pass
+        if iterator_limit is not None:
+            try:
+                config.iterator_limit = max(1, int(iterator_limit))
+            except (TypeError, ValueError):
+                pass
+
+    def configure_analysis(
+        self,
+        config: AnalysisRuntimeConfig | None = None,
+        *,
+        enabled: bool | None = None,
+        ttl_seconds: float | None = None,
+    ) -> None:
+        """Update analysis runtime preferences and rebuild the agent cache."""
+
+        base = config or self.analysis_config
+        normalized = AnalysisRuntimeConfig(
+            enabled=bool(getattr(base, "enabled", True)),
+            ttl_seconds=max(30.0, float(getattr(base, "ttl_seconds", 120.0) or 120.0)),
+        )
+        if enabled is not None:
+            normalized.enabled = bool(enabled)
+        if ttl_seconds is not None:
+            try:
+                normalized.ttl_seconds = max(30.0, float(ttl_seconds))
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                pass
+        self.analysis_config = normalized
+        self._analysis_agent = None
+
+    def get_chunking_config(self) -> ChunkingRuntimeConfig:
+        """Return a copy of the current chunking runtime config."""
+
+        config = self._chunk_config
+        return ChunkingRuntimeConfig(
+            default_profile=config.default_profile,
+            overlap_chars=config.overlap_chars,
+            max_inline_tokens=config.max_inline_tokens,
+            iterator_limit=config.iterator_limit,
+        )
+
+    def analysis_enabled(self) -> bool:
+        """Return whether the preflight analysis pipeline is active."""
+
+        return bool(getattr(self.analysis_config, "enabled", False))
+
+    def ensure_chunk_index(self) -> ChunkIndex:
+        """Return the lazily constructed chunk index shared across tools."""
+
+        if self._chunk_index is None:
+            self._chunk_index = ChunkIndex()
+        return self._chunk_index
+
+    def _ingest_snapshot_manifest(self, snapshot: Mapping[str, Any]) -> None:
+        manifest = snapshot.get("chunk_manifest")
+        if isinstance(manifest, Mapping):
+            self._ingest_chunk_manifest(manifest)
+        extras = snapshot.get("source_tab_snapshots")
+        if isinstance(extras, Sequence):
+            for candidate in extras:
+                if isinstance(candidate, Mapping):
+                    self._ingest_snapshot_manifest(candidate)
+
+    def _ingest_chunk_manifest(self, manifest: Mapping[str, Any]) -> None:
+        try:
+            self.ensure_chunk_index().ingest_manifest(manifest)
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Chunk manifest ingestion failed", exc_info=True)
+
+    def _resolve_chunk_tool(self) -> Any | None:
+        registration = self.tools.get("document_chunk")
+        if registration is None:
+            return None
+        impl = getattr(registration, "impl", registration)
+        runner = getattr(impl, "run", None)
+        if callable(runner):
+            return impl
+        if callable(impl):
+            return impl
+        return None
+
+    def _hydrate_chunk_text(
+        self,
+        *,
+        chunk_id: str,
+        document_id: str | None,
+        cache_key: str | None,
+        version: str | None,
+    ) -> str:
+        tool = self._resolve_chunk_tool()
+        if tool is None:
+            return ""
+        kwargs: dict[str, Any] = {"chunk_id": chunk_id, "include_text": True}
+        if document_id:
+            kwargs["document_id"] = document_id
+        if cache_key:
+            kwargs["cache_key"] = cache_key
+        if version:
+            kwargs["version"] = version
+        try:
+            runner = getattr(tool, "run", None)
+            if callable(runner):
+                result = runner(**kwargs)
+            else:
+                result = tool(**kwargs)
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Chunk hydration failed for %s", chunk_id, exc_info=True)
+            return ""
+        if not isinstance(result, Mapping):
+            return ""
+        chunk_payload = result.get("chunk")
+        if isinstance(chunk_payload, Mapping):
+            text = chunk_payload.get("text")
+            if isinstance(text, str):
+                return text
+        return ""
+
+    def _build_manifest_chunk_context(
+        self,
+        snapshot: Mapping[str, Any],
+        selection_span: tuple[int, int],
+        *,
+        hydrate_text: bool,
+    ) -> _ChunkContext | None:
+        manifest = snapshot.get("chunk_manifest")
+        if not isinstance(manifest, Mapping):
+            return None
+        chunks = manifest.get("chunks")
+        if not isinstance(chunks, Sequence) or not chunks:
+            return None
+        self._ingest_chunk_manifest(manifest)
+        chosen = self._select_manifest_chunk(chunks, selection_span)
+        if chosen is None:
+            return None
+        chunk_id = str(chosen.get("id") or "").strip()
+        if not chunk_id:
+            return None
+        document_id = str(manifest.get("document_id") or self._resolve_document_id(snapshot) or "document")
+        start = self._coerce_index(chosen.get("start"), selection_span[0])
+        end = self._coerce_index(chosen.get("end"), max(selection_span[1], start + 1))
+        if end <= start:
+            end = start + max(1, selection_span[1] - selection_span[0])
+        chunk_hash = chosen.get("hash")
+        pointer_id = chosen.get("outline_pointer_id")
+        context = _ChunkContext(
+            chunk_id=chunk_id,
+            document_id=document_id,
+            char_range=(start, end),
+            chunk_hash=str(chunk_hash).strip() if isinstance(chunk_hash, str) and chunk_hash.strip() else None,
+            pointer_id=str(pointer_id).strip() if isinstance(pointer_id, str) and pointer_id.strip() else None,
+        )
+        if hydrate_text:
+            cache_key = manifest.get("cache_key")
+            version = manifest.get("version")
+            text = self._hydrate_chunk_text(
+                chunk_id=chunk_id,
+                document_id=document_id,
+                cache_key=str(cache_key).strip() if isinstance(cache_key, str) and cache_key.strip() else None,
+                version=str(version).strip() if isinstance(version, str) and version.strip() else None,
+            )
+            context.text = text or None
+        return context
+
+    def _analysis_hint_message(self, snapshot: Mapping[str, Any]) -> dict[str, str] | None:
+        advice = self._run_preflight_analysis(snapshot, source="controller")
+        if advice is None:
+            return None
+        hint_text = self._format_analysis_hint(advice)
+        if not hint_text:
+            return None
+        return {"role": "system", "content": hint_text}
+
+    def _run_preflight_analysis(
+        self,
+        snapshot: Mapping[str, Any],
+        *,
+        source: str = "controller",
+        force_refresh: bool = False,
+    ) -> AnalysisAdvice | None:
+        if not self.analysis_enabled():
+            return None
+        document_id = self._resolve_document_id(snapshot)
+        if not document_id:
+            return None
+        agent = self._ensure_analysis_agent()
+        analysis_input = self._build_analysis_input(snapshot)
+        advice = agent.analyze(analysis_input, force_refresh=force_refresh, source=source)
+        self._analysis_advice_cache[document_id] = advice
+        return advice
+
+    def _ensure_analysis_agent(self) -> AnalysisAgent:
+        agent = self._analysis_agent
+        if agent is not None:
+            return agent
+        telemetry_emitter = getattr(telemetry_service, "emit", None)
+        if not callable(telemetry_emitter):
+            telemetry_emitter = None
+        agent = AnalysisAgent(
+            ttl_seconds=self.analysis_config.ttl_seconds,
+            telemetry_emitter=telemetry_emitter,
+        )
+        self._analysis_agent = agent
+        return agent
+
+    def _build_analysis_input(self, snapshot: Mapping[str, Any]) -> AnalysisInput:
+        selection_start, selection_end = self._analysis_selection_bounds(snapshot)
+        manifest = snapshot.get("chunk_manifest") if isinstance(snapshot.get("chunk_manifest"), Mapping) else None
+        chunk_profile = manifest.get("chunk_profile") if isinstance(manifest, Mapping) else None
+        chunk_cache_key = manifest.get("cache_key") if isinstance(manifest, Mapping) else None
+        outline_age = self._coerce_optional_float(snapshot.get("outline_age_seconds"))
+        if outline_age is None:
+            completed = snapshot.get("outline_completed_at")
+            outline_age = self._outline_age_from_timestamp(completed)
+        selection_hash = self._coerce_optional_str(snapshot.get("selection_hash"))
+        document_chars = self._coerce_optional_int(snapshot.get("length"))
+        if document_chars is None:
+            text = snapshot.get("text")
+            if isinstance(text, str):
+                document_chars = len(text)
+        chunk_flow_flags: tuple[str, ...] = ()
+        tracker = self._chunk_flow_tracker
+        if tracker and tracker.warning_active:
+            chunk_flow_flags = (tracker.last_reason or "chunk_flow_warning",)
+        plot_loop_flags: tuple[str, ...] = ()
+        plot_state_status = self._coerce_optional_str(snapshot.get("plot_state_status"))
+        loop_tracker = self._plot_loop_tracker
+        if loop_tracker is not None:
+            if loop_tracker.pending_update:
+                plot_state_status = "pending_update"
+                plot_loop_flags = ("pending_update",)
+            elif loop_tracker.outline_called and not plot_state_status:
+                plot_state_status = "ok"
+        concordance_status = self._coerce_optional_str(snapshot.get("concordance_status"))
+        concordance_age = self._coerce_optional_float(snapshot.get("concordance_age_seconds"))
+        extras: dict[str, object] = {}
+        if chunk_flow_flags:
+            extras["chunk_flow"] = chunk_flow_flags
+        if plot_loop_flags:
+            extras["plot_loop"] = plot_loop_flags
+        if manifest and manifest.get("generated_at") is not None:
+            extras["chunk_manifest_generated_at"] = manifest.get("generated_at")
+        document_id = self._resolve_document_id(snapshot) or "document"
+        version = snapshot.get("version") or snapshot.get("version_id") or snapshot.get("document_version")
+        return AnalysisInput(
+            document_id=document_id,
+            document_version=str(version) if version else None,
+            document_path=self._coerce_optional_str(snapshot.get("path")),
+            selection_start=selection_start,
+            selection_end=selection_end,
+            document_chars=document_chars,
+            chunk_profile_hint=self._chunk_config.default_profile,
+            chunk_index_ready=self._chunk_index is not None,
+            chunk_manifest_profile=str(chunk_profile) if chunk_profile else None,
+            chunk_manifest_cache_key=str(chunk_cache_key) if chunk_cache_key else None,
+            outline_digest=self._coerce_optional_str(snapshot.get("outline_digest")),
+            outline_age_seconds=outline_age,
+            outline_version_id=self._coerce_optional_int(snapshot.get("outline_version_id")),
+            plot_state_status=plot_state_status,
+            plot_override_version=self._coerce_optional_int(snapshot.get("plot_override_version")),
+            concordance_status=concordance_status,
+            concordance_age_seconds=concordance_age,
+            retrieval_enabled=True,
+            selection_fingerprint=selection_hash,
+            extra_metadata=extras or None,
+            chunk_flow_warnings=chunk_flow_flags or None,
+            plot_loop_flags=plot_loop_flags or None,
+        )
+
+    def _analysis_selection_bounds(self, snapshot: Mapping[str, Any]) -> tuple[int, int]:
+        span = self._selection_span(snapshot)
+        if span is not None:
+            return span
+        selection = snapshot.get("selection")
+        start = 0
+        end = 0
+        if isinstance(selection, Mapping):
+            start = self._coerce_index(selection.get("start"), 0)
+            end = self._coerce_index(selection.get("end"), start)
+        elif isinstance(selection, Sequence) and len(selection) >= 2:
+            try:
+                start = int(selection[0])
+                end = int(selection[1])
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                start = 0
+                end = 0
+        document_length = self._coerce_optional_int(snapshot.get("length"))
+        if document_length is not None:
+            start = max(0, min(start, document_length))
+            end = max(start, min(end, document_length))
+        return (start, end)
+
+    def _format_analysis_hint(self, advice: AnalysisAdvice) -> str:
+        lines = [
+            f"- Chunk profile: {advice.chunk_profile}",
+            f"- Required tools: {', '.join(advice.required_tools) if advice.required_tools else 'none'}",
+        ]
+        if advice.optional_tools:
+            lines.append(f"- Optional tools: {', '.join(advice.optional_tools)}")
+        lines.append(f"- Outline refresh required: {'yes' if advice.must_refresh_outline else 'no'}")
+        if advice.plot_state_status:
+            lines.append(f"- Plot state status: {advice.plot_state_status}")
+        if advice.concordance_status:
+            lines.append(f"- Concordance status: {advice.concordance_status}")
+        if advice.warnings:
+            warning_lines = "\n".join(f"  - {warning.message}" for warning in advice.warnings)
+            lines.append(f"- Warnings:\n{warning_lines}")
+        return "Preflight analysis summary:\n" + "\n".join(lines)
+
+    def _remember_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+        document_id = self._resolve_document_id(snapshot)
+        if not document_id:
+            return
+        self._latest_snapshot_cache[document_id] = dict(snapshot)
+
+    def get_latest_analysis_advice(self, document_id: str | None) -> AnalysisAdvice | None:
+        if not document_id:
+            return None
+        return self._analysis_advice_cache.get(document_id)
+
+    def get_latest_snapshot(self, document_id: str | None) -> Mapping[str, Any] | None:
+        if not document_id:
+            return None
+        cached = self._latest_snapshot_cache.get(document_id)
+        if cached is None:
+            return None
+        return dict(cached)
+
+    def _subscribe_document_cache_bus(self) -> None:
+        try:
+            bus = get_document_cache_bus()
+        except Exception:  # pragma: no cover - defensive bus acquisition
+            LOGGER.debug("Unable to acquire document cache bus", exc_info=True)
+            return
+        self._cache_bus = bus
+        try:
+            bus.subscribe(DocumentChangedEvent, self._handle_document_cache_event, weak=True)
+            bus.subscribe(DocumentClosedEvent, self._handle_document_cache_event, weak=True)
+        except Exception:  # pragma: no cover - cache bus subscription failures should not break controller
+            LOGGER.debug("Failed to subscribe to document cache bus", exc_info=True)
+
+    def _handle_document_cache_event(self, event: DocumentCacheEvent) -> None:
+        document_id = getattr(event, "document_id", None)
+        if not document_id:
+            return
+        self._analysis_advice_cache.pop(document_id, None)
+        self._latest_snapshot_cache.pop(document_id, None)
+        agent = self._analysis_agent
+        if agent is None:
+            return
+        try:
+            agent.invalidate_document(document_id)
+        except Exception:  # pragma: no cover - cache invalidation best-effort
+            LOGGER.debug("Failed to invalidate analysis cache for %s", document_id, exc_info=True)
+
+    def _emit_analysis_invocation_event(
+        self,
+        *,
+        event_name: str,
+        document_id: str | None,
+        selection_start: int | None,
+        selection_end: int | None,
+        force_refresh: bool,
+        reason: str | None,
+        snapshot_origin: str,
+    ) -> None:
+        emitter = getattr(telemetry_service, "emit", None)
+        if not callable(emitter):
+            return
+        payload: dict[str, object] = {
+            "document_id": document_id,
+            "selection_start": selection_start if selection_start is not None else None,
+            "selection_end": selection_end if selection_end is not None else None,
+            "force_refresh": bool(force_refresh),
+            "snapshot_origin": snapshot_origin,
+            "source": "tool",
+        }
+        if reason:
+            payload["reason"] = reason
+        payload["has_selection_override"] = selection_start is not None and selection_end is not None
+        emitter(event_name, payload)
+
+    def request_analysis_advice(
+        self,
+        *,
+        document_id: str | None = None,
+        snapshot: Mapping[str, Any] | None = None,
+        selection_start: int | None = None,
+        selection_end: int | None = None,
+        force_refresh: bool = False,
+        reason: str | None = None,
+    ) -> AnalysisAdvice | None:
+        """Public entry point for UI code to rerun the analysis agent."""
+
+        return self._advisor_tool_entrypoint(
+            document_id=document_id,
+            snapshot=snapshot,
+            selection_start=selection_start,
+            selection_end=selection_end,
+            force_refresh=force_refresh,
+            reason=reason,
+            invocation_source="ui",
+        )
+
+    def _advisor_tool_entrypoint(
+        self,
+        *,
+        document_id: str | None = None,
+        snapshot: Mapping[str, Any] | None = None,
+        selection_start: int | None = None,
+        selection_end: int | None = None,
+        force_refresh: bool = False,
+        reason: str | None = None,
+        invocation_source: str | None = None,
+    ) -> AnalysisAdvice | None:
+        source = (invocation_source or "tool").strip() or "tool"
+        if not self.analysis_enabled():
+            return None
+        candidate_snapshot: Mapping[str, Any] | None = snapshot
+        target_id = document_id
+        if candidate_snapshot is None and target_id:
+            cached = self._latest_snapshot_cache.get(target_id)
+            if cached is not None:
+                candidate_snapshot = dict(cached)
+                snapshot_origin = "cache"
+            else:
+                snapshot_origin = "missing"
+        else:
+            snapshot_origin = "provided"
+        if candidate_snapshot is None:
+            raise ValueError("snapshot or document_id is required for analysis")
+        snapshot_payload = dict(candidate_snapshot)
+        resolved_id = target_id or self._resolve_document_id(snapshot_payload)
+        if resolved_id:
+            snapshot_payload.setdefault("document_id", resolved_id)
+        if selection_start is not None and selection_end is not None:
+            snapshot_payload["selection"] = {"start": selection_start, "end": selection_end}
+        if source == "tool":
+            self._emit_analysis_invocation_event(
+                event_name="analysis.advisor_tool.invoked",
+                document_id=resolved_id,
+                selection_start=selection_start,
+                selection_end=selection_end,
+                force_refresh=force_refresh,
+                reason=reason,
+                snapshot_origin=snapshot_origin,
+            )
+        return self._run_preflight_analysis(snapshot_payload, source=source, force_refresh=force_refresh)
+
+    @staticmethod
+    def _select_manifest_chunk(
+        chunks: Sequence[Any],
+        selection_span: tuple[int, int],
+    ) -> Mapping[str, Any] | None:
+        start, end = selection_span
+        width = max(1, end - start)
+        center = start + width // 2
+        fallback: Mapping[str, Any] | None = None
+        for chunk in chunks:
+            if not isinstance(chunk, Mapping):
+                continue
+            chunk_start = AIController._coerce_index(chunk.get("start"), start)
+            chunk_end = AIController._coerce_index(chunk.get("end"), chunk_start + 1)
+            if chunk_end <= chunk_start:
+                chunk_end = chunk_start + 1
+            if chunk_start <= center < chunk_end:
+                return chunk
+            if fallback is None and start < chunk_end and end > chunk_start:
+                fallback = chunk
+        return fallback
+
     def configure_budget_policy(self, policy: ContextBudgetPolicy | None) -> None:
         """Update (or initialize) the active budget policy."""
 
@@ -403,13 +1184,22 @@ class AIController:
         """Execute a chat turn against the compiled agent graph."""
 
         snapshot = dict(doc_snapshot or {})
+        self._ingest_snapshot_manifest(snapshot)
+        self._remember_snapshot(snapshot)
         message_plan = self._build_messages(prompt, snapshot, history)
         outline_hint = self._outline_routing_hint(prompt, snapshot)
+        analysis_hint = self._analysis_hint_message(snapshot)
         base_messages = list(message_plan.messages)
+        insert_index = 1
+        if analysis_hint:
+            base_messages.insert(insert_index, analysis_hint)
+            message_plan.prompt_tokens += self._estimate_message_tokens(analysis_hint)
+            insert_index += 1
         if outline_hint:
             hint_message = {"role": "system", "content": outline_hint}
-            base_messages.insert(1, hint_message)
+            base_messages.insert(insert_index, hint_message)
             message_plan.prompt_tokens += self._estimate_message_tokens(hint_message)
+            insert_index += 1
         completion_budget = message_plan.completion_budget
         merged_metadata = self._build_metadata(snapshot, metadata)
         tool_specs = [registration.as_openai_tool() for registration in self.tools.values()]
@@ -432,216 +1222,246 @@ class AIController:
         async def _runner() -> dict:
             if self._trace_compactor is not None:
                 self._trace_compactor.reset()
-            conversation: list[dict[str, Any]] = list(base_messages)
-            conversation_tokens = message_plan.prompt_tokens
-            response_text = ""
-            turn_count = 0
-            tool_iterations = 0
-            executed_tool_calls: list[dict[str, Any]] = []
-            pending_patch_application = False
-            diff_builders_since_edit = 0
-            patch_reminders_sent = 0
-            tool_followup_prompts_sent = 0
-            tool_followup_user_prompts_sent = 0
+            chunk_tracker = _ChunkFlowTracker(document_id=self._resolve_document_id(snapshot))
+            self._chunk_flow_tracker = chunk_tracker
+            plot_tracker: _PlotLoopTracker | None = None
+            if getattr(self.subagent_config, "plot_scaffolding_enabled", False):
+                plot_tracker = _PlotLoopTracker(document_id=self._resolve_document_id(snapshot))
+            self._plot_loop_tracker = plot_tracker
+            try:
+                conversation: list[dict[str, Any]] = list(base_messages)
+                conversation_tokens = message_plan.prompt_tokens
+                response_text = ""
+                turn_count = 0
+                tool_iterations = 0
+                executed_tool_calls: list[dict[str, Any]] = []
+                pending_patch_application = False
+                diff_builders_since_edit = 0
+                patch_reminders_sent = 0
+                tool_followup_prompts_sent = 0
+                tool_followup_user_prompts_sent = 0
+                plot_loop_reminders_sent = 0
 
-            turn_metrics = self._new_turn_context(
-                snapshot=snapshot,
-                prompt_tokens=message_plan.prompt_tokens,
-                conversation_length=len(base_messages),
-                response_reserve=completion_budget,
-            )
-            subagent_jobs: list[SubagentJob] = []
-            subagent_messages: list[dict[str, str]] = []
-            runtime = self._subagent_runtime
-            if runtime is not None and runtime.manager is not None and self.subagent_config.enabled:
-                try:
-                    subagent_jobs, subagent_messages = await self._run_subagent_pipeline(
-                        prompt=prompt,
-                        snapshot=snapshot,
-                        turn_context=turn_metrics,
-                    )
-                except Exception:  # pragma: no cover - defensive guard
-                    LOGGER.debug("Subagent pipeline failed; continuing without helper context", exc_info=True)
-                    subagent_jobs = []
-                    subagent_messages = []
-                job_pointer_ids = tuple(job.job_id for job in subagent_jobs if job.job_id)
-                document_id_hint = self._resolve_document_id(snapshot)
-                for message in subagent_messages:
-                    pending_tokens = self._estimate_message_tokens(message)
-                    decision = self._evaluate_budget(
-                        prompt_tokens=conversation_tokens,
-                        response_reserve=completion_budget,
-                        snapshot=snapshot,
-                        pending_tool_tokens=pending_tokens,
-                        suppress_telemetry=True,
-                    )
-                    if decision is not None and decision.verdict == "reject" and not decision.dry_run:
-                        LOGGER.debug("Skipping subagent summary due to budget limits")
-                        break
-                    conversation.append(message)
-                    conversation_tokens += pending_tokens
-                    turn_metrics["prompt_tokens"] += pending_tokens
-                    self._register_subagent_trace_entry(
-                        message,
-                        token_count=pending_tokens,
-                        job_ids=job_pointer_ids,
-                        document_id=document_id_hint,
-                    )
-            while True:
-                turn_count += 1
-                turn = await self._invoke_model_turn(
-                    conversation,
-                    tool_specs=tool_specs if tool_specs else None,
-                    metadata=merged_metadata,
-                    on_event=on_event,
-                    max_completion_tokens=completion_budget,
+                turn_metrics = self._new_turn_context(
+                    snapshot=snapshot,
+                    prompt_tokens=message_plan.prompt_tokens,
+                    conversation_length=len(base_messages),
+                    response_reserve=completion_budget,
                 )
-                assistant_message = turn.assistant_message
-                assistant_tokens = self._estimate_message_tokens(assistant_message)
-                conversation.append(assistant_message)
-                conversation_tokens += assistant_tokens
-                response_text = turn.response_text
+                subagent_jobs: list[SubagentJob] = []
+                subagent_messages: list[dict[str, str]] = []
+                runtime = self._subagent_runtime
+                if runtime is not None and runtime.manager is not None and self.subagent_config.enabled:
+                    try:
+                        subagent_jobs, subagent_messages = await self._run_subagent_pipeline(
+                            prompt=prompt,
+                            snapshot=snapshot,
+                            turn_context=turn_metrics,
+                        )
+                    except Exception:  # pragma: no cover - defensive guard
+                        LOGGER.debug("Subagent pipeline failed; continuing without helper context", exc_info=True)
+                        subagent_jobs = []
+                        subagent_messages = []
+                    job_pointer_ids = tuple(job.job_id for job in subagent_jobs if job.job_id)
+                    document_id_hint = self._resolve_document_id(snapshot)
+                    for message in subagent_messages:
+                        pending_tokens = self._estimate_message_tokens(message)
+                        decision = self._evaluate_budget(
+                            prompt_tokens=conversation_tokens,
+                            response_reserve=completion_budget,
+                            snapshot=snapshot,
+                            pending_tool_tokens=pending_tokens,
+                            suppress_telemetry=True,
+                        )
+                        if decision is not None and decision.verdict == "reject" and not decision.dry_run:
+                            LOGGER.debug("Skipping subagent summary due to budget limits")
+                            break
+                        conversation.append(message)
+                        conversation_tokens += pending_tokens
+                        turn_metrics["prompt_tokens"] += pending_tokens
+                        self._register_subagent_trace_entry(
+                            message,
+                            token_count=pending_tokens,
+                            job_ids=job_pointer_ids,
+                            document_id=document_id_hint,
+                        )
+                while True:
+                    turn_count += 1
+                    turn = await self._invoke_model_turn(
+                        conversation,
+                        tool_specs=tool_specs if tool_specs else None,
+                        metadata=merged_metadata,
+                        on_event=on_event,
+                        max_completion_tokens=completion_budget,
+                    )
+                    assistant_message = turn.assistant_message
+                    assistant_tokens = self._estimate_message_tokens(assistant_message)
+                    conversation.append(assistant_message)
+                    conversation_tokens += assistant_tokens
+                    response_text = turn.response_text
 
-                if not turn.tool_calls:
-                    fallback_applied = False
-                    if not response_text and executed_tool_calls:
-                        if tool_followup_prompts_sent < self.max_tool_followup_prompts:
-                            reminder_text = self._tool_only_response_prompt()
-                            LOGGER.debug(
-                                "Injected tool follow-up reminder (empty assistant response, attempt=%s)",
-                                tool_followup_prompts_sent + 1,
+                    if not turn.tool_calls:
+                        fallback_applied = False
+                        if not response_text and executed_tool_calls:
+                            if tool_followup_prompts_sent < self.max_tool_followup_prompts:
+                                reminder_text = self._tool_only_response_prompt()
+                                LOGGER.debug(
+                                    "Injected tool follow-up reminder (empty assistant response, attempt=%s)",
+                                    tool_followup_prompts_sent + 1,
+                                )
+                                reminder_message = {"role": "system", "content": reminder_text}
+                                conversation.append(reminder_message)
+                                conversation_tokens += self._estimate_message_tokens(reminder_message)
+                                tool_followup_prompts_sent += 1
+                                continue
+                            if tool_followup_user_prompts_sent < self.max_tool_followup_user_prompts:
+                                user_followup = self._tool_only_response_user_prompt(executed_tool_calls)
+                                LOGGER.debug(
+                                    "Injected tool follow-up user prompt (empty assistant response, attempt=%s)",
+                                    tool_followup_user_prompts_sent + 1,
+                                )
+                                user_message = {"role": "user", "content": user_followup}
+                                conversation.append(user_message)
+                                conversation_tokens += self._estimate_message_tokens(user_message)
+                                tool_followup_user_prompts_sent += 1
+                                continue
+                            response_text = self._tool_only_response_fallback(executed_tool_calls)
+                            assistant_message["content"] = response_text
+                            new_tokens = self._estimate_message_tokens(assistant_message)
+                            conversation_tokens += new_tokens - assistant_tokens
+                            assistant_tokens = new_tokens
+                            fallback_applied = True
+                            LOGGER.warning(
+                                "No assistant response after %s follow-up prompt(s); returning fallback summary.",
+                                tool_followup_prompts_sent,
                             )
-                            reminder_message = {"role": "system", "content": reminder_text}
+
+                        if (
+                            pending_patch_application
+                            and not fallback_applied
+                            and patch_reminders_sent < self.max_pending_patch_reminders
+                        ):
+                            reminder = self._pending_patch_prompt()
+                            LOGGER.debug("Injected patch reminder (pending diff)")
+                            reminder_message = {"role": "system", "content": reminder}
                             conversation.append(reminder_message)
                             conversation_tokens += self._estimate_message_tokens(reminder_message)
-                            tool_followup_prompts_sent += 1
+                            patch_reminders_sent += 1
                             continue
-                        if tool_followup_user_prompts_sent < self.max_tool_followup_user_prompts:
-                            user_followup = self._tool_only_response_user_prompt(executed_tool_calls)
-                            LOGGER.debug(
-                                "Injected tool follow-up user prompt (empty assistant response, attempt=%s)",
-                                tool_followup_user_prompts_sent + 1,
-                            )
-                            user_message = {"role": "user", "content": user_followup}
-                            conversation.append(user_message)
-                            conversation_tokens += self._estimate_message_tokens(user_message)
-                            tool_followup_user_prompts_sent += 1
+                        plot_tracker = self._plot_loop_tracker
+                        if (
+                            plot_tracker is not None
+                            and plot_tracker.needs_update_prompt()
+                            and plot_loop_reminders_sent < self.max_pending_patch_reminders
+                        ):
+                            reminder_message = {
+                                "role": "system",
+                                "content": plot_tracker.update_prompt(),
+                            }
+                            LOGGER.debug("Injected plot-state update reminder")
+                            conversation.append(reminder_message)
+                            conversation_tokens += self._estimate_message_tokens(reminder_message)
+                            plot_loop_reminders_sent += 1
                             continue
-                        response_text = self._tool_only_response_fallback(executed_tool_calls)
-                        assistant_message["content"] = response_text
-                        new_tokens = self._estimate_message_tokens(assistant_message)
-                        conversation_tokens += new_tokens - assistant_tokens
-                        assistant_tokens = new_tokens
-                        fallback_applied = True
+                        break
+
+                    tool_followup_prompts_sent = 0
+                    tool_followup_user_prompts_sent = 0
+                    tool_iterations += 1
+                    if tool_iterations > max_iterations:
                         LOGGER.warning(
-                            "No assistant response after %s follow-up prompt(s); returning fallback summary.",
-                            tool_followup_prompts_sent,
+                            "Max tool iterations (%s) reached; returning partial response.",
+                            max_iterations,
                         )
+                        break
+
+                    tool_messages, tool_records, tool_token_cost = await self._handle_tool_calls(
+                        turn.tool_calls,
+                        on_event,
+                    )
+                    executed_tool_calls.extend(tool_records)
+                    tool_messages, conversation_tokens = self._compact_tool_messages(
+                        tool_messages,
+                        tool_records,
+                        conversation_tokens=conversation_tokens,
+                        response_reserve=completion_budget,
+                        snapshot=snapshot,
+                    )
+                    conversation.extend(tool_messages)
+                    turn_metrics["tool_tokens"] += tool_token_cost
+                    turn_metrics["conversation_length"] = len(conversation)
+                    self._record_tool_names(turn_metrics, tool_records)
+                    self._record_tool_metrics(turn_metrics, tool_records)
+                    guardrail_hints = self._guardrail_hints_from_records(tool_records)
+                    for hint in guardrail_hints:
+                        hint_message = {"role": "system", "content": hint}
+                        conversation.append(hint_message)
+                        conversation_tokens += self._estimate_message_tokens(hint_message)
+
+                    for record in tool_records:
+                        name = str(record.get("name") or "").lower()
+                        if name == "diff_builder" and not self._tool_call_failed(record):
+                            pending_patch_application = True
+                            diff_builders_since_edit += 1
+                        elif name == "document_edit":
+                            if self._tool_call_failed(record):
+                                pending_patch_application = True
+                            else:
+                                pending_patch_application = False
+                                diff_builders_since_edit = 0
+                                patch_reminders_sent = 0
+                        elif name == "plot_state_update" and not self._tool_call_failed(record):
+                            plot_loop_reminders_sent = 0
 
                     if (
                         pending_patch_application
-                        and not fallback_applied
-                        and patch_reminders_sent < self.max_pending_patch_reminders
+                        and diff_builders_since_edit >= self.diff_builder_reminder_threshold
                     ):
-                        reminder = self._pending_patch_prompt()
-                        LOGGER.debug("Injected patch reminder (pending diff)")
-                        reminder_message = {"role": "system", "content": reminder}
+                        reminder_text = self._diff_accumulation_prompt(diff_builders_since_edit)
+                        LOGGER.debug(
+                            "Injected diff_builder consolidation reminder (count=%s)", diff_builders_since_edit
+                        )
+                        reminder_message = {"role": "system", "content": reminder_text}
                         conversation.append(reminder_message)
                         conversation_tokens += self._estimate_message_tokens(reminder_message)
-                        patch_reminders_sent += 1
+                        diff_builders_since_edit = 0
                         continue
-                    break
 
-                tool_followup_prompts_sent = 0
-                tool_followup_user_prompts_sent = 0
-                tool_iterations += 1
-                if tool_iterations > max_iterations:
-                    LOGGER.warning(
-                        "Max tool iterations (%s) reached; returning partial response.",
-                        max_iterations,
-                    )
-                    break
-
-                tool_messages, tool_records, tool_token_cost = await self._handle_tool_calls(
-                    turn.tool_calls,
-                    on_event,
-                )
-                executed_tool_calls.extend(tool_records)
-                tool_messages, conversation_tokens = self._compact_tool_messages(
-                    tool_messages,
-                    tool_records,
-                    conversation_tokens=conversation_tokens,
-                    response_reserve=completion_budget,
-                    snapshot=snapshot,
-                )
-                conversation.extend(tool_messages)
-                turn_metrics["tool_tokens"] += tool_token_cost
                 turn_metrics["conversation_length"] = len(conversation)
-                self._record_tool_names(turn_metrics, tool_records)
-                self._record_tool_metrics(turn_metrics, tool_records)
-                guardrail_hints = self._guardrail_hints_from_records(tool_records)
-                for hint in guardrail_hints:
-                    hint_message = {"role": "system", "content": hint}
-                    conversation.append(hint_message)
-                    conversation_tokens += self._estimate_message_tokens(hint_message)
-
-                for record in tool_records:
-                    name = str(record.get("name") or "").lower()
-                    if name == "diff_builder" and not self._tool_call_failed(record):
-                        pending_patch_application = True
-                        diff_builders_since_edit += 1
-                    elif name == "document_edit":
-                        if self._tool_call_failed(record):
-                            pending_patch_application = True
-                        else:
-                            pending_patch_application = False
-                            diff_builders_since_edit = 0
-                            patch_reminders_sent = 0
-
-                if (
-                    pending_patch_application
-                    and diff_builders_since_edit >= self.diff_builder_reminder_threshold
-                ):
-                    reminder_text = self._diff_accumulation_prompt(diff_builders_since_edit)
-                    LOGGER.debug(
-                        "Injected diff_builder consolidation reminder (count=%s)", diff_builders_since_edit
-                    )
-                    reminder_message = {"role": "system", "content": reminder_text}
-                    conversation.append(reminder_message)
-                    conversation_tokens += self._estimate_message_tokens(reminder_message)
-                    diff_builders_since_edit = 0
-                    continue
-
-            turn_metrics["conversation_length"] = len(conversation)
-            self._log_response_text(response_text)
-            self._emit_context_usage(turn_metrics)
-            LOGGER.debug(
-                "Chat turn complete (chars=%s, tool calls=%s)",
-                len(response_text),
-                len(executed_tool_calls),
-            )
-            compaction_stats = None
-            if self._trace_compactor is not None:
-                trace_stats = self._trace_compactor.stats_snapshot().as_dict()
-                compaction_stats = trace_stats
-                if trace_stats.get("total_compactions") or trace_stats.get("tokens_saved"):
-                    telemetry_service.emit(
-                        "trace_compaction",
-                        {
-                            "run_id": turn_metrics.get("run_id"),
-                            "document_id": turn_metrics.get("document_id"),
-                            **trace_stats,
-                        },
-                    )
-            return {
-                "prompt": prompt,
-                "response": response_text,
-                "doc_snapshot": snapshot,
-                "tool_calls": executed_tool_calls,
-                "graph": self.graph,
-                "trace_compaction": compaction_stats,
-                "subagent_jobs": [job.as_payload() for job in subagent_jobs],
-            }
+                self._log_response_text(response_text)
+                self._emit_context_usage(turn_metrics)
+                LOGGER.debug(
+                    "Chat turn complete (chars=%s, tool calls=%s)",
+                    len(response_text),
+                    len(executed_tool_calls),
+                )
+                compaction_stats = None
+                if self._trace_compactor is not None:
+                    trace_stats = self._trace_compactor.stats_snapshot().as_dict()
+                    compaction_stats = trace_stats
+                    if trace_stats.get("total_compactions") or trace_stats.get("tokens_saved"):
+                        telemetry_service.emit(
+                            "trace_compaction",
+                            {
+                                "run_id": turn_metrics.get("run_id"),
+                                "document_id": turn_metrics.get("document_id"),
+                                **trace_stats,
+                            },
+                        )
+                return {
+                    "prompt": prompt,
+                    "response": response_text,
+                    "doc_snapshot": snapshot,
+                    "tool_calls": executed_tool_calls,
+                    "graph": self.graph,
+                    "trace_compaction": compaction_stats,
+                    "subagent_jobs": [job.as_payload() for job in subagent_jobs],
+                }
+            finally:
+                if self._chunk_flow_tracker is chunk_tracker:
+                    self._chunk_flow_tracker = None
+                if self._plot_loop_tracker is plot_tracker:
+                    self._plot_loop_tracker = None
 
         async with self._task_lock:
             task = asyncio.create_task(_runner())
@@ -963,6 +1783,7 @@ class AIController:
         )
         self._copy_snapshot_outline_metrics(context, snapshot)
         self._copy_snapshot_embedding_metadata(context, snapshot)
+        self._record_analysis_summary(context, document_id)
         return context
 
     def _record_tool_names(self, context: dict[str, Any], records: Sequence[Mapping[str, Any]]) -> None:
@@ -989,8 +1810,24 @@ class AIController:
             return []
         hints: list[str] = []
         seen: set[str] = set()
+        chunk_tracker = self._chunk_flow_tracker
+        plot_tracker = self._plot_loop_tracker
         for record in records:
             payload = self._deserialize_tool_result(record)
+            if chunk_tracker is not None:
+                chunk_lines = chunk_tracker.observe_tool(record, payload if isinstance(payload, Mapping) else None)
+                if chunk_lines:
+                    chunk_hint = self._format_guardrail_hint("Chunk Flow", chunk_lines)
+                    if chunk_hint and chunk_hint not in seen:
+                        hints.append(chunk_hint)
+                        seen.add(chunk_hint)
+            if plot_tracker is not None:
+                plot_lines = plot_tracker.observe_tool(record, payload if isinstance(payload, Mapping) else None)
+                if plot_lines:
+                    plot_hint = self._format_guardrail_hint("Plot Loop", plot_lines)
+                    if plot_hint and plot_hint not in seen:
+                        hints.append(plot_hint)
+                        seen.add(plot_hint)
             if not isinstance(payload, Mapping):
                 continue
             name = str(record.get("name") or "").lower()
@@ -1186,20 +2023,15 @@ class AIController:
         digest = snapshot.get("outline_digest")
         if digest:
             context["outline_digest"] = str(digest)
-        status = snapshot.get("outline_status")
-        if status:
-            context["outline_status"] = str(status)
-        version_id = self._coerce_optional_int(snapshot.get("outline_version_id"))
-        if version_id is not None:
-            context["outline_version_id"] = version_id
-        latency = self._coerce_optional_float(snapshot.get("outline_latency_ms"))
-        if latency is not None:
-            context["outline_latency_ms"] = latency
-        node_count = self._coerce_optional_int(snapshot.get("outline_node_count"))
-        if node_count is not None:
-            context["outline_node_count"] = node_count
-        token_count = self._coerce_optional_int(snapshot.get("outline_token_count"))
-        if token_count is not None:
+            telemetry_service.emit("chunk_flow.requested", {
+                "document_id": chunk.get("document_id") or self.document_id,
+                "chunk_id": chunk.get("chunk_id"),
+                "chunk_length": length,
+                "window_start": start,
+                "window_end": end,
+                "pointerized": bool(chunk.get("pointer")),
+                "source": "document_chunk",
+            })
             context["outline_token_count"] = token_count
         trimmed = snapshot.get("outline_trimmed")
         if isinstance(trimmed, bool):
@@ -1231,6 +2063,29 @@ class AIController:
         detail = snapshot.get("embedding_detail")
         if detail:
             context["embedding_detail"] = str(detail)
+
+    def _record_analysis_summary(self, context: dict[str, Any], document_id: str | None) -> None:
+        if not document_id:
+            return
+        advice = self.get_latest_analysis_advice(document_id)
+        if advice is None:
+            return
+        context["analysis_chunk_profile"] = advice.chunk_profile
+        context["analysis_required_tools"] = tuple(advice.required_tools)
+        context["analysis_optional_tools"] = tuple(advice.optional_tools)
+        context["analysis_must_refresh_outline"] = bool(advice.must_refresh_outline)
+        if advice.plot_state_status:
+            context["analysis_plot_state_status"] = advice.plot_state_status
+        if advice.concordance_status:
+            context["analysis_concordance_status"] = advice.concordance_status
+        warning_codes = tuple(warning.code for warning in advice.warnings if warning.code)
+        if warning_codes:
+            context["analysis_warning_codes"] = warning_codes
+        if advice.cache_state:
+            context["analysis_cache_state"] = advice.cache_state
+        context["analysis_generated_at"] = advice.generated_at
+        if advice.rule_trace:
+            context["analysis_rule_trace"] = tuple(advice.rule_trace)
 
     def _outline_age_from_timestamp(self, value: object) -> float | None:
         if value in (None, ""):
@@ -1442,6 +2297,9 @@ class AIController:
         plot_hint = self._maybe_update_plot_state(snapshot, results)
         if plot_hint:
             messages.append({"role": "system", "content": plot_hint})
+        concordance_hint = self._maybe_update_character_map(snapshot, results)
+        if concordance_hint:
+            messages.append({"role": "system", "content": concordance_hint})
         turn_context["subagent_jobs"] = len(results)
         return results, messages
 
@@ -1461,25 +2319,44 @@ class AIController:
         span_length = end - start
         if span_length <= 0 or span_length < config.selection_min_chars:
             return []
-        text = snapshot.get("text")
-        if not isinstance(text, str) or not text:
+        text, window_start, window_end = self._snapshot_text_segment(snapshot)
+        selection_within_window = bool(text) and start >= window_start and end <= window_end
+        selection_text = ""
+        if selection_within_window and text:
+            local_start = start - window_start
+            local_end = end - window_start
+            selection_text = text[local_start:local_end]
+        chunk_context = self._build_manifest_chunk_context(
+            snapshot,
+            selection_span,
+            hydrate_text=not selection_within_window,
+        )
+        if not selection_text and (chunk_context is None or not chunk_context.text):
             return []
-        chunk_text = text[start:end]
-        preview = chunk_text[: config.chunk_preview_chars].strip()
+        context_text = chunk_context.text if chunk_context else None
+        preview_source = (context_text or selection_text or "").strip()
+        if not preview_source:
+            return []
+        preview = preview_source[: config.chunk_preview_chars].strip()
         if not preview:
             return []
 
-        document_id = self._resolve_document_id(snapshot) or "document"
+        document_id = chunk_context.document_id if chunk_context else (self._resolve_document_id(snapshot) or "document")
         version = snapshot.get("version") or snapshot.get("document_version")
-        chunk_id = f"selection:{start}-{end}"
-        chunk_hash = self._hash_subagent_chunk(document_id, version, chunk_text)
-        token_estimate = self._estimate_text_tokens(chunk_text)
+        chunk_id = chunk_context.chunk_id if chunk_context else f"selection:{start}-{end}"
+        char_range = chunk_context.char_range if chunk_context else (start, end)
+        chunk_hash = chunk_context.chunk_hash if chunk_context else None
+        if not chunk_hash:
+            chunk_hash = self._hash_subagent_chunk(document_id, version, preview_source)
+        pointer_id = chunk_context.pointer_id if chunk_context and chunk_context.pointer_id else f"selection:{document_id}:{chunk_id}"
+        token_source = context_text or selection_text or preview_source
+        token_estimate = self._estimate_text_tokens(token_source)
         chunk_ref = ChunkReference(
             document_id=document_id,
             chunk_id=chunk_id,
             version_id=str(version) if version else None,
-            pointer_id=f"selection:{document_id}:{chunk_id}",
-            char_range=(start, end),
+            pointer_id=pointer_id,
+            char_range=char_range,
             token_estimate=token_estimate,
             chunk_hash=chunk_hash,
             preview=preview,
@@ -1521,14 +2398,37 @@ class AIController:
             return None
         if end_idx < start_idx:
             start_idx, end_idx = end_idx, start_idx
-        text = snapshot.get("text")
-        if isinstance(text, str):
-            length = len(text)
-            start_idx = max(0, min(start_idx, length))
-            end_idx = max(start_idx, min(end_idx, length))
+        doc_length = snapshot.get("length")
+        if not isinstance(doc_length, int):
+            text = snapshot.get("text")
+            doc_length = len(text) if isinstance(text, str) else 0
+        start_idx = max(0, min(start_idx, doc_length))
+        end_idx = max(start_idx, min(end_idx, doc_length))
         if end_idx == start_idx:
             return None
         return (start_idx, end_idx)
+
+    @staticmethod
+    def _snapshot_text_segment(snapshot: Mapping[str, Any]) -> tuple[str, int, int]:
+        text = snapshot.get("text")
+        if not isinstance(text, str) or not text:
+            return "", 0, 0
+        text_range = snapshot.get("text_range")
+        start_offset = 0
+        end_offset = len(text)
+        if isinstance(text_range, Mapping):
+            start_offset = AIController._coerce_index(text_range.get("start"), 0)
+            end_offset = AIController._coerce_index(text_range.get("end"), start_offset + len(text))
+        if end_offset <= start_offset:
+            end_offset = start_offset + len(text)
+        return text, start_offset, end_offset
+
+    @staticmethod
+    def _coerce_index(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     @staticmethod
     def _hash_subagent_chunk(document_id: str, version: Any, chunk_text: str) -> str:
@@ -1623,8 +2523,52 @@ class AIController:
 
         doc_label = document_id or jobs[0].chunk_ref.document_id or "document"
         return (
-            f"Plot scaffolding refreshed for '{doc_label}'. Call DocumentPlotStateTool when you need "
-            "character or arc continuity before editing."
+            f"Plot scaffolding refreshed for '{doc_label}'. Call PlotOutlineTool before editing for continuity "
+            "and follow up with PlotStateUpdateTool after applying chunk edits."
+        )
+
+    def _maybe_update_character_map(
+        self,
+        snapshot: Mapping[str, Any],
+        jobs: Sequence[SubagentJob],
+    ) -> str | None:
+        if not jobs or not self.subagent_config.plot_scaffolding_enabled:
+            return None
+        runtime = self._subagent_runtime
+        if runtime is None:
+            return None
+        store = runtime.ensure_character_map_store()
+
+        document_id = self._resolve_document_id(snapshot)
+        ingested = 0
+        for job in jobs:
+            if job.state != SubagentJobState.SUCCEEDED or job.result is None:
+                continue
+            summary = (job.result.summary or "").strip()
+            if not summary:
+                continue
+            chunk = job.chunk_ref
+            target_document_id = chunk.document_id or document_id
+            if not target_document_id:
+                continue
+            store.ingest_summary(
+                target_document_id,
+                summary,
+                version_id=chunk.version_id,
+                chunk_id=chunk.chunk_id,
+                pointer_id=chunk.pointer_id,
+                chunk_hash=chunk.chunk_hash,
+                char_range=chunk.char_range,
+            )
+            ingested += 1
+
+        if not ingested:
+            return None
+
+        doc_label = document_id or jobs[0].chunk_ref.document_id or "document"
+        return (
+            f"Character concordance refreshed for '{doc_label}'. Call CharacterMapTool to review "
+            "entity mentions before editing across scenes."
         )
 
     def _register_subagent_trace_entry(
@@ -1682,7 +2626,10 @@ class AIController:
             return None
         doc_id = self._resolve_document_id(snapshot)
         raw_text = snapshot.get("text")
-        if isinstance(raw_text, str):
+        doc_length = snapshot.get("length")
+        if isinstance(doc_length, int):
+            doc_chars = max(0, doc_length)
+        elif isinstance(raw_text, str):
             doc_chars = len(raw_text)
         else:
             try:
@@ -2129,7 +3076,7 @@ class AIController:
         summary = summarize_tool_content(payload, budget_tokens=_POINTER_SUMMARY_TOKENS)
         instructions = (
             "Re-run the AI helper with Subagents enabled on the same document selection or call "
-            "DocumentPlotStateTool to rebuild the scouting report referenced by this pointer."
+            "PlotOutlineTool to rebuild the scouting report referenced by this pointer."
         )
         pointer = build_pointer(summary, tool_name="SubagentScoutingReport", rehydrate_instructions=instructions)
         pointer.metadata.setdefault("source", "context_budget")
@@ -2167,6 +3114,12 @@ class AIController:
             message = f"Tool '{call.name or 'unknown'}' is not registered."
             await self._emit_tool_result_event(call, message, None, on_event)
             return message, resolved_arguments, None
+
+        block_reason = self._plot_loop_block(call.name)
+        if block_reason:
+            payload = {"status": "plot_loop_blocked", "reason": block_reason}
+            await self._emit_tool_result_event(call, block_reason, payload, on_event)
+            return block_reason, resolved_arguments, payload
 
         try:
             result = await self._invoke_tool_impl(registration.impl, resolved_arguments)
@@ -2294,6 +3247,12 @@ class AIController:
                 normalized["content"] = text_value
                 normalized.pop("text", None)
         return normalized
+
+    def _plot_loop_block(self, tool_name: str | None) -> str | None:
+        tracker = self._plot_loop_tracker
+        if tracker is None:
+            return None
+        return tracker.before_tool(tool_name)
 
     async def _invoke_tool_impl(self, tool_impl: Any, arguments: Any) -> Any:
         target = getattr(tool_impl, "run", tool_impl)

@@ -15,6 +15,7 @@ from tinkerbell.ai.memory.cache_bus import (
 from tinkerbell.chat.message_model import EditDirective
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.editor.patches import PatchResult
+from tinkerbell.services import bridge as bridge_module
 from tinkerbell.services.bridge import DocumentBridge, DocumentVersionMismatchError
 
 
@@ -178,19 +179,136 @@ def test_queue_edit_patch_conflict_raises_and_tracks_failure():
     editor = RecordingEditor()
     bridge = DocumentBridge(editor=editor)
     snapshot = bridge.generate_snapshot()
-    editor.state.update_text("HELLO WORLD")
 
-    diff = """--- a/doc.txt
-+++ b/doc.txt
-@@ -1 +1 @@
--hello world
-+hello brave world
-"""
+    diff = (
+        "--- a/doc.txt\n"
+        "+++ b/doc.txt\n"
+        "@@ -1 +1 @@\n"
+        "-HELLO WORLD\n"
+        "+HELLO BRAVE WORLD\n"
+    )
 
     with pytest.raises(RuntimeError):
         bridge.queue_edit({"action": "patch", "diff": diff, "document_version": snapshot["version"]})
 
-    assert editor.state.text == "HELLO WORLD"
+    assert editor.state.text == "hello world"
+    assert bridge.patch_metrics.conflicts == 1
+
+
+def test_patch_apply_emits_success_telemetry(monkeypatch: pytest.MonkeyPatch):
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(bridge_module, "telemetry_emit", _emit)
+
+    diff = _make_diff(editor.state.text, "hello brave world")
+    bridge.queue_edit({"action": "patch", "diff": diff, "document_version": snapshot["version"]})
+
+    event = next((payload for name, payload in captured if name == "patch.apply"), None)
+    assert event is not None
+    assert event["status"] == "success"
+    assert event["range_count"] >= 1
+
+
+def test_patch_apply_emits_conflict_telemetry(monkeypatch: pytest.MonkeyPatch):
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(bridge_module, "telemetry_emit", _emit)
+
+    diff = _make_diff("HELLO WORLD", "HELLO BRAVE WORLD")
+    with pytest.raises(RuntimeError):
+        bridge.queue_edit({"action": "patch", "diff": diff, "document_version": snapshot["version"]})
+
+    event = next((payload for name, payload in captured if name == "patch.apply"), None)
+    assert event is not None
+    assert event["status"] == "conflict"
+    assert event.get("reason")
+
+
+def test_patch_apply_emits_stale_telemetry(monkeypatch: pytest.MonkeyPatch):
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(bridge_module, "telemetry_emit", _emit)
+
+    editor.state.update_text("HELLO WORLD")
+
+    with pytest.raises(DocumentVersionMismatchError):
+        bridge.queue_edit({"action": "patch", "diff": _make_diff("hello", "hola"), "document_version": snapshot["version"]})
+
+    event = next((payload for name, payload in captured if name == "patch.apply"), None)
+    assert event is not None
+    assert event["status"] == "stale"
+
+
+def test_queue_edit_applies_streamed_ranges():
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+
+    bridge.queue_edit(
+        {
+            "action": "patch",
+            "ranges": [
+                {
+                    "start": 0,
+                    "end": 5,
+                    "replacement": "HELLO",
+                    "match_text": "hello",
+                },
+            ],
+            "document_version": snapshot["version"],
+            "content_hash": snapshot["content_hash"],
+        }
+    )
+
+    assert editor.state.text.startswith("HELLO")
+    assert bridge.patch_metrics.total == 1
+
+
+def test_queue_edit_range_patch_detects_mismatch():
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+    editor.state.update_text("HOLA world")
+
+    with pytest.raises(RuntimeError):
+        bridge.queue_edit(
+            {
+                "action": "patch",
+                "ranges": [
+                    {
+                        "start": 0,
+                        "end": 5,
+                        "replacement": "HELLO",
+                        "match_text": "hello",
+                    }
+                ],
+                "document_version": snapshot["version"],
+                "content_hash": snapshot["content_hash"],
+            }
+        )
+
+    assert editor.state.text.startswith("HOLA")
     assert bridge.patch_metrics.conflicts == 1
 
 

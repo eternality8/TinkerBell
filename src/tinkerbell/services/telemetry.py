@@ -51,6 +51,16 @@ class ContextUsageEvent:
     retrieval_strategy: str | None = None
     retrieval_latency_ms: float | None = None
     retrieval_pointer_count: int | None = None
+    analysis_chunk_profile: str | None = None
+    analysis_required_tools: tuple[str, ...] = ()
+    analysis_optional_tools: tuple[str, ...] = ()
+    analysis_must_refresh_outline: bool | None = None
+    analysis_plot_state_status: str | None = None
+    analysis_concordance_status: str | None = None
+    analysis_warning_codes: tuple[str, ...] = ()
+    analysis_cache_state: str | None = None
+    analysis_generated_at: float | None = None
+    analysis_rule_trace: tuple[str, ...] = ()
 
 
 class TelemetrySink(Protocol):
@@ -370,6 +380,10 @@ class PersistentTelemetrySink(TelemetrySink):
 def _event_to_payload(event: ContextUsageEvent) -> dict[str, Any]:
     data = asdict(event)
     data["tool_names"] = list(event.tool_names)
+    data["analysis_required_tools"] = list(event.analysis_required_tools)
+    data["analysis_optional_tools"] = list(event.analysis_optional_tools)
+    data["analysis_warning_codes"] = list(event.analysis_warning_codes)
+    data["analysis_rule_trace"] = list(event.analysis_rule_trace)
     return data
 
 
@@ -385,7 +399,7 @@ def _event_from_payload(payload: object) -> ContextUsageEvent | None:
             response_reserve=payload.get("response_reserve"),
             timestamp=float(payload.get("timestamp", 0.0)),
             conversation_length=int(payload.get("conversation_length", 0)),
-            tool_names=tuple(payload.get("tool_names") or ()),
+            tool_names=_coerce_str_tuple(payload.get("tool_names")),
             run_id=str(payload.get("run_id") or ""),
             embedding_backend=_coerce_optional_str(payload.get("embedding_backend")),
             embedding_model=_coerce_optional_str(payload.get("embedding_model")),
@@ -404,6 +418,16 @@ def _event_from_payload(payload: object) -> ContextUsageEvent | None:
             retrieval_strategy=_coerce_optional_str(payload.get("retrieval_strategy")),
             retrieval_latency_ms=_coerce_optional_float(payload.get("retrieval_latency_ms")),
             retrieval_pointer_count=_coerce_optional_int(payload.get("retrieval_pointer_count")),
+            analysis_chunk_profile=_coerce_optional_str(payload.get("analysis_chunk_profile")),
+            analysis_required_tools=_coerce_str_tuple(payload.get("analysis_required_tools")),
+            analysis_optional_tools=_coerce_str_tuple(payload.get("analysis_optional_tools")),
+            analysis_must_refresh_outline=_coerce_optional_bool(payload.get("analysis_must_refresh_outline")),
+            analysis_plot_state_status=_coerce_optional_str(payload.get("analysis_plot_state_status")),
+            analysis_concordance_status=_coerce_optional_str(payload.get("analysis_concordance_status")),
+            analysis_warning_codes=_coerce_str_tuple(payload.get("analysis_warning_codes")),
+            analysis_cache_state=_coerce_optional_str(payload.get("analysis_cache_state")),
+            analysis_generated_at=_coerce_optional_float(payload.get("analysis_generated_at")),
+            analysis_rule_trace=_coerce_str_tuple(payload.get("analysis_rule_trace")),
         )
     except (TypeError, ValueError):
         return None
@@ -448,6 +472,33 @@ def _coerce_optional_bool(value: object) -> bool | None:
         if lowered in {"false", "0", "no"}:
             return False
     return None
+
+
+def _coerce_str_tuple(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, tuple):
+        items = value
+    elif isinstance(value, list):
+        items = tuple(value)
+    elif isinstance(value, set):
+        items = tuple(sorted(value))
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        if "," in text:
+            parts = [part.strip() for part in text.split(",") if part.strip()]
+            return tuple(parts)
+        return (text,)
+    else:
+        return ()
+    normalized: list[str] = []
+    for item in items:
+        text = str(item).strip()
+        if text:
+            normalized.append(text)
+    return tuple(normalized)
 
 
 __all__ = [

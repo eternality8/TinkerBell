@@ -1,8 +1,11 @@
 """Registry of agent tools."""
 
 from . import (
+    character_edit_planner,
+    character_map,
     diff_builder,
     document_apply_patch,
+    document_chunk,
     document_snapshot,
     document_edit,
     document_outline,
@@ -10,12 +13,16 @@ from . import (
     document_plot_state,
     list_tabs,
     search_replace,
+    tool_usage_advisor,
     validation,
 )
 
 __all__ = [
+    "character_edit_planner",
+    "character_map",
     "diff_builder",
     "document_snapshot",
+    "document_chunk",
     "document_edit",
     "document_apply_patch",
     "document_outline",
@@ -23,5 +30,6 @@ __all__ = [
     "document_plot_state",
     "list_tabs",
     "search_replace",
+    "tool_usage_advisor",
     "validation",
 ]

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING, cast
 
+from ..ai.analysis import AnalysisAdvice
 from ..chat.chat_panel import ChatPanel, ChatTurnSnapshot
 from ..chat.commands import (
     ActionType,
@@ -31,14 +32,20 @@ from ..services.bridge_router import WorkspaceBridgeRouter
 from ..services.importers import FileImporter
 from ..services.settings import Settings, SettingsStore
 from ..utils import file_io
+from ..utils import file_io
+from ..services import telemetry as telemetry_service
 from ..widgets.status_bar import StatusBar
 from ..ai.tools.document_apply_patch import DocumentApplyPatchTool
 from ..ai.tools.registry import (
     ToolRegistryContext,
     ToolRegistrationError,
+    register_character_map_tool,
+    register_character_planner_tool,
     register_default_tools,
     register_phase3_tools,
     register_plot_state_tool,
+    unregister_character_map_tool,
+    unregister_character_planner_tool,
     unregister_phase3_tools,
     unregister_plot_state_tool,
 )
@@ -47,6 +54,7 @@ from .ai_review_controller import AIReviewController, EditSummary, PendingReview
 from .ai_turn_coordinator import AITurnCoordinator
 from .document_session_service import DocumentSessionService
 from .document_state_monitor import DocumentStateMonitor
+from .document_status_service import DocumentStatusService
 from .embedding_controller import EmbeddingController, EmbeddingRuntimeState
 from .import_controller import ImportController
 from .models.actions import MenuSpec, ToolbarSpec, WindowAction
@@ -57,11 +65,13 @@ from .telemetry_controller import TelemetryController
 from .tool_trace_presenter import ToolTracePresenter
 from .tools.provider import ToolProvider
 from .window_shell import WindowChrome
+from .widgets import CommandPaletteDialog, DocumentStatusWindow, PaletteCommand, build_palette_commands
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from ..ai.orchestration import AIController
     from ..ai.memory import DocumentEmbeddingIndex
     from ..ai.memory.plot_state import DocumentPlotStateStore
+    from ..ai.memory.character_map import CharacterMapStore
     from ..widgets.dialogs import SettingsDialogResult
 
 QApplication: Any
@@ -110,6 +120,7 @@ class MainWindow(QMainWindow):
         self._bridge = WorkspaceBridgeRouter(self._workspace)
         self._editor.add_tab_created_listener(self._bridge.track_tab)
         self._status_bar = StatusBar()
+        self._status_bar.set_document_status_callback(self._handle_document_status_clicked)
         self._document_monitor: DocumentStateMonitor | None = None
         self._document_session = DocumentSessionService(
             context=self._context,
@@ -143,11 +154,13 @@ class MainWindow(QMainWindow):
         )
         self._workspace.add_active_listener(self._document_monitor.handle_active_tab_changed)
         self._workspace.add_active_listener(self._handle_active_tab_for_review)
+        self._workspace.add_active_listener(self._handle_active_tab_for_document_status)
         initial_subagent_enabled = bool(getattr(initial_settings, "enable_subagents", False))
         self._telemetry_controller = TelemetryController(
             status_bar=self._status_bar,
             context=self._context,
             initial_subagent_enabled=initial_subagent_enabled,
+            chat_panel=self._chat_panel,
         )
         self._review_controller = AIReviewController(
             status_bar=self._status_bar,
@@ -199,6 +212,10 @@ class MainWindow(QMainWindow):
             chat_panel=self._chat_panel,
             tool_trace_index=self._tool_trace_index,
         )
+        self._document_status_service: DocumentStatusService | None = None
+        self._document_status_window: DocumentStatusWindow | None = None
+        self._command_palette: CommandPaletteDialog | None = None
+        self._document_status_events_registered = False
         self._suggestion_task: asyncio.Task[Any] | None = None
         self._suggestion_request_id = 0
         self._suggestion_cache_key: str | None = None
@@ -233,6 +250,7 @@ class MainWindow(QMainWindow):
             outline_digest_resolver=self._resolve_outline_digest,
             directive_schema_provider=self._directive_parameters_schema,
             plot_state_store_resolver=self._resolve_plot_state_store,
+            character_map_store_resolver=self._resolve_character_map_store,
             phase3_outline_enabled=self._phase3_outline_enabled,
             plot_scaffolding_enabled=self._plot_scaffolding_enabled,
         )
@@ -263,7 +281,10 @@ class MainWindow(QMainWindow):
         self._last_outline_status: tuple[str, str] | None = None
         self._initialize_ui()
         self._telemetry_controller.register_subagent_listeners()
+        self._telemetry_controller.register_chunk_flow_listeners()
         self._telemetry_controller.update_subagent_indicator()
+        self._telemetry_controller.reset_chunk_flow_state()
+        self._register_document_status_listeners()
         if initial_settings is not None:
             self._settings_runtime.apply_theme_setting(initial_settings)
         self._embedding_controller.refresh_runtime(initial_settings)
@@ -370,12 +391,14 @@ class MainWindow(QMainWindow):
         self._menus = chrome_state.menus
         self._toolbars = chrome_state.toolbars
         self._qt_actions = chrome_state.qt_actions
+        self._initialize_command_palette()
         self._wire_signals()
         self._register_default_ai_tools()
 
         self.update_status("Ready")
         self._document_session.restore_last_session_document()
         self._document_monitor.update_autosave_indicator(document=self._editor.to_document())
+        self._refresh_document_status_badge()
 
     def _action_callbacks(self) -> Dict[str, Callable[[], Any]]:
         """Return the callbacks wired into menu and toolbar actions."""
@@ -392,7 +415,26 @@ class MainWindow(QMainWindow):
             "ai_accept_changes": self._handle_accept_ai_changes,
             "ai_reject_changes": self._handle_reject_ai_changes,
             "settings_open": self._handle_settings_requested,
+            "view_document_status": self._handle_document_status_action,
+            "command_palette": self._handle_command_palette_requested,
         }
+
+    def _initialize_command_palette(self) -> None:
+        """Instantiate the palette and seed it with the current actions."""
+
+        palette = CommandPaletteDialog(parent=self)
+        palette.set_entries(self._build_palette_entries())
+        self._command_palette = palette
+
+    def _build_palette_entries(self) -> list[PaletteCommand]:
+        return build_palette_commands(self._actions, exclude=("command_palette",))
+
+    def _handle_command_palette_requested(self) -> None:
+        if self._command_palette is None:
+            self._initialize_command_palette()
+        if self._command_palette is not None:
+            self._command_palette.set_entries(self._build_palette_entries())
+            self._command_palette.show()
 
     def _wire_signals(self) -> None:
         """Connect editor and chat events to the window handlers."""
@@ -504,15 +546,25 @@ class MainWindow(QMainWindow):
     def _register_plot_state_tool(self, *, register_fn: Callable[..., Any] | None = None) -> None:
         context = self._tool_registry_context()
         register_plot_state_tool(context, register_fn=register_fn)
+        register_character_map_tool(context, register_fn=register_fn)
+        register_character_planner_tool(context, register_fn=register_fn)
 
     def _unregister_plot_state_tool(self) -> None:
         unregister_plot_state_tool(self._context.ai_controller)
+        unregister_character_map_tool(self._context.ai_controller)
+        unregister_character_planner_tool(self._context.ai_controller)
 
     def _resolve_plot_state_store(self) -> DocumentPlotStateStore | None:
         controller = self._context.ai_controller
         if controller is None:
             return None
         return getattr(controller, "plot_state_store", None)
+
+    def _resolve_character_map_store(self) -> CharacterMapStore | None:
+        controller = self._context.ai_controller
+        if controller is None:
+            return None
+        return getattr(controller, "character_map_store", None)
 
     @staticmethod
     def _directive_parameters_schema() -> Dict[str, Any]:
@@ -591,6 +643,12 @@ class MainWindow(QMainWindow):
             return
         if request.command is ManualCommandType.FIND_SECTIONS:
             self._handle_manual_find_sections_command(request)
+            return
+        if request.command is ManualCommandType.ANALYZE:
+            self._handle_manual_analyze_command(request)
+            return
+        if request.command is ManualCommandType.STATUS:
+            self._handle_manual_status_command(request)
             return
         self._post_assistant_notice(f"Unsupported manual command '{request.command.value}'.")
         self.update_status("Manual command unsupported")
@@ -685,6 +743,171 @@ class MainWindow(QMainWindow):
         )
         self.update_status("Find sections ready")
 
+    def _handle_manual_analyze_command(self, request: ManualCommandRequest) -> None:
+        controller = self._context.ai_controller
+        if controller is None:
+            self._post_assistant_notice("AI assistant is unavailable.")
+            self.update_status("Analysis unavailable")
+            return
+        enabled_probe = getattr(controller, "analysis_enabled", None)
+        if callable(enabled_probe) and not enabled_probe():
+            self._post_assistant_notice("Preflight analysis is disabled. Enable it in Settings > AI to use /analyze.")
+            self.update_status("Analysis disabled")
+            return
+
+        args = dict(request.args)
+        doc_reference = args.get("document_id")
+        resolved_id = None
+        if doc_reference:
+            resolved_id = self._resolve_manual_document_id(doc_reference)
+            if resolved_id is None:
+                self._post_assistant_notice(f"Couldn't find a document matching '{doc_reference}'.")
+                self.update_status("Document not found")
+                return
+        if resolved_id is None:
+            document = self._safe_active_document()
+            if document is None:
+                self._post_assistant_notice("No active document to analyze.")
+                self.update_status("Analysis unavailable")
+                return
+            resolved_id = document.document_id
+
+        selection_start = args.get("selection_start")
+        selection_end = args.get("selection_end")
+        if (selection_start is None) ^ (selection_end is None):
+            self._post_assistant_notice("Selection overrides require both --start and --end.")
+            self.update_status("Analysis aborted")
+            return
+
+        target_tab_id: str | None = None
+        target_document: DocumentState | None = None
+        for tab in self._workspace.iter_tabs():
+            document = tab.document()
+            if document.document_id == resolved_id:
+                target_tab_id = tab.id
+                target_document = document
+                break
+        if target_document is None:
+            target_document = self._workspace.find_document_by_id(resolved_id)
+        if target_document is None:
+            self._post_assistant_notice("Document is not open in the workspace.")
+            self.update_status("Analysis aborted")
+            return
+
+        try:
+            snapshot = (
+                self._bridge.generate_snapshot(tab_id=target_tab_id)
+                if target_tab_id is not None
+                else target_document.snapshot()
+            )
+        except Exception as exc:  # pragma: no cover - defensive path
+            _LOGGER.debug("Snapshot for manual analysis failed", exc_info=True)
+            self._post_assistant_notice(f"Unable to capture snapshot for analysis: {exc}")
+            self.update_status("Analysis failed")
+            return
+
+        if selection_start is not None and selection_end is not None:
+            snapshot = dict(snapshot)
+            snapshot["selection"] = {"start": selection_start, "end": selection_end}
+
+        force_refresh = bool(args.get("force_refresh"))
+        analyze_reason = (args.get("reason") or "").strip() or None
+        telemetry_payload = {
+            "document_id": resolved_id,
+            "selection_start": selection_start,
+            "selection_end": selection_end,
+            "force_refresh": force_refresh,
+            "reason": analyze_reason,
+            "source": "manual_command",
+            "has_selection_override": selection_start is not None and selection_end is not None,
+        }
+        telemetry_service.emit("analysis.ui_override.requested", dict(telemetry_payload))
+
+        try:
+            advice = controller.request_analysis_advice(
+                document_id=resolved_id,
+                snapshot=snapshot,
+                selection_start=selection_start,
+                selection_end=selection_end,
+                force_refresh=force_refresh,
+                reason=analyze_reason,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Manual analysis command failed", exc_info=True)
+            failure_payload = dict(telemetry_payload)
+            failure_payload["status"] = "error"
+            failure_payload["error"] = str(exc)
+            telemetry_service.emit("analysis.ui_override.failed", failure_payload)
+            self._post_assistant_notice(f"Analysis command failed: {exc}")
+            self.update_status("Analysis failed")
+            return
+
+        if advice is None:
+            completion_payload = dict(telemetry_payload)
+            completion_payload["status"] = "empty"
+            telemetry_service.emit("analysis.ui_override.completed", completion_payload)
+            self._post_assistant_notice("Preflight analysis did not return any advice.")
+            self.update_status("Analysis unavailable")
+            return
+
+        label = self._document_label_from_id(resolved_id)
+        message = self._format_analysis_notice(advice, document_label=label)
+        self._post_assistant_notice(message)
+        completion_payload = dict(telemetry_payload)
+        completion_payload.update(
+            {
+                "status": "ok",
+                "cache_state": advice.cache_state,
+                "chunk_profile": advice.chunk_profile,
+                "required_tools": list(advice.required_tools),
+                "optional_tools": list(advice.optional_tools),
+                "warning_codes": [warning.code for warning in advice.warnings],
+            }
+        )
+        telemetry_service.emit("analysis.ui_override.completed", completion_payload)
+        self.update_status("Analysis ready")
+        self._telemetry_controller.refresh_analysis_state(resolved_id, document_label=label)
+
+    def _handle_manual_status_command(self, request: ManualCommandRequest) -> None:
+        service = self._ensure_document_status_service()
+        if service is None:
+            self._post_assistant_notice("Document status tooling is unavailable. Install the UI dependencies and restart.")
+            self.update_status("Document status unavailable")
+            return
+
+        args = dict(request.args)
+        doc_reference = args.get("document_id")
+        resolved_id = self._resolve_manual_document_id(doc_reference) if doc_reference else None
+        if doc_reference and resolved_id is None:
+            self._post_assistant_notice(f"Couldn't find a document matching '{doc_reference}'.")
+            self.update_status("Document not found")
+            return
+
+        as_json = bool(args.get("as_json"))
+        payload = self._show_document_status_window(document_id=resolved_id)
+        if payload is None:
+            try:
+                payload = service.build_status_payload(resolved_id)
+                self._apply_document_status_badge(payload)
+            except ValueError:
+                self._post_assistant_notice("Open a document before requesting status.")
+                self.update_status("Document status unavailable")
+                return
+            except Exception as exc:  # pragma: no cover - defensive guard
+                _LOGGER.debug("Manual status command failed", exc_info=True)
+                self._post_assistant_notice(f"Document status command failed: {exc}")
+                self.update_status("Document status failed")
+                return
+
+        summary_text = str(payload.get("summary") or "Document status ready.").strip()
+        if as_json:
+            body = json.dumps(payload, indent=2, ensure_ascii=False)
+            message = f"```json\n{body}\n```"
+        else:
+            message = summary_text
+        self._post_assistant_notice(message)
+        self.update_status("Document status ready")
+
     def _resolve_manual_document_id(self, reference: str | None) -> str | None:
         text = (reference or "").strip()
         if not text:
@@ -742,6 +965,210 @@ class MainWindow(QMainWindow):
         if document is not None:
             return self._document_monitor.document_display_name(document)
         return WINDOW_APP_NAME
+
+    def _format_analysis_notice(
+        self,
+        advice: AnalysisAdvice,
+        *,
+        document_label: str | None = None,
+    ) -> str:
+        doc_label = document_label or self._document_label_from_id(advice.document_id)
+        header_bits = [f"Preflight analysis for {doc_label}"]
+        chunk_profile = (advice.chunk_profile or "auto").strip()
+        if chunk_profile:
+            header_bits.append(f"profile {chunk_profile}")
+        cache_state = advice.cache_state.strip() if advice.cache_state else ""
+        if cache_state:
+            header_bits.append(f"cache={cache_state}")
+        header = " · ".join(header_bits) + "."
+
+        required_tools = ", ".join(advice.required_tools) if advice.required_tools else "none"
+        parts = [header, f"Required tools: {required_tools}."]
+        if advice.optional_tools:
+            parts.append(f"Optional tools: {', '.join(advice.optional_tools)}.")
+        refresh_text = "yes" if advice.must_refresh_outline else "no"
+        parts.append(f"Outline refresh required: {refresh_text}.")
+        if advice.plot_state_status:
+            parts.append(f"Plot state: {advice.plot_state_status}.")
+        if advice.concordance_status:
+            parts.append(f"Concordance: {advice.concordance_status}.")
+
+        warnings = advice.warnings or ()
+        if warnings:
+            parts.append("Warnings:")
+            for warning in warnings:
+                parts.append(f"- ({warning.severity}) {warning.code}: {warning.message}")
+
+        traces = advice.rule_trace or ()
+        if traces:
+            max_traces = 5
+            parts.append("Rule trace:")
+            for trace in traces[:max_traces]:
+                parts.append(f"- {trace}")
+            remaining = len(traces) - max_traces
+            if remaining > 0:
+                parts.append(f"… {remaining} additional rule(s).")
+
+        if advice.generated_at:
+            generated_at = datetime.fromtimestamp(advice.generated_at, tz=timezone.utc)
+            iso_text = generated_at.isoformat().replace("+00:00", "Z")
+            parts.append(f"Generated at {iso_text}.")
+
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Document status helpers
+    # ------------------------------------------------------------------
+    def _handle_document_status_action(self) -> None:
+        payload = self._show_document_status_window()
+        if payload is not None:
+            self.update_status("Document status ready")
+
+    def _handle_document_status_clicked(self) -> None:
+        self._handle_document_status_action()
+
+    def _show_document_status_window(self, document_id: str | None = None) -> Mapping[str, Any] | None:
+        service = self._ensure_document_status_service()
+        if service is None:
+            return None
+        descriptors = service.list_document_descriptors()
+        if not descriptors:
+            self._status_bar.set_document_status_badge("", detail=None)
+            self._post_assistant_notice("Open a document before viewing status.")
+            self.update_status("Document status unavailable")
+            return None
+        window = self._ensure_document_status_window()
+        if window is None:
+            return None
+        window.update_documents(descriptors)
+        payload = window.show(document_id=document_id)
+        if payload is not None:
+            self._apply_document_status_badge(payload)
+        return payload
+
+    def _ensure_document_status_window(self) -> DocumentStatusWindow | None:
+        if self._document_status_window is not None:
+            return self._document_status_window
+        service = self._ensure_document_status_service()
+        if service is None:
+            return None
+        parent = self._qt_parent_widget()
+        try:
+            self._document_status_window = DocumentStatusWindow(
+                documents=service.list_document_descriptors(),
+                status_loader=self._load_document_status_payload,
+                parent=parent,
+            )
+        except Exception:  # pragma: no cover - optional Qt dependency
+            _LOGGER.debug("Document status window initialization failed", exc_info=True)
+            self._document_status_window = None
+        return self._document_status_window
+
+    def _load_document_status_payload(self, document_id: str | None) -> Mapping[str, Any]:
+        service = self._ensure_document_status_service()
+        if service is None:
+            raise RuntimeError("Document status service unavailable")
+        payload = service.build_status_payload(document_id)
+        self._apply_document_status_badge(payload)
+        return payload
+
+    def _apply_document_status_badge(self, payload: Mapping[str, Any] | None) -> None:
+        status_bar = self._status_bar
+        if status_bar is None:
+            return
+        badge: Mapping[str, Any] | None = None
+        if isinstance(payload, Mapping):
+            candidate = payload.get("badge")
+            if isinstance(candidate, Mapping):
+                badge = candidate
+        if badge is None:
+            status_bar.set_document_status_badge("", detail=None)
+            return
+        status_text = str(badge.get("status") or "").strip()
+        detail_value = badge.get("detail") if isinstance(badge, Mapping) else None
+        if detail_value is None:
+            detail_text = None
+        elif isinstance(detail_value, str):
+            detail_text = detail_value
+        else:
+            detail_text = str(detail_value)
+        severity_value = badge.get("severity") if isinstance(badge, Mapping) else None
+        severity = str(severity_value).strip() if isinstance(severity_value, str) else None
+        status_bar.set_document_status_badge(status_text, detail=detail_text, severity=severity)
+
+    def _refresh_document_status_badge(self, document_id: str | None = None) -> None:
+        status_bar = self._status_bar
+        if status_bar is None:
+            return
+        service = self._document_status_service or self._ensure_document_status_service()
+        if service is None:
+            status_bar.set_document_status_badge("", detail=None)
+            return
+        try:
+            payload = service.build_status_payload(document_id)
+        except ValueError:
+            status_bar.set_document_status_badge("", detail=None)
+            return
+        except Exception:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Refreshing document status badge failed", exc_info=True)
+            return
+        self._apply_document_status_badge(payload)
+
+    def _handle_active_tab_for_document_status(self, tab: DocumentTab | None) -> None:
+        document_id = None
+        if tab is not None:
+            try:
+                document_id = tab.document().document_id
+            except Exception:  # pragma: no cover - defensive guard
+                document_id = None
+        self._refresh_document_status_badge(document_id=document_id)
+
+    def _handle_document_status_signal(self, payload: Mapping[str, Any] | None) -> None:
+        document_id: str | None = None
+        if isinstance(payload, Mapping):
+            for key in ("document_id", "documentId", "document"):
+                candidate = payload.get(key)
+                if candidate:
+                    document_id = str(candidate)
+                    break
+        self._refresh_document_status_badge(document_id=document_id)
+        window = self._document_status_window
+        if window is not None:
+            try:
+                window.refresh(document_id=document_id)
+            except Exception:  # pragma: no cover - defensive guard
+                _LOGGER.debug("Document status window refresh failed", exc_info=True)
+
+    def _register_document_status_listeners(self) -> None:
+        if self._document_status_events_registered:
+            return
+        for event_name in (
+            "chunk_flow.requested",
+            "chunk_flow.escaped_full_snapshot",
+            "chunk_flow.retry_success",
+            "analysis.preflight.completed",
+            "analysis.preflight.failed",
+            "analysis.ui_override.completed",
+        ):
+            telemetry_service.register_event_listener(event_name, self._handle_document_status_signal)
+        self._document_status_events_registered = True
+
+    def _ensure_document_status_service(self) -> DocumentStatusService | None:
+        if self._document_status_service is not None:
+            return self._document_status_service
+        if self._workspace is None:
+            return None
+        outline_resolver = self._outline_memory
+        self._document_status_service = DocumentStatusService(
+            workspace=self._workspace,
+            bridge=self._bridge,
+            telemetry=self._telemetry_controller,
+            controller_resolver=lambda: self._context.ai_controller,
+            outline_memory_resolver=outline_resolver,
+            plot_state_resolver=self._resolve_plot_state_store,
+            character_map_resolver=self._resolve_character_map_store,
+        )
+        return self._document_status_service
 
     def _render_manual_outline_response(
         self,

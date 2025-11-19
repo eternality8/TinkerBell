@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tinkerbell.ai.tools.diff_builder import DiffBuilderTool
-from tinkerbell.editor.patches import PatchApplyError, apply_unified_diff
+from tinkerbell.editor.patches import PatchApplyError, RangePatch, apply_streamed_ranges, apply_unified_diff
 
 
 def test_apply_unified_diff_handles_multiple_hunks():
@@ -98,3 +98,27 @@ def test_apply_unified_diff_handles_blank_context_lines():
 
     assert "Barnaby" in result.text
     assert result.summary.startswith("patch:")
+
+
+def test_apply_streamed_ranges_updates_multiple_spans():
+    original = "alpha beta gamma"
+    ranges = [
+        RangePatch(start=0, end=5, replacement="ALPHA", match_text="alpha"),
+        RangePatch(start=6, end=10, replacement="BETA", match_text="beta"),
+    ]
+
+    result = apply_streamed_ranges(original, ranges)
+
+    assert result.text.startswith("ALPHA BETA")
+    assert len(result.spans) == 2
+
+
+def test_apply_streamed_ranges_detects_overlap():
+    original = "alpha beta"
+    ranges = [
+        RangePatch(start=0, end=5, replacement="ALPHA", match_text="alpha"),
+        RangePatch(start=4, end=9, replacement="OMEGA", match_text="a bet"),
+    ]
+
+    with pytest.raises(PatchApplyError):
+        apply_streamed_ranges(original, ranges)

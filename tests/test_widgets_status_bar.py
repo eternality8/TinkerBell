@@ -70,6 +70,18 @@ def test_status_bar_subagent_status_tracks_tooltip() -> None:
     assert bar.subagent_state == ("", "")
 
 
+def test_status_bar_chunk_flow_indicator_tracks_state() -> None:
+    bar = StatusBar()
+
+    bar.set_chunk_flow_state("Warning", detail="doc-1 fetched full snapshot")
+
+    assert bar.chunk_flow_state == ("Warning", "doc-1 fetched full snapshot")
+
+    bar.set_chunk_flow_state(None)
+
+    assert bar.chunk_flow_state == ("", "")
+
+
 def test_status_bar_review_controls_toggle_visibility() -> None:
     bar = StatusBar()
 
@@ -101,3 +113,30 @@ def test_status_bar_review_control_callbacks_fire() -> None:
     bar._review_controls.trigger_reject()
 
     assert calls == ["accept", "reject"]
+
+
+def test_status_bar_document_status_badge_tracks_severity() -> None:
+    bar = StatusBar()
+
+    bar.set_document_status_badge("Doc Ready", detail="profile auto", severity="info")
+
+    assert bar.document_status_badge == ("Doc Ready", "profile auto")
+    assert bar.document_status_severity == "info"
+
+    bar.set_document_status_badge(None, detail=None)
+
+    assert bar.document_status_badge == ("", "")
+    assert bar.document_status_severity == ""
+
+
+def test_status_bar_document_status_callback_invokes_indicator() -> None:
+    bar = StatusBar()
+    calls: list[str] = []
+
+    bar.set_document_status_callback(lambda: calls.append("clicked"))
+    indicator = bar._document_status_indicator  # noqa: SLF001 - intentional white-box access
+    indicator.set_state("Ready", "detail", severity="normal")
+
+    indicator._handle_clicked()  # noqa: SLF001 - simulate user interaction
+
+    assert calls == ["clicked"]

@@ -1,6 +1,6 @@
 # AI v2 Phase 5 Implementation Plan
 
-_Last updated: 18 Nov 2025_
+_Last updated: 19 Nov 2025_
 
 ## Purpose & scope
 Phase 5 ships the remaining large-document capabilities on top of the Phase 0–4 runtime (token policy, outline/retrieval guardrails, subagent + plot scaffolding). This document converts the roadmap bullets from `ai_v2_plan.md` into execution-ready workstreams with concrete tasks, file touchpoints, telemetry hooks, and validation requirements.
@@ -19,17 +19,17 @@ Phase 5 ships the remaining large-document capabilities on top of the Phase 0–
 **Key components:** `tinkerbell.services.bridge.DocumentBridge`, `tinkerbell.ai.tools.document_snapshot`, `tinkerbell.ai.prompts`, `tinkerbell.chat.commands`, new chunk manifest schema shared with `AIController`.
 
 **Tasks**
-1. **Schema design & prompts**
+1. **Schema design & prompts** ✅
    - Draft manifest shape (`window`, `chunk_profile`, offsets, outline pointer IDs) and document it in `docs/ai_v2.md`.
    - Update chat command schemas so tool calls can specify window constraints; add migration notes for existing tests.
-2. **Bridge + tool implementation**
+2. **Bridge + tool implementation** ✅
    - Extend `DocumentBridge.generate_snapshot()` with optional `window`, `max_tokens`, `chunk_profile`, `include_text`, `delta_only` args; ensure defaults keep legacy behavior.
    - Cache recent chunk manifests (per tab) and return them with the snapshot payload.
    - Update `DocumentSnapshotTool` to pass through new params, include manifest metadata, and expose sane defaults (selection ± X chars).
-3. **Controller & prompt integration**
+3. **Controller & prompt integration** ✅
    - Teach `AIController` planners to request windowed snapshots first; fallback to full snapshots only behind explicit budget decisions.
    - Adjust system prompts to describe the new manifest + chunk flow.
-4. **Validation**
+4. **Validation** ✅
    - Add `tests/test_document_snapshot.py` covering parameter combinations + manifest caching.
    - Expand `tests/test_agent.py` scenarios ensuring controller prefers slim snapshots and emits guardrail hints when falling back.
    - Update docs + release notes with operator-facing guidance.
@@ -41,61 +41,59 @@ Phase 5 ships the remaining large-document capabilities on top of the Phase 0–
 
 **Tasks**
 1. **Chunk index service**
-   - Implement `ChunkIndex` that subscribes to `DocumentCacheBus`, builds semantic-aware chunks (configurable profiles), stores offsets/hashes/outline pointer IDs, and exposes lookup APIs.
-   - Persist lightweight per-tab cache inside `AIController` for reuse.
+   - ✅ Implemented `ChunkIndex` with cache-bus subscriptions, manifest ingestion, window metadata storage, iterator helpers, and automatic evictions on document change/close events.
+   - ✅ `AIController.ensure_chunk_index()` now owns a per-runtime instance reused by tools and manifests.
 2. **Tool surface + settings**
-   - Create `DocumentChunkTool` returning single chunk or iterator handles whose inline text payloads are always <2K tokens; when a chunk exceeds that cap, return only pointer + manifest metadata so callers can request it through pointer-friendly channels.
-   - Extend settings UI/CLI for profile selection (code/notes/prose) and overlap controls; surface active profile in the status bar.
-3. **Runtime integration**
-   - Wire `AIController` and subagent runtime to use chunk fetches when manifests indicate missing context.
-   - Add telemetry events (`chunk_cache.hit/miss`, `chunk_tool.window_tokens`) and ensure pointer-only responses follow the same budget accounting as other pointerized payloads.
-4. **Validation**
-   - Write `tests/test_document_chunk_tool.py` + `tests/test_chunk_index.py` for boundary calculations, cache invalidation, iterator semantics.
-   - Add guardrail tests ensuring chunk requests respect budget policy and pointerization rules.
+   - ✅ `DocumentChunkTool` ships with inline-token caps, iterator cursors, and pointer-only fallbacks plus `chunk_cache.hit/miss` + `chunk_tool.window_tokens` telemetry events.
+   - ✅ Settings/runtime expose `chunk_profile`, `chunk_overlap_chars`, `chunk_max_inline_tokens`, and `chunk_iterator_limit`, all routed through `AIController.configure_chunking()`.
+3. **Runtime integration** ✅
+   - ✅ Wired `AIController` and subagent runtime to use chunk fetches when manifests indicate missing context (manifest ingestion + hydration helpers in `controller.py`).
+   - ✅ Added telemetry events (`chunk_cache.hit/miss`, `chunk_tool.window_tokens`) and ensured pointer-only responses follow the same budget accounting as other pointerized payloads.
+4. **Validation** ✅
+   - ✅ Added `tests/test_chunk_index.py`, `tests/test_document_chunk_tool.py`, and extended `tests/test_ai_tools.py` to cover manifest ingestion, iterator semantics, and registry wiring.
+   - ✅ Added controller regression coverage in `tests/test_agent.py` ensuring chunk-first planning ingests manifests and hydrates chunk references.
 
-### 3. Streaming diff + multi-range patch flow
+### 3. Streaming diff + multi-range patch flow ✅
 **Objective:** Avoid full-buffer diffs by operating on chunk streams.
 
 **Key components:** new `StreamedDiffBuilder` (under `tinkerbell.ai.tools.diff_builder`), updates to `DocumentApplyPatchTool`, `tinkerbell.services.bridge.DocumentBridge`, `editor.patches`.
 
 **Tasks**
-1. **Diff builder abstraction**
-   - Design streaming API that consumes chunk iterators, emits multi-range diffs keyed by chunk hashes/spans, and reports telemetry metrics (range count, bytes touched).
-   - Maintain compatibility with existing diff summaries for UI/traces.
-2. **Patch/tool updates**
-   - Enhance `DocumentApplyPatchTool` to accept multi-range payloads; serialize metadata so `DocumentBridge` can merge spans server-side.
-   - Update `apply_unified_diff` helpers (or add sibling) to handle multiple disjoint ranges and overlapping edits.
-3. **Bridge + cache bus integration**
-   - Modify `DocumentBridge.queue_edit()` to accept new payloads, publish rich span metadata to the cache bus, and retain legacy behavior behind a feature flag.
-4. **Validation**
-   - Expand `tests/test_patches.py`, add `tests/test_diff_builder.py`, and introduce regression fixtures in `test_data/` representing mega-edits.
-   - Add telemetry assertions verifying streamed diffs report latency + range counts.
+1. **Diff builder abstraction** ✅
+   - ✅ `StreamedDiffBuilder`, `StreamedEditRequest`, and telemetry stats power range-based patches without buffering the full doc while keeping chunk metadata intact for traces.
+2. **Patch/tool updates** ✅
+   - ✅ `DocumentApplyPatchTool` now accepts `patches=` (multi-range) payloads, emits `diff.streamed` telemetry, and falls back to unified diffs for legacy callers.
+   - ✅ Added `RangePatch` + `apply_streamed_ranges` to `editor.patches` alongside the legacy `apply_unified_diff` path.
+3. **Bridge + cache bus integration** ✅
+   - ✅ `DocumentBridge.queue_edit()` ingests streamed ranges, enforces match-text validation, publishes span metadata, and keeps the old diff flow for rollback.
+4. **Validation** ✅
+   - ✅ Regression coverage via new `tests/test_diff_builder.py`, `tests/test_document_apply_patch.py`, and expanded `tests/test_patches.py`, `tests/test_bridge.py`, `tests/test_ai_tools.py`.
+   - ✅ Telemetry assertions ensure streamed diffs report range counts + bytes touched for dashboards.
 
 ### 3b. Diff tooling reliability fixes (parallel to Workstream 3)
 Even after streaming diffs ship, we must harden the existing patch/edit path so legacy agents and UI actions stop corrupting text. The following tasks come directly from `ai_fixes.md` and should be executed alongside Workstream 3; treat them as a co-equal workstream rather than a follow-up.
 
-#### 3b.1 Snapshot-anchored range resolution
-- Extend `DocumentApplyPatchTool` (and `DocumentEditTool`) with optional `match_text`/`expected_text` plus `selection_fingerprint` parameters.
-- When anchors are supplied, locate the text in the latest snapshot, realign `start/end`, or raise a refresh error if no unique match is found.
-- Validate that any provided `target_range` still matches the anchor text; reject otherwise and instruct agents to refresh snapshots.
+#### 3b.1 Snapshot-anchored range resolution — ✅ landed 19 Nov
+- `DocumentApplyPatchTool` and `DocumentEditTool` now accept `match_text`/`expected_text` plus `selection_fingerprint`, enforce anchor uniqueness, and refuse stale ranges with refresh guidance (see `tests/test_document_apply_patch.py`).
+- Follow-up: monitor telemetry for anchor failure rates once counters from 3b.5 go live.
 
-#### 3b.2 Inline edit auto-conversion safety
-- Apply the same anchoring checks inside `DocumentEditTool._auto_convert_to_patch` before synthesizing diffs.
-- Abort early when the snapshot slice no longer matches the requested content instead of emitting a bogus diff.
+#### 3b.2 Inline edit auto-conversion safety — ✅ landed 19 Nov
+- `_auto_convert_to_patch` mirrors anchoring validation, blocking bogus diffs when snapshots drift; guarded by new cases in `tests/test_ai_tools.py`.
+- Follow-up: keep prompts aligned with the “always send anchors” rule (tracked under 3b.4).
 
-#### 3b.3 Guardrails on implicit insertions
-- Stop defaulting to `(0, 0)` when the agent omits `target_range` and no anchor exists; require explicit ranges or anchors for replace operations.
-- Allow caret-based inserts only when the action is explicitly `insert` or carries a flagged intent.
-- Return actionable errors so agents learn to supply enough context, preventing duplicated paragraphs.
+#### 3b.3 Guardrails on implicit insertions — ✅ landed 19 Nov
+- Replace operations now require explicit ranges or anchors, caret inserts stay scoped to explicit `insert` intents, and user-facing errors explain how to recover.
+- Covered via regression updates in `tests/test_document_apply_patch.py` / `tests/test_ai_tools.py` plus bridge-level assertions.
 
-#### 3b.4 Tool schema & instruction updates
-- Extend the tool manifest to document the new parameters and guide agents to copy `selection_text`/`selection_hash` from `document_snapshot`.
-- Refresh system prompts/examples to show how to include anchors and handle validation failures.
+#### 3b.4 Tool schema & instruction updates — ✅ landed 19 Nov
+- System + tool prompts in `tinkerbell/ai/prompts.py` now spell out anchor requirements, copying `selection_text`/`selection_hash`, and the retry path when hashes drift.
+- `docs/ai_v2.md` gained the "Snapshot-anchored editing guardrails" section with workflow tables, telemetry callouts, and migration guidance for agent authors.
+- Tool manifests (`chat.commands`, `message_model`) remain the single source of truth for parameter schemas; prompts/docs now mirror them so agents and operators stay aligned.
 
-#### 3b.5 Testing & telemetry
-- Add unit tests for anchor realignment, mismatch rejection, missing-range errors, and inline conversion safety.
-- Reproduce historic failure modes (mid-word insertions, duplicate replacements) inside `tests/test_patches.py` and `tests/test_editor_widget.py` to ensure they now fail fast.
-- Instrument telemetry (e.g., anchor mismatch counters, patch success/conflict ratios) so we can verify improvements after rollout.
+#### 3b.5 Testing & telemetry — ✅ landed 19 Nov
+- `DocumentApplyPatchTool`, `DocumentEditTool`, and `DocumentBridge` emit `patch.anchor` + `patch.apply` telemetry for success/conflict/stale paths; counters surface in dashboards.
+- Editor widget now rejects zero-length replace directives, reproducing the historical failure locally and blocking it in production (`tinkerbell/editor/editor_widget.py`).
+- Regression suite expanded: `tests/test_ai_tools.py`, `tests/test_bridge.py`, and `tests/test_editor_widget.py` assert telemetry payloads, anchor enforcement, and UI guardrails.
 
 ### 4. Prompt + telemetry guardrails for selective reads
 **Objective:** Ensure the agent and operators stay on the chunk-first path.
@@ -103,18 +101,14 @@ Even after streaming diffs ship, we must harden the existing patch/edit path so 
 **Key components:** `tinkerbell.ai.prompts`, `AIController` guardrail hints, `tinkerbell.ai.services.telemetry`, status bar/chat UI badges, docs.
 
 **Tasks**
-1. **Prompt refresh**
-   - Update system + tool prompts to emphasize the order of operations (delta snapshot → chunk tool → outline/retrieval → plot/concordance as needed).
-   - Add instructions on interpreting chunk manifests + analyzer recommendations (see Workstream 7).
-2. **Guardrail enforcement**
-   - Emit controller hints whenever a tool bypasses the chunk flow (e.g., full snapshot used) and require agents to acknowledge.
-   - Add UI badges inside `tinkerbell.chat.panel.ChatPanel` and `tinkerbell.widgets.status_bar.StatusBarController` showing when the assistant deviates from selective read guidance.
-3. **Telemetry + docs**
-   - Introduce events such as `chunk_flow.requested`, `chunk_flow.escaped_full_snapshot`, `chunk_flow.retry_success`; wire them through `tinkerbell.ai.services.telemetry.TelemetryClient` so they propagate to existing exports and status bar debug counters.
-   - Document operator recovery steps in `docs/ai_v2.md`, README, and guardrail playbooks.
-4. **Validation**
-   - Extend `tests/test_agent.py` and `tests/test_ai_turn_coordinator.py` to assert guardrail hints appear + agent acknowledgements are required.
-   - Add widget tests for new badges and telemetry counters.
+1. **Prompt refresh** ✅
+   - System + tool prompts in `tinkerbell/ai/prompts.py` now explicitly require the "snapshot → chunk tool → outline" order and describe manifest hydration rules.
+2. **Guardrail enforcement** ✅
+   - `_ChunkFlowTracker` emits guardrail hints + `chunk_flow.*` telemetry whenever a full snapshot slips through, and the chat panel/status bar surface badges (`Chunk Flow Warning` / `Recovered`) so operators can react immediately.
+3. **Telemetry + docs** ✅
+   - `chunk_flow.requested`, `chunk_flow.escaped_full_snapshot`, and `chunk_flow.retry_success` events flow through the telemetry bus, with docs/readme updates explaining recovery steps.
+4. **Validation** ✅
+   - Added regression coverage: `tests/test_chat_panel.py`, `tests/test_widgets_status_bar.py`, and the new `tests/test_telemetry_controller.py` assert the badges + telemetry wiring; the existing controller tests already cover guardrail hint injection.
 
 ### 5. Character/entity concordance automation
 **Objective:** Finish the entity pipeline so the agent can plan character-wide edits safely.
@@ -122,16 +116,14 @@ Even after streaming diffs ship, we must harden the existing patch/edit path so 
 **Key components:** new `CharacterMapStore` (under `tinkerbell.ai.memory`), `CharacterMapTool`, `CharacterEditPlannerTool`, UI affordances, telemetry.
 
 **Tasks**
-1. **Store + pipeline**
-   - Build `CharacterMapStore` reusing chunk manifests + plot state data, adding alias/pronoun mapping, exemplar quotes, and chunk IDs.
-   - Subscribe to cache bus events so concordance data invalidates on edits/closures.
-2. **Tooling + planners**
-   - Implement `CharacterMapTool` returning entity lists, appearances, pointer IDs.
-   - Add `CharacterEditPlannerTool` (subagent-friendly) that walks chunks, tracks completion state, and records results back into plot/character memory.
-3. **UI & UX**
-   - Provide optional dialog or status hints so users can inspect concordance output and monitor planner progress.
-4. **Validation**
-   - Author `tests/test_character_map_tool.py`, extend `tests/test_plot_state.py` & `tests/test_subagent_manager.py` for planner loops, add telemetry assertions.
+1. **Store + pipeline** ✅
+   - `CharacterMapStore` now records aliases/pronouns, exemplar mentions, cache-bus invalidations, and planner progress (`PlannerTaskProgress`).
+2. **Tooling + planners** ✅
+   - `CharacterMapTool` + `CharacterEditPlannerTool` are registered behind the plot-scaffolding flag, exposed via `ToolProvider`, and wired into `SubagentRuntimeManager`.
+3. **UI & UX (delegated)** ✅
+   - Scope now lives under Workstream 8’s Document Status console; WS5 deliverables are complete once data/modeling pieces land.
+4. **Validation** ✅ (tooling)
+   - Added `tests/test_character_map_store.py`, `tests/test_character_map_tool.py`, `tests/test_character_edit_planner_tool.py`, and extended `tests/test_tool_provider.py`; planner telemetry + UI tests remain once surfaces ship.
 
 ### 6. Storyline continuity orchestration
 **Objective:** Upgrade plot scaffolding into a structured plot memory with enforced edit loops.
@@ -139,34 +131,59 @@ Even after streaming diffs ship, we must harden the existing patch/edit path so 
 **Key components:** `PlotStateMemory` (timeline graphs, dependency tracking), `PlotOutlineTool`, `PlotStateUpdateTool`, `SubagentRuntimeManager`, `AIController`, persistence options for overrides.
 
 **Tasks**
-1. **Memory upgrade**
-   - Extend `DocumentPlotStateStore` into `PlotStateMemory` (new module/file) storing arcs, beats, dependencies, human overrides, and version metadata.
-   - Ensure cache bus events wipe stale entries and that memory respects per-document caps.
-2. **Tool suite**
-   - Ship `PlotOutlineTool` + `PlotStateUpdateTool` with strict schemas; require the manager agent to call them before/after chunk edits.
-   - Update prompts + controller logic to enforce the "read plot state → edit chunk → update plot state" loop.
-3. **Telemetry/persistence**
-   - Add telemetry events for plot state reads/writes and optional persistence of human-authored overrides (profile-level JSON under `~/.tinkerbell`).
-4. **Validation**
-   - Enhance `tests/test_plot_state.py`, add `tests/test_plot_state_tool.py`, and extend controller/subagent tests covering enforced loops + pointerization of plot payloads.
+1. **Memory upgrade** ✅ (landed)
+   - `PlotStateMemory` (`src/tinkerbell/ai/memory/plot_memory.py`) now tracks arcs, beats, dependencies, version metadata, and human overrides with cache-bus clears + cap enforcement.
+   - `PlotOverrideStore` persists manual directives under `~/.tinkerbell/plot_overrides.json`, and overrides rehydrate at startup.
+2. **Tool suite** ✅
+   - `PlotOutlineTool` (alias `DocumentPlotStateTool`) now exposes enriched snapshots; `PlotStateUpdateTool` captures manual dependencies/overrides, both registered via `ui.tools.provider` + `ai.tools.registry` and available to subagents.
+   - `_PlotLoopTracker` inside `AIController` enforces the "outline → edit → update" loop with guardrail hints, automatically activating when `SubagentRuntimeConfig.plot_scaffolding_enabled` is `True`. New controller tests (`tests/test_agent.py::test_plot_loop_*`) cover the block/allow/update-reminder paths.
+3. **Telemetry/persistence** ✅
+   - `plot_state.read`/`plot_state.write` telemetry events now fire from the outline/update tools; persistence of overrides validated via `PlotOverrideStore` round-trips.
+   - `docs/ai_v2.md` + `docs/ai_v2_release_notes.md` now describe the telemetry fields, override file path, and operator workflow.
+4. **Validation** ✅
+   - `tests/test_plot_state.py`, `tests/test_document_plot_state_tool.py`, `tests/test_tool_provider.py`, and the new guardrail coverage in `tests/test_agent.py` exercise the memory store, tool factories, and controller enforcement.
+   - Telemetry + persistence documented; release-note entry added under Phase 5.1.
 
 ### 7. Preflight analysis & tool recommendations
-**Objective:** Inject document-aware planning before each run so the agent automatically chooses the right tool mix.
+**Objective:** Inject document-aware planning before each run so the agent automatically chooses the right tool mix and operators see why.
 
-**Key components:** new `tinkerbell.ai.analysis` package, `AnalysisAgent`, controller hooks (`AIController._build_messages`), `ToolUsageAdvisorTool`, UI transparency.
+**Key components:** new `tinkerbell.ai.analysis` package, `AnalysisAgent`, controller hooks (`AIController._build_messages`), `ToolUsageAdvisorTool`, chat panel/status-bar surfacing, telemetry additions.
 
 **Tasks**
-1. **Analysis module**
-   - Build rule-based `AnalysisAgent` that inspects document metadata (size, outline freshness, chunk index status, plot/concordance caches, guardrail flags) and emits structured advice (chunk profile, required tools, caution flags).
-   - Support caching per `document_version` and TTL-based invalidation.
-2. **Controller integration**
-   - Invoke the analyzer before prompt construction; inject its output as system metadata and log decisions for telemetry/diagnostics.
-   - Provide a `ToolUsageAdvisorTool` so the agent can re-run analysis mid-turn when conditions change.
-3. **UI & telemetry**
-   - Surface analyzer decisions in the chat panel (e.g., “Preflight recommends chunk profile: prose, retrieval: on, plot state: stale”).
-   - Emit telemetry events capturing analyzer latency, cache hits, and operator overrides.
+1. **Analysis module** — ✅ code + cache invalidation landed 19 Nov
+   - `tinkerbell/ai/analysis/` now exists with `models.py`, `sources.py`, `rules.py`, `cache.py`, and `agent.py`; `AnalysisAgent` already powers controller preflight runs.
+   - Inputs capture document metadata, chunk manifest hints, guardrail flags, plot/concordance freshness, and produce advice with `chunk_profile`, tool lists, outline refresh flags, and `rule_trace` telemetry.
+   - Cache now subscribes to the document bus via `AIController`, so `DocumentChanged`/`DocumentClosed` events immediately invalidate advice + snapshot caches.
+2. **Rule engine + telemetry plumbing** — ✅ analysis + override events wired
+   - Base rule set (chunk profile, outline freshness, plot/concordance, retrieval) is active, emitting `AnalysisFinding` traces recorded inside `AnalysisAdvice`.
+   - `AnalysisAgent` emits `analysis.preflight.*` plus the new `analysis.advisor_tool.invoked` / `analysis.ui_override.*` events. Advice metadata flows through `TelemetryManager`, `ContextUsageEvent`, and `scripts/export_context_usage.py`, and the docs/release notes describe the new columns.
+3. **Controller + tool integration** — ✅ controller + tool + telemetry context complete (docs/tests follow-up)
+   - `AIController` owns `_analysis_agent`, `configure_analysis()`, snapshot caching, `_run_preflight_analysis()`, `get_latest_analysis_advice()`, and injects a “Preflight analysis summary” system message ahead of prompts.
+   - Advice objects (including cache state, tool lists, warnings, rule traces, timestamps) now flow into manual commands, telemetry contexts, and the `ToolUsageAdvisorTool` entry point, so dashboards/exports receive structured data.
+4. **UI & operator transparency** — ✅ surfaced 19 Nov (status/chat badges + `/analyze`; docs/tests remain)
+   - Status bar gains an analysis indicator, the chat panel shows a preflight badge + hover detail, TelemetryController refreshes them after each turn, and the `/analyze` manual command displays formatted advice or errors.
+5. **Validation & docs** — ✅ coverage & docs updated
+   - `tests/test_analysis_agent.py`, `tests/test_agent.py` (analysis hint, cache invalidation, telemetry emission), and `tests/test_ai_tools.py` lock down analyzer/tool behavior; follow-on widget tests remain optional.
+   - `docs/ai_v2.md` and `docs/ai_v2_release_notes.md` now document the analyzer workflow, UI badges, manual `/analyze` command, and telemetry/export fields so ops/support can reference them.
+
+### 8. Document status console & UX surfacing
+**Objective:** Provide a unified "Document Status" window that exposes chunk manifests, plot/concordance summaries, planner progress, and telemetry state so operators can inspect readiness before edits.
+
+**Key components:** new `DocumentStatusWindow` (Qt dialog) under `src/tinkerbell/ui/widgets/`, data adapters pulling from `OutlineRuntime`, `CharacterMapStore`, `DocumentPlotStateStore`, planner telemetry, and status bar/command palette hooks to launch the window.
+
+**Tasks**
+1. **Design & scaffolding**
+   - ✅ Dialog now ships with a severity-aware header, metadata grid (path, selection, version, language), doc selector, and dedicated tabs for Chunks, Outline, Plot & Concordance, and Telemetry—including Copy/Save actions and manual refresh.
+   - ✅ `DocumentStatusService` (in `tinkerbell/ui/document_status_service.py`) assembles payloads from controller caches, outline/plot/concordance stores, planner stats, and telemetry so the window stays data-driven.
+2. **Data bindings**
+   - ✅ Chunk manifests, outline freshness, plot/concordance snapshots, and planner stats all hydrate the window via `DocumentStatusWindow._update_views()`, with incremental refresh supported through the Refresh button and new signal-driven `MainWindow._handle_document_status_signal` hook.
+   - ✅ Telemetry badges now style both the status bar indicator and the Telemetry tab (severity-aware backgrounds for chunk flow/analysis). Badge refreshes propagate to the open dialog whenever chunk-flow or analysis events fire, so operators see warnings without reopening the window.
+3. **Interaction & commands**
+   - ✅ `View → Document Status...` plus the global `Ctrl+Shift+D` action now launch the dialog, and the command palette (`Ctrl+Shift+P`) automatically indexes the `Document Status...` entry so operators can search for it alongside other window actions.
+   - ✅ `/status` manual command resolves tab references/`--doc` flags, opens the dialog (or falls back to JSON summaries via `--json`) and keeps the dropdown in sync so multi-document inspection works from chat, the status bar, the menu, or the palette.
+   - ✅ Document Status window exposes "Save JSON…" (writes via `export_payload`) plus the existing "Copy JSON" affordance so operators can persist the payload.
 4. **Validation**
-   - Create `tests/test_analysis_agent.py`, extend `tests/test_agent.py` to ensure analyzer output is honored, and add widget tests for UI surfacing.
+   - ✅ Headless + Qt coverage now lives in `tests/test_document_status_window.py` (payload loading, telemetry badges, Save JSON) and `tests/test_document_status_service.py` (payload assembly + severity selection), keeping the dialog + `/status` wiring locked down alongside the existing status bar indicator tests.
 
 ## Cross-cutting deliverables
 - **Docs & runbooks:** Update README, `docs/ai_v2.md`, guardrail guides, and release notes after each workstream lands.

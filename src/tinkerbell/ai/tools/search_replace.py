@@ -11,7 +11,7 @@ from typing import Any, ClassVar, Literal, Mapping, Protocol
 class SearchReplaceBridge(Protocol):
     """Subset of the document bridge used by the search/replace tool."""
 
-    def generate_snapshot(self, *, delta_only: bool = False) -> Mapping[str, Any]:
+    def generate_snapshot(self, *, delta_only: bool = False, **_: Any) -> Mapping[str, Any]:
         ...
 
     def queue_edit(self, directive: Mapping[str, Any]) -> None:
