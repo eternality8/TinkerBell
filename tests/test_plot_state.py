@@ -108,3 +108,31 @@ def test_plot_state_memory_persists_overrides(tmp_path) -> None:
     second = PlotStateMemory(override_store=PlotOverrideStore(path=path))
     overrides = second.list_overrides("doc-plot")
     assert any(override.override_id == "manual" for override in overrides)
+
+
+def test_plot_state_manual_update_tracks_entities(tmp_path) -> None:
+    store = PlotStateMemory(override_store=_override_store(tmp_path))
+    summary = store.apply_manual_update(
+        "doc-plot",
+        entities=[
+            {
+                "entity_id": "geraldine",
+                "name": "Geraldine",
+                "type": "giraffe",
+                "role": "tea specialist",
+                "summary": "Geraldine the giraffe keeps the high-shelf tea program on track.",
+                "supporting_pointers": ["pointer-789"],
+            }
+        ],
+    )
+
+    assert summary["entity_updates"] == 1
+
+    snapshot = store.snapshot("doc-plot")
+    assert snapshot is not None
+    entities = snapshot["entities"]
+    assert entities
+    entity = entities[0]
+    assert entity["name"] == "Geraldine"
+    assert entity["attributes"].get("role") == "tea specialist"
+    assert "pointer-789" in entity["supporting_pointers"]

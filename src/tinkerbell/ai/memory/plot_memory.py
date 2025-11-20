@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .plot_state import DocumentPlotState, DocumentPlotStateStore, PlotArc, PlotBeat
+from .plot_state import DocumentPlotState, DocumentPlotStateStore, PlotArc, PlotBeat, PlotEntity
 
 LOGGER = logging.getLogger(__name__)
 
@@ -253,6 +253,7 @@ class PlotStateMemory(DocumentPlotStateStore):
         document_id: str,
         *,
         version_id: str | None = None,
+        entities: Iterable[Mapping[str, Any]] | None = None,
         arcs: Iterable[Mapping[str, Any]] | None = None,
         overrides: Iterable[Mapping[str, Any]] | None = None,
         dependencies: Iterable[Mapping[str, Any]] | None = None,
@@ -263,6 +264,7 @@ class PlotStateMemory(DocumentPlotStateStore):
             state = DocumentPlotState(document_id=document_id)
             self._records[document_id] = state
         state.touch(version_id=version_id)
+        entity_updates = self._apply_entity_updates(state, entities or ())
         arc_updates = self._apply_arc_updates(state, arcs or ())
         override_updates = self._apply_override_updates(document_id, overrides or ())
         dependency_updates = self._apply_dependency_updates(document_id, dependencies or ())
@@ -271,6 +273,7 @@ class PlotStateMemory(DocumentPlotStateStore):
         self._enforce_limits(state)
         return {
             "document_id": document_id,
+            "entity_updates": entity_updates,
             "arc_updates": arc_updates,
             "override_updates": override_updates,
             "dependency_updates": dependency_updates,
@@ -314,6 +317,72 @@ class PlotStateMemory(DocumentPlotStateStore):
             self._overrides.pop(document_id, None)
             self._version_metadata.pop(document_id, None)
         self._persist_overrides()
+
+    def _apply_entity_updates(self, state: DocumentPlotState, updates: Iterable[Mapping[str, Any]]) -> int:
+        count = 0
+        for entry in updates:
+            if not isinstance(entry, Mapping):
+                continue
+            raw_name = entry.get("name") or entry.get("entity_id")
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                continue
+            entity_id = str(entry.get("entity_id") or _slugify(raw_name))
+            entity = self._find_entity(state, entity_id)
+            normalized_name = raw_name.strip()
+            if entity is None:
+                entity = PlotEntity(entity_id=entity_id, name=normalized_name)
+                state.entities.append(entity)
+            else:
+                entity.name = normalized_name
+
+            pointer_value = entry.get("pointer_id")
+            pointer_id = pointer_value.strip() if isinstance(pointer_value, str) and pointer_value.strip() else None
+            summary_value = entry.get("summary")
+            summary_text = summary_value.strip() if isinstance(summary_value, str) else None
+            entity.touch(pointer_id=pointer_id, summary=summary_text)
+
+            kind_value = entry.get("kind") or entry.get("type")
+            if isinstance(kind_value, str) and kind_value.strip():
+                entity.kind = kind_value.strip()
+
+            salience_value = entry.get("salience")
+            if isinstance(salience_value, (int, float)):
+                entity.salience = float(salience_value)
+
+            supporting = entry.get("supporting_pointers")
+            if isinstance(supporting, Iterable) and not isinstance(supporting, (str, bytes)):
+                for pointer in supporting:
+                    if isinstance(pointer, str) and pointer.strip():
+                        entity.touch(pointer_id=pointer.strip(), summary=None)
+
+            attribute_payload: dict[str, Any] = {}
+            for key in ("attributes", "metadata"):
+                value = entry.get(key)
+                if isinstance(value, Mapping):
+                    attribute_payload.update({str(k): v for k, v in value.items() if isinstance(k, str)})
+
+            reserved = {
+                "entity_id",
+                "name",
+                "summary",
+                "kind",
+                "type",
+                "pointer_id",
+                "supporting_pointers",
+                "salience",
+                "attributes",
+                "metadata",
+            }
+            for key, value in entry.items():
+                if not isinstance(key, str) or key in reserved:
+                    continue
+                attribute_payload.setdefault(key, value)
+
+            if attribute_payload:
+                entity.attributes.update(attribute_payload)
+
+            count += 1
+        return count
 
     def _apply_arc_updates(self, state: DocumentPlotState, updates: Iterable[Mapping[str, Any]]) -> int:
         applied = 0
@@ -364,6 +433,13 @@ class PlotStateMemory(DocumentPlotStateStore):
         for beat in arc.beats:
             if beat.beat_id == beat_id:
                 return beat
+        return None
+
+    @staticmethod
+    def _find_entity(state: DocumentPlotState, entity_id: str) -> PlotEntity | None:
+        for entity in state.entities:
+            if entity.entity_id == entity_id:
+                return entity
         return None
 
     def _apply_override_updates(self, document_id: str, overrides: Iterable[Mapping[str, Any]]) -> int:

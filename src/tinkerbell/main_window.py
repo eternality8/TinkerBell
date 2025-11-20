@@ -859,7 +859,7 @@ class MainWindow(QMainWindow):
 
         self._editor.add_snapshot_listener(self._handle_editor_snapshot)
         self._editor.add_text_listener(self._handle_editor_text_changed)
-        self._editor.add_selection_listener(self._handle_editor_selection_changed)
+        self._editor.add__listener(self._handle_editor_selection_changed)
         self._chat_panel.add_request_listener(self._handle_chat_request)
         self._chat_panel.add_session_reset_listener(self._handle_chat_session_reset)
         self._chat_panel.add_suggestion_panel_listener(self._handle_suggestion_panel_toggled)

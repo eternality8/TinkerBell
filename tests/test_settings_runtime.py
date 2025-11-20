@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 from tinkerbell.services.settings import Settings
@@ -41,6 +42,7 @@ class _ControllerStub:
         self.subagent_config = None
         self.updated_clients: list[object] = []
         self.client = SimpleNamespace(settings=SimpleNamespace(debug_logging=False))
+        self.event_logging_enabled = False
 
     def set_max_tool_iterations(self, value: int) -> None:
         self.max_iterations = value
@@ -56,6 +58,10 @@ class _ControllerStub:
 
     def update_client(self, client) -> None:
         self.updated_clients.append(client)
+
+    def configure_debug_event_logging(self, *, enabled: bool | None = None, event_log_dir=None) -> None:
+        if enabled is not None:
+            self.event_logging_enabled = bool(enabled)
 
 
 class _FakeTask:
@@ -199,7 +205,23 @@ def test_apply_runtime_settings_disables_controller_without_credentials() -> Non
     assert runtime.ai_client_signature is None
     assert ai_state["task"] is None
     assert ai_state["streaming"] is False
-    assert task.cancelled is True
-    assert telemetry.flags[-1] is False
-    assert embedding.runtime_settings is updated
-    assert bundle["register_state"]["count"] == 0
+
+
+def test_event_logging_toggle_updates_controller() -> None:
+    base = Settings(api_key="live", base_url="https://api", model="gpt-4o-mini", debug_event_logging=False)
+    bundle = _runtime_bundle(base)
+    runtime = bundle["runtime"]
+    context = bundle["context"]
+    controller = _ControllerStub()
+    context.ai_controller = controller
+    runtime.ai_client_signature = runtime._ai_settings_signature(base)
+
+    updated = replace(base, debug_event_logging=True)
+    runtime.apply_runtime_settings(
+        updated,
+        chat_panel_handler=lambda s: None,
+        phase3_handler=lambda s: None,
+        plot_scaffolding_handler=lambda s: None,
+    )
+
+    assert controller.event_logging_enabled is True

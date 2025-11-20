@@ -11,6 +11,7 @@ _Last updated: 19 Nov 2025_
 - **Storyline continuity orchestration (Phase 5.1)** – `PlotStateMemory`, `PlotOutlineTool`, and `PlotStateUpdateTool` now enforce the “outline → edit → update” loop with guardrail hints, persistence for operator overrides, and `plot_state.*` telemetry.
 - **Preflight analysis & tool recommendations (Phase 5.2)** – Rule-based analyzer feeds proactive tool hints into the controller, status bar/chat badges, manual `/analyze`, ContextUsage exports, and telemetry (`analysis.advisor_tool.*`, `analysis.ui_override.*`).
 - **Configurable sampling temperature** – The AI settings dialog now exposes the OpenAI-compatible temperature control (0.0–2.0) so creative writing sessions can lean toward higher variety without editing `settings.json` manually.
+- **Per-turn debug event logs** – When `debug_logging` (or `TINKERBELL_DEBUG=1`) is enabled, every AI turn now emits a JSONL trace under `~/.tinkerbell/logs/events/` capturing the active snapshot text, assistant messages, tool payloads, and edit outcomes for easier post-mortem debugging. The Settings dialog (Features tab) exposes a “Capture per-chat event logs (JSONL)” toggle so you can enable/disable this without editing `settings.json`.
 
 ## Feature flags
 

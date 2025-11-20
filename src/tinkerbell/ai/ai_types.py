@@ -184,6 +184,7 @@ class SubagentRuntimeConfig:
     max_jobs_per_turn: int = 2
     selection_min_chars: int = 400
     chunk_preview_chars: int = 1_200
+    plot_outline_min_chars: int = 400
     allowed_tools: tuple[str, ...] = (
         "document_snapshot",
         "document_outline",
@@ -199,6 +200,7 @@ class SubagentRuntimeConfig:
         self.max_jobs_per_turn = max(0, int(self.max_jobs_per_turn or 0))
         self.selection_min_chars = max(0, int(self.selection_min_chars or 0))
         self.chunk_preview_chars = max(200, int(self.chunk_preview_chars or 200))
+        self.plot_outline_min_chars = max(0, int(self.plot_outline_min_chars or 0))
         allowed = tuple(tool.strip() for tool in self.allowed_tools if tool)
         self.allowed_tools = allowed or (
             "document_snapshot",

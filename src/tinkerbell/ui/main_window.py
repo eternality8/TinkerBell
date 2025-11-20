@@ -115,6 +115,7 @@ class MainWindow(QMainWindow):
         self._plot_scaffolding_enabled = bool(getattr(initial_settings, "enable_plot_scaffolding", False))
         show_tool_panel = bool(getattr(initial_settings, "show_tool_activity_panel", False))
         self._editor = TabbedEditorWidget()
+        self._editor.set_tab_close_handler(self._handle_tab_close_request)
         self._workspace = self._editor.workspace
         self._chat_panel = ChatPanel(show_tool_activity_panel=show_tool_panel)
         self._bridge = WorkspaceBridgeRouter(self._workspace)
@@ -1755,21 +1756,36 @@ class MainWindow(QMainWindow):
         if active_tab is None:
             self.update_status("No tab to close")
             return
-        closed = self._editor.close_active_tab()
+        handled = self._close_tab(active_tab.id)
+        if not handled:
+            self.update_status("No tab to close")
+
+    def _handle_tab_close_request(self, tab_id: str) -> bool:
+        return self._close_tab(tab_id)
+
+    def _close_tab(self, tab_id: str) -> bool:
+        was_active = self._workspace.active_tab_id == tab_id
+        try:
+            closed = self._editor.close_tab(tab_id)
+        except KeyError:
+            return False
         self._review_controller.mark_pending_session_orphaned(closed.id, reason="tab-closed")
         document = closed.document()
         self._document_monitor.clear_unsaved_snapshot(path=document.metadata.path, tab_id=closed.id)
         if self._review_overlay_manager is not None:
             self._review_overlay_manager.discard_overlay(closed.id)
         if self._workspace.tab_count() == 0:
-            self._handle_new_tab_requested()
-        else:
+            self._document_session.set_current_path(None)
+        elif was_active:
             new_active = self._workspace.active_tab
             if new_active is not None:
                 self._document_session.set_current_path(new_active.document().metadata.path)
         self._document_session.sync_workspace_state()
-        self._document_monitor.update_autosave_indicator(document=self._editor.to_document())
+        active_tab = self._workspace.active_tab
+        if active_tab is not None:
+            self._document_monitor.update_autosave_indicator(document=active_tab.document())
         self.update_status(f"Closed tab {closed.title}")
+        return True
 
     def _handle_save_requested(self) -> None:
         """Save the current document, prompting for a path if required."""

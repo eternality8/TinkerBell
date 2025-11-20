@@ -90,6 +90,16 @@ def test_bool_env_overrides_enable_debug_logging(monkeypatch: pytest.MonkeyPatch
     assert overridden.debug_logging is True
 
 
+def test_bool_env_overrides_enable_debug_event_logging(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    SettingsStore(path).save(Settings())
+    monkeypatch.setenv("TINKERBELL_DEBUG_EVENT_LOGGING", "1")
+
+    overridden = SettingsStore(path).load()
+
+    assert overridden.debug_event_logging is True
+
+
 def test_float_env_override_sets_temperature(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     SettingsStore(path).save(Settings())
@@ -238,3 +248,25 @@ def test_same_api_mode_resets_unknown_backend(tmp_path: Path) -> None:
     assert settings.embedding_backend == "auto"
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload.get("embedding_backend") == "auto"
+
+
+def test_local_dtype_default_label_migrates(tmp_path: Path) -> None:
+    target = tmp_path / "settings.json"
+    target.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "embedding_mode": "local",
+                    "st_dtype": "Default",
+                },
+                "version": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = SettingsStore(target).load()
+
+    assert settings.metadata.get("st_dtype") == ""
+    persisted = json.loads(target.read_text(encoding="utf-8"))
+    assert persisted.get("metadata", {}).get("st_dtype") == ""

@@ -450,6 +450,35 @@ def test_document_edit_tool_blocks_caret_replace_without_insert_action():
         tool.run(action="replace", content="X", target_range=(5, 5))
 
 
+def test_document_edit_tool_refreshes_snapshot_when_selection_missing():
+    fingerprint = hashlib.sha1(b"Hello").hexdigest()
+
+    class _LazySelectionBridge(_PatchBridgeStub):
+        def generate_snapshot(self, *, include_text: bool | None = None, **kwargs):  # type: ignore[override]
+            include_flag = bool(include_text)
+            snapshot = super().generate_snapshot(include_text=include_flag, **kwargs)
+            snapshot.pop("selection_text", None)
+            snapshot.pop("selection_hash", None)
+            if include_flag:
+                snapshot["selection_text"] = "Hello"
+                snapshot["selection_hash"] = fingerprint
+            return snapshot
+
+    bridge = _LazySelectionBridge(text="Hello world", selection=(0, 5), version="digest-refresh")
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+
+    status = tool.run(
+        action="replace",
+        content="HELLO",
+        target_range=(0, 5),
+        selection_fingerprint=fingerprint,
+    )
+
+    assert "digest-refresh" in status
+    assert len(bridge.snapshot_requests) >= 2
+    assert bridge.snapshot_requests[-1]["include_text"] is True
+
+
 def test_document_edit_tool_allows_patches_when_patch_only_enabled():
     bridge = _EditBridgeStub()
     bridge.last_diff_summary = "patch"

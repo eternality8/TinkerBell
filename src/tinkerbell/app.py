@@ -335,6 +335,7 @@ def _build_ai_controller(settings: Settings, *, debug_logging: bool = False) -> 
         telemetry_enabled=telemetry_enabled,
         telemetry_limit=telemetry_limit,
         subagent_config=subagent_config,
+        debug_event_logging=bool(getattr(settings, "debug_event_logging", False)),
     )
 
 

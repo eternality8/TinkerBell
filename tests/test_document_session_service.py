@@ -192,6 +192,26 @@ def test_restore_last_session_document_reopens_previous_file(tmp_path: Path) -> 
     assert sync_calls == [False]
 
 
+def test_restore_last_session_document_cleans_orphan_snapshots(tmp_path: Path) -> None:
+    ghost = tmp_path / "ghost.md"
+    ghost.write_text("ghost", encoding="utf-8")
+    normalized = str(ghost.expanduser().resolve())
+    settings = Settings(
+        unsaved_snapshots={
+            normalized: {"text": "Lost", "language": "markdown", "selection": [0, 4]},
+            str(tmp_path / "stale.md"): {"text": "Stale", "language": "markdown", "selection": [0, 5]},
+        },
+        untitled_snapshots={"tab-stale": {"text": "scratch", "language": "markdown"}},
+    )
+    service, tracker = _make_service(settings=settings)
+
+    service.restore_last_session_document()
+
+    assert settings.unsaved_snapshots == {}
+    assert settings.untitled_snapshots == {}
+    assert tracker.store.saved  # cleanup persisted to disk
+
+
 def test_apply_pending_snapshot_for_path_restores_document(tmp_path: Path) -> None:
     service, tracker = _make_service(settings=Settings())
     path = tmp_path / "draft.md"

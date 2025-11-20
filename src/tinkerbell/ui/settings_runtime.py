@@ -51,6 +51,7 @@ class SettingsRuntime:
         self._active_theme: str | None = None
         self._active_theme_request: str | None = None
         self._debug_logging_enabled = bool(getattr(initial_settings, "debug_logging", False)) if initial_settings else False
+        self._event_logging_enabled = bool(getattr(initial_settings, "debug_event_logging", False)) if initial_settings else False
         self._ai_client_signature: tuple[Any, ...] | None = self._ai_settings_signature(initial_settings)
 
     # ------------------------------------------------------------------
@@ -76,6 +77,7 @@ class SettingsRuntime:
         phase3_handler(settings)
         plot_scaffolding_handler(settings)
         self._apply_debug_logging_setting(settings)
+        self._apply_event_logging_setting(settings)
         self.apply_theme_setting(settings)
         self._embedding_controller.refresh_runtime(settings)
         self._refresh_ai_runtime(settings)
@@ -143,6 +145,7 @@ class SettingsRuntime:
                 budget_policy=policy,
                 subagent_config=self._build_subagent_runtime_config(settings),
                 temperature=getattr(settings, "temperature", 0.2),
+                debug_event_logging=bool(getattr(settings, "debug_event_logging", False)),
             )
             controller.configure_chunking(
                 default_profile=getattr(settings, "chunk_profile", "auto"),
@@ -164,6 +167,12 @@ class SettingsRuntime:
             self._update_logging_configuration(new_debug)
             self._debug_logging_enabled = new_debug
         self._update_ai_debug_logging(new_debug)
+
+    def _apply_event_logging_setting(self, settings: Settings) -> None:
+        new_flag = bool(getattr(settings, "debug_event_logging", False))
+        if new_flag != self._event_logging_enabled:
+            self._event_logging_enabled = new_flag
+        self._update_ai_event_logging(new_flag)
 
     def _update_logging_configuration(self, debug_enabled: bool) -> None:
         level = logging.DEBUG if debug_enabled else logging.INFO
@@ -188,6 +197,22 @@ class SettingsRuntime:
             _LOGGER.debug("AI client debug logging set to %s", debug_enabled)
         except Exception as exc:  # pragma: no cover - defensive guard
             _LOGGER.debug("Unable to update AI client debug flag: %s", exc)
+
+    def _update_ai_event_logging(self, enabled: bool) -> None:
+        controller = self._context.ai_controller
+        if controller is None:
+            return
+        configurator = getattr(controller, "configure_debug_event_logging", None)
+        if callable(configurator):
+            try:
+                configurator(enabled=enabled)
+            except Exception as exc:
+                _LOGGER.debug("Unable to update event logging flag: %s", exc)
+        else:  # pragma: no cover - fallback for legacy controllers
+            try:
+                controller.debug_event_logging = enabled
+            except Exception as exc:
+                _LOGGER.debug("Unable to set event logging attribute: %s", exc)
 
     def _refresh_ai_runtime(self, settings: Settings) -> None:
         new_subagent_flag = bool(getattr(settings, "enable_subagents", False))
@@ -225,6 +250,7 @@ class SettingsRuntime:
             self._apply_temperature_setting(controller, settings)
 
         self._update_ai_debug_logging(bool(getattr(settings, "debug_logging", False)))
+        self._update_ai_event_logging(self._event_logging_enabled)
 
     def _ai_settings_ready(self, settings: Settings) -> bool:
         return bool((settings.api_key or "").strip() and (settings.base_url or "").strip() and (settings.model or "").strip())

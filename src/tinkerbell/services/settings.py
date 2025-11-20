@@ -41,6 +41,7 @@ _ENV_OVERRIDES: Mapping[str, str] = {
 }
 _BOOL_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_DEBUG_LOGGING": "debug_logging",
+    "TINKERBELL_DEBUG_EVENT_LOGGING": "debug_event_logging",
     "TINKERBELL_TOOL_ACTIVITY_PANEL": "show_tool_activity_panel",
     "TINKERBELL_PHASE3_OUTLINE_TOOLS": "phase3_outline_tools",
     "TINKERBELL_ENABLE_SUBAGENTS": "enable_subagents",
@@ -115,6 +116,7 @@ class Settings:
     font_size: int = 13
     window_geometry: str | None = None
     debug_logging: bool = False
+    debug_event_logging: bool = False
     show_tool_activity_panel: bool = False
     phase3_outline_tools: bool = False
     enable_subagents: bool = False
@@ -422,6 +424,15 @@ class SettingsStore:
             normalized_api, api_migrated = self._normalize_embedding_api_metadata(embedding_api_payload)
             metadata["embedding_api"] = normalized_api
             migrated = migrated or api_migrated
+
+        dtype_value = metadata.get("st_dtype")
+        if dtype_value is not None:
+            normalized_dtype = str(dtype_value).strip()
+            if normalized_dtype.lower() == "default":
+                normalized_dtype = ""
+            if normalized_dtype != dtype_value:
+                metadata["st_dtype"] = normalized_dtype
+                migrated = True
         return metadata, migrated, mode_missing
 
     def _normalize_embedding_api_metadata(self, payload: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:

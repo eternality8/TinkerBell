@@ -799,6 +799,29 @@ def register_plot_memory_tools(
         "additionalProperties": False,
     }
 
+    entity_schema = {
+        "type": "object",
+        "properties": {
+            "entity_id": {"type": "string", "description": "Stable slug identifier for the entity."},
+            "name": {"type": "string", "description": "Human-readable name for the entity."},
+            "summary": {"type": "string", "description": "Concise description capturing the current state."},
+            "kind": {"type": "string", "description": "Entity classification (character, place, etc.)."},
+            "type": {"type": "string", "description": "Alias for 'kind' to ease agent prompts."},
+            "salience": {"type": "number", "description": "Relative importance score (0-1)."},
+            "pointer_id": {"type": "string", "description": "Pointer referencing the supporting chunk."},
+            "supporting_pointers": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Additional chunk pointers associated with the entity.",
+            },
+            "attributes": {"type": "object", "description": "Structured metadata such as roles or goals."},
+            "metadata": {"type": "object", "description": "Alias for attributes to align with other tools."},
+            "role": {"type": "string", "description": "Free-form role or job description."},
+        },
+        "required": ["name"],
+        "additionalProperties": True,
+    }
+
     update_schema = {
         "type": "object",
         "properties": {
@@ -807,6 +830,7 @@ def register_plot_memory_tools(
                 "description": "Optional explicit target; defaults to the active document.",
             },
             "version_id": {"type": "string", "description": "Document version identifier for bookkeeping."},
+            "entities": {"type": "array", "items": entity_schema},
             "arcs": {"type": "array", "items": arc_schema},
             "overrides": {"type": "array", "items": override_schema},
             "dependencies": {"type": "array", "items": dependency_schema},

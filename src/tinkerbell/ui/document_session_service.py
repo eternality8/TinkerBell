@@ -152,6 +152,9 @@ class DocumentSessionService:
         if settings is None:
             return
 
+        if self._cleanup_orphan_snapshots(settings):
+            self.persist_settings(settings)
+
         if self._restore_workspace_tabs(settings):
             self.sync_workspace_state(persist=False)
             return
@@ -400,6 +403,50 @@ class DocumentSessionService:
             settings.last_open_file = None
             self.persist_settings(settings)
         self._status_updater("Last session file missing")
+
+    def _cleanup_orphan_snapshots(self, settings: Settings) -> bool:
+        entries = [entry for entry in (settings.open_tabs or []) if isinstance(entry, Mapping)]
+        active_paths: set[str] = set()
+        active_tab_ids: set[str] = set()
+        for entry in entries:
+            tab_id = entry.get("tab_id")
+            if tab_id:
+                active_tab_ids.add(str(tab_id))
+            path_value = entry.get("path")
+            if path_value:
+                normalized = self._normalize_snapshot_path(path_value)
+                if normalized:
+                    active_paths.add(normalized)
+
+        snapshots = dict(settings.unsaved_snapshots or {})
+        removed_file_snapshots = False
+        for key in list(snapshots):
+            if key not in active_paths:
+                snapshots.pop(key, None)
+                removed_file_snapshots = True
+        if removed_file_snapshots:
+            settings.unsaved_snapshots = snapshots
+
+        untitled = dict(settings.untitled_snapshots or {})
+        removed_untitled_snapshots = False
+        for tab_id in list(untitled):
+            if tab_id not in active_tab_ids:
+                untitled.pop(tab_id, None)
+                removed_untitled_snapshots = True
+        if removed_untitled_snapshots:
+            settings.untitled_snapshots = untitled
+
+        return removed_file_snapshots or removed_untitled_snapshots
+
+    @staticmethod
+    def _normalize_snapshot_path(value: Any) -> str | None:
+        try:
+            return str(Path(value).expanduser().resolve())
+        except Exception:
+            try:
+                return str(Path(str(value)).expanduser().resolve())
+            except Exception:
+                return None
 
     def _infer_language(self, path: Path | None) -> str:
         if path is None:

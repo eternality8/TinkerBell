@@ -72,7 +72,7 @@ async def test_sentence_transformer_provider_builds_local_provider(tmp_path: Pat
     model_kwargs = created_models[0].kwargs
     assert model_kwargs["device"] == "cpu"
     assert Path(model_kwargs["cache_folder"]).name == "cache"
-    assert model_kwargs["model_kwargs"] == {"torch_dtype": "torch-float16"}
+    assert model_kwargs["model_kwargs"] == {"dtype": "torch-float16"}
 
     vectors = await provider.embed_documents(["alpha", "delta foxtrot"])
     assert vectors == [[5.0], [13.0]]

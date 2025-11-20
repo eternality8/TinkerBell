@@ -60,6 +60,26 @@ def test_tabbed_editor_closing_tab_updates_workspace(tmp_path: Path) -> None:
     assert len(widget.workspace.serialize_tabs()) == 1
 
 
+def test_tabbed_editor_close_handler_can_intercept(tmp_path: Path) -> None:
+    widget = TabbedEditorWidget()
+    first_id = widget.active_tab_id()
+    assert first_id is not None
+    second = widget.create_tab(document=_build_state("content"))
+
+    handled: list[str] = []
+
+    def _handler(tab_id: str) -> bool:
+        handled.append(tab_id)
+        widget.close_tab(tab_id)
+        return True
+
+    widget.set_tab_close_handler(_handler)
+    widget.request_tab_close(second.id)
+
+    assert handled == [second.id]
+    assert widget.workspace.tab_count() == 1
+
+
 def test_selection_listeners_fire_on_tab_switch() -> None:
     widget = TabbedEditorWidget()
     second = widget.create_tab(document=_build_state("other"))

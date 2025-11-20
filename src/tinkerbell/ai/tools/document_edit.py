@@ -51,7 +51,7 @@ class DocumentEditTool:
         action = self._resolve_action(payload)
         payload = self._validate_payload(payload, action)
         if self.patch_only and action in {ActionType.REPLACE.value, ActionType.INSERT.value, ActionType.ANNOTATE.value}:
-            payload = self._auto_convert_to_patch(payload, tab_id=tab_id)
+            payload = self._auto_convert_to_patch_with_retry(payload, tab_id=tab_id)
             action = ActionType.PATCH.value
         self._enforce_patch_mode(action)
         self._queue_edit(payload, tab_id=tab_id)
@@ -205,7 +205,33 @@ class DocumentEditTool:
             return f"queued (version={version})"
         return "queued"
 
-    def _auto_convert_to_patch(self, payload: EditDirective | Mapping[str, Any], *, tab_id: str | None) -> Mapping[str, Any]:
+    def _auto_convert_to_patch_with_retry(
+        self,
+        payload: EditDirective | Mapping[str, Any],
+        *,
+        tab_id: str | None,
+    ) -> Mapping[str, Any]:
+        try:
+            return self._auto_convert_to_patch(payload, tab_id=tab_id, include_text=False)
+        except ValueError as exc:
+            if not self._should_refresh_snapshot(exc):
+                raise
+            return self._auto_convert_to_patch(payload, tab_id=tab_id, include_text=True)
+
+    @staticmethod
+    def _should_refresh_snapshot(error: Exception) -> bool:
+        if not isinstance(error, ValueError):
+            return False
+        message = str(error)
+        return "Snapshot did not include selection_text" in message
+
+    def _auto_convert_to_patch(
+        self,
+        payload: EditDirective | Mapping[str, Any],
+        *,
+        tab_id: str | None,
+        include_text: bool,
+    ) -> Mapping[str, Any]:
         snapshot_fn = getattr(self.bridge, "generate_snapshot", None)
         if not callable(snapshot_fn):
             raise ValueError(
@@ -215,7 +241,7 @@ class DocumentEditTool:
         snapshot = dict(
             cast(
                 Mapping[str, Any],
-                self._invoke_snapshot(typed_snapshot_fn, tab_id=tab_id),
+                self._invoke_snapshot(typed_snapshot_fn, tab_id=tab_id, include_text=include_text),
             )
         )
         base_text = snapshot.get("text", "")
@@ -639,10 +665,23 @@ class DocumentEditTool:
 
         queue_edit(payload)
 
-    def _invoke_snapshot(self, snapshot_fn: Callable[..., Mapping[str, Any]], *, tab_id: str | None) -> Mapping[str, Any]:
+    def _invoke_snapshot(
+        self,
+        snapshot_fn: Callable[..., Mapping[str, Any]],
+        *,
+        tab_id: str | None,
+        include_text: bool = False,
+    ) -> Mapping[str, Any]:
         try:
+            if include_text:
+                return snapshot_fn(delta_only=False, tab_id=tab_id, include_text=True)
             return snapshot_fn(delta_only=False, tab_id=tab_id)
         except TypeError:
+            if include_text:
+                try:
+                    return snapshot_fn(delta_only=False, tab_id=tab_id)
+                except TypeError:
+                    return snapshot_fn(delta_only=False)
             return snapshot_fn(delta_only=False)
 
     def _last_diff(self, tab_id: str | None) -> str | None:

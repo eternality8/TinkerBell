@@ -526,7 +526,7 @@ class EmbeddingController:
                 state.status = "error"
                 state.error = f"Unknown st_dtype '{dtype_name}'"
                 return None, state
-            model_kwargs = {"torch_dtype": dtype_value}
+            model_kwargs = {"dtype": dtype_value}
         try:
             from sentence_transformers import SentenceTransformer
         except Exception as exc:

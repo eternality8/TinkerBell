@@ -5,6 +5,7 @@ import pytest
 from tinkerbell.chat.message_model import EditDirective
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.editor.editor_widget import EditorWidget
+from tinkerbell.editor.patches import PatchResult
 
 
 @pytest.fixture(autouse=True)
@@ -33,6 +34,21 @@ def test_editor_widget_applies_ai_edit_insert_and_replace():
     replace = EditDirective(action="replace", target_range=(0, 5), content="hi")
     widget.apply_ai_edit(replace)
     assert widget.to_document().text == "hi world"
+
+
+def test_ai_edits_collapse_selection_after_application():
+    widget = EditorWidget()
+    widget.load_document(DocumentState(text="hello"))
+
+    insert = EditDirective(action="insert", target_range=(5, 5), content=" world")
+    widget.apply_ai_edit(insert)
+    selection = widget.to_document().selection
+    assert selection.start == selection.end == len("hello world")
+
+    replace = EditDirective(action="replace", target_range=(0, 5), content="hi")
+    widget.apply_ai_edit(replace)
+    selection = widget.to_document().selection
+    assert selection.start == selection.end == len("hi")
 
 
 def test_editor_widget_rejects_zero_length_replace():
@@ -87,3 +103,14 @@ def test_editor_widget_diff_overlay_tracks_state():
     widget.clear_diff_overlay()
 
     assert widget.diff_overlay is None
+
+
+def test_patch_result_collapses_selection_to_span_end():
+    widget = EditorWidget()
+    widget.load_document(DocumentState(text="hello world"))
+
+    result = PatchResult(text="hello brave world", spans=((6, 11),), summary="patch: +5")
+    widget.apply_patch_result(result)
+
+    selection = widget.to_document().selection
+    assert selection.start == selection.end == 11

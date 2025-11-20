@@ -1304,6 +1304,9 @@ def test_plot_loop_blocks_edit_without_outline(sample_snapshot):
 
     snapshot = dict(sample_snapshot)
     snapshot["document_id"] = "doc-plot-block"
+    long_text = "Long document " * 200
+    snapshot["text"] = long_text
+    snapshot["length"] = len(long_text)
 
     result = asyncio.run(controller.run_chat("draft scene", snapshot))
 
@@ -1330,6 +1333,9 @@ def test_plot_loop_respects_flag_disabled(sample_snapshot):
 
     snapshot = dict(sample_snapshot)
     snapshot["document_id"] = "doc-plot-off"
+    long_text = "Long document " * 200
+    snapshot["text"] = long_text
+    snapshot["length"] = len(long_text)
 
     result = asyncio.run(controller.run_chat("draft scene", snapshot))
 
@@ -1387,6 +1393,9 @@ def test_plot_loop_allows_edit_after_outline_and_requires_update(sample_snapshot
 
     snapshot = dict(sample_snapshot)
     snapshot["document_id"] = "doc-plot"
+    long_text = "Long document " * 200
+    snapshot["text"] = long_text
+    snapshot["length"] = len(long_text)
 
     result = asyncio.run(controller.run_chat("keep plot aligned", snapshot))
 
@@ -1406,6 +1415,33 @@ def test_plot_loop_allows_edit_after_outline_and_requires_update(sample_snapshot
 
     update_trace = [entry for entry in result["tool_calls"] if entry["name"] == "plot_state_update"]
     assert update_trace and json.loads(update_trace[0]["result"])["status"] == "ok"
+
+
+def test_plot_loop_skips_guard_for_short_document(sample_snapshot):
+    edit_turn = [_build_tool_call_event("document_edit", {"action": "insert", "position": 0, "content": "New story"})]
+    final_turn = [AIStreamEvent(type="content.done", content="done")]
+    stub_client = _StubClient([edit_turn, final_turn])
+    config = SubagentRuntimeConfig(enabled=False, plot_scaffolding_enabled=True)
+    controller = AIController(client=cast(AIClient, stub_client), subagent_config=config)
+
+    edit_calls: list[dict[str, Any]] = []
+
+    class _EditTool:
+        def run(self, action: str, position: int, content: str) -> dict[str, Any]:
+            edit_calls.append({"action": action, "position": position, "content": content})
+            return {"status": "ok"}
+
+    controller.register_tool("document_edit", _EditTool())
+
+    snapshot = dict(sample_snapshot)
+    snapshot["document_id"] = "doc-short"
+    snapshot["text"] = ""
+    snapshot["length"] = 0
+
+    result = asyncio.run(controller.run_chat("draft intro", snapshot))
+
+    assert len(edit_calls) == 1
+    assert result["tool_calls"][0]["status"] == "ok"
 
 
 def test_ai_controller_compacts_tool_output_with_pointer(sample_snapshot):

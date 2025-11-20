@@ -31,6 +31,7 @@ class PlotStateUpdateTool:
         *,
         document_id: str | None = None,
         version_id: str | None = None,
+        entities: Sequence[Mapping[str, Any]] | None = None,
         arcs: Sequence[Mapping[str, Any]] | None = None,
         overrides: Sequence[Mapping[str, Any]] | None = None,
         dependencies: Sequence[Mapping[str, Any]] | None = None,
@@ -58,6 +59,7 @@ class PlotStateUpdateTool:
                 "reason": "document_id_unavailable",
             }
 
+        entity_updates = self._coerce_sequence(entities)
         arc_updates = self._coerce_sequence(arcs)
         override_updates = self._coerce_sequence(overrides)
         dependency_updates = self._coerce_sequence(dependencies)
@@ -67,6 +69,7 @@ class PlotStateUpdateTool:
         update_summary = store.apply_manual_update(
             target_id,
             version_id=version_id,
+            entities=entity_updates,
             arcs=arc_updates,
             overrides=override_updates,
             dependencies=dependency_updates,
@@ -83,6 +86,7 @@ class PlotStateUpdateTool:
             "plot_state.write",
             {
                 "document_id": target_id,
+                "entity_updates": update_summary.get("entity_updates", 0),
                 "arc_updates": update_summary.get("arc_updates", 0),
                 "override_updates": update_summary.get("override_updates", 0),
                 "dependency_updates": update_summary.get("dependency_updates", 0),
@@ -94,6 +98,7 @@ class PlotStateUpdateTool:
             "status": "ok",
             "document_id": target_id,
             "version_id": update_summary.get("version_id"),
+            "entity_updates": update_summary.get("entity_updates", 0),
             "arc_updates": update_summary.get("arc_updates", 0),
             "override_updates": update_summary.get("override_updates", 0),
             "dependency_updates": update_summary.get("dependency_updates", 0),

@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -798,6 +799,12 @@ class SettingsDialog(QDialog):
         self._debug_checkbox = QCheckBox("Enable debug logging")
         self._debug_checkbox.setObjectName("debug_logging_checkbox")
         self._debug_checkbox.setChecked(self._original.debug_logging)
+        self._event_log_checkbox = QCheckBox("Capture per-chat event logs (JSONL)")
+        self._event_log_checkbox.setObjectName("debug_event_logging_checkbox")
+        self._event_log_checkbox.setToolTip(
+            "Writes turn-by-turn JSONL files when debug logging is enabled for diagnosing tool issues."
+        )
+        self._event_log_checkbox.setChecked(bool(getattr(self._original, "debug_event_logging", False)))
         self._tool_panel_checkbox = QCheckBox("Show tool activity panel (debug view)")
         self._tool_panel_checkbox.setObjectName("tool_activity_checkbox")
         self._tool_panel_checkbox.setChecked(
@@ -917,14 +924,13 @@ class SettingsDialog(QDialog):
         self._context_prompt_override_toggle.toggled.connect(self._toggle_context_prompt_override)
         self._context_reserve_override_toggle.toggled.connect(self._toggle_context_reserve_override)
 
-        form_layout = QFormLayout()
+        # Build grouped form sections for the tabbed layout
         base_url_container = QWidget()
         base_url_layout = QVBoxLayout(base_url_container)
         base_url_layout.setContentsMargins(0, 0, 0, 0)
         base_url_layout.setSpacing(2)
         base_url_layout.addWidget(self._base_url_input)
         base_url_layout.addWidget(self._base_url_hint)
-        form_layout.addRow("Base URL", base_url_container)
 
         api_container = QWidget()
         api_layout = QVBoxLayout(api_container)
@@ -934,77 +940,68 @@ class SettingsDialog(QDialog):
         show_checkbox.setObjectName("show_api_checkbox")
         show_checkbox.toggled.connect(self._toggle_api_visibility)
         api_layout.addWidget(show_checkbox)
-        form_layout.addRow("API Key", api_container)
 
-        form_layout.addRow("Model", self._model_combo)
         temperature_container = QWidget()
         temperature_layout = QVBoxLayout(temperature_container)
         temperature_layout.setContentsMargins(0, 0, 0, 0)
         temperature_layout.setSpacing(2)
         temperature_layout.addWidget(self._temperature_input)
         temperature_layout.addWidget(self._temperature_hint)
-        form_layout.addRow("Temperature", temperature_container)
-        form_layout.addRow("Organization", self._organization_input)
-        form_layout.addRow("Theme", self._theme_input)
+
         embedding_backend_container = QWidget()
         embedding_backend_layout = QVBoxLayout(embedding_backend_container)
         embedding_backend_layout.setContentsMargins(0, 0, 0, 0)
         embedding_backend_layout.setSpacing(2)
         embedding_backend_layout.addWidget(self._embedding_backend_combo)
         embedding_backend_layout.addWidget(self._embedding_backend_hint)
-        form_layout.addRow("Embedding Backend", embedding_backend_container)
+
         embedding_model_container = QWidget()
         embedding_model_layout = QVBoxLayout(embedding_model_container)
         embedding_model_layout.setContentsMargins(0, 0, 0, 0)
         embedding_model_layout.setSpacing(2)
         embedding_model_layout.addWidget(self._embedding_model_input)
         embedding_model_layout.addWidget(self._embedding_model_hint)
-        form_layout.addRow("Embedding Model", embedding_model_container)
+
         embedding_mode_container = QWidget()
         embedding_mode_layout = QVBoxLayout(embedding_mode_container)
         embedding_mode_layout.setContentsMargins(0, 0, 0, 0)
         embedding_mode_layout.setSpacing(2)
         embedding_mode_layout.addWidget(self._embedding_mode_combo)
         embedding_mode_layout.addWidget(self._embedding_mode_hint)
-        form_layout.addRow("Embeddings Mode", embedding_mode_container)
+
         embedding_mode_stack_container = QWidget()
         embedding_mode_stack_layout = QVBoxLayout(embedding_mode_stack_container)
         embedding_mode_stack_layout.setContentsMargins(0, 0, 0, 0)
         embedding_mode_stack_layout.setSpacing(4)
         embedding_mode_stack_layout.addWidget(self._embedding_mode_stack)
-        form_layout.addRow("Embedding Options", embedding_mode_stack_container)
-        form_layout.addRow("Debug", self._debug_checkbox)
-        form_layout.addRow("Tool Traces", self._tool_panel_checkbox)
+
         phase3_container = QWidget()
         phase3_layout = QVBoxLayout(phase3_container)
         phase3_layout.setContentsMargins(0, 0, 0, 0)
         phase3_layout.setSpacing(2)
         phase3_layout.addWidget(self._phase3_outline_checkbox)
         phase3_layout.addWidget(self._phase3_outline_hint)
-        form_layout.addRow("Phase 3 Tools", phase3_container)
+
         subagent_container = QWidget()
         subagent_layout = QVBoxLayout(subagent_container)
         subagent_layout.setContentsMargins(0, 0, 0, 0)
         subagent_layout.setSpacing(2)
         subagent_layout.addWidget(self._subagent_checkbox)
         subagent_layout.addWidget(self._subagent_hint)
-        form_layout.addRow("Phase 4 Subagents", subagent_container)
+
         plot_container = QWidget()
         plot_layout = QVBoxLayout(plot_container)
         plot_layout.setContentsMargins(0, 0, 0, 0)
         plot_layout.setSpacing(2)
         plot_layout.addWidget(self._plot_scaffolding_checkbox)
         plot_layout.addWidget(self._plot_scaffolding_hint)
-        form_layout.addRow("Plot Scaffolding", plot_container)
-        form_layout.addRow("Max Tool Iterations", self._max_tool_iterations_input)
-        form_layout.addRow("Max Context Tokens", self._max_context_tokens_input)
+
         reserve_container = QWidget()
         reserve_layout = QVBoxLayout(reserve_container)
         reserve_layout.setContentsMargins(0, 0, 0, 0)
         reserve_layout.setSpacing(2)
         reserve_layout.addWidget(self._response_token_reserve_input)
         reserve_layout.addWidget(self._reserve_hint)
-        form_layout.addRow("Response Token Reserve", reserve_container)
 
         timeout_container = QWidget()
         timeout_layout = QVBoxLayout(timeout_container)
@@ -1012,7 +1009,7 @@ class SettingsDialog(QDialog):
         timeout_layout.setSpacing(2)
         timeout_layout.addWidget(self._request_timeout_input)
         timeout_layout.addWidget(self._timeout_hint)
-        form_layout.addRow("AI Timeout", timeout_container)
+
         policy_container = QWidget()
         policy_layout = QVBoxLayout(policy_container)
         policy_layout.setContentsMargins(0, 0, 0, 0)
@@ -1028,10 +1025,68 @@ class SettingsDialog(QDialog):
         reserve_row.addWidget(self._context_reserve_override_input)
         policy_layout.addLayout(reserve_row)
         policy_layout.addWidget(self._context_policy_hint)
-        form_layout.addRow("Context Budget Policy", policy_container)
+
+        def _build_form_tab(rows: list[tuple[str, QWidget | Any]]) -> QWidget:
+            tab = QWidget()
+            form = QFormLayout(tab)
+            form.setContentsMargins(0, 0, 0, 0)
+            form.setSpacing(8)
+            for label, widget in rows:
+                form.addRow(label, widget)
+            return tab
+
+        general_tab = _build_form_tab(
+            [
+                ("Base URL", base_url_container),
+                ("API Key", api_container),
+                ("Model", self._model_combo),
+                ("Temperature", temperature_container),
+                ("Organization", self._organization_input),
+                ("Theme", self._theme_input),
+            ]
+        )
+
+        embedding_tab = _build_form_tab(
+            [
+                ("Embedding Backend", embedding_backend_container),
+                ("Embedding Model", embedding_model_container),
+                ("Embeddings Mode", embedding_mode_container),
+                ("Embedding Options", embedding_mode_stack_container),
+            ]
+        )
+
+        features_tab = _build_form_tab(
+            [
+                ("Debug", self._debug_checkbox),
+                ("Event Logs", self._event_log_checkbox),
+                ("Tool Traces", self._tool_panel_checkbox),
+                ("Phase 3 Tools", phase3_container),
+                ("Phase 4 Subagents", subagent_container),
+                ("Plot Scaffolding", plot_container),
+            ]
+        )
+
+        runtime_tab = _build_form_tab(
+            [
+                ("Max Tool Iterations", self._max_tool_iterations_input),
+                ("Max Context Tokens", self._max_context_tokens_input),
+                ("Response Token Reserve", reserve_container),
+                ("AI Timeout", timeout_container),
+            ]
+        )
+
+        policy_tab = _build_form_tab([("Context Budget Policy", policy_container)])
+
+        tab_widget = QTabWidget()
+        tab_widget.setObjectName("settings_tab_widget")
+        tab_widget.addTab(general_tab, "General")
+        tab_widget.addTab(embedding_tab, "Embeddings")
+        tab_widget.addTab(features_tab, "Features")
+        tab_widget.addTab(runtime_tab, "Runtime")
+        tab_widget.addTab(policy_tab, "Policy")
 
         layout = QVBoxLayout(self)
-        layout.addLayout(form_layout)
+        layout.addWidget(tab_widget, 1)
 
         validation_row = QHBoxLayout()
         self._validation_label = QLabel()
@@ -1138,6 +1193,7 @@ class SettingsDialog(QDialog):
             embedding_backend = "sentence-transformers"
         embedding_model = self._embedding_model_input.text().strip() or self._original.embedding_model_name
         debug_logging = self._debug_checkbox.isChecked()
+        debug_event_logging = self._event_log_checkbox.isChecked()
         show_tool_activity_panel = self._tool_panel_checkbox.isChecked()
         phase3_outline_tools = self._phase3_outline_checkbox.isChecked()
         enable_subagents = self._subagent_checkbox.isChecked()
@@ -1159,6 +1215,7 @@ class SettingsDialog(QDialog):
             embedding_backend=embedding_backend,
             embedding_model_name=embedding_model,
             debug_logging=debug_logging,
+            debug_event_logging=debug_event_logging,
             show_tool_activity_panel=show_tool_activity_panel,
             phase3_outline_tools=phase3_outline_tools,
             enable_subagents=enable_subagents,
@@ -1407,7 +1464,11 @@ class SettingsDialog(QDialog):
         payload["st_model_path"] = self._local_model_path_input.text().strip()
         device_text = self._local_device_combo.currentText().strip()
         payload["st_device"] = device_text if device_text and device_text.lower() != "auto" else ""
-        dtype_text = self._local_dtype_combo.currentText().strip()
+        dtype_data = self._local_dtype_combo.currentData()
+        dtype_text = str(dtype_data).strip() if isinstance(dtype_data, str) else ""
+        if not dtype_text:
+            text_value = self._local_dtype_combo.currentText().strip()
+            dtype_text = "" if text_value.lower() == "default" else text_value
         payload["st_dtype"] = dtype_text
         payload["st_cache_dir"] = self._local_cache_dir_input.text().strip()
         payload["st_batch_size"] = int(self._local_batch_size_input.value())
@@ -1617,7 +1678,10 @@ class SettingsDialog(QDialog):
         icon = QMessageBox.Icon.Information if success else QMessageBox.Icon.Warning
         box.setIcon(icon)
         box.setText(message)
-        box.setStandardButtons(QMessageBox.StandardButton.NoButton)
+        box.setStandardButtons(QMessageBox.StandardButton.Close)
+        close_button = box.button(QMessageBox.StandardButton.Close)
+        if close_button is not None:
+            close_button.clicked.connect(box.close)
         box.setModal(False)
         box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         box.show()

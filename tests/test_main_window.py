@@ -775,7 +775,7 @@ def test_file_snapshot_persisted_for_dirty_document(tmp_path: Path):
     assert settings.unsaved_snapshots[normalized]["text"] == "Hello world"
 
 
-def test_open_document_restores_file_snapshot(tmp_path: Path):
+def test_open_document_skips_orphan_snapshot(tmp_path: Path):
     target = tmp_path / "notes.md"
     target.write_text("Hello", encoding="utf-8")
     normalized = str(target.resolve())
@@ -787,10 +787,11 @@ def test_open_document_restores_file_snapshot(tmp_path: Path):
     window.open_document(target)
 
     document = window.editor_widget.to_document()
-    assert document.text == "Draft"
+    assert document.text == "Hello"
     assert document.metadata.path == target
-    assert document.dirty is True
-    assert window.last_status_message == f"Restored unsaved changes for {target.name}"
+    assert document.dirty is False
+    assert normalized not in (settings.unsaved_snapshots or {})
+    assert window.last_status_message == f"Loaded {target.name}"
 
 
 def test_save_document_clears_file_snapshot(tmp_path: Path):
@@ -804,6 +805,36 @@ def test_save_document_clears_file_snapshot(tmp_path: Path):
     window.save_document()
 
     assert str(target.resolve()) not in settings.unsaved_snapshots
+
+
+def test_tab_close_request_drops_snapshot(tmp_path: Path) -> None:
+    target = tmp_path / "notes.md"
+    target.write_text("Hello", encoding="utf-8")
+    settings = Settings()
+    window = _make_window(settings=settings)
+    window.open_document(target)
+    window.editor_widget.set_text("Updated text")
+
+    normalized = str(target.resolve())
+    assert normalized in settings.unsaved_snapshots
+    tab_id = window.editor_widget.active_tab_id()
+    assert tab_id is not None
+
+    window.editor_widget.request_tab_close(tab_id)
+
+    assert normalized not in (settings.unsaved_snapshots or {})
+
+
+def test_last_tab_can_close_without_replacement() -> None:
+    window = _make_window()
+    tab_id = window.editor_widget.active_tab_id()
+    assert tab_id is not None
+
+    window.editor_widget.request_tab_close(tab_id)
+
+    assert window.editor_widget.workspace.tab_count() == 0
+    assert window.editor_widget.active_tab_id() is None
+    assert "Closed tab" in window.last_status_message
 
 
 def test_revert_discards_unsaved_changes(tmp_path: Path):
@@ -836,7 +867,7 @@ def test_revert_without_path_updates_status():
     assert window.last_status_message == "No file to revert"
 
 
-def test_startup_restores_file_snapshot(tmp_path: Path):
+def test_startup_skips_orphan_snapshot(tmp_path: Path):
     target = tmp_path / "story.md"
     target.write_text("Once", encoding="utf-8")
     normalized = str(target.resolve())
@@ -848,9 +879,10 @@ def test_startup_restores_file_snapshot(tmp_path: Path):
     window = _make_window(settings=settings)
 
     document = window.editor_widget.to_document()
-    assert document.text == "Once upon"
+    assert document.text == "Once"
     assert document.metadata.path == target
-    assert window.last_status_message == f"Restored unsaved changes for {target.name}"
+    assert normalized not in (settings.unsaved_snapshots or {})
+    assert window.last_status_message == f"Loaded {target.name}"
 
 
 def test_settings_dialog_updates_context_and_persists(

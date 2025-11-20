@@ -14,6 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, cast
 
 from openai.types.chat import ChatCompletionToolParam
@@ -46,6 +47,7 @@ from ..services.context_policy import BudgetDecision, ContextBudgetPolicy
 from ..services.telemetry import ContextUsageEvent, TelemetrySink
 from ..agents.graph import build_agent_graph
 from .budget_manager import BudgetManager, ContextBudgetExceeded
+from .event_log import ChatEventLogger
 from .subagent_runtime import SubagentRuntimeManager
 from .telemetry_manager import TelemetryManager
 
@@ -440,6 +442,8 @@ class AIController:
     temperature: float = 0.2
     telemetry_enabled: bool = False
     telemetry_limit: int = 200
+    debug_event_logging: bool = False
+    event_log_dir: Path | str | None = None
     telemetry_sink: TelemetrySink | None = None
     agent_config: AgentConfig | None = None
     budget_policy: ContextBudgetPolicy | None = None
@@ -463,6 +467,7 @@ class AIController:
     _analysis_advice_cache: dict[str, AnalysisAdvice] = field(default_factory=dict, init=False, repr=False)
     _latest_snapshot_cache: dict[str, Mapping[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _cache_bus: DocumentCacheBus | None = field(default=None, init=False, repr=False)
+    _event_logger: ChatEventLogger | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.tools:
@@ -493,6 +498,7 @@ class AIController:
             pointer_builder=self._build_tool_pointer,
             estimate_message_tokens=self._estimate_message_tokens,
         )
+        self.configure_debug_event_logging(enabled=self.debug_event_logging, event_log_dir=self.event_log_dir)
 
     @property
     def graph(self) -> Dict[str, Any]:
@@ -1164,6 +1170,23 @@ class AIController:
         )
         self.subagent_config = runtime
 
+    def configure_debug_event_logging(
+        self,
+        *,
+        enabled: bool | None = None,
+        event_log_dir: Path | str | None = None,
+    ) -> None:
+        """Rebuild the event logger with the latest toggle/directory."""
+
+        if enabled is not None:
+            self.debug_event_logging = bool(enabled)
+        if event_log_dir is not None:
+            self.event_log_dir = event_log_dir
+        self._event_logger = ChatEventLogger(
+            enabled=bool(self.debug_event_logging),
+            base_dir=self.event_log_dir,
+        )
+
     def unregister_tool(self, name: str) -> None:
         """Remove a tool and rebuild the agent graph."""
 
@@ -1232,9 +1255,29 @@ class AIController:
             chunk_tracker = _ChunkFlowTracker(document_id=self._resolve_document_id(snapshot))
             self._chunk_flow_tracker = chunk_tracker
             plot_tracker: _PlotLoopTracker | None = None
-            if getattr(self.subagent_config, "plot_scaffolding_enabled", False):
+            if self._should_enforce_plot_loop(snapshot):
                 plot_tracker = _PlotLoopTracker(document_id=self._resolve_document_id(snapshot))
             self._plot_loop_tracker = plot_tracker
+            turn_metrics = self._new_turn_context(
+                snapshot=snapshot,
+                prompt_tokens=message_plan.prompt_tokens,
+                conversation_length=len(base_messages),
+                response_reserve=completion_budget,
+            )
+            document_id = self._resolve_document_id(snapshot)
+            document_path = snapshot.get("path") or snapshot.get("tab_name")
+            event_logger = self._event_logger or ChatEventLogger(enabled=False)
+            log_run = event_logger.start_run(
+                run_id=str(turn_metrics.get("run_id")),
+                prompt=prompt,
+                document_id=document_id,
+                document_path=str(document_path) if document_path else None,
+                snapshot=snapshot,
+                metadata=merged_metadata,
+                history=history or None,
+            )
+            log_context = log_run
+            active_log = log_context.__enter__()
             try:
                 conversation: list[dict[str, Any]] = list(base_messages)
                 conversation_tokens = message_plan.prompt_tokens
@@ -1248,13 +1291,6 @@ class AIController:
                 tool_followup_prompts_sent = 0
                 tool_followup_user_prompts_sent = 0
                 plot_loop_reminders_sent = 0
-
-                turn_metrics = self._new_turn_context(
-                    snapshot=snapshot,
-                    prompt_tokens=message_plan.prompt_tokens,
-                    conversation_length=len(base_messages),
-                    response_reserve=completion_budget,
-                )
                 subagent_jobs: list[SubagentJob] = []
                 subagent_messages: list[dict[str, str]] = []
                 runtime = self._subagent_runtime
@@ -1306,6 +1342,21 @@ class AIController:
                     conversation.append(assistant_message)
                     conversation_tokens += assistant_tokens
                     response_text = turn.response_text
+                    active_log.log_assistant_message(
+                        turn_index=turn_count,
+                        message=assistant_message,
+                        response_text=response_text,
+                        tool_calls=[
+                            {
+                                "id": call.call_id,
+                                "name": call.name,
+                                "index": call.index,
+                                "arguments": call.arguments,
+                                "parsed": call.parsed,
+                            }
+                            for call in turn.tool_calls
+                        ],
+                    )
 
                     if not turn.tool_calls:
                         fallback_applied = False
@@ -1395,6 +1446,11 @@ class AIController:
                         snapshot=snapshot,
                     )
                     conversation.extend(tool_messages)
+                    active_log.log_tool_batch(
+                        turn_index=turn_count,
+                        records=tool_records,
+                        messages=tool_messages,
+                    )
                     turn_metrics["tool_tokens"] += tool_token_cost
                     turn_metrics["conversation_length"] = len(conversation)
                     self._record_tool_names(turn_metrics, tool_records)
@@ -1455,6 +1511,22 @@ class AIController:
                                 **trace_stats,
                             },
                         )
+                completion_warnings: list[str] = []
+                if pending_patch_application:
+                    completion_warnings.append("pending_patch_pending")
+                if chunk_tracker.warning_active:
+                    completion_warnings.append("chunk_flow_warning")
+                if plot_tracker is not None and plot_tracker.pending_update:
+                    completion_warnings.append("plot_state_pending_update")
+                active_log.log_completion(
+                    response_text=response_text,
+                    tool_call_count=len(executed_tool_calls),
+                    warnings=completion_warnings,
+                    trace_compaction=compaction_stats or {},
+                )
+                log_context.__exit__(None, None, None)
+                log_path = getattr(log_context, "path", None)
+                event_log_path = str(log_path) if log_path else None
                 return {
                     "prompt": prompt,
                     "response": response_text,
@@ -1463,7 +1535,11 @@ class AIController:
                     "graph": self.graph,
                     "trace_compaction": compaction_stats,
                     "subagent_jobs": [job.as_payload() for job in subagent_jobs],
+                    "event_log_path": event_log_path,
                 }
+            except Exception as exc:
+                log_context.__exit__(exc.__class__, exc, exc.__traceback__)
+                raise
             finally:
                 if self._chunk_flow_tracker is chunk_tracker:
                     self._chunk_flow_tracker = None
@@ -3196,6 +3272,7 @@ class AIController:
             "parsed": call.parsed,
             "resolved_arguments": resolved_arguments,
             "result": serialized_result,
+            "raw_result": raw_result,
             "status": status,
             "tokens_used": tokens_used,
             "duration_ms": round(duration_ms, 3),
@@ -3276,6 +3353,28 @@ class AIController:
         if tracker is None:
             return None
         return tracker.before_tool(tool_name)
+
+    def _should_enforce_plot_loop(self, snapshot: Mapping[str, Any]) -> bool:
+        if not getattr(self.subagent_config, "plot_scaffolding_enabled", False):
+            return False
+        document_chars = self._snapshot_document_chars(snapshot) or 0
+        if document_chars <= 0:
+            return False
+        min_chars_raw = getattr(self.subagent_config, "plot_outline_min_chars", 0)
+        try:
+            min_chars = int(min_chars_raw or 0)
+        except (TypeError, ValueError):  # pragma: no cover - defensive cast
+            min_chars = 0
+        min_threshold = max(1, min_chars)
+        return document_chars >= min_threshold
+
+    def _snapshot_document_chars(self, snapshot: Mapping[str, Any]) -> int | None:
+        document_chars = self._coerce_optional_int(snapshot.get("length"))
+        if document_chars is None:
+            text = snapshot.get("text")
+            if isinstance(text, str):
+                document_chars = len(text)
+        return document_chars
 
     async def _invoke_tool_impl(self, tool_impl: Any, arguments: Any) -> Any:
         target = getattr(tool_impl, "run", tool_impl)

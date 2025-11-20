@@ -49,6 +49,7 @@ class TabbedEditorWidget(QWidgetBase):
         self._editor_lookup: Dict[int, str] = {}
         self._main_thread_executor: Executor | None = None
         self._tab_created_listeners: list[TabCreatedListener] = []
+        self._tab_close_handler: Callable[[str], bool | None] | None = None
 
         editor_factory = lambda: EditorWidget(parent=self)  # noqa: E731 - intentional lambda factory
         if workspace is None:
@@ -201,6 +202,18 @@ class TabbedEditorWidget(QWidgetBase):
         self._sync_active_tab()
         return tab
 
+    def set_tab_close_handler(self, handler: Callable[[str], bool | None] | None) -> None:
+        """Register a callback that can intercept tab-close requests."""
+
+        self._tab_close_handler = handler
+
+    def request_tab_close(self, tab_id: str) -> None:
+        """Simulate a user-driven tab close (used by Qt + tests)."""
+
+        if self._tab_close_handler is not None and self._tab_close_handler(tab_id):
+            return
+        self.close_tab(tab_id)
+
     def set_main_thread_executor(self, executor: Executor | None) -> None:
         self._main_thread_executor = executor
         for tab in self._workspace.iter_tabs():
@@ -255,7 +268,7 @@ class TabbedEditorWidget(QWidgetBase):
         tab_id = self._tab_id_for_editor(editor)
         if tab_id is None:
             return
-        self.close_tab(tab_id)
+        self.request_tab_close(tab_id)
 
     def _sync_active_tab(self) -> None:
         tab = self._workspace.active_tab

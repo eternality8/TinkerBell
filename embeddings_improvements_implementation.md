@@ -43,7 +43,7 @@ This document converts the high-level strategy from `embeddings_improvements.md`
 - [x] **D3. Licensing notes**
   - Added explicit reminders that local/remote BYO models are governed by their upstream licenses and require user review/attribution.
 
-## Workstream E – Testing & QA Automation
+## Workstream E – Testing 
 - [ ] **E1. Unit tests**
   - Cover settings migration, backend gating, SecretVault serialization, and SentenceTransformers provider wiring using mocks.
 - [ ] **E2. Integration tests**
@@ -54,3 +54,4 @@ This document converts the high-level strategy from `embeddings_improvements.md`
 2. Workstreams B and C can proceed in parallel once schema/mode logic exists.
 3. Land Workstream D updates alongside initial feature flagging so early adopters have guidance.
 4. Finalize with Workstream E to ensure coverage before public release.
+pip 

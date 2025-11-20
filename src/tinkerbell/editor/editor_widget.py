@@ -260,18 +260,24 @@ class EditorWidget(QWidgetBase):
 
         action = directive.action.lower()
         start, end = self._clamp_range(*directive.target_range)
+        caret_position: int | None = None
         if action == "insert":
             self.insert_text(directive.content, position=start)
+            caret_position = start + len(directive.content)
         elif action == "replace":
             if start == end:
                 raise ValueError("Replace directives must target a non-empty range; use action='insert' for caret edits")
             self.replace_range(start, end, directive.content)
+            caret_position = start + len(directive.content)
         elif action == "annotate":
             annotation = f"\n[AI Note]: {directive.content.strip()}\n"
             insert_at = end if end > start else len(self._text_buffer)
             self.insert_text(annotation, position=insert_at)
+            caret_position = insert_at + len(annotation)
         else:
             raise ValueError(f"Unsupported directive action: {directive.action}")
+        if caret_position is not None:
+            self.apply_selection(SelectionRange(caret_position, caret_position))
         self._mark_change_source("programmatic")
         return self.to_document()
 
@@ -294,13 +300,13 @@ class EditorWidget(QWidgetBase):
 
         spans = result.spans or ()
         if spans:
-            start, end = spans[-1]
+            _, end = spans[-1]
         elif selection_hint is not None:
-            start, end = selection_hint
+            _start, end = self._clamp_range(*selection_hint)
         else:
-            start = end = len(result.text)
+            end = len(result.text)
 
-        self.apply_selection(SelectionRange(start, end))
+        self.apply_selection(SelectionRange(end, end))
         self._mark_change_source("programmatic")
         return self.to_document()
 
