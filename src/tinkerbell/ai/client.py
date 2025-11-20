@@ -162,7 +162,7 @@ class ClientSettings:
     retry_min_seconds: float = 0.5
     retry_max_seconds: float = 6.0
     default_headers: Mapping[str, str] | None = None
-    metadata: Mapping[str, str] | None = None
+    metadata: Mapping[str, Any] | None = None
     debug_logging: bool = False
 
 
@@ -387,12 +387,16 @@ class AIClient:
 
         return payload
 
-    def _merge_metadata(self, runtime_metadata: Mapping[str, str] | None) -> Dict[str, str] | None:
+    def _merge_metadata(self, runtime_metadata: Mapping[str, Any] | None) -> Dict[str, str] | None:
         combined: Dict[str, str] = {}
-        if self._settings.metadata:
-            combined.update(self._settings.metadata)
-        if runtime_metadata:
-            combined.update(runtime_metadata)
+        sources = [self._settings.metadata, runtime_metadata]
+        for source in sources:
+            if not source:
+                continue
+            for key, value in source.items():
+                if not isinstance(key, str) or not isinstance(value, str):
+                    continue
+                combined[key] = value
         return combined or None
 
     def _normalize_stream_event(self, event: ChatCompletionStreamEvent[Any]) -> AIStreamEvent | None:

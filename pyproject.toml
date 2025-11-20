@@ -30,6 +30,11 @@ tinkerbell = "tinkerbell.app:main"
 ai_tokenizers = [
   "tiktoken>=0.12,<0.13"
 ]
+embeddings = [
+  "sentence-transformers>=3.0,<4.0",
+  "torch>=2.2,<2.4",
+  "numpy>=1.26,<3.0"
+]
 
 [dependency-groups]
 dev = [

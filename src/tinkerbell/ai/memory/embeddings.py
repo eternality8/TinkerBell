@@ -326,6 +326,8 @@ class DocumentEmbeddingIndex:
         batch_size: int | None = None,
         requests_per_minute: int | None = 120,
         loop: asyncio.AbstractEventLoop | None = None,
+        mode: str | None = None,
+        provider_label: str | None = None,
     ) -> None:
         self._provider = provider
         self._loop = loop or asyncio.get_event_loop()
@@ -336,6 +338,8 @@ class DocumentEmbeddingIndex:
         self._rate_limiter = AsyncRateLimiter(rate_per_minute=requests_per_minute)
         provider_batch = provider.max_batch_size if provider else 8
         self._batch_size = max(1, batch_size or provider_batch)
+        self._embedding_mode = mode
+        self._provider_label = provider_label
         self._cache_bus.subscribe(DocumentChangedEvent, self._handle_changed, weak=True)
         self._cache_bus.subscribe(DocumentClosedEvent, self._handle_closed, weak=True)
 
@@ -345,6 +349,14 @@ class DocumentEmbeddingIndex:
         if provider is None:
             return None
         return getattr(provider, "name", None)
+
+    def _telemetry_context(self) -> dict[str, Any]:
+        context: dict[str, Any] = {"provider": self.provider_name}
+        if self._embedding_mode:
+            context["embedding_mode"] = self._embedding_mode
+        if self._provider_label:
+            context["provider_label"] = self._provider_label
+        return context
 
     async def ingest_outline(
         self,
@@ -395,8 +407,8 @@ class DocumentEmbeddingIndex:
                     "outline_hash": outline_hash,
                     "chunk_count": reused_count,
                     "processed_chunks": len(specs),
-                    "provider": self.provider_name,
                     "document_length": document_length,
+                    **self._telemetry_context(),
                 },
             )
         embedded_count = 0
@@ -419,8 +431,8 @@ class DocumentEmbeddingIndex:
                         "error": str(exc)[:200],
                         "embedded": embedded_count,
                         "dirty_chunks": dirty_count,
-                        "provider": self.provider_name,
                         "document_length": document_length,
+                        **self._telemetry_context(),
                     },
                 )
                 return EmbeddingIngestResult(
@@ -465,9 +477,9 @@ class DocumentEmbeddingIndex:
                     "outline_hash": outline_hash,
                     "embedded": embedded_count,
                     "dirty_chunks": dirty_count,
-                    "provider": self.provider_name,
                     "status": "ok",
                     "document_length": document_length,
+                    **self._telemetry_context(),
                 },
             )
         return EmbeddingIngestResult(

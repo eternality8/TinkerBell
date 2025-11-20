@@ -7,17 +7,19 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialogButtonBox,
     QDoubleSpinBox,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
 )
 
-from tinkerbell.services.settings import Settings
+from tinkerbell.services.settings import DEFAULT_EMBEDDING_MODE, Settings
 from tinkerbell.widgets import dialogs
 from tinkerbell.widgets.dialogs import (
     DocumentExportDialog,
@@ -49,6 +51,7 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     model_combo = dialog.findChild(QComboBox, "model_combo")
     organization_input = dialog.findChild(QLineEdit, "organization_input")
     theme_input = dialog.findChild(QLineEdit, "theme_input")
+    temperature_input = dialog.findChild(QDoubleSpinBox, "temperature_input")
     tool_checkbox = dialog.findChild(QCheckBox, "tool_activity_checkbox")
     timeout_input = dialog.findChild(QDoubleSpinBox, "request_timeout_input")
     context_input = dialog.findChild(QSpinBox, "max_context_tokens_input")
@@ -65,6 +68,7 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert model_combo is not None
     assert organization_input is not None
     assert theme_input is not None
+    assert temperature_input is not None
     assert tool_checkbox is not None
     assert timeout_input is not None
     assert context_input is not None
@@ -81,6 +85,7 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     model_combo.setEditText("gpt-custom")
     organization_input.setText("acme")
     theme_input.setText("dracula")
+    temperature_input.setValue(0.85)
     tool_checkbox.setChecked(True)
     timeout_input.setValue(42.5)
     context_input.setValue(256_000)
@@ -99,6 +104,7 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert updated.model == "gpt-custom"
     assert updated.organization == "acme"
     assert updated.theme == "dracula"
+    assert updated.temperature == pytest.approx(0.85)
     assert updated.show_tool_activity_panel is True
     assert updated.request_timeout == pytest.approx(42.5)
     assert updated.max_context_tokens == 256_000
@@ -107,6 +113,7 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert updated.context_policy.dry_run is False
     assert updated.context_policy.prompt_budget_override == 100_000
     assert updated.context_policy.response_reserve_override == 12_000
+    assert updated.metadata.get("embedding_mode") == DEFAULT_EMBEDDING_MODE
 
 
 def test_settings_dialog_validation_uses_validator(qtbot, dialog_settings: Settings) -> None:
@@ -150,6 +157,80 @@ def test_settings_dialog_test_button_runs_api_tester(qtbot, dialog_settings: Set
     assert captured["settings"].api_key == dialog_settings.api_key
     assert dialog.api_tested is True
     assert "api" in (dialog.last_api_test.message or "").lower()
+
+
+def test_settings_dialog_custom_mode_updates_metadata(qtbot, dialog_settings: Settings) -> None:
+    dialog = SettingsDialog(settings=dialog_settings, show_toasts=False)
+    qtbot.addWidget(dialog)
+
+    mode_combo = dialog.findChild(QComboBox, "embedding_mode_combo")
+    custom_index = mode_combo.findData("custom-api")
+    assert custom_index >= 0
+    mode_combo.setCurrentIndex(custom_index)
+
+    base_input = dialog.findChild(QLineEdit, "embedding_custom_base_url_input")
+    key_input = dialog.findChild(QLineEdit, "embedding_custom_api_key_input")
+    headers_input = dialog.findChild(QPlainTextEdit, "embedding_custom_headers_input")
+    assert base_input is not None
+    assert key_input is not None
+    assert headers_input is not None
+
+    base_input.setText("https://embeddings.example/v1")
+    key_input.setText("embed-key")
+    headers_input.setPlainText('{"X-Test": "1"}')
+
+    updated = dialog.gather_settings()
+
+    assert updated.metadata.get("embedding_mode") == "custom-api"
+    api_metadata = updated.metadata.get("embedding_api", {})
+    assert api_metadata.get("base_url") == "https://embeddings.example/v1"
+    assert api_metadata.get("api_key") == "embed-key"
+    assert api_metadata.get("default_headers", {}).get("X-Test") == "1"
+
+
+def test_settings_dialog_local_mode_requires_model_path(qtbot, dialog_settings: Settings) -> None:
+    dialog = SettingsDialog(settings=dialog_settings, show_toasts=False)
+    qtbot.addWidget(dialog)
+
+    mode_combo = dialog.findChild(QComboBox, "embedding_mode_combo")
+    local_index = mode_combo.findData("local")
+    assert local_index >= 0
+    mode_combo.setCurrentIndex(local_index)
+
+    button_box = dialog.findChild(QDialogButtonBox)
+    assert button_box is not None
+    save_button = button_box.button(QDialogButtonBox.StandardButton.Save)
+    assert save_button is not None
+
+    model_input = dialog.findChild(QLineEdit, "embedding_local_model_path_input")
+    assert model_input is not None
+    model_input.clear()
+    QApplication.processEvents()
+    assert save_button.isEnabled() is False
+
+    model_input.setText("sentence-transformers/all-MiniLM-L6-v2")
+    QApplication.processEvents()
+    assert save_button.isEnabled() is True
+
+
+def test_settings_dialog_embedding_test_button_uses_tester(qtbot, dialog_settings: Settings) -> None:
+    captured: dict[str, Settings] = {}
+
+    def embedding_tester(settings: Settings) -> ValidationResult:
+        captured["settings"] = settings
+        return ValidationResult(ok=True, message="Embeddings reachable")
+
+    dialog = SettingsDialog(settings=dialog_settings, embedding_tester=embedding_tester, show_toasts=False)
+    qtbot.addWidget(dialog)
+
+    test_button = dialog.findChild(QPushButton, "embedding_test_button")
+    assert test_button is not None
+
+    qtbot.mouseClick(test_button, Qt.MouseButton.LeftButton)
+
+    assert captured["settings"].api_key == dialog_settings.api_key
+    assert dialog.embedding_tested is True
+    assert "embedding" in (dialog.last_embedding_test.message or "").lower()
 
 
 def test_open_file_dialog_returns_path_via_custom_dialog(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
 import httpx
@@ -28,11 +31,17 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from ..services.settings import ContextPolicySettings, Settings
+from ..services.settings import (
+    ContextPolicySettings,
+    DEFAULT_EMBEDDING_MODE,
+    EMBEDDING_MODE_CHOICES,
+    Settings,
+)
 from ..services.telemetry import count_text_tokens
 
 __all__ = [
@@ -55,8 +64,14 @@ _EMBEDDING_BACKENDS: tuple[tuple[str, str], ...] = (
     ("auto", "Auto (match chat model)"),
     ("openai", "OpenAI (direct)"),
     ("langchain", "LangChain (OpenAI-compatible)"),
+    ("sentence-transformers", "SentenceTransformers (local)"),
     ("disabled", "Disabled"),
 )
+_EMBEDDING_MODE_LABELS: Mapping[str, str] = {
+    "same-api": "Same API (default)",
+    "custom-api": "Custom API (separate key)",
+    "local": "Local (SentenceTransformers)",
+}
 _HINT_COLORS = {
     "info": "#6a737d",
     "success": "#1a7f37",
@@ -545,6 +560,8 @@ class SettingsDialogResult:
     validation_message: str | None = None
     api_tested: bool = False
     api_test_message: str | None = None
+    embedding_tested: bool = False
+    embedding_test_message: str | None = None
 
 
 def open_file_dialog(
@@ -665,6 +682,7 @@ class SettingsDialog(QDialog):
         available_models: Sequence[str] | None = None,
         validator: SettingsValidator | None = None,
         api_tester: SettingsTester | None = None,
+        embedding_tester: SettingsTester | None = None,
         show_toasts: bool = True,
     ) -> None:
         super().__init__(parent)
@@ -682,6 +700,14 @@ class SettingsDialog(QDialog):
         self._field_errors: dict[str, str] = {}
         self._active_toasts: list[QMessageBox] = []
         self._save_button: QPushButton | None = None
+        self._embedding_tester = embedding_tester
+        self._last_embedding_test = ValidationResult(ok=False, message="")
+
+        metadata = dict(getattr(self._original, "metadata", {}) or {})
+        self._metadata_snapshot = metadata
+        self._embedding_api_metadata = dict(metadata.get("embedding_api") or {})
+        raw_mode = str(metadata.get("embedding_mode") or DEFAULT_EMBEDDING_MODE)
+        self._initial_embedding_mode = raw_mode if raw_mode in EMBEDDING_MODE_CHOICES else DEFAULT_EMBEDDING_MODE
 
         self._base_url_input = QLineEdit(self._original.base_url)
         self._base_url_input.setObjectName("base_url_input")
@@ -708,6 +734,19 @@ class SettingsDialog(QDialog):
                 self._model_combo.setCurrentIndex(index)
             else:
                 self._model_combo.setEditText(self._original.model)
+        self._temperature_input = QDoubleSpinBox()
+        self._temperature_input.setObjectName("temperature_input")
+        self._temperature_input.setRange(0.0, 2.0)
+        self._temperature_input.setSingleStep(0.05)
+        self._temperature_input.setDecimals(2)
+        temp_default = float(getattr(self._original, "temperature", 0.2) or 0.0)
+        temp_default = max(0.0, min(temp_default, 2.0))
+        self._temperature_input.setValue(temp_default)
+        self._temperature_input.setToolTip("Sampling temperature for chat completions.")
+        self._temperature_hint = QLabel("0 = deterministic, 1+ trades accuracy for creativity.")
+        self._temperature_hint.setObjectName("temperature_hint")
+        self._prepare_hint_label(self._temperature_hint)
+        self._temperature_input.valueChanged.connect(self._update_temperature_hint)
         self._organization_input = QLineEdit(self._original.organization or "")
         self._organization_input.setObjectName("organization_input")
         self._theme_input = QLineEdit(self._original.theme)
@@ -730,6 +769,32 @@ class SettingsDialog(QDialog):
         self._embedding_model_hint = QLabel("Defaults to text-embedding-3-large when left blank.")
         self._embedding_model_hint.setObjectName("embedding_model_hint")
         self._prepare_hint_label(self._embedding_model_hint)
+        self._embedding_mode_combo = QComboBox()
+        self._embedding_mode_combo.setObjectName("embedding_mode_combo")
+        for mode in EMBEDDING_MODE_CHOICES:
+            label = _EMBEDDING_MODE_LABELS.get(mode, mode.replace("-", " ").title())
+            self._embedding_mode_combo.addItem(label, mode)
+        mode_index = self._embedding_mode_combo.findData(self._initial_embedding_mode)
+        self._embedding_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        self._embedding_mode_combo.currentIndexChanged.connect(self._handle_embedding_mode_changed)
+        self._embedding_mode_hint = QLabel("Embeddings reuse the same API credentials by default.")
+        self._embedding_mode_hint.setObjectName("embedding_mode_hint")
+        self._prepare_hint_label(self._embedding_mode_hint)
+        self._embedding_mode_stack = QStackedWidget()
+        self._embedding_mode_stack.setObjectName("embedding_mode_stack")
+        self._mode_index_map: dict[str, int] = {}
+        same_panel = self._build_same_api_panel()
+        custom_panel = self._build_custom_api_panel()
+        local_panel = self._build_local_embedding_panel()
+        for index, (mode, panel) in enumerate(
+            (
+                ("same-api", same_panel),
+                ("custom-api", custom_panel),
+                ("local", local_panel),
+            )
+        ):
+            self._mode_index_map[mode] = index
+            self._embedding_mode_stack.addWidget(panel)
         self._debug_checkbox = QCheckBox("Enable debug logging")
         self._debug_checkbox.setObjectName("debug_logging_checkbox")
         self._debug_checkbox.setChecked(self._original.debug_logging)
@@ -872,6 +937,13 @@ class SettingsDialog(QDialog):
         form_layout.addRow("API Key", api_container)
 
         form_layout.addRow("Model", self._model_combo)
+        temperature_container = QWidget()
+        temperature_layout = QVBoxLayout(temperature_container)
+        temperature_layout.setContentsMargins(0, 0, 0, 0)
+        temperature_layout.setSpacing(2)
+        temperature_layout.addWidget(self._temperature_input)
+        temperature_layout.addWidget(self._temperature_hint)
+        form_layout.addRow("Temperature", temperature_container)
         form_layout.addRow("Organization", self._organization_input)
         form_layout.addRow("Theme", self._theme_input)
         embedding_backend_container = QWidget()
@@ -888,6 +960,19 @@ class SettingsDialog(QDialog):
         embedding_model_layout.addWidget(self._embedding_model_input)
         embedding_model_layout.addWidget(self._embedding_model_hint)
         form_layout.addRow("Embedding Model", embedding_model_container)
+        embedding_mode_container = QWidget()
+        embedding_mode_layout = QVBoxLayout(embedding_mode_container)
+        embedding_mode_layout.setContentsMargins(0, 0, 0, 0)
+        embedding_mode_layout.setSpacing(2)
+        embedding_mode_layout.addWidget(self._embedding_mode_combo)
+        embedding_mode_layout.addWidget(self._embedding_mode_hint)
+        form_layout.addRow("Embeddings Mode", embedding_mode_container)
+        embedding_mode_stack_container = QWidget()
+        embedding_mode_stack_layout = QVBoxLayout(embedding_mode_stack_container)
+        embedding_mode_stack_layout.setContentsMargins(0, 0, 0, 0)
+        embedding_mode_stack_layout.setSpacing(4)
+        embedding_mode_stack_layout.addWidget(self._embedding_mode_stack)
+        form_layout.addRow("Embedding Options", embedding_mode_stack_container)
         form_layout.addRow("Debug", self._debug_checkbox)
         form_layout.addRow("Tool Traces", self._tool_panel_checkbox)
         phase3_container = QWidget()
@@ -969,6 +1054,11 @@ class SettingsDialog(QDialog):
         self._test_button.clicked.connect(self._run_api_test)
         self._test_button.setEnabled(self._api_tester is not None)
         validation_row.addWidget(self._test_button, 0)
+        self._embedding_test_button = QPushButton("Test Embeddings")
+        self._embedding_test_button.setObjectName("embedding_test_button")
+        self._embedding_test_button.clicked.connect(self._run_embedding_test)
+        self._embedding_test_button.setEnabled(self._embedding_tester is not None)
+        validation_row.addWidget(self._embedding_test_button, 0)
         layout.addLayout(validation_row)
 
         buttons = QDialogButtonBox(
@@ -982,7 +1072,9 @@ class SettingsDialog(QDialog):
         self._update_base_url_hint()
         self._update_reserve_hint()
         self._update_timeout_hint()
+        self._update_temperature_hint()
         self._update_context_policy_hint()
+        self._handle_embedding_mode_changed()
         self._handle_embedding_backend_changed()
         self._validate_embedding_fields()
         self._update_buttons_state()
@@ -1019,6 +1111,18 @@ class SettingsDialog(QDialog):
 
         return self._last_api_test
 
+    @property
+    def embedding_tested(self) -> bool:
+        """Indicate whether the last embedding test succeeded."""
+
+        return self._last_embedding_test.ok
+
+    @property
+    def last_embedding_test(self) -> ValidationResult:
+        """Return the status of the most recent embedding test."""
+
+        return self._last_embedding_test
+
     def gather_settings(self) -> Settings:
         """Assemble a `Settings` instance from the current form widgets."""
 
@@ -1027,7 +1131,11 @@ class SettingsDialog(QDialog):
         model = self._model_combo.currentText().strip() or self._original.model
         organization = self._organization_input.text().strip() or None
         theme = self._theme_input.text().strip() or self._original.theme
+        temperature = float(self._temperature_input.value())
+        embedding_mode = self._embedding_mode_value()
         embedding_backend = self._selected_embedding_backend()
+        if embedding_mode == "local":
+            embedding_backend = "sentence-transformers"
         embedding_model = self._embedding_model_input.text().strip() or self._original.embedding_model_name
         debug_logging = self._debug_checkbox.isChecked()
         show_tool_activity_panel = self._tool_panel_checkbox.isChecked()
@@ -1039,6 +1147,7 @@ class SettingsDialog(QDialog):
         response_token_reserve = int(self._response_token_reserve_input.value())
         request_timeout = float(self._request_timeout_input.value())
         context_policy = self._gather_context_policy_settings()
+        metadata = self._build_embedding_metadata()
         return replace(
             self._original,
             base_url=base_url,
@@ -1046,6 +1155,7 @@ class SettingsDialog(QDialog):
             model=model,
             organization=organization,
             theme=theme,
+            temperature=temperature,
             embedding_backend=embedding_backend,
             embedding_model_name=embedding_model,
             debug_logging=debug_logging,
@@ -1058,11 +1168,261 @@ class SettingsDialog(QDialog):
             response_token_reserve=response_token_reserve,
             request_timeout=request_timeout,
             context_policy=context_policy,
+            metadata=metadata,
         )
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+    def _build_embedding_metadata(self) -> dict[str, Any]:
+        metadata = dict(self._metadata_snapshot)
+        mode = self._embedding_mode_value()
+        metadata["embedding_mode"] = mode
+        if mode == "custom-api":
+            metadata["embedding_api"] = self._collect_custom_api_metadata()
+        elif "embedding_api" in metadata:
+            metadata["embedding_api"] = dict(self._embedding_api_metadata)
+        if mode == "local":
+            for key, value in self._collect_local_embedding_metadata().items():
+                if value in (None, ""):
+                    metadata.pop(key, None)
+                else:
+                    metadata[key] = value
+        return metadata
+
+    def _build_same_api_panel(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        label = QLabel("Reuse the chat API credentials for embedding calls.")
+        self._prepare_hint_label(label)
+        layout.addWidget(label)
+        return container
+
+    def _build_custom_api_panel(self) -> QWidget:
+        container = QWidget()
+        layout = QFormLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        base_url = self._embedding_api_metadata.get("base_url", "") or ""
+        self._custom_api_base_url_input = QLineEdit(str(base_url))
+        self._custom_api_base_url_input.setObjectName("embedding_custom_base_url_input")
+        self._custom_api_base_url_input.setPlaceholderText("https://api.example.com/v1")
+        self._custom_api_base_url_input.textChanged.connect(self._validate_embedding_fields)
+        layout.addRow("Endpoint", self._custom_api_base_url_input)
+
+        api_key = self._embedding_api_metadata.get("api_key", "") or ""
+        hint = self._embedding_api_metadata.get("api_key_hint", "") or ""
+        self._custom_api_key_input = QLineEdit(str(api_key))
+        self._custom_api_key_input.setObjectName("embedding_custom_api_key_input")
+        self._custom_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        if not api_key and hint:
+            self._custom_api_key_input.setPlaceholderText(f"Stored secret ({hint})")
+        self._custom_api_key_input.textChanged.connect(self._validate_embedding_fields)
+        api_key_container = QWidget()
+        api_key_layout = QVBoxLayout(api_key_container)
+        api_key_layout.setContentsMargins(0, 0, 0, 0)
+        api_key_layout.setSpacing(2)
+        api_key_layout.addWidget(self._custom_api_key_input)
+        show_checkbox = QCheckBox("Show custom API key")
+        show_checkbox.setObjectName("embedding_custom_show_key_checkbox")
+        show_checkbox.toggled.connect(
+            lambda checked: self._custom_api_key_input.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+        )
+        api_key_layout.addWidget(show_checkbox)
+        layout.addRow("API Key", api_key_container)
+
+        organization = self._embedding_api_metadata.get("organization") or ""
+        self._custom_api_org_input = QLineEdit(str(organization))
+        self._custom_api_org_input.setObjectName("embedding_custom_organization_input")
+        self._custom_api_org_input.setPlaceholderText("Optional organization / tenant")
+        layout.addRow("Organization", self._custom_api_org_input)
+
+        timeout_value = float(self._embedding_api_metadata.get("request_timeout") or self._original.request_timeout)
+        self._custom_api_timeout_input = QDoubleSpinBox()
+        self._custom_api_timeout_input.setObjectName("embedding_custom_timeout_input")
+        self._custom_api_timeout_input.setRange(5.0, 600.0)
+        self._custom_api_timeout_input.setSuffix(" s")
+        self._custom_api_timeout_input.setSingleStep(5.0)
+        self._custom_api_timeout_input.setValue(timeout_value)
+        layout.addRow("Timeout", self._custom_api_timeout_input)
+
+        retries_value = int(self._embedding_api_metadata.get("max_retries") or self._original.max_retries)
+        self._custom_api_max_retries_input = QSpinBox()
+        self._custom_api_max_retries_input.setObjectName("embedding_custom_max_retries_input")
+        self._custom_api_max_retries_input.setRange(0, 10)
+        self._custom_api_max_retries_input.setValue(retries_value)
+        layout.addRow("Max Retries", self._custom_api_max_retries_input)
+
+        retry_min = float(self._embedding_api_metadata.get("retry_min_seconds") or self._original.retry_min_seconds)
+        self._custom_api_retry_min_input = QDoubleSpinBox()
+        self._custom_api_retry_min_input.setObjectName("embedding_custom_retry_min_input")
+        self._custom_api_retry_min_input.setRange(0.1, 30.0)
+        self._custom_api_retry_min_input.setSingleStep(0.1)
+        self._custom_api_retry_min_input.setValue(retry_min)
+        layout.addRow("Retry Min", self._custom_api_retry_min_input)
+
+        retry_max = float(self._embedding_api_metadata.get("retry_max_seconds") or self._original.retry_max_seconds)
+        self._custom_api_retry_max_input = QDoubleSpinBox()
+        self._custom_api_retry_max_input.setObjectName("embedding_custom_retry_max_input")
+        self._custom_api_retry_max_input.setRange(0.1, 120.0)
+        self._custom_api_retry_max_input.setSingleStep(0.5)
+        self._custom_api_retry_max_input.setValue(retry_max)
+        layout.addRow("Retry Max", self._custom_api_retry_max_input)
+
+        headers_payload = self._embedding_api_metadata.get("default_headers") or {}
+        headers_text = json.dumps(headers_payload, indent=2) if headers_payload else ""
+        self._custom_api_headers_input = QPlainTextEdit(headers_text)
+        self._custom_api_headers_input.setObjectName("embedding_custom_headers_input")
+        self._custom_api_headers_input.setPlaceholderText('{"X-Request-ID": "abc-123"}')
+        self._custom_api_headers_input.textChanged.connect(self._validate_embedding_fields)
+        layout.addRow("Headers (JSON)", self._custom_api_headers_input)
+
+        return container
+
+    def _build_local_embedding_panel(self) -> QWidget:
+        container = QWidget()
+        layout = QFormLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        model_path = self._metadata_snapshot.get("st_model_path", "") or ""
+        self._local_model_path_input = QLineEdit(str(model_path))
+        self._local_model_path_input.setObjectName("embedding_local_model_path_input")
+        self._local_model_path_input.setPlaceholderText("SentenceTransformers model path or HF repo")
+        self._local_model_path_input.textChanged.connect(self._validate_embedding_fields)
+        model_container = QWidget()
+        model_layout = QHBoxLayout(model_container)
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        model_layout.setSpacing(4)
+        model_layout.addWidget(self._local_model_path_input, 1)
+        browse_model = QPushButton("Browse…")
+        browse_model.setObjectName("embedding_local_model_browse_button")
+        browse_model.clicked.connect(self._browse_local_model_path)
+        model_layout.addWidget(browse_model, 0)
+        layout.addRow("Model Path", model_container)
+
+        self._local_device_combo = QComboBox()
+        self._local_device_combo.setObjectName("embedding_local_device_combo")
+        self._local_device_combo.setEditable(True)
+        for choice in ("auto", "cpu", "cuda:0", "cuda:1", "mps"):
+            self._local_device_combo.addItem(choice)
+        device_value = str(self._metadata_snapshot.get("st_device") or "auto")
+        index = self._local_device_combo.findText(device_value)
+        if index >= 0:
+            self._local_device_combo.setCurrentIndex(index)
+        else:
+            self._local_device_combo.setEditText(device_value)
+        self._local_device_combo.currentTextChanged.connect(self._validate_embedding_fields)
+        layout.addRow("Device", self._local_device_combo)
+
+        self._local_dtype_combo = QComboBox()
+        self._local_dtype_combo.setObjectName("embedding_local_dtype_combo")
+        self._local_dtype_combo.setEditable(True)
+        for choice in ("", "float32", "float16", "bfloat16", "int8"):
+            label = "Default" if not choice else choice
+            self._local_dtype_combo.addItem(label, choice)
+        dtype_value = str(self._metadata_snapshot.get("st_dtype") or "")
+        dtype_index = self._local_dtype_combo.findData(dtype_value)
+        if dtype_index >= 0:
+            self._local_dtype_combo.setCurrentIndex(dtype_index)
+        else:
+            self._local_dtype_combo.setEditText(dtype_value)
+        self._local_dtype_combo.currentTextChanged.connect(self._validate_embedding_fields)
+        layout.addRow("Torch DType", self._local_dtype_combo)
+
+        cache_dir = self._metadata_snapshot.get("st_cache_dir", "") or ""
+        self._local_cache_dir_input = QLineEdit(str(cache_dir))
+        self._local_cache_dir_input.setObjectName("embedding_local_cache_dir_input")
+        self._local_cache_dir_input.setPlaceholderText("Optional cache directory")
+        cache_container = QWidget()
+        cache_layout = QHBoxLayout(cache_container)
+        cache_layout.setContentsMargins(0, 0, 0, 0)
+        cache_layout.setSpacing(4)
+        cache_layout.addWidget(self._local_cache_dir_input, 1)
+        browse_cache = QPushButton("Browse…")
+        browse_cache.setObjectName("embedding_local_cache_browse_button")
+        browse_cache.clicked.connect(self._browse_local_cache_dir)
+        cache_layout.addWidget(browse_cache, 0)
+        layout.addRow("Cache Dir", cache_container)
+
+        batch_override = self._metadata_snapshot.get("st_batch_size")
+        batch_value = int(batch_override) if isinstance(batch_override, int) else 8
+        self._local_batch_size_input = QSpinBox()
+        self._local_batch_size_input.setObjectName("embedding_local_batch_size_input")
+        self._local_batch_size_input.setRange(1, 256)
+        self._local_batch_size_input.setValue(batch_value)
+        self._local_batch_size_input.valueChanged.connect(self._validate_embedding_fields)
+        layout.addRow("Batch Size", self._local_batch_size_input)
+
+        return container
+
+    def _collect_custom_api_metadata(self) -> dict[str, Any]:
+        payload = dict(self._embedding_api_metadata)
+        base_url = self._custom_api_base_url_input.text().strip()
+        if base_url:
+            payload["base_url"] = base_url
+        else:
+            payload.pop("base_url", None)
+
+        organization = self._custom_api_org_input.text().strip()
+        if organization:
+            payload["organization"] = organization
+        else:
+            payload.pop("organization", None)
+
+        api_key = self._custom_api_key_input.text().strip()
+        payload["api_key"] = api_key
+        if api_key:
+            payload.pop("api_key_ciphertext", None)
+            payload.pop("api_key_hint", None)
+        else:
+            payload.pop("api_key_ciphertext", None)
+            payload.pop("api_key_hint", None)
+
+        payload["request_timeout"] = float(self._custom_api_timeout_input.value())
+        payload["max_retries"] = int(self._custom_api_max_retries_input.value())
+        payload["retry_min_seconds"] = float(self._custom_api_retry_min_input.value())
+        payload["retry_max_seconds"] = float(self._custom_api_retry_max_input.value())
+
+        headers_text = self._custom_api_headers_input.toPlainText().strip()
+        if headers_text:
+            try:
+                headers_obj = json.loads(headers_text)
+            except json.JSONDecodeError:
+                headers_obj = None
+            if isinstance(headers_obj, Mapping):
+                payload["default_headers"] = dict(headers_obj)
+        else:
+            payload.pop("default_headers", None)
+
+        return payload
+
+    def _collect_local_embedding_metadata(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        payload["st_model_path"] = self._local_model_path_input.text().strip()
+        device_text = self._local_device_combo.currentText().strip()
+        payload["st_device"] = device_text if device_text and device_text.lower() != "auto" else ""
+        dtype_text = self._local_dtype_combo.currentText().strip()
+        payload["st_dtype"] = dtype_text
+        payload["st_cache_dir"] = self._local_cache_dir_input.text().strip()
+        payload["st_batch_size"] = int(self._local_batch_size_input.value())
+        return payload
+
+    def _browse_local_model_path(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "Select Model Directory")
+        if selected:
+            self._local_model_path_input.setText(selected)
+
+    def _browse_local_cache_dir(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "Select Cache Directory")
+        if selected:
+            self._local_cache_dir_input.setText(selected)
+
     def _toggle_api_visibility(self, checked: bool) -> None:
         self._api_key_input.setEchoMode(
             QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
@@ -1093,6 +1453,17 @@ class SettingsDialog(QDialog):
             raw_result = self._api_tester(candidate)
             self._last_api_test = _coerce_validation_result(raw_result)
         self._display_status(self._last_api_test, fallback="API test completed.", toast=True)
+
+    def _run_embedding_test(self) -> None:
+        if self._embedding_tester is None:
+            self._last_embedding_test = ValidationResult(
+                ok=False, message="No embeddings tester configured; cannot run test."
+            )
+        else:
+            candidate = self.gather_settings()
+            raw_result = self._embedding_tester(candidate)
+            self._last_embedding_test = _coerce_validation_result(raw_result)
+        self._display_status(self._last_embedding_test, fallback="Embedding test completed.", toast=True)
 
     def _display_status(self, result: ValidationResult, *, fallback: str, toast: bool = False) -> None:
         self._validation_label.setVisible(True)
@@ -1154,6 +1525,21 @@ class SettingsDialog(QDialog):
             message = "Large (>300s) timeouts can stall the UI if the API hangs."
         self._set_hint(self._timeout_hint, message, level)
         self._set_field_error("timeout", message if level == "error" else None)
+
+    def _update_temperature_hint(self) -> None:
+        temperature = float(self._temperature_input.value())
+        level = "info"
+        message = "0 = deterministic, higher values increase variety."
+        if temperature >= 1.2:
+            level = "warning"
+            message = "High (>1.2) temps boost creativity but risk tangents."
+        elif temperature >= 0.6:
+            level = "success"
+            message = "0.6–1.1 is a balanced creative range for drafting."
+        elif temperature <= 0.1:
+            level = "info"
+            message = "Near-zero temps keep responses predictable."
+        self._set_hint(self._temperature_hint, message, level)
 
     def _update_context_policy_hint(self) -> None:
         enabled = self._context_policy_enabled.isChecked()
@@ -1220,6 +1606,8 @@ class SettingsDialog(QDialog):
             self._validate_button.setEnabled(self._validator is not None and not has_errors)
         if self._test_button is not None:
             self._test_button.setEnabled(self._api_tester is not None and not has_errors)
+        if self._embedding_test_button is not None:
+            self._embedding_test_button.setEnabled(self._embedding_tester is not None and not has_errors)
 
     def _show_toast(self, message: str, *, success: bool) -> None:
         if not self._toast_enabled or not message:
@@ -1243,6 +1631,18 @@ class SettingsDialog(QDialog):
         box.destroyed.connect(lambda *_: _cleanup())
         QTimer.singleShot(3500, box.close)
 
+    def _embedding_mode_value(self) -> str:
+        index = self._embedding_mode_combo.currentIndex()
+        value = self._embedding_mode_combo.itemData(index)
+        return str(value) if isinstance(value, str) and value else self._initial_embedding_mode
+
+    def _select_embedding_backend(self, backend: str) -> None:
+        index = self._embedding_backend_combo.findData(backend)
+        if index >= 0:
+            self._embedding_backend_combo.blockSignals(True)
+            self._embedding_backend_combo.setCurrentIndex(index)
+            self._embedding_backend_combo.blockSignals(False)
+
     def _selected_embedding_backend(self) -> str:
         index = self._embedding_backend_combo.currentIndex()
         value = self._embedding_backend_combo.itemData(index)
@@ -1250,23 +1650,93 @@ class SettingsDialog(QDialog):
             return value
         return "auto"
 
+    def _handle_embedding_mode_changed(self) -> None:
+        mode = self._embedding_mode_value()
+        stack_index = self._mode_index_map.get(mode, 0)
+        self._embedding_mode_stack.setCurrentIndex(stack_index)
+        if mode == "custom-api":
+            hint = "Configure a dedicated endpoint and API key just for embeddings."
+        elif mode == "local":
+            hint = "Run embeddings locally via SentenceTransformers; install the embeddings extra."
+        else:
+            hint = "Reuse your chat API credentials for embeddings."
+        self._set_hint(self._embedding_mode_hint, hint)
+        self._handle_embedding_backend_changed()
+
     def _handle_embedding_backend_changed(self) -> None:
         backend = self._selected_embedding_backend()
-        hint = "Embeddings disabled; retrieval falls back to regex + outlines." if backend == "disabled" else "LangChain adapters support OpenAI-compatible providers like DeepSeek or GLM." if backend == "langchain" else "Use your configured OpenAI endpoint for embeddings."
+        mode = self._embedding_mode_value()
+        if mode == "local" and backend != "sentence-transformers":
+            self._select_embedding_backend("sentence-transformers")
+            backend = "sentence-transformers"
+        hint = (
+            "Embeddings disabled; retrieval falls back to regex + outlines."
+            if backend == "disabled"
+            else "LangChain adapters support OpenAI-compatible providers like DeepSeek or GLM."
+            if backend == "langchain"
+            else "Run embeddings locally via SentenceTransformers." if backend == "sentence-transformers" else "Use your configured OpenAI endpoint for embeddings."
+        )
         self._set_hint(self._embedding_backend_hint, hint)
-        self._embedding_model_input.setEnabled(backend != "disabled")
+        self._embedding_backend_combo.setEnabled(mode != "local")
+        self._embedding_model_input.setEnabled(backend != "disabled" and mode != "local")
         self._validate_embedding_fields()
 
     def _validate_embedding_fields(self) -> None:
+        mode = self._embedding_mode_value()
         backend = self._selected_embedding_backend()
         model = self._embedding_model_input.text().strip()
-        if backend == "disabled":
+        if mode == "local" or backend == "disabled":
             self._set_field_error("embedding_model_name", None)
-            return
-        if not model:
+        elif not model:
             self._set_field_error("embedding_model_name", "Embedding model is required unless embeddings are disabled.")
+        else:
+            self._set_field_error("embedding_model_name", None)
+        self._validate_custom_api_fields(mode)
+        self._validate_local_fields(mode)
+
+    def _validate_custom_api_fields(self, mode: str) -> None:
+        if mode != "custom-api":
+            self._set_field_error("embedding_custom_base_url", None)
+            self._set_field_error("embedding_custom_api_key", None)
+            self._set_field_error("embedding_custom_headers", None)
             return
-        self._set_field_error("embedding_model_name", None)
+        base_url = self._custom_api_base_url_input.text().strip()
+        api_key = self._custom_api_key_input.text().strip() or self._embedding_api_metadata.get("api_key", "")
+        if not base_url:
+            self._set_field_error("embedding_custom_base_url", "Base URL is required for custom embeddings.")
+        else:
+            parsed = urlparse(base_url)
+            if (parsed.scheme or "").lower() != "https" or not parsed.netloc:
+                self._set_field_error("embedding_custom_base_url", "Provide a valid https:// endpoint for embeddings.")
+            else:
+                self._set_field_error("embedding_custom_base_url", None)
+        if not api_key:
+            self._set_field_error("embedding_custom_api_key", "API key is required for custom embeddings.")
+        else:
+            self._set_field_error("embedding_custom_api_key", None)
+        headers_text = self._custom_api_headers_input.toPlainText().strip()
+        if headers_text:
+            try:
+                headers_obj = json.loads(headers_text)
+                valid_headers = isinstance(headers_obj, Mapping)
+            except json.JSONDecodeError:
+                valid_headers = False
+            if not valid_headers:
+                self._set_field_error("embedding_custom_headers", "Custom headers must be valid JSON.")
+            else:
+                self._set_field_error("embedding_custom_headers", None)
+        else:
+            self._set_field_error("embedding_custom_headers", None)
+
+    def _validate_local_fields(self, mode: str) -> None:
+        if mode != "local":
+            self._set_field_error("embedding_local_model_path", None)
+            return
+        path = self._local_model_path_input.text().strip()
+        if not path:
+            self._set_field_error("embedding_local_model_path", "Local embeddings require a model path or identifier.")
+        else:
+            self._set_field_error("embedding_local_model_path", None)
 
 
 def show_settings_dialog(
@@ -1276,16 +1746,19 @@ def show_settings_dialog(
     models: Sequence[str] | None = None,
     validator: SettingsValidator | None = None,
     api_tester: SettingsTester | None = None,
+    embedding_tester: SettingsTester | None = None,
 ) -> SettingsDialogResult:
     """Display the settings dialog and return the captured values."""
 
     tester = api_tester if api_tester is not None else test_ai_api_settings
+    embedding_test = embedding_tester if embedding_tester is not None else test_embedding_settings
     dialog = SettingsDialog(
         settings=settings,
         parent=parent,
         available_models=models,
         validator=validator,
         api_tester=tester,
+        embedding_tester=embedding_test,
     )
     accepted = dialog.exec() == int(QDialog.DialogCode.Accepted)
     last_message = dialog.last_validation.message or None
@@ -1296,6 +1769,8 @@ def show_settings_dialog(
         validation_message=last_message,
         api_tested=dialog.api_tested,
         api_test_message=dialog.last_api_test.message or None,
+        embedding_tested=dialog.embedding_tested,
+        embedding_test_message=dialog.last_embedding_test.message or None,
     )
 
 
@@ -1343,4 +1818,60 @@ def test_ai_api_settings(settings: Settings) -> ValidationResult:
         snippet = f"{snippet[:117]}..."
     reason = snippet or response.reason_phrase or "Unknown error"
     return ValidationResult(False, f"API responded with {response.status_code}: {reason}")
+
+
+def test_embedding_settings(settings: Settings) -> ValidationResult:
+    """Exercise the embedding backend using the selected mode and metadata."""
+
+    try:
+        from ..ui.embedding_controller import EmbeddingController
+    except Exception as exc:  # pragma: no cover - optional dependency guard
+        return ValidationResult(False, f"Embedding controller unavailable: {exc}")
+
+    metadata = getattr(settings, "metadata", {}) or {}
+    cache_root = (Path(tempfile.gettempdir()) / "tinkerbell-embedding-test").resolve()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    loop = asyncio.new_event_loop()
+    controller: EmbeddingController | None = None
+    previous_loop: asyncio.AbstractEventLoop | None
+    try:
+        previous_loop = asyncio.get_event_loop_policy().get_event_loop() if asyncio.get_event_loop_policy() else None
+    except RuntimeError:
+        previous_loop = None
+    try:
+        controller = EmbeddingController(
+            status_bar=None,
+            cache_root_resolver=lambda: cache_root,
+            outline_worker_resolver=lambda: None,
+            async_loop_resolver=lambda: None,
+            background_task_runner=lambda coro: None,
+            phase3_outline_enabled=True,
+        )
+        mode = controller._resolve_embedding_mode(metadata)
+        backend = controller._normalize_backend(getattr(settings, "embedding_backend", "auto"), mode)
+        if backend == "disabled":
+            return ValidationResult(False, "Embeddings are disabled; pick a backend before testing.")
+        embedding_settings = controller._build_embedding_settings(settings, metadata, mode)
+        model_name = getattr(settings, "embedding_model_name", "") or "text-embedding-3-large"
+        provider, state = controller._build_embedding_provider(backend, model_name, embedding_settings, metadata, mode)
+        if provider is None:
+            return ValidationResult(False, state.error or "Unable to build embedding provider.")
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(controller._validator.validate(provider, mode=mode))
+        if result.status == "ready":
+            return ValidationResult(True, result.detail or "Embeddings validated successfully.")
+        return ValidationResult(False, result.error or "Embedding validation failed.")
+    except Exception as exc:  # pragma: no cover - best-effort diagnostics
+        return ValidationResult(False, f"Embedding test failed: {exc}")
+    finally:
+        try:
+            if controller is not None:
+                controller._dispose_embedding_resource()
+        except Exception:
+            pass
+        try:
+            asyncio.set_event_loop(previous_loop)
+        except Exception:
+            pass
+        loop.close()
 

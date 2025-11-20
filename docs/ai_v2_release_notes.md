@@ -10,6 +10,7 @@ _Last updated: 19 Nov 2025_
 - **Integration, telemetry, hardening (Phase 4.4)** – Sequential multi-job smoke tests, cache-hit telemetry, TraceCompactor coverage for helper summaries, and a repeatable latency benchmark (`benchmarks/subagent_latency.md`).
 - **Storyline continuity orchestration (Phase 5.1)** – `PlotStateMemory`, `PlotOutlineTool`, and `PlotStateUpdateTool` now enforce the “outline → edit → update” loop with guardrail hints, persistence for operator overrides, and `plot_state.*` telemetry.
 - **Preflight analysis & tool recommendations (Phase 5.2)** – Rule-based analyzer feeds proactive tool hints into the controller, status bar/chat badges, manual `/analyze`, ContextUsage exports, and telemetry (`analysis.advisor_tool.*`, `analysis.ui_override.*`).
+- **Configurable sampling temperature** – The AI settings dialog now exposes the OpenAI-compatible temperature control (0.0–2.0) so creative writing sessions can lean toward higher variety without editing `settings.json` manually.
 
 ## Feature flags
 

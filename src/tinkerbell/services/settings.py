@@ -10,16 +10,26 @@ import os
 import sys
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, MutableMapping, Literal
 
 from cryptography.fernet import Fernet, InvalidToken
 
-__all__ = ["Settings", "SettingsStore", "SecretVault", "DebugSettings", "ContextPolicySettings"]
+__all__ = [
+    "Settings",
+    "SettingsStore",
+    "SecretVault",
+    "DebugSettings",
+    "ContextPolicySettings",
+    "EMBEDDING_MODE_CHOICES",
+    "DEFAULT_EMBEDDING_MODE",
+    "redact_secret",
+    "redact_metadata",
+]
 
 LOGGER = logging.getLogger(__name__)
 _SETTINGS_DIR = Path.home() / ".tinkerbell"
 _DEFAULT_SETTINGS_PATH = _SETTINGS_DIR / "settings.json"
-_SETTINGS_VERSION = 2
+_SETTINGS_VERSION = 3
 _ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_API_KEY": "api_key",
     "TINKERBELL_BASE_URL": "base_url",
@@ -38,10 +48,18 @@ _BOOL_ENV_OVERRIDES: Mapping[str, str] = {
 }
 _FLOAT_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_REQUEST_TIMEOUT": "request_timeout",
+    "TINKERBELL_TEMPERATURE": "temperature",
 }
 _TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
 _API_KEY_FIELD = "api_key_ciphertext"
 _SECRET_BACKEND_ENV = "TINKERBELL_SECRET_BACKEND"
+DEFAULT_EMBEDDING_MODE = "same-api"
+EMBEDDING_MODE_CHOICES: tuple[str, ...] = ("same-api", "custom-api", "local")
+_REMOTE_EMBEDDING_BACKENDS = {"auto", "openai", "langchain"}
+_DISABLED_EMBEDDING_BACKEND = "disabled"
+_LOCAL_EMBEDDING_BACKEND = "sentence-transformers"
+_BACKEND_ALIASES = {"st": _LOCAL_EMBEDDING_BACKEND, "sentence_transformers": _LOCAL_EMBEDDING_BACKEND}
+EmbeddingMode = Literal["same-api", "custom-api", "local"]
 
 
 @dataclass(slots=True)
@@ -70,6 +88,7 @@ class Settings:
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-4o-mini"
+    temperature: float = 0.2
     theme: str = "default"
     organization: str | None = None
     request_timeout: float = 90.0
@@ -83,7 +102,7 @@ class Settings:
     embedding_model_name: str = "text-embedding-3-large"
     autosave_interval: float = 60.0
     default_headers: dict[str, str] = field(default_factory=dict)
-    metadata: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
     recent_files: list[str] = field(default_factory=list)
     last_open_file: str | None = None
     unsaved_snapshot: dict[str, Any] | None = None
@@ -206,6 +225,17 @@ class SettingsStore:
             )
             needs_migration = migrated
             data = _filter_fields(payload)
+            metadata_payload = data.get("metadata")
+            (
+                metadata,
+                metadata_migrated,
+                embedding_mode_was_missing,
+            ) = self._normalize_metadata(metadata_payload)
+            data["metadata"] = metadata
+            needs_migration = needs_migration or metadata_migrated
+            if embedding_mode_was_missing and data.get("embedding_backend") != _DISABLED_EMBEDDING_BACKEND:
+                data["embedding_backend"] = _DISABLED_EMBEDDING_BACKEND
+                needs_migration = True
             debug_payload = data.get("debug")
             if isinstance(debug_payload, Mapping):
                 try:
@@ -226,6 +256,10 @@ class SettingsStore:
             if plaintext_key:
                 settings = replace(settings, api_key=plaintext_key)
 
+            settings, policy_migrated = self._apply_embedding_policy(settings)
+            if policy_migrated:
+                needs_migration = True
+
         version_mismatch = bool(payload) and payload.get("version") != _SETTINGS_VERSION
         if needs_migration or version_mismatch:
             try:
@@ -237,6 +271,7 @@ class SettingsStore:
             settings = self._apply_overrides(settings, overrides, source="CLI")
 
         settings = self._apply_env_overrides(settings)
+        settings, _ = self._apply_embedding_policy(settings)
         return settings
 
     def save(self, settings: Settings) -> Path:
@@ -256,6 +291,7 @@ class SettingsStore:
         ciphertext = self._encrypt_api_key(api_key)
         if ciphertext:
             data[_API_KEY_FIELD] = ciphertext
+        data["metadata"] = self._prepare_metadata_for_storage(data.get("metadata"))
         data["version"] = _SETTINGS_VERSION
         data["secret_backend"] = self._vault.strategy
         return data
@@ -285,6 +321,11 @@ class SettingsStore:
             if key not in allowed or value is None:
                 continue
             filtered[key] = value
+        metadata_override = filtered.get("metadata")
+        if isinstance(metadata_override, Mapping):
+            merged_metadata = dict(settings.metadata or {})
+            merged_metadata.update(metadata_override)
+            filtered["metadata"] = merged_metadata
         if filtered:
             LOGGER.debug(
                 "Applying %s settings overrides: %s", source, sorted(filtered)
@@ -316,16 +357,152 @@ class SettingsStore:
             settings = self._apply_overrides(settings, overrides, source="environment")
         return settings
 
-    def _encrypt_api_key(self, api_key: str) -> str | None:
-        if not api_key:
+    def _apply_embedding_policy(self, settings: Settings) -> tuple[Settings, bool]:
+        original_metadata = getattr(settings, "metadata", {}) or {}
+        metadata = dict(original_metadata)
+        raw_mode = metadata.get("embedding_mode")
+        mode, mode_changed, _ = _normalize_embedding_mode_value(raw_mode)
+        if mode_changed or raw_mode != mode:
+            metadata["embedding_mode"] = mode
+        backend = self._normalize_backend_value(getattr(settings, "embedding_backend", "auto"))
+        backend, backend_changed = self._resolve_backend_for_mode(mode, backend)
+        mutated = backend_changed or metadata != original_metadata
+        if not mutated:
+            return settings, False
+        updates: Dict[str, Any] = {}
+        if metadata != original_metadata:
+            updates["metadata"] = metadata
+        if backend != settings.embedding_backend:
+            updates["embedding_backend"] = backend
+        return replace(settings, **updates), True
+
+    def _normalize_backend_value(self, backend: Any) -> str:
+        if backend is None:
+            return "auto"
+        normalized = str(backend).strip().lower()
+        if not normalized:
+            return "auto"
+        return _BACKEND_ALIASES.get(normalized, normalized)
+
+    def _resolve_backend_for_mode(self, mode: EmbeddingMode, backend: str) -> tuple[str, bool]:
+        if mode == "local":
+            desired = _LOCAL_EMBEDDING_BACKEND
+            return (desired, backend != desired)
+        allowed_remote = _REMOTE_EMBEDDING_BACKENDS
+        if mode == "custom-api":
+            if backend not in allowed_remote:
+                LOGGER.debug(
+                    "Embedding backend %s is not valid for custom-api mode; forcing openai.",
+                    backend,
+                )
+                return "openai", True
+            return backend, False
+        allowed_same_api = allowed_remote | {_DISABLED_EMBEDDING_BACKEND}
+        if backend not in allowed_same_api:
+            LOGGER.debug(
+                "Embedding backend %s is not valid for same-api mode; falling back to auto.",
+                backend,
+            )
+            return "auto", True
+        return backend, False
+
+    def _normalize_metadata(self, payload: Any) -> tuple[dict[str, Any], bool, bool]:
+        if isinstance(payload, Mapping):
+            metadata = dict(payload)
+        else:
+            metadata = {}
+            if payload not in (None, ""):
+                LOGGER.debug("Ignoring non-mapping metadata payload of type %s", type(payload))
+        raw_mode = metadata.get("embedding_mode")
+        mode, mode_changed, mode_missing = _normalize_embedding_mode_value(raw_mode)
+        metadata["embedding_mode"] = mode
+        migrated = mode_changed
+        embedding_api_payload = metadata.get("embedding_api")
+        if isinstance(embedding_api_payload, Mapping):
+            normalized_api, api_migrated = self._normalize_embedding_api_metadata(embedding_api_payload)
+            metadata["embedding_api"] = normalized_api
+            migrated = migrated or api_migrated
+        return metadata, migrated, mode_missing
+
+    def _normalize_embedding_api_metadata(self, payload: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        metadata = dict(payload)
+        migrated = False
+        plaintext = metadata.get("api_key") or ""
+        ciphertext = metadata.get("api_key_ciphertext") or ""
+        if plaintext and not ciphertext:
+            token = self._encrypt_secret_value(plaintext, field_name="embedding API key")
+            if token:
+                metadata["api_key_ciphertext"] = token
+            hint = metadata.get("api_key_hint")
+            if not hint:
+                metadata["api_key_hint"] = redact_secret(plaintext)
+            migrated = True
+        elif not plaintext:
+            metadata.setdefault("api_key", "")
+        if metadata.get("api_key_ciphertext"):
+            if not metadata.get("api_key"):
+                try:
+                    metadata["api_key"] = self._vault.decrypt(metadata["api_key_ciphertext"])
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    LOGGER.warning("Unable to decrypt embedding API key: %s", exc)
+                    metadata["api_key"] = ""
+                    metadata["api_key_ciphertext"] = ""
+                    metadata.setdefault("api_key_hint", "")
+                    migrated = True
+        plaintext = metadata.get("api_key") or ""
+        hint = metadata.get("api_key_hint")
+        if plaintext and not hint:
+            metadata["api_key_hint"] = redact_secret(plaintext)
+            migrated = True
+        return metadata, migrated
+
+    def _prepare_metadata_for_storage(self, metadata: Any) -> dict[str, Any]:
+        if not isinstance(metadata, Mapping):
+            return {"embedding_mode": DEFAULT_EMBEDDING_MODE}
+        prepared: dict[str, Any] = {}
+        for key, value in metadata.items():
+            if key == "embedding_api" and isinstance(value, Mapping):
+                serialized_api = self._serialize_embedding_api_metadata(value)
+                if serialized_api:
+                    prepared[key] = serialized_api
+            else:
+                prepared[key] = value
+        prepared.setdefault("embedding_mode", DEFAULT_EMBEDDING_MODE)
+        return prepared
+
+    def _serialize_embedding_api_metadata(self, metadata: Mapping[str, Any]) -> dict[str, Any]:
+        payload = dict(metadata)
+        plaintext = payload.pop("api_key", "") or ""
+        ciphertext = payload.get("api_key_ciphertext") or ""
+        hint = payload.get("api_key_hint") or ""
+        if plaintext:
+            token = self._encrypt_secret_value(plaintext, field_name="embedding API key")
+            if token:
+                payload["api_key_ciphertext"] = token
+                ciphertext = token
+            if not hint:
+                hint = redact_secret(plaintext)
+        if ciphertext:
+            payload["api_key_ciphertext"] = ciphertext
+        if hint:
+            payload["api_key_hint"] = hint
+        elif ciphertext:
+            payload.setdefault("api_key_hint", "")
+        return payload
+
+    def _encrypt_secret_value(self, secret: str, *, field_name: str) -> str | None:
+        if not secret:
             return None
         try:
-            token = self._vault.encrypt(api_key)
-            LOGGER.debug("API key encrypted via %s backend", self._vault.strategy)
+            token = self._vault.encrypt(secret)
+            LOGGER.debug("%s encrypted via %s backend", field_name, self._vault.strategy)
             return token
         except Exception as exc:  # pragma: no cover - extremely rare
-            LOGGER.warning("Failed to encrypt API key: %s", exc)
+            LOGGER.warning("Failed to encrypt %s: %s", field_name, exc)
             return None
+
+    def _encrypt_api_key(self, api_key: str) -> str | None:
+        return self._encrypt_secret_value(api_key, field_name="API key")
 
     def _decrypt_api_key(
         self, ciphertext: str | None, legacy_plaintext: str | None
@@ -421,6 +598,47 @@ def _filter_fields(payload: Mapping[str, Any]) -> Dict[str, Any]:
             continue
         result[key] = value
     return result
+
+
+def _normalize_embedding_mode_value(value: Any) -> tuple[EmbeddingMode, bool, bool]:
+    if value is None:
+        return DEFAULT_EMBEDDING_MODE, True, True
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return DEFAULT_EMBEDDING_MODE, True, True
+    if normalized in EMBEDDING_MODE_CHOICES:
+        return normalized, False, False
+    LOGGER.warning(
+        "Unknown embedding_mode '%s'; defaulting to %s.",
+        value,
+        DEFAULT_EMBEDDING_MODE,
+    )
+    return DEFAULT_EMBEDDING_MODE, True, False
+
+
+def redact_secret(value: str) -> str:
+    stripped = (value or "").strip()
+    if not stripped:
+        return ""
+    if len(stripped) <= 4:
+        return "*" * len(stripped)
+    return f"{stripped[:2]}{'*' * (len(stripped) - 4)}{stripped[-2:]}"
+
+
+def redact_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(metadata, Mapping):
+        return {}
+    redacted: dict[str, Any] = {}
+    for key, value in metadata.items():
+        if key == "embedding_api" and isinstance(value, Mapping):
+            api_meta = dict(value)
+            raw_key = api_meta.get("api_key")
+            if isinstance(raw_key, str):
+                api_meta["api_key"] = redact_secret(raw_key)
+            redacted[key] = api_meta
+        else:
+            redacted[key] = value
+    return redacted
 
 
 def _dpapi_supported() -> bool:

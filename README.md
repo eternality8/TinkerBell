@@ -101,17 +101,28 @@ uv sync --extra ai_tokenizers
 
 > `tiktoken` currently requires a Rust toolchain for Python 3.13 on Windows. Install [rustup](https://rustup.rs/) or run the command under Python 3.12 until official wheels are published. Without the extra, the editor automatically falls back to the deterministic byte-length estimator.
 
+### Optional extras (local embeddings)
+
+Local SentenceTransformers mode depends on PyTorch and friends, so install the new embeddings extra before turning the flag on:
+
+```powershell
+uv sync --extra embeddings
+```
+
+This pulls `sentence-transformers>=3.0`, `torch>=2.2`, and `numpy>=1.26`. Windows users may need the VC++ Build Tools (and the right CUDA runtime if you target a GPU). Once installed you can download Hugging Face models or point at an on-disk clone without polluting the default runtime environment.
+
 ### Embedding backends & configuration
 
 Phase 3 outline/retrieval tooling relies on an embedding index that can speak either native OpenAI embeddings or any LangChain-compatible provider. The runtime picks the backend from **Settings → AI → Embeddings** and mirrors the choice into telemetry/status widgets.
 
 1. **Enable the tools** – Toggle **Settings → Experimental → Phase 3 outline tools** (or launch with `--enable-phase3-outline-tools`) so the outline worker + embedding runtime spin up.
-2. **Choose a backend** – In the settings dialog select `Auto/OpenAI`, `LangChain`, or `Disabled`. `Auto` resolves to OpenAI unless the feature flag is off. The same knobs are exposed via CLI/environment overrides:
+2. **Pick a mode + backend** – The settings dialog exposes a mode selector (`Same API`, `Custom API`, `Local`) plus a backend dropdown. The remote modes map to the OpenAI/LangChain stack (`auto`, `openai`, `langchain`, or `disabled`), while `Local` forces `sentence-transformers`. CLI/env overrides remain available for the backend:
 	 - CLI: `uv run tinkerbell --embedding-backend langchain --embedding-model deepseek-embedding`
 	 - Env vars: `TINKERBELL_EMBEDDING_BACKEND=langchain`, `TINKERBELL_EMBEDDING_MODEL=deepseek-embedding`
-3. **Provide credentials** – OpenAI embeddings reuse the global API key/base URL/org. LangChain adapters fall back to `langchain_openai.OpenAIEmbeddings`, so install `langchain-openai` and set the relevant API key/env vars for whichever provider you target.
+3. **Provide credentials or a model path** – Remote backends reuse the global API key/base URL/org (or `metadata.embedding_api.*` when the custom mode is enabled). Local mode expects a SentenceTransformers repo or folder plus optional device/dtype/cache overrides.
 	- The app auto-detects common LangChain families (OpenAI, DeepSeek, GLM/Zhipu, Moonshot/Kimi). It inspects `embedding_model_name` (or `settings.metadata["langchain_provider_family"]` / `TINKERBELL_LANGCHAIN_PROVIDER_FAMILY`) and wires the correct base URL, tokenizer hint, and embedding dimensionality. Provider-specific API keys can live in `settings.metadata["<family>_api_key"]` or env vars such as `DEEPSEEK_API_KEY`, `GLM_API_KEY`, and `MOONSHOT_API_KEY`. Override URLs per family with `settings.metadata["<family>_base_url"]` when needed. Unknown models fall back to the stock OpenAI configuration until you supply manual overrides.
-4. **Advanced overrides** – When you need a non-OpenAI LangChain class, drop this into `settings.metadata` (or export `TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS/KWARGS`):
+4. **Test the backend** – Click **Test Embeddings** in the dialog to run a short encode roundtrip. Remote errors usually signal invalid credentials or missing LangChain providers; local errors usually mean the embeddings extra is not installed (`uv sync --extra embeddings`) or the model path/device is unavailable.
+5. **Advanced overrides** – When you need a non-OpenAI LangChain class, drop this into `settings.metadata` (or export `TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS/KWARGS`):
 
 	 ```jsonc
 	 {
@@ -125,7 +136,17 @@ Phase 3 outline/retrieval tooling relies on an embedding index that can speak ei
 	 ```
 
 	 The kwargs blob can be stored as a dict in `settings.metadata` or as a JSON string in `TINKERBELL_LANGCHAIN_EMBEDDINGS_KWARGS`. All fields merge with the automatically supplied `model` argument.
-5. **Observe the runtime** – The status bar shows `Embeddings: LangChain/OpenAI/Error` labels, and every `ContextUsageEvent` now includes `embedding_backend`, `embedding_model`, and `embedding_status` so exports/audits can segment LangChain usage.
+6. **Observe the runtime** – The status bar shows `Embeddings: OpenAI/LangChain/SentenceTransformers/Error` labels, and every `ContextUsageEvent` now includes `embedding_backend`, `embedding_model`, and `embedding_status` so exports/audits can segment remote vs. local runs.
+
+#### Bring-your-own SentenceTransformers models (local mode)
+
+1. Run `uv sync --extra embeddings` (or `pip install -e '.[embeddings]'`) to pull in PyTorch + SentenceTransformers.
+2. Download or clone your preferred model (`sentence-transformers/all-MiniLM-L6-v2`, `BAAI/bge-large-en-v1.5`, etc.) and note the directory path. Hugging Face repo IDs can also be entered directly and will be cached locally.
+3. Open **Settings → AI → Embeddings**, set **Mode** to `Local`, and paste the model path/repo ID. Optional fields cover device targeting (`cpu`, `cuda:0`, `mps`), Torch dtype overrides, cache directory, and batch size.
+4. Press **Test Embeddings** to confirm the model loads before closing the dialog. The validator performs a tiny encode call and reports timing/errors inline.
+5. Save, reopen your document, and watch the status bar flip to `Embeddings: SentenceTransformers` once the worker hydrates the local encoder.
+
+> Licensing reminder: local models (and remote BYO providers) ship under their own licenses. Review the upstream terms for every model you install and make sure you have permission to run it with your data; TinkerBell only wires the runtime and cannot grant redistribution or attribution rights on your behalf.
 
 If embeddings are disabled or initialization fails, the outline worker keeps running but retrieval calls degrade gracefully and telemetry marks the backend as `unavailable`.
 

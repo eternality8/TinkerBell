@@ -4490,6 +4490,7 @@ class MainWindow(QMainWindow):
                 response_token_reserve=getattr(settings, "response_token_reserve", 16_000),
                 budget_policy=policy,
                 subagent_config=self._build_subagent_runtime_config(settings),
+                temperature=getattr(settings, "temperature", 0.2),
             )
         except Exception as exc:
             _LOGGER.warning("Failed to initialize AI controller: %s", exc)

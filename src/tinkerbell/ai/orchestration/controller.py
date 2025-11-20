@@ -437,6 +437,7 @@ class AIController:
     max_tool_followup_user_prompts: int = 1
     max_context_tokens: int = 128_000
     response_token_reserve: int = 16_000
+    temperature: float = 0.2
     telemetry_enabled: bool = False
     telemetry_limit: int = 200
     telemetry_sink: TelemetrySink | None = None
@@ -476,6 +477,7 @@ class AIController:
         config.max_iterations = self._normalize_iterations(config.max_iterations)
         self.agent_config = config.clamp()
         self.max_tool_iterations = self.agent_config.max_iterations
+        self.temperature = self._normalize_temperature(self.temperature)
         self._rebuild_graph()
         self._subagent_runtime = SubagentRuntimeManager(tool_resolver=self._tool_registry_snapshot)
         self.configure_context_window(
@@ -633,6 +635,11 @@ class AIController:
             self.response_token_reserve = self._normalize_response_reserve(response_token_reserve)
         else:
             self.response_token_reserve = self._normalize_response_reserve(self.response_token_reserve)
+
+    def set_temperature(self, value: float | None) -> None:
+        """Update the default sampling temperature used for chat turns."""
+
+        self.temperature = self._normalize_temperature(value)
 
     def configure_chunking(
         self,
@@ -1605,7 +1612,11 @@ class AIController:
     async def _complete_simple_chat(self, messages: Sequence[Mapping[str, Any]]) -> str:
         chunks: list[str] = []
         final_chunk: str | None = None
-        async for event in self.client.stream_chat(messages=messages, temperature=0.3, max_tokens=300):
+        async for event in self.client.stream_chat(
+            messages=messages,
+            temperature=self.temperature,
+            max_tokens=300,
+        ):
             if event.type == "content.delta" and event.content:
                 chunks.append(str(event.content))
             elif event.type == "content.done" and event.content:
@@ -1667,6 +1678,17 @@ class AIController:
         except (TypeError, ValueError):
             candidate = default
         return max(4_000, min(candidate, 64_000))
+
+    @staticmethod
+    def _normalize_temperature(value: float | None) -> float:
+        default = 0.2
+        if value is None:
+            return default
+        try:
+            candidate = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(0.0, min(candidate, 2.0))
 
     def _effective_response_reserve(self, context_limit: int) -> int:
         limit = max(0, int(context_limit))
@@ -2746,6 +2768,7 @@ class AIController:
         }
         if max_completion_tokens is not None:
             stream_kwargs["max_completion_tokens"] = max_completion_tokens
+        stream_kwargs["temperature"] = self.temperature
 
         async for event in self.client.stream_chat(**stream_kwargs):
             await self._dispatch_event(event, on_event)

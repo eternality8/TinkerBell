@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Mapping
 
 from ..ai.ai_types import SubagentRuntimeConfig
 from ..services.settings import Settings
@@ -141,6 +142,7 @@ class SettingsRuntime:
                 response_token_reserve=getattr(settings, "response_token_reserve", 16_000),
                 budget_policy=policy,
                 subagent_config=self._build_subagent_runtime_config(settings),
+                temperature=getattr(settings, "temperature", 0.2),
             )
             controller.configure_chunking(
                 default_profile=getattr(settings, "chunk_profile", "auto"),
@@ -220,6 +222,7 @@ class SettingsRuntime:
             self._apply_context_policy_settings(controller, settings)
             self._apply_subagent_runtime_config(controller, settings)
             self._apply_chunking_settings(controller, settings)
+            self._apply_temperature_setting(controller, settings)
 
         self._update_ai_debug_logging(bool(getattr(settings, "debug_logging", False)))
 
@@ -230,7 +233,7 @@ class SettingsRuntime:
         if settings is None:
             return None
         headers = tuple(sorted((settings.default_headers or {}).items()))
-        metadata = tuple(sorted((settings.metadata or {}).items()))
+        metadata = _metadata_signature(settings.metadata)
         return (
             settings.base_url,
             settings.api_key,
@@ -334,6 +337,15 @@ class SettingsRuntime:
         except Exception as exc:  # pragma: no cover - defensive guard
             _LOGGER.debug("Unable to update chunking settings: %s", exc)
 
+    def _apply_temperature_setting(self, controller: Any, settings: Settings) -> None:
+        setter = getattr(controller, "set_temperature", None)
+        if not callable(setter):
+            return
+        try:
+            setter(getattr(settings, "temperature", None))
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to update sampling temperature: %s", exc)
+
     def _disable_ai_controller(self) -> None:
         controller = self._context.ai_controller
         if controller is None and self._ai_client_signature is None:
@@ -352,3 +364,21 @@ class SettingsRuntime:
 
 
 __all__ = ["SettingsRuntime"]
+
+
+def _metadata_signature(metadata: Any) -> tuple[tuple[str, str], ...]:
+    if not isinstance(metadata, Mapping):
+        return ()
+    entries: list[tuple[str, str]] = []
+    for key, value in sorted(metadata.items(), key=lambda item: str(item[0])):
+        entries.append((str(key), _stable_metadata_value(value)))
+    return tuple(entries)
+
+
+def _stable_metadata_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except TypeError:
+        return repr(value)

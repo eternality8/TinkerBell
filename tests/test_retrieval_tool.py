@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import cast
+
+import pytest
 
 from tinkerbell.ai.memory.buffers import DocumentSummaryMemory, OutlineNode
 from tinkerbell.ai.memory.embeddings import (
     ChunkEmbeddingRecord,
     DocumentEmbeddingIndex,
     EmbeddingMatch,
+    LocalEmbeddingProvider,
 )
 from tinkerbell.ai.tools.document_find_sections import DocumentFindSectionsTool
 from tinkerbell.editor.document_model import DocumentMetadata, DocumentState
@@ -164,6 +168,61 @@ def test_retrieval_tool_reports_provider_error_and_falls_back() -> None:
     assert payload["provider"] == "error-stub"
 
 
+@pytest.mark.asyncio
+async def test_retrieval_tool_ingests_with_local_embedding_provider(tmp_path: Path) -> None:
+    document = DocumentState(
+        text="""## Intro\nAlpha beta text\n## Details\nGamma delta epsilon""",
+        document_id="doc-local",
+    )
+    nodes = _build_local_outline_nodes(document)
+    memory = DocumentSummaryMemory()
+    memory.update(
+        document.document_id,
+        summary="Summary",
+        nodes=nodes,
+        version_id=document.version_id,
+        outline_hash="outline-local",
+    )
+
+    def _vectorize(texts: list[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for text in texts:
+            lowered = text.lower()
+            vectors.append([1.0 if "gamma" in lowered else 0.0, float(len(text))])
+        return vectors
+
+    provider = LocalEmbeddingProvider(embed_batch=_vectorize, name="local:dummy", max_batch_size=4)
+    index = DocumentEmbeddingIndex(
+        storage_dir=tmp_path,
+        provider=provider,
+        loop=asyncio.get_running_loop(),
+        mode="local",
+        provider_label="SentenceTransformers",
+    )
+
+    ingest = await index.ingest_outline(document=document, nodes=nodes, outline_hash="outline-local")
+    assert ingest.embedded == len(nodes)
+
+    tool = DocumentFindSectionsTool(
+        embedding_index=index,
+        document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
+        outline_memory=memory,
+    )
+
+    response = await asyncio.to_thread(tool.run, document_id=document.document_id, query="Gamma delta")
+
+    assert response["status"] == "ok"
+    assert response["strategy"] == "embedding"
+    assert response["offline_mode"] is False
+    assert response["pointers"]
+    pointer = response["pointers"][0]
+    assert pointer["outline_node_id"] == nodes[1].id
+    outline_context = pointer.get("outline_context", {})
+    assert outline_context.get("node_id") == nodes[1].id
+
+    await index.aclose()
+
+
 def test_retrieval_tool_detects_unsupported_documents() -> None:
     metadata = DocumentMetadata()
     metadata.path = Path("manual.pdf")
@@ -224,6 +283,35 @@ def _build_chunk_record(
         dims=3,
         vector=(0.1, 0.2, 0.3),
     )
+
+
+def _build_local_outline_nodes(document: DocumentState) -> list[OutlineNode]:
+    text = document.text
+    divider = text.index("## Details")
+    intro_range = (0, divider)
+    details_range = (divider, len(text))
+    return [
+        OutlineNode(
+            id="local-node-0",
+            parent_id=None,
+            level=1,
+            text="Intro",
+            char_range=intro_range,
+            chunk_id=f"{document.document_id}-intro",
+            blurb="Intro section",
+            token_estimate=12,
+        ),
+        OutlineNode(
+            id="local-node-1",
+            parent_id=None,
+            level=1,
+            text="Details",
+            char_range=details_range,
+            chunk_id=f"{document.document_id}-details",
+            blurb="Details section",
+            token_estimate=16,
+        ),
+    ]
 
 
 class _ErrorEmbeddingIndex:

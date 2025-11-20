@@ -7,17 +7,19 @@ import importlib
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import hashlib
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Mapping, cast
+from typing import Any, Callable, Coroutine, Mapping, Sequence, cast
 
 from ..ai.memory import (
     DocumentEmbeddingIndex,
     EmbeddingProvider,
     LangChainEmbeddingProvider,
+    LocalEmbeddingProvider,
     OpenAIEmbeddingProvider,
 )
-from ..services.settings import Settings
+from ..services.settings import DEFAULT_EMBEDDING_MODE, EMBEDDING_MODE_CHOICES, Settings
 from ..widgets.status_bar import StatusBar
 
 LOGGER = logging.getLogger(__name__)
@@ -35,6 +37,7 @@ class EmbeddingRuntimeState:
     status: str = "disabled"
     detail: str | None = None
     error: str | None = None
+    mode: str = DEFAULT_EMBEDDING_MODE
 
     @property
     def label(self) -> str:
@@ -50,7 +53,37 @@ class EmbeddingRuntimeState:
             "embedding_model": self.model,
             "embedding_status": self.status,
             "embedding_detail": self.detail or self.error,
+            "embedding_mode": self.mode,
         }
+
+
+@dataclass(slots=True)
+class EmbeddingValidationResult:
+    status: str
+    detail: str | None = None
+    error: str | None = None
+
+
+class EmbeddingValidator:
+    """Lightweight helper that validates embedding providers asynchronously."""
+
+    def __init__(self, *, sample_text: str = "TinkerBell embeddings validation ping", timeout: float = 15.0) -> None:
+        self._sample_text = sample_text
+        self._timeout = timeout
+
+    async def validate(self, provider: EmbeddingProvider, *, mode: str) -> EmbeddingValidationResult:
+        async def _run() -> None:
+            if mode == "local":
+                await provider.embed_documents([self._sample_text])
+            else:
+                await provider.embed_query(self._sample_text)
+
+        try:
+            await asyncio.wait_for(_run(), timeout=self._timeout)
+        except Exception as exc:
+            LOGGER.warning("Embedding validation failed (%s backend): %s", mode, exc)
+            return EmbeddingValidationResult(status="error", error=f"Validation failed: {exc}")
+        return EmbeddingValidationResult(status="ready", detail="Validated")
 
 
 @dataclass(slots=True, frozen=True)
@@ -149,6 +182,7 @@ class EmbeddingController:
         self._embedding_signature: tuple[Any, ...] | None = None
         self._embedding_snapshot_metadata: dict[str, Any] = {}
         self._embedding_resource: Any | None = None
+        self._validator = EmbeddingValidator()
 
     # ------------------------------------------------------------------
     # Life-cycle hooks
@@ -168,28 +202,40 @@ class EmbeddingController:
             )
             return
 
-        backend = (getattr(settings, "embedding_backend", "auto") or "auto").strip().lower()
-        if backend in {"", "auto"}:
-            backend = "openai"
+        metadata = getattr(settings, "metadata", {}) or {}
+        mode = self._resolve_embedding_mode(metadata)
+        backend = self._normalize_backend(getattr(settings, "embedding_backend", "auto"), mode)
         if backend == "disabled":
             self._teardown_embedding_runtime(reason="Embeddings disabled in settings")
             return
 
         model_name = (getattr(settings, "embedding_model_name", "") or "").strip() or "text-embedding-3-large"
-        signature = self._embedding_settings_signature(settings, backend, model_name)
+        embedding_settings = self._build_embedding_settings(settings, metadata, mode)
+        signature = self._embedding_settings_signature(embedding_settings, backend, model_name, metadata, mode)
         if signature == self._embedding_signature and self._embedding_index is not None:
             self._set_embedding_state(self._embedding_state)
             return
 
         self._teardown_embedding_runtime(reason="Reinitializing embedding backend", keep_status=True)
 
-        provider, provider_state = self._build_embedding_provider(backend, model_name, settings)
+        provider, provider_state = self._build_embedding_provider(
+            backend,
+            model_name,
+            embedding_settings,
+            metadata,
+            mode,
+        )
         if provider is None:
             self._set_embedding_state(provider_state)
             return
 
         cache_root = self._resolve_embedding_cache_root()
-        index = self._create_embedding_index(provider, storage_dir=cache_root)
+        index = self._create_embedding_index(
+            provider,
+            storage_dir=cache_root,
+            mode=mode,
+            provider_label=provider_state.provider_label,
+        )
         if index is None:
             error_state = EmbeddingRuntimeState(
                 backend=backend,
@@ -197,6 +243,7 @@ class EmbeddingController:
                 provider_label=provider_state.provider_label,
                 status="error",
                 error=f"Unable to initialize embedding cache under {cache_root}",
+                mode=mode,
             )
             self._set_embedding_state(error_state)
             return
@@ -205,6 +252,7 @@ class EmbeddingController:
         self._embedding_signature = signature
         self._set_embedding_state(provider_state)
         self.propagate_index_to_worker()
+        self._schedule_validation(provider, mode=mode, signature=signature)
 
     # ------------------------------------------------------------------
     # Public utility helpers
@@ -236,8 +284,66 @@ class EmbeddingController:
     def _resolve_embedding_cache_root(self) -> Path:
         return self._cache_root_resolver()
 
-    def _embedding_settings_signature(self, settings: Settings, backend: str, model: str) -> tuple[Any, ...]:
-        metadata = getattr(settings, "metadata", {}) or {}
+    def _resolve_embedding_mode(self, metadata: Mapping[str, Any]) -> str:
+        raw_value = str(metadata.get("embedding_mode") or DEFAULT_EMBEDDING_MODE).strip().lower()
+        if raw_value in EMBEDDING_MODE_CHOICES:
+            return raw_value
+        return DEFAULT_EMBEDDING_MODE
+
+    def _normalize_backend(self, backend: str | None, mode: str) -> str:
+        normalized = (backend or "auto").strip().lower()
+        if normalized in {"", "auto"}:
+            normalized = "openai"
+        if mode == "local":
+            return "sentence-transformers"
+        if normalized == "sentence-transformers" and mode != "local":
+            return "openai"
+        return normalized
+
+    def _build_embedding_settings(self, settings: Settings, metadata: Mapping[str, Any], mode: str) -> Settings:
+        if mode != "custom-api":
+            return settings
+        payload = metadata.get("embedding_api")
+        if not isinstance(payload, Mapping):
+            return settings
+        overrides: dict[str, Any] = {}
+        for field_name in (
+            "base_url",
+            "api_key",
+            "organization",
+            "request_timeout",
+            "max_retries",
+            "retry_min_seconds",
+            "retry_max_seconds",
+        ):
+            value = payload.get(field_name)
+            if value in (None, ""):
+                continue
+            try:
+                if field_name in {"request_timeout", "retry_min_seconds", "retry_max_seconds"}:
+                    overrides[field_name] = float(value)
+                elif field_name == "max_retries":
+                    overrides[field_name] = int(value)
+                else:
+                    overrides[field_name] = value
+            except (TypeError, ValueError):
+                continue
+        headers = payload.get("default_headers")
+        if isinstance(headers, Mapping) and headers:
+            normalized_headers = {str(k): str(v) for k, v in headers.items()}
+            overrides["default_headers"] = normalized_headers
+        if not overrides:
+            return settings
+        return replace(settings, **overrides)
+
+    def _embedding_settings_signature(
+        self,
+        settings: Settings,
+        backend: str,
+        model: str,
+        metadata: Mapping[str, Any],
+        mode: str,
+    ) -> tuple[Any, ...]:
         class_override = metadata.get("langchain_embeddings_class")
         kwargs_payload = metadata.get("langchain_embeddings_kwargs")
         provider_hint = metadata.get("langchain_provider_family")
@@ -258,23 +364,59 @@ class EmbeddingController:
             provider_hint,
             env_provider_family,
             provider_env_secrets,
+            mode,
+            self._signature_for_embedding_api(metadata),
+            self._signature_for_sentence_transformers(metadata),
         )
+
+    @staticmethod
+    def _signature_for_embedding_api(metadata: Mapping[str, Any]) -> str | None:
+        payload = metadata.get("embedding_api")
+        if not isinstance(payload, Mapping):
+            return None
+        filtered: dict[str, Any] = {}
+        secret = str(payload.get("api_key") or "").strip()
+        if secret:
+            filtered["api_key_fingerprint"] = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+        for key in ("base_url", "organization", "request_timeout", "max_retries", "retry_min_seconds", "retry_max_seconds"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                filtered[key] = value
+        headers = payload.get("default_headers")
+        if isinstance(headers, Mapping) and headers:
+            filtered["default_headers"] = {str(k): str(v) for k, v in sorted(headers.items(), key=lambda item: str(item[0]))}
+        if not filtered:
+            return None
+        return json.dumps(filtered, sort_keys=True, default=str)
+
+    @staticmethod
+    def _signature_for_sentence_transformers(metadata: Mapping[str, Any]) -> str | None:
+        keys = ("st_model_path", "st_device", "st_dtype", "st_cache_dir", "st_batch_size")
+        filtered = {key: metadata.get(key) for key in keys if metadata.get(key) not in (None, "")}
+        if not filtered:
+            return None
+        return json.dumps(filtered, sort_keys=True, default=str)
 
     def _build_embedding_provider(
         self,
         backend: str,
         model_name: str,
         settings: Settings,
+        metadata: Mapping[str, Any],
+        mode: str,
     ) -> tuple[EmbeddingProvider | None, EmbeddingRuntimeState]:
         if backend == "openai":
-            return self._build_openai_embedding_provider(model_name, settings)
+            return self._build_openai_embedding_provider(model_name, settings, mode)
         if backend == "langchain":
-            return self._build_langchain_embedding_provider(model_name, settings)
+            return self._build_langchain_embedding_provider(model_name, settings, metadata, mode)
+        if backend == "sentence-transformers":
+            return self._build_sentence_transformer_provider(model_name, metadata, mode)
         state = EmbeddingRuntimeState(
             backend=backend,
             model=model_name,
             status="error",
             error=f"Unknown backend '{backend}'",
+            mode=mode,
         )
         return None, state
 
@@ -282,8 +424,16 @@ class EmbeddingController:
         self,
         model_name: str,
         settings: Settings,
+        mode: str,
     ) -> tuple[EmbeddingProvider | None, EmbeddingRuntimeState]:
-        state = EmbeddingRuntimeState(backend="openai", model=model_name, provider_label="OpenAI", status="error")
+        label_suffix = "Shared" if mode == "same-api" else "Custom API"
+        state = EmbeddingRuntimeState(
+            backend="openai",
+            model=model_name,
+            provider_label=f"OpenAI/{label_suffix}",
+            status="error",
+            mode=mode,
+        )
         api_key = (getattr(settings, "api_key", "") or "").strip()
         base_url = (getattr(settings, "base_url", "") or "").strip() or OPENAI_API_BASE_URL
         if not api_key:
@@ -316,10 +466,12 @@ class EmbeddingController:
         self,
         model_name: str,
         settings: Settings,
+        metadata: Mapping[str, Any],
+        mode: str,
     ) -> tuple[EmbeddingProvider | None, EmbeddingRuntimeState]:
-        state = EmbeddingRuntimeState(backend="langchain", model=model_name, provider_label="LangChain")
+        state = EmbeddingRuntimeState(backend="langchain", model=model_name, provider_label="LangChain", mode=mode)
         try:
-            embeddings, provider_template = self._instantiate_langchain_embeddings(model_name, settings)
+            embeddings, provider_template = self._instantiate_langchain_embeddings(model_name, settings, metadata)
         except Exception as exc:
             state.status = "error"
             state.error = str(exc)
@@ -333,15 +485,116 @@ class EmbeddingController:
         state.status = "ready"
         return provider, state
 
-    def _instantiate_langchain_embeddings(self, model_name: str, settings: Settings) -> tuple[Any, _LangChainProviderTemplate]:
-        metadata = getattr(settings, "metadata", {}) or {}
-        class_override = metadata.get("langchain_embeddings_class") or os.environ.get("TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS")
-        raw_kwargs = metadata.get("langchain_embeddings_kwargs") or os.environ.get("TINKERBELL_LANGCHAIN_EMBEDDINGS_KWARGS")
+    def _build_sentence_transformer_provider(
+        self,
+        model_name: str,
+        metadata: Mapping[str, Any],
+        mode: str,
+    ) -> tuple[EmbeddingProvider | None, EmbeddingRuntimeState]:
+        state = EmbeddingRuntimeState(
+            backend="sentence-transformers",
+            model=model_name,
+            provider_label="SentenceTransformers",
+            mode=mode,
+        )
+        target_model = str(metadata.get("st_model_path") or model_name).strip()
+        if not target_model:
+            state.status = "error"
+            state.error = "metadata.st_model_path is required for local embeddings"
+            return None, state
+        batch_override = metadata.get("st_batch_size")
+        try:
+            batch_size = max(1, int(batch_override)) if batch_override is not None else 8
+        except (TypeError, ValueError):
+            state.status = "error"
+            state.error = "metadata.st_batch_size must be an integer"
+            return None, state
+        cache_dir = str(metadata.get("st_cache_dir") or "").strip() or None
+        raw_device = str(metadata.get("st_device") or "auto").strip()
+        device_arg = None if raw_device in {"", "auto"} else raw_device
+        dtype_name = str(metadata.get("st_dtype") or "").strip()
+        model_kwargs: dict[str, Any] | None = None
+        if dtype_name:
+            try:
+                torch_module = importlib.import_module("torch")
+            except Exception as exc:
+                state.status = "error"
+                state.error = f"torch is required when st_dtype is set: {exc}"
+                return None, state
+            dtype_value = getattr(torch_module, dtype_name, None)
+            if dtype_value is None:
+                state.status = "error"
+                state.error = f"Unknown st_dtype '{dtype_name}'"
+                return None, state
+            model_kwargs = {"torch_dtype": dtype_value}
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception as exc:
+            state.status = "error"
+            state.error = (
+                "sentence-transformers is required for local embeddings. Install the 'embeddings' extra."
+                f" ({exc})"
+            )
+            return None, state
+
+        try:
+            model = SentenceTransformer(
+                target_model,
+                device=device_arg,
+                cache_folder=cache_dir,
+                model_kwargs=model_kwargs,
+            )
+        except Exception as exc:
+            state.status = "error"
+            state.error = f"Failed to load SentenceTransformer model: {exc}"
+            return None, state
+
+        async def _encode_batch(texts: Sequence[str]) -> list[list[float]]:
+            inputs = list(texts)
+            if not inputs:
+                return []
+            vectors = await asyncio.to_thread(
+                model.encode,
+                inputs,
+                batch_size=batch_size,
+                convert_to_numpy=True,
+                device=device_arg,
+            )
+            return self._coerce_local_vectors(vectors)
+
+        async def _encode_query(text: str) -> list[float]:
+            batch = await _encode_batch([text])
+            return batch[0]
+
+        provider = LocalEmbeddingProvider(
+            embed_batch=_encode_batch,
+            embed_query=_encode_query,
+            name=f"sentence-transformers:{Path(target_model).name or target_model}",
+            max_batch_size=batch_size,
+        )
+        self._embedding_resource = model
+        state.status = "ready"
+        state.detail = Path(target_model).name or target_model
+        return provider, state
+
+    def _instantiate_langchain_embeddings(
+        self,
+        model_name: str,
+        settings: Settings,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> tuple[Any, _LangChainProviderTemplate]:
+        metadata_payload = metadata or getattr(settings, "metadata", {}) or {}
+        class_override = metadata_payload.get("langchain_embeddings_class") or os.environ.get(
+            "TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS"
+        )
+        raw_kwargs = metadata_payload.get("langchain_embeddings_kwargs") or os.environ.get(
+            "TINKERBELL_LANGCHAIN_EMBEDDINGS_KWARGS"
+        )
         extra_kwargs = self._parse_langchain_kwargs(raw_kwargs)
-        provider_template = self._detect_langchain_provider_template(model_name, metadata)
+        provider_template = self._detect_langchain_provider_template(model_name, metadata_payload)
         params = dict(extra_kwargs)
         params.setdefault("model", model_name)
-        self._apply_langchain_provider_template(params, provider_template, model_name, settings, metadata)
+        self._apply_langchain_provider_template(params, provider_template, model_name, settings, metadata_payload)
         if class_override:
             module_name, _, attr_name = class_override.rpartition(".")
             if not module_name or not attr_name:
@@ -461,15 +714,81 @@ class EmbeddingController:
             return data if isinstance(data, dict) else {}
         return {}
 
-    def _create_embedding_index(self, provider: EmbeddingProvider, *, storage_dir: Path) -> DocumentEmbeddingIndex | None:
+    @staticmethod
+    def _coerce_local_vectors(batch: Any) -> list[list[float]]:
+        payload = batch.tolist() if hasattr(batch, "tolist") else batch
+        if not isinstance(payload, Sequence):
+            raise TypeError("Embedding batch must be a sequence")
+        normalized: list[list[float]] = []
+        for vector in payload:
+            candidate = vector.tolist() if hasattr(vector, "tolist") else vector
+            if not isinstance(candidate, Sequence):
+                raise TypeError("Embedding vector must be a sequence")
+            normalized.append([float(component) for component in candidate])
+        return normalized
+
+    def _create_embedding_index(
+        self,
+        provider: EmbeddingProvider,
+        *,
+        storage_dir: Path,
+        mode: str | None = None,
+        provider_label: str | None = None,
+    ) -> DocumentEmbeddingIndex | None:
         try:
             loop = self._resolve_async_loop()
             if loop is not None:
-                return DocumentEmbeddingIndex(storage_dir=storage_dir, provider=provider, loop=loop)
-            return DocumentEmbeddingIndex(storage_dir=storage_dir, provider=provider)
+                return DocumentEmbeddingIndex(
+                    storage_dir=storage_dir,
+                    provider=provider,
+                    loop=loop,
+                    mode=mode,
+                    provider_label=provider_label,
+                )
+            return DocumentEmbeddingIndex(
+                storage_dir=storage_dir,
+                provider=provider,
+                mode=mode,
+                provider_label=provider_label,
+            )
         except Exception as exc:
             LOGGER.warning("Failed to initialize embedding index: %s", exc)
             return None
+
+    def _schedule_validation(self, provider: EmbeddingProvider, *, mode: str, signature: tuple[Any, ...]) -> None:
+        async def _run() -> None:
+            result = await self._validator.validate(provider, mode=mode)
+            if self._embedding_signature != signature:
+                return
+            self._apply_validation_result(result)
+
+        self._run_background_task(_run)
+
+    def _apply_validation_result(self, result: EmbeddingValidationResult) -> None:
+        current = self._embedding_state
+        if current.backend in {"disabled", "unavailable"}:
+            return
+        success = result.status == "ready"
+        detail = current.detail
+        error = current.error
+        status = current.status
+        if success:
+            status = "ready"
+            detail = result.detail or detail or "Validated"
+            error = None
+        else:
+            status = "error"
+            error = result.error or "Embedding validation failed"
+        updated = EmbeddingRuntimeState(
+            backend=current.backend,
+            model=current.model,
+            provider_label=current.provider_label,
+            status=status,
+            detail=detail,
+            error=error,
+            mode=current.mode,
+        )
+        self._set_embedding_state(updated)
 
     def _teardown_embedding_runtime(
         self,
@@ -533,4 +852,4 @@ class EmbeddingController:
             pass
 
 
-__all__ = ["EmbeddingController", "EmbeddingRuntimeState", "OPENAI_API_BASE_URL"]
+__all__ = ["EmbeddingController", "EmbeddingRuntimeState", "EmbeddingValidator", "OPENAI_API_BASE_URL"]

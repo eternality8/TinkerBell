@@ -17,7 +17,13 @@ from .ai.ai_types import SubagentRuntimeConfig
 from .ai.orchestration import AIController
 from .ai.client import AIClient, ClientSettings
 from .ui.main_window import MainWindow, WindowContext
-from .services.settings import Settings, SettingsStore
+from .services.settings import (
+    Settings,
+    SettingsStore,
+    EMBEDDING_MODE_CHOICES,
+    redact_metadata,
+    redact_secret,
+)
 from .theme import theme_manager
 from .utils import logging as logging_utils
 
@@ -138,6 +144,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         cli_overrides["embedding_backend"] = args.embedding_backend
     if args.embedding_model is not None:
         cli_overrides["embedding_model_name"] = args.embedding_model
+    metadata_override: Dict[str, Any] | None = None
+    if "metadata" in cli_overrides and isinstance(cli_overrides.get("metadata"), Mapping):
+        metadata_override = dict(cli_overrides["metadata"])
+    if args.embedding_mode is not None:
+        metadata_override = dict(metadata_override or {})
+        metadata_override["embedding_mode"] = args.embedding_mode
+    if metadata_override is not None:
+        cli_overrides["metadata"] = metadata_override
 
     overrides_mapping: Dict[str, Any] | None = cli_overrides or None
     settings = load_settings(resolved_path, store=settings_store, overrides=overrides_mapping)
@@ -317,6 +331,7 @@ def _build_ai_controller(settings: Settings, *, debug_logging: bool = False) -> 
         max_tool_iterations=limit,
         max_context_tokens=context_tokens,
         response_token_reserve=response_reserve,
+        temperature=getattr(settings, "temperature", 0.2),
         telemetry_enabled=telemetry_enabled,
         telemetry_limit=telemetry_limit,
         subagent_config=subagent_config,
@@ -404,9 +419,14 @@ def _parse_cli_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, lis
         help="Disable plot/entity scaffolding for this session.",
     )
     parser.add_argument(
+        "--embedding-mode",
+        choices=EMBEDDING_MODE_CHOICES,
+        help="Select the embeddings mode (same-api, custom-api, local).",
+    )
+    parser.add_argument(
         "--embedding-backend",
-        choices=["auto", "openai", "langchain", "disabled"],
-        help="Override the embedding backend (auto, openai, langchain, disabled).",
+        choices=["auto", "openai", "langchain", "sentence-transformers", "st", "disabled"],
+        help="Override the embedding backend (auto, openai, langchain, sentence-transformers, disabled).",
     )
     parser.add_argument(
         "--embedding-model",
@@ -509,7 +529,8 @@ def _dump_settings(
     payload = asdict(settings)
     api_key = payload.get("api_key", "")
     if isinstance(api_key, str):
-        payload["api_key"] = _redact_secret(api_key)
+        payload["api_key"] = redact_secret(api_key)
+    payload["metadata"] = redact_metadata(payload.get("metadata"))
     metadata = {
         "path": str(store.path),
         "secret_backend": getattr(store.vault, "strategy", "unknown"),
@@ -519,15 +540,6 @@ def _dump_settings(
     output = {"settings": payload, "meta": metadata}
     json.dump(output, destination, indent=2)
     destination.write("\n")
-
-
-def _redact_secret(value: str) -> str:
-    stripped = value.strip()
-    if not stripped:
-        return ""
-    if len(stripped) <= 4:
-        return "*" * len(stripped)
-    return f"{stripped[:2]}{'*' * (len(stripped) - 4)}{stripped[-2:]}"
 
 
 def _active_env_overrides() -> list[str]:
