@@ -26,8 +26,10 @@ from ..chat.commands import (
 from ..chat.message_model import ChatMessage, EditDirective, ToolTrace
 from ..editor.document_model import DocumentMetadata, DocumentState, SelectionRange
 from ..editor.workspace import DocumentTab
+from ..documents.ranges import TextRange
 from ..editor.tabbed_editor import TabbedEditorWidget
 from ..ai.memory.buffers import DocumentSummaryMemory
+from ..services.bridge import DocumentBridge
 from ..services.bridge_router import WorkspaceBridgeRouter
 from ..services.importers import FileImporter
 from ..services.settings import Settings, SettingsStore
@@ -120,6 +122,9 @@ class MainWindow(QMainWindow):
         self._chat_panel = ChatPanel(show_tool_activity_panel=show_tool_panel)
         self._bridge = WorkspaceBridgeRouter(self._workspace)
         self._editor.add_tab_created_listener(self._bridge.track_tab)
+        self._safe_ai_config: tuple[bool, int, float] = (False, 2, 0.05)
+        self._editor.add_tab_created_listener(self._handle_tab_created_for_safe_editing)
+        self._apply_safe_edit_settings(initial_settings)
         self._status_bar = StatusBar()
         self._status_bar.set_document_status_callback(self._handle_document_status_clicked)
         self._document_monitor: DocumentStateMonitor | None = None
@@ -1599,13 +1604,15 @@ class MainWindow(QMainWindow):
             self._chat_panel.set_ai_running(False)
 
     def _handle_edit_applied(self, directive: EditDirective, _state: DocumentState, diff: str) -> None:
+        self._emit_guardrail_notice(None, None)
         summary = f"Applied {directive.action} ({diff})"
         self.update_status(summary)
         metadata: Dict[str, Any] = {}
-        range_hint: tuple[int, int] = directive.target_range
+        range_hint: TextRange = directive.target_range
         context = getattr(self._bridge, "last_edit_context", None)
         if directive.action == ActionType.PATCH.value and context is not None:
             range_hint = context.target_range
+        range_summary = range_hint.to_tuple()
         if directive.action == "replace":
             if context is not None and context.action == "replace":
                 metadata["text_before"] = context.replaced_text
@@ -1619,7 +1626,7 @@ class MainWindow(QMainWindow):
                 metadata["spans"] = context.spans
         trace = ToolTrace(
             name=f"edit:{directive.action}",
-            input_summary=f"range={range_hint}",
+            input_summary=f"range={range_summary}",
             output_summary=diff,
             metadata=metadata,
         )
@@ -1672,14 +1679,133 @@ class MainWindow(QMainWindow):
         )
         self._document_monitor.update_autosave_indicator(document=current_document or _state)
 
-    def _handle_edit_failure(self, directive: EditDirective, message: str) -> None:
+    def _handle_edit_failure(
+        self,
+        directive: EditDirective,
+        message: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         action = (directive.action or "").strip().lower()
+        context = dict(metadata or {})
+        reason = context.get("reason") or message or "Edit failed"
+        tab_hint = context.get("tab_id")
+        detail_bits: list[str] = []
+        status_hint = context.get("status")
+        cause_hint = context.get("cause")
+        range_count = context.get("range_count")
+        if status_hint:
+            detail_bits.append(f"status={status_hint}")
+        if cause_hint:
+            detail_bits.append(f"cause={cause_hint}")
+        if isinstance(range_count, int):
+            detail_bits.append(f"ranges={range_count}")
+        if context.get("streamed"):
+            detail_bits.append("streamed")
+        if tab_hint:
+            detail_bits.append(f"tab={tab_hint}")
+        detail_suffix = f" ({', '.join(detail_bits)})" if detail_bits else ""
+
         if action == ActionType.PATCH.value:
-            notice = message or "Patch rejected"
-            self.update_status("Patch rejected – ask TinkerBell to re-sync")
-            self._post_assistant_notice(f"Patch apply failed: {notice}. Please request a fresh snapshot.")
+            guardrail_notice = self._describe_safe_edit_guardrail(context, reason)
+            if guardrail_notice is not None:
+                status_text, detail_text, toast_text = guardrail_notice
+                self.update_status(f"Safe edit blocked patch{detail_suffix}")
+                self._emit_guardrail_notice(status_text, detail_text)
+                if toast_text:
+                    self._post_assistant_notice(toast_text)
+                return
+
+            self._emit_guardrail_notice(None, None)
+            self.update_status(f"Patch rejected{detail_suffix}")
+            sentences = [f"Patch apply failed: {reason}."]
+            if detail_bits:
+                sentences.append(f"Details: {', '.join(detail_bits)}.")
+            sentences.append("Request a fresh snapshot before retrying.")
+            self._post_assistant_notice(" ".join(sentences))
         else:
-            self.update_status(f"Edit failed: {message or 'Unknown error'}")
+            self.update_status(f"Edit failed: {reason}{detail_suffix}")
+            if detail_bits:
+                self._post_assistant_notice(
+                    f"Edit failed ({', '.join(detail_bits)}): {reason}"
+                )
+
+    def _describe_safe_edit_guardrail(
+        self,
+        metadata: Mapping[str, Any] | None,
+        reason: str,
+    ) -> tuple[str, str, str] | None:
+        if not metadata:
+            return None
+        cause = str(metadata.get("cause") or "").strip()
+        if cause != DocumentBridge.CAUSE_INSPECTOR_FAILURE:
+            return None
+        diagnostics = metadata.get("diagnostics")
+        diag_map = diagnostics if isinstance(diagnostics, Mapping) else {}
+        reason_text = self._condense_whitespace(str(metadata.get("reason") or reason or ""))
+        detail_bits: list[str] = []
+        if reason_text:
+            detail_bits.append(reason_text)
+        duplicate = diag_map.get("duplicate")
+        if isinstance(duplicate, Mapping):
+            count = duplicate.get("count")
+            snippet = self._summarize_inspector_snippet(duplicate.get("paragraph"))
+            if count and snippet:
+                detail_bits.append(f"Repeated paragraph ({count}×): {snippet}")
+        boundary = diag_map.get("boundary")
+        if isinstance(boundary, Mapping):
+            detail = boundary.get("detail")
+            if detail:
+                detail_bits.append(str(detail))
+        split = diag_map.get("split")
+        if isinstance(split, Mapping):
+            detail = split.get("detail")
+            if detail:
+                detail_bits.append(str(detail))
+        window_hint = ""
+        window = diag_map.get("window")
+        if isinstance(window, Mapping):
+            start = window.get("start")
+            end = window.get("end")
+            if isinstance(start, int) and isinstance(end, int) and end > start:
+                length = max(1, end - start)
+                window_hint = f"Inspect characters {start:,}–{end:,} (~{length:,} chars)."
+                detail_bits.append(window_hint)
+        detail_text = " ".join(bit for bit in detail_bits if bit).strip()
+        reason_label = self._summarize_guardrail_reason(reason_text)
+        status_text = f"Safe Edit: {reason_label}" if reason_label else "Safe Edit Blocked"
+        toast_lines = ["Safe edit guardrail rejected the patch."]
+        if reason_text:
+            toast_lines.append(reason_text)
+        if window_hint:
+            toast_lines.append(window_hint)
+        toast_lines.append("Request a fresh snapshot before retrying.")
+        toast_text = " ".join(line for line in toast_lines if line)
+        return (status_text, detail_text or status_text, toast_text)
+
+    def _emit_guardrail_notice(self, status: str | None, detail: str | None) -> None:
+        if self._status_bar is not None:
+            self._status_bar.set_guardrail_notice(status, detail=detail)
+        setter = getattr(self._chat_panel, "set_guardrail_state", None)
+        if callable(setter):
+            setter(status, detail=detail, category="safe_edit")
+
+    def _summarize_guardrail_reason(self, reason: str, *, limit: int = 60) -> str:
+        text = self._condense_whitespace(reason)
+        if not text:
+            return ""
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit - 1].rstrip()}…"
+
+    def _summarize_inspector_snippet(self, value: Any, *, limit: int = 80) -> str:
+        if value is None:
+            return ""
+        text = self._condense_whitespace(str(value))
+        if not text:
+            return ""
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit - 1].rstrip()}…"
 
     def _maybe_clear_diff_overlay(self, state: DocumentState) -> None:
         if self._review_overlay_manager is not None:
@@ -1859,6 +1985,7 @@ class MainWindow(QMainWindow):
             chat_panel_handler=self._apply_chat_panel_settings,
             phase3_handler=self._apply_phase3_outline_setting,
             plot_scaffolding_handler=self._apply_plot_scaffolding_setting,
+            safe_edit_handler=self._apply_safe_edit_settings,
         )
         self._document_session.persist_settings(result.settings)
         self.update_status("Settings updated")
@@ -2131,6 +2258,48 @@ class MainWindow(QMainWindow):
         self._unregister_plot_state_tool()
         if self._tool_provider is not None:
             self._tool_provider.reset_plot_state_tool()
+
+    def _handle_tab_created_for_safe_editing(self, tab: DocumentTab) -> None:
+        self._configure_bridge_safe_edits(tab.bridge, self._safe_ai_config)
+
+    def _apply_safe_edit_settings(self, settings: Settings | None) -> None:
+        config = self._coerce_safe_ai_config(settings)
+        if getattr(self, "_safe_ai_config", None) == config:
+            return
+        self._safe_ai_config = config
+        for tab in self._workspace.iter_tabs():
+            self._configure_bridge_safe_edits(tab.bridge, config)
+
+    def _configure_bridge_safe_edits(self, bridge: Any, config: tuple[bool, int, float]) -> None:
+        configure = getattr(bridge, "configure_safe_editing", None)
+        if not callable(configure):  # pragma: no cover - legacy bridge fallback
+            return
+        enabled, duplicate_threshold, token_drift = config
+        try:
+            configure(
+                enabled=enabled,
+                duplicate_threshold=duplicate_threshold,
+                token_drift=token_drift,
+            )
+        except Exception:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to configure safe AI edits", exc_info=True)
+
+    @staticmethod
+    def _coerce_safe_ai_config(settings: Settings | None) -> tuple[bool, int, float]:
+        if settings is None:
+            return (False, 2, 0.05)
+        enabled = bool(getattr(settings, "safe_ai_edits", False))
+        duplicate_raw = getattr(settings, "safe_ai_duplicate_threshold", 2)
+        token_raw = getattr(settings, "safe_ai_token_drift", 0.05)
+        try:
+            duplicate_threshold = max(2, int(duplicate_raw))
+        except (TypeError, ValueError):
+            duplicate_threshold = 2
+        try:
+            token_drift = max(0.0, float(token_raw))
+        except (TypeError, ValueError):
+            token_drift = 0.05
+        return (enabled, duplicate_threshold, token_drift)
 
     def _apply_chat_panel_settings(self, settings: Settings) -> None:
         visible = bool(getattr(settings, "show_tool_activity_panel", False))

@@ -29,6 +29,7 @@ from .chat.message_model import ChatMessage, EditDirective, ToolTrace
 from .editor.document_model import DocumentMetadata, DocumentState, SelectionRange
 from .editor.editor_widget import DiffOverlayState
 from .editor.workspace import DocumentTab
+from .documents.ranges import TextRange
 from .editor.tabbed_editor import TabbedEditorWidget
 from .services import telemetry as telemetry_service
 from .ai.ai_types import SubagentRuntimeConfig
@@ -208,8 +209,11 @@ class EditSummary:
     directive: EditDirective
     diff: str
     spans: tuple[tuple[int, int], ...]
-    range_hint: tuple[int, int]
+    range_hint: TextRange
     created_at: datetime = field(default_factory=_utcnow)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "range_hint", TextRange.from_value(self.range_hint, fallback=(0, 0)))
 
 
 @dataclass(slots=True)
@@ -2620,10 +2624,11 @@ class MainWindow(QMainWindow):
         summary = f"Applied {directive.action} ({diff})"
         self.update_status(summary)
         metadata: Dict[str, Any] = {}
-        range_hint: tuple[int, int] = directive.target_range
+        range_hint: TextRange = directive.target_range
         context = getattr(self._bridge, "last_edit_context", None)
         if directive.action == ActionType.PATCH.value and context is not None:
             range_hint = context.target_range
+        range_summary = range_hint.to_tuple()
         if directive.action == "replace":
             if context is not None and context.action == "replace":
                 metadata["text_before"] = context.replaced_text
@@ -2637,7 +2642,7 @@ class MainWindow(QMainWindow):
                 metadata["spans"] = context.spans
         trace = ToolTrace(
             name=f"edit:{directive.action}",
-            input_summary=f"range={range_hint}",
+            input_summary=f"range={range_summary}",
             output_summary=diff,
             metadata=metadata,
         )
@@ -2690,21 +2695,52 @@ class MainWindow(QMainWindow):
         )
         self._update_autosave_indicator(document=current_document or _state)
 
-    def _handle_edit_failure(self, directive: EditDirective, message: str) -> None:
+    def _handle_edit_failure(
+        self,
+        directive: EditDirective,
+        message: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         action = (directive.action or "").strip().lower()
+        context = dict(metadata or {})
+        reason = context.get("reason") or message or "Edit failed"
+        tab_hint = context.get("tab_id")
+        detail_bits: list[str] = []
+        status_hint = context.get("status")
+        cause_hint = context.get("cause")
+        range_count = context.get("range_count")
+        if status_hint:
+            detail_bits.append(f"status={status_hint}")
+        if cause_hint:
+            detail_bits.append(f"cause={cause_hint}")
+        if isinstance(range_count, int):
+            detail_bits.append(f"ranges={range_count}")
+        if context.get("streamed"):
+            detail_bits.append("streamed")
+        if tab_hint:
+            detail_bits.append(f"tab={tab_hint}")
+        detail_suffix = f" ({', '.join(detail_bits)})" if detail_bits else ""
+
         if action == ActionType.PATCH.value:
-            notice = message or "Patch rejected"
-            self.update_status("Patch rejected – ask TinkerBell to re-sync")
-            self._post_assistant_notice(f"Patch apply failed: {notice}. Please request a fresh snapshot.")
+            self.update_status(f"Patch rejected{detail_suffix}")
+            sentences = [f"Patch apply failed: {reason}."]
+            if detail_bits:
+                sentences.append(f"Details: {', '.join(detail_bits)}.")
+            sentences.append("Request a fresh snapshot before retrying.")
+            self._post_assistant_notice(" ".join(sentences))
         else:
-            self.update_status(f"Edit failed: {message or 'Unknown error'}")
+            self.update_status(f"Edit failed: {reason}{detail_suffix}")
+            if detail_bits:
+                self._post_assistant_notice(
+                    f"Edit failed ({', '.join(detail_bits)}): {reason}"
+                )
 
     def _apply_diff_overlay(
         self,
         trace: ToolTrace,
         *,
         document: DocumentState,
-        range_hint: tuple[int, int],
+        range_hint: TextRange | Mapping[str, Any] | Sequence[int] | tuple[int, int] | None,
         tab_id: str | None = None,
         spans_override: tuple[tuple[int, int], ...] | None = None,
         label_override: str | None = None,
@@ -2712,10 +2748,11 @@ class MainWindow(QMainWindow):
         target_id = tab_id or self._find_tab_id_for_document(document)
         if not target_id:
             return
+        normalized_range = self._coerce_text_range(range_hint)
         metadata = trace.metadata if isinstance(trace.metadata, Mapping) else {}
         spans = spans_override if spans_override is not None else self._coerce_overlay_spans(
             metadata.get("spans"),
-            fallback_range=range_hint,
+            fallback_range=normalized_range,
         )
         diff_payload = metadata.get("diff_preview") if isinstance(metadata, Mapping) else None
         label = label_override or str(diff_payload or trace.output_summary or trace.name)
@@ -2735,7 +2772,7 @@ class MainWindow(QMainWindow):
         self,
         raw_spans: Any,
         *,
-        fallback_range: tuple[int, int] | None,
+        fallback_range: TextRange | Mapping[str, Any] | Sequence[int] | tuple[int, int] | None,
     ) -> tuple[tuple[int, int], ...]:
         spans: list[tuple[int, int]] = []
         if isinstance(raw_spans, Sequence):
@@ -2752,12 +2789,27 @@ class MainWindow(QMainWindow):
                 if end < start:
                     start, end = end, start
                 spans.append((start, end))
-        if not spans and fallback_range is not None and fallback_range[0] != fallback_range[1]:
-            start, end = fallback_range
+        fallback_tuple: tuple[int, int] | None = None
+        if fallback_range is not None:
+            normalized = self._coerce_text_range(fallback_range)
+            fallback_tuple = normalized.to_tuple() if normalized is not None else None
+        if not spans and fallback_tuple is not None and fallback_tuple[0] != fallback_tuple[1]:
+            start, end = fallback_tuple
             if end < start:
                 start, end = end, start
             spans.append((start, end))
         return tuple(spans)
+
+    @staticmethod
+    def _coerce_text_range(
+        range_hint: TextRange | Mapping[str, Any] | Sequence[int] | tuple[int, int] | None,
+    ) -> TextRange | None:
+        if range_hint is None:
+            return None
+        try:
+            return TextRange.from_value(range_hint)
+        except (TypeError, ValueError):
+            return None
 
     def _merge_overlay_spans(
         self,

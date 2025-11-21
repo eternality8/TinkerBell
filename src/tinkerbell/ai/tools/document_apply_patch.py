@@ -10,6 +10,7 @@ from .diff_builder import DiffBuilderTool, StreamedDiffBuilder, StreamedEditRequ
 from .document_edit import DocumentEditTool, Bridge as EditBridge
 from .document_snapshot import SnapshotProvider
 from ...chat.commands import ActionType
+from ...documents.range_normalizer import compose_normalized_replacement, normalize_text_range
 from ...services.bridge import DocumentVersionMismatchError
 from ...services.telemetry import emit as telemetry_emit
 
@@ -55,6 +56,10 @@ class DocumentApplyPatchTool:
         base_text = snapshot.get("text", "")
         if not streaming_mode and not isinstance(base_text, str):
             raise ValueError("Snapshot did not provide document text")
+        if streaming_mode:
+            normalization_text = self._resolve_document_text_for_streaming(snapshot, tab_id=tab_id)
+        else:
+            normalization_text = str(base_text)
 
         document_length = int(snapshot.get("length") or len(base_text))
         selection_tuple = snapshot.get("selection") or (0, 0)
@@ -65,6 +70,7 @@ class DocumentApplyPatchTool:
             requests = self._coerce_streaming_requests(patches or (), length=document_length)
             if not requests:
                 raise ValueError("Patch ranges are required when streaming diffs are enabled")
+            requests = self._normalize_streaming_requests(requests, text=normalization_text)
             streamed_result = self._build_streamed_ranges(requests, snapshot, tab_id=tab_id)
             payload = self._build_streamed_payload(
                 streamed_result,
@@ -133,10 +139,22 @@ class DocumentApplyPatchTool:
             resolved_range=(start, end),
         )
         new_text = str(content)
-        if base_text[start:end] == new_text:
+        normalized = normalize_text_range(base_text, start, end, replacement=new_text)
+        normalized_replacement = compose_normalized_replacement(
+            base_text,
+            normalized,
+            new_text,
+            original_start=start,
+            original_end=end,
+        )
+        if normalized.slice_text == normalized_replacement:
             return "skipped: content already matches selection"
 
-        updated_text = base_text[:start] + new_text + base_text[end:]
+        updated_text = (
+            base_text[: normalized.start]
+            + normalized_replacement
+            + base_text[normalized.end :]
+        )
         filename = self._normalize_filename(snapshot)
         diff = self.diff_builder.run(
             base_text,
@@ -394,6 +412,57 @@ class DocumentApplyPatchTool:
         if rationale is not None:
             payload["rationale"] = rationale
         return payload
+
+    def _resolve_document_text_for_streaming(
+        self,
+        snapshot: Mapping[str, Any],
+        *,
+        tab_id: str | None,
+    ) -> str:
+        text_value = snapshot.get("text")
+        if isinstance(text_value, str) and text_value:
+            return text_value
+        refreshed = dict(self._generate_snapshot(tab_id=tab_id, include_text=True))
+        refreshed_text = refreshed.get("text")
+        if isinstance(refreshed_text, str):
+            return refreshed_text
+        raise ValueError("Unable to load document text for streamed patch normalization")
+
+    def _normalize_streaming_requests(
+        self,
+        requests: Sequence[StreamedEditRequest],
+        *,
+        text: str,
+    ) -> list[StreamedEditRequest]:
+        if not requests:
+            return []
+        document = text or ""
+        normalized_requests: list[StreamedEditRequest] = []
+        for entry in requests:
+            normalized = normalize_text_range(document, entry.start, entry.end, replacement=entry.replacement)
+            normalized_replacement = compose_normalized_replacement(
+                document,
+                normalized,
+                entry.replacement,
+                original_start=entry.start,
+                original_end=entry.end,
+            )
+            chunk_id = entry.chunk_id
+            chunk_hash = entry.chunk_hash
+            if normalized.start != entry.start or normalized.end != entry.end:
+                chunk_id = None
+                chunk_hash = None
+            normalized_requests.append(
+                StreamedEditRequest(
+                    start=normalized.start,
+                    end=normalized.end,
+                    replacement=normalized_replacement,
+                    match_text=normalized.slice_text,
+                    chunk_id=chunk_id,
+                    chunk_hash=chunk_hash,
+                )
+            )
+        return normalized_requests
 
     def _load_window_snapshot(
         self,

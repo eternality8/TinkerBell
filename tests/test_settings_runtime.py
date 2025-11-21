@@ -161,9 +161,10 @@ def test_apply_runtime_settings_creates_controller_and_refreshes_runtime(monkeyp
         chat_panel_handler=lambda s: handlers.setdefault("chat", s is settings),
         phase3_handler=lambda s: handlers.setdefault("phase3", True),
         plot_scaffolding_handler=lambda s: handlers.setdefault("plot", True),
+        safe_edit_handler=lambda s: handlers.setdefault("safe", True),
     )
 
-    assert handlers == {"chat": True, "phase3": True, "plot": True}
+    assert handlers == {"chat": True, "phase3": True, "plot": True, "safe": True}
     assert context.ai_controller is controller
     assert bundle["register_state"]["count"] == 1
     assert telemetry.flags[-1] is True
@@ -199,6 +200,7 @@ def test_apply_runtime_settings_disables_controller_without_credentials() -> Non
         chat_panel_handler=lambda s: None,
         phase3_handler=lambda s: None,
         plot_scaffolding_handler=lambda s: None,
+        safe_edit_handler=lambda s: None,
     )
 
     assert context.ai_controller is None
@@ -222,6 +224,24 @@ def test_event_logging_toggle_updates_controller() -> None:
         chat_panel_handler=lambda s: None,
         phase3_handler=lambda s: None,
         plot_scaffolding_handler=lambda s: None,
+        safe_edit_handler=lambda s: None,
     )
 
     assert controller.event_logging_enabled is True
+
+
+def test_safe_edit_handler_invoked() -> None:
+    base = Settings(api_key="live", base_url="https://api", model="gpt-4o-mini")
+    bundle = _runtime_bundle(base)
+    runtime = bundle["runtime"]
+    invoked: list[Settings] = []
+
+    runtime.apply_runtime_settings(
+        base,
+        chat_panel_handler=lambda s: None,
+        phase3_handler=lambda s: None,
+        plot_scaffolding_handler=lambda s: None,
+        safe_edit_handler=lambda s: invoked.append(s),
+    )
+
+    assert invoked == [base]

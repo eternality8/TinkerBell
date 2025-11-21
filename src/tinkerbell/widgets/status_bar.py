@@ -265,6 +265,8 @@ class StatusBar:
         self._subagent_detail: str = ""
         self._chunk_flow_status: str = ""
         self._chunk_flow_detail: str = ""
+        self._guardrail_status: str = ""
+        self._guardrail_detail: str = ""
         self._analysis_status: str = ""
         self._analysis_detail: str = ""
         self._context_widget = ContextUsageWidget()
@@ -282,6 +284,7 @@ class StatusBar:
         self._autosave_label: Any = None
         self._subagent_label: Any = None
         self._chunk_flow_label: Any = None
+        self._guardrail_label: Any = None
         self._analysis_label: Any = None
 
         if self._qt_bar is not None:
@@ -397,6 +400,22 @@ class StatusBar:
         except Exception:
             pass
 
+    def set_guardrail_notice(self, status: str | None, *, detail: str | None = None) -> None:
+        """Show high-level guardrail notices (e.g., safe edit rejections)."""
+
+        self._guardrail_status = (status or "").strip()
+        self._guardrail_detail = (detail or "").strip()
+        label = self._guardrail_label
+        if label is None:
+            return
+        self._update_label(label, self._format_guardrail_text())
+        visible = bool(self._guardrail_status)
+        try:
+            label.setToolTip(self._guardrail_detail or self._guardrail_status)
+            label.setVisible(visible)
+        except Exception:
+            pass
+
     def set_analysis_state(self, status: str | None, *, detail: str | None = None) -> None:
         """Display the latest preflight analysis summary."""
 
@@ -507,6 +526,10 @@ class StatusBar:
         return (self._chunk_flow_status, self._chunk_flow_detail)
 
     @property
+    def guardrail_notice_state(self) -> tuple[str, str]:
+        return (self._guardrail_status, self._guardrail_detail)
+
+    @property
     def analysis_state(self) -> tuple[str, str]:
         return (self._analysis_status, self._analysis_detail)
 
@@ -550,6 +573,9 @@ class StatusBar:
         self._chunk_flow_label = QLabel(self._format_chunk_flow_text())
         self._chunk_flow_label.setObjectName("tb-status-chunk-flow")
         self._chunk_flow_label.setVisible(False)
+        self._guardrail_label = QLabel(self._format_guardrail_text())
+        self._guardrail_label.setObjectName("tb-status-guardrail")
+        self._guardrail_label.setVisible(False)
         self._analysis_label = QLabel(self._format_analysis_text())
         self._analysis_label.setObjectName("tb-status-analysis")
         self._analysis_label.setVisible(False)
@@ -563,6 +589,7 @@ class StatusBar:
             self._autosave_label,
             self._subagent_label,
             self._chunk_flow_label,
+            self._guardrail_label,
             self._analysis_label,
         ):
             label.setContentsMargins(8, 0, 8, 0)
@@ -603,6 +630,9 @@ class StatusBar:
 
     def _format_chunk_flow_text(self) -> str:
         return f"Chunk Flow: {self._chunk_flow_status}" if self._chunk_flow_status else ""
+
+    def _format_guardrail_text(self) -> str:
+        return f"Guardrail: {self._guardrail_status}" if self._guardrail_status else ""
 
     def _format_analysis_text(self) -> str:
         return f"Analysis: {self._analysis_status}" if self._analysis_status else ""

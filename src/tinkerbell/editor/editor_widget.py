@@ -11,9 +11,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional, Protocol, Sequence
+from typing import Any, Mapping, Optional, Protocol, Sequence
 
 from ..chat.message_model import EditDirective
+from ..documents.ranges import TextRange
 from .document_model import DocumentState, SelectionRange
 from .patches import PatchResult
 from .syntax.markdown import MarkdownPreview, render_preview
@@ -95,7 +96,7 @@ class _UndoEntry:
     """Represents a text snapshot for undo/redo bookkeeping."""
 
     text: str
-    selection: SelectionRange
+    selection: TextRange
 
 
 @dataclass(slots=True)
@@ -196,16 +197,26 @@ class EditorWidget(QWidgetBase):
         self._emit_selection_changed()
         self._mark_change_source("programmatic")
 
+    def restore_document(self, document: DocumentState) -> DocumentState:
+        """Restore a document snapshot without preserving undo history."""
+
+        self.load_document(document)
+        return self.to_document()
+
     def to_document(self) -> DocumentState:
         """Return the current document representation."""
 
         self._state.text = self._text_buffer
         return self._state
 
-    def apply_selection(self, selection: SelectionRange) -> None:
+    def apply_selection(
+        self,
+        selection: SelectionRange | TextRange | Mapping[str, Any] | Sequence[int],
+    ) -> None:
         """Apply an external selection update to the widget."""
 
-        clamped = self._clamp_range(selection.start, selection.end)
+        normalized = self._coerce_selection(selection)
+        clamped = self._clamp_range(normalized.start, normalized.end)
         self._state.selection = SelectionRange(*clamped)
         if self._qt_editor is not None and QTextCursor is not None:
             cursor = self._qt_editor.textCursor()
@@ -381,7 +392,9 @@ class EditorWidget(QWidgetBase):
         if not self._undo_stack:
             return
         entry = self._undo_stack.pop()
-        self._redo_stack.append(_UndoEntry(text=self._text_buffer, selection=self._state.selection))
+        self._redo_stack.append(
+            _UndoEntry(text=self._text_buffer, selection=self._state.selection.to_text_range())
+        )
         self._text_buffer = entry.text
         self._state.text = entry.text
         self.apply_selection(entry.selection)
@@ -397,7 +410,9 @@ class EditorWidget(QWidgetBase):
         if not self._redo_stack:
             return
         entry = self._redo_stack.pop()
-        self._undo_stack.append(_UndoEntry(text=self._text_buffer, selection=self._state.selection))
+        self._undo_stack.append(
+            _UndoEntry(text=self._text_buffer, selection=self._state.selection.to_text_range())
+        )
         self._text_buffer = entry.text
         self._state.text = entry.text
         self.apply_selection(entry.selection)
@@ -436,7 +451,7 @@ class EditorWidget(QWidgetBase):
         return start, end
 
     def _push_undo_snapshot(self, previous_text: str) -> None:
-        entry = _UndoEntry(text=previous_text, selection=self._state.selection)
+        entry = _UndoEntry(text=previous_text, selection=self._state.selection.to_text_range())
         self._undo_stack.append(entry)
         if len(self._undo_stack) > self.MAX_HISTORY:
             self._undo_stack.pop(0)
@@ -471,6 +486,15 @@ class EditorWidget(QWidgetBase):
     def _emit_selection_changed(self) -> None:
         for listener in list(self._selection_listeners):
             listener(self._state.selection)
+
+    def _coerce_selection(
+        self,
+        selection: SelectionRange | TextRange | Mapping[str, Any] | Sequence[int],
+    ) -> SelectionRange:
+        try:
+            return SelectionRange.from_value(selection)
+        except (TypeError, ValueError) as exc:  # pragma: no cover - defensive guard
+            raise ValueError("Selection must provide start/end bounds") from exc
 
     # Qt callbacks -----------------------------------------------------
     def _handle_qt_text_changed(self) -> None:

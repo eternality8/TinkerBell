@@ -8,6 +8,7 @@ from typing import Any, Callable, ClassVar, Iterable, Mapping, Protocol, Sequenc
 
 from ...chat.commands import ActionType, extract_tab_reference, parse_agent_payload, resolve_tab_reference
 from ...chat.message_model import EditDirective
+from ...documents.range_normalizer import compose_normalized_replacement, normalize_text_range
 from ...services.telemetry import emit as telemetry_emit
 from .diff_builder import DiffBuilderTool
 
@@ -32,14 +33,15 @@ class Bridge(Protocol):
 
 DirectiveInput = EditDirective | Mapping[str, Any] | str | bytes
 
+_DOCUMENT_SCOPE_TOKENS = {"document"}
+
 
 @dataclass(slots=True)
 class DocumentEditTool:
     """Apply validated edit directives via the bridge."""
 
     bridge: Bridge
-    patch_only: bool = False
-    allow_inline_edits: bool = False
+    patch_only: bool = True
     diff_builder: DiffBuilderTool = field(default_factory=DiffBuilderTool)
     diff_context_lines: int = 5
     anchor_event: str = "patch.anchor"
@@ -49,11 +51,15 @@ class DocumentEditTool:
         payload = self._coerce_input(self._resolve_input(directive, fields))
         tab_id = self._normalize_tab_id(tab_id, payload)
         action = self._resolve_action(payload)
-        payload = self._validate_payload(payload, action)
-        if self.patch_only and action in {ActionType.REPLACE.value, ActionType.INSERT.value, ActionType.ANNOTATE.value}:
+        if action == ActionType.PATCH.value:
+            payload = self._prepare_patch_payload(payload)
+        elif self.patch_only:
             payload = self._auto_convert_to_patch_with_retry(payload, tab_id=tab_id)
             action = ActionType.PATCH.value
-        self._enforce_patch_mode(action)
+        else:
+            raise ValueError(
+                "DocumentEditTool is configured for diff-only edits; convert content edits into patches before calling document_edit."
+            )
         self._queue_edit(payload, tab_id=tab_id)
 
         diff = self._last_diff(tab_id)
@@ -84,15 +90,6 @@ class DocumentEditTool:
             return payload.action.lower()
         action = payload.get("action") if isinstance(payload, Mapping) else None
         return str(action).lower() if action else ""
-
-    def _validate_payload(self, payload: EditDirective | Mapping[str, Any], action: str):
-        if action == ActionType.PATCH.value:
-            return self._prepare_patch_payload(payload)
-        if not self.allow_inline_edits and not self.patch_only:
-            raise ValueError(
-                "DocumentEditTool is configured for diff-only edits; call document_apply_patch to convert inline content edits into patches."
-            )
-        return payload
 
     def _prepare_patch_payload(self, payload: EditDirective | Mapping[str, Any]) -> Mapping[str, Any]:
         if isinstance(payload, EditDirective):
@@ -181,16 +178,6 @@ class DocumentEditTool:
             return None
         token_text = str(token).strip()
         return token_text or None
-
-    def _enforce_patch_mode(self, action: str) -> None:
-        if self.patch_only and action != ActionType.PATCH.value:
-            raise ValueError(
-                "Patch-only mode requires unified diff directives; call document_apply_patch (or diff_builder + document_edit) to convert your content edits into a patch."
-            )
-        if action != ActionType.PATCH.value and not self.allow_inline_edits:
-            raise ValueError(
-                "DocumentEditTool is configured for diff-only edits; convert content edits into patches before calling document_edit."
-            )
 
     def _format_status(self, action: str, diff: str | None, version: str | None) -> str:
         if diff and version:
@@ -326,10 +313,21 @@ class DocumentEditTool:
                 reason="Replace directives require a non-empty target_range",
             )
             raise ValueError("Caret inserts must use the 'insert' action or include an explicit intent flag")
-        match_text_payload = base_text[start:end]
-        updated_text = base_text[:start] + content + base_text[end:]
-        if updated_text == base_text:
+        original_start, original_end = start, end
+        normalized = normalize_text_range(base_text, start, end, replacement=content)
+        normalized_replacement = compose_normalized_replacement(
+            base_text,
+            normalized,
+            content,
+            original_start=original_start,
+            original_end=original_end,
+        )
+        if normalized.slice_text == normalized_replacement:
             raise ValueError("Content already matches document; nothing to patch")
+
+        start, end = normalized.start, normalized.end
+        match_text_payload = normalized.slice_text
+        updated_text = base_text[:start] + normalized_replacement + base_text[end:]
 
         filename = self._normalize_diff_filename(snapshot)
         diff = self.diff_builder.run(
@@ -355,7 +353,7 @@ class DocumentEditTool:
                 {
                     "start": start,
                     "end": end,
-                    "replacement": content,
+                    "replacement": normalized_replacement,
                     "match_text": match_text_payload,
                 }
             ],
@@ -372,7 +370,7 @@ class DocumentEditTool:
         return {
             "action": payload.action,
             "content": payload.content,
-            "target_range": payload.target_range,
+            "target_range": payload.target_range.to_dict(),
             "rationale": payload.rationale,
             "selection_fingerprint": payload.selection_fingerprint,
             "match_text": getattr(payload, "match_text", None),
@@ -544,20 +542,38 @@ class DocumentEditTool:
 
     @staticmethod
     def _resolve_range(
-        target_range: Mapping[str, Any] | Sequence[int] | tuple[int, int] | None,
+        target_range: Mapping[str, Any] | Sequence[int] | tuple[int, int] | str | None,
         selection: Sequence[int],
         length: int,
     ) -> tuple[int, int]:
+        document_scope = False
         if target_range is None:
             start, end = selection if len(selection) == 2 else (0, 0)
+        elif isinstance(target_range, str):
+            token = target_range.strip().lower()
+            if not token or token not in _DOCUMENT_SCOPE_TOKENS:
+                raise ValueError("target_range string must be 'document'")
+            document_scope = True
+            start = 0
+            end = length
         elif isinstance(target_range, Mapping):
-            start = int(target_range.get("start", 0))
-            end = int(target_range.get("end", 0))
+            scope = str(target_range.get("scope", "")).strip().lower()
+            if scope and scope in _DOCUMENT_SCOPE_TOKENS:
+                document_scope = True
+                start, end = 0, length
+            else:
+                start = int(target_range.get("start", 0))
+                end = int(target_range.get("end", 0))
         elif isinstance(target_range, Sequence) and len(target_range) == 2:
             start = int(target_range[0])
             end = int(target_range[1])
         else:
-            raise ValueError("target_range must be a [start, end] sequence or {'start','end'} mapping")
+            raise ValueError(
+                "target_range must be 'document', a [start, end] sequence, or {'start','end'} mapping"
+            )
+
+        if document_scope:
+            return (0, length)
 
         start = max(0, min(start, length))
         end = max(0, min(end, length))

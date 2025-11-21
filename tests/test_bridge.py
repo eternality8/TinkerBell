@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+from typing import Any, Mapping
 
 import pytest
 
@@ -15,6 +16,7 @@ from tinkerbell.ai.memory.cache_bus import (
 from tinkerbell.chat.message_model import EditDirective
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.editor.patches import PatchResult
+from tinkerbell.editor.post_edit_inspector import InspectionResult
 from tinkerbell.services import bridge as bridge_module
 from tinkerbell.services.bridge import DocumentBridge, DocumentVersionMismatchError
 
@@ -78,32 +80,104 @@ def test_generate_snapshot():
     assert snapshot["selection_text"] == editor.state.text[:5]
 
 
-def test_queue_edit_applies_insert_and_tracks_diff():
-    editor = RecordingEditor()
-    bridge = DocumentBridge(editor=editor)
-
-    bridge.queue_edit(EditDirective(action="insert", target_range=(5, 5), content="!!!"))
-
-    assert editor.state.text == "hello!!! world"
-    assert bridge.last_diff_summary == "+3 chars"
-
-
-def test_queue_edit_accepts_dict_and_defaults_to_selection():
-    editor = RecordingEditor()
-    editor.state.selection = SelectionRange(0, 5)
-    bridge = DocumentBridge(editor=editor)
-
-    bridge.queue_edit({"action": "replace", "content": "hi"})
-
-    assert editor.state.text.startswith("hi")
-    assert editor.applied[-1].target_range == (0, 5)
-
-
 def test_queue_edit_rejects_invalid_payload():
     bridge = DocumentBridge(editor=RecordingEditor())
 
     with pytest.raises(ValueError):
         bridge.queue_edit({"content": "oops"})
+
+
+def test_queue_edit_rejects_inline_directives():
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+
+    with pytest.raises(ValueError, match="patch directives"):
+        bridge.queue_edit(EditDirective(action="insert", target_range=(5, 5), content="!!!"))
+
+
+def test_range_patch_expands_to_word_boundaries():
+    editor = RecordingEditor()
+    editor.state.update_text("alpha bravo")
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+
+    payload = {
+        "action": "patch",
+        "document_version": snapshot["version"],
+        "content_hash": snapshot["content_hash"],
+        "ranges": [
+            {"start": 1, "end": 4, "replacement": "ALPHA", "match_text": "lph"},
+        ],
+    }
+
+    bridge.queue_edit(payload)
+
+    assert editor.state.text == "ALPHA bravo"
+    context = bridge.last_edit_context
+    assert context is not None
+    assert context.target_range.to_tuple() == (0, 5)
+
+
+def test_range_patch_expands_to_paragraph_boundaries():
+    text = "Alpha one\nAlpha two\n\nSecond block\n"
+    editor = RecordingEditor()
+    editor.state.update_text(text)
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+
+    start = 2
+    end = 9
+    payload = {
+        "action": "patch",
+        "document_version": snapshot["version"],
+        "content_hash": snapshot["content_hash"],
+        "ranges": [
+            {
+                "start": start,
+                "end": end,
+                "replacement": "Updated first paragraph.\n",
+                "match_text": text[start:end],
+            }
+        ],
+    }
+
+    bridge.queue_edit(payload)
+
+    expected = "Updated first paragraph.\n\nSecond block\n"
+    assert editor.state.text == expected
+    context = bridge.last_edit_context
+    assert context is not None
+    blank_line_index = text.find("\n\n")
+    assert context.target_range.to_tuple() == (0, blank_line_index)
+
+
+def test_patch_failure_metadata_includes_target_range():
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+
+    payload = {
+        "action": "patch",
+        "document_version": snapshot["version"],
+        "content_hash": snapshot["content_hash"],
+        "ranges": [
+            {
+                "start": 0,
+                "end": 5,
+                "replacement": "HELLO",
+                "match_text": "hello",
+            }
+        ],
+    }
+
+    editor.state.update_text("HELLO world!!!")
+
+    with pytest.raises(DocumentVersionMismatchError):
+        bridge.queue_edit(payload)
+
+    metadata = bridge.last_failure_metadata
+    assert metadata is not None
+    assert metadata["target_range"] == {"start": 0, "end": 5}
 
 
 def test_queue_edit_rejects_stale_snapshot_version():
@@ -116,12 +190,30 @@ def test_queue_edit_rejects_stale_snapshot_version():
     with pytest.raises(DocumentVersionMismatchError):
         bridge.queue_edit(
             {
-                "action": "replace",
-                "content": "patched",
-                "target_range": (0, 5),
+                "action": "patch",
+                "diff": _make_diff("hello world", "patched world"),
                 "document_version": snapshot["version"],
+                "content_hash": snapshot["content_hash"],
             }
         )
+
+
+def test_queue_edit_rejects_content_hash_mismatch():
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+
+    payload = {
+        "action": "patch",
+        "diff": _make_diff(editor.state.text, "HELLO world"),
+        "document_version": snapshot["version"],
+        "content_hash": "bogus-hash",
+    }
+
+    with pytest.raises(DocumentVersionMismatchError) as exc:
+        bridge.queue_edit(payload)
+
+    assert "content_hash" in str(exc.value)
 
 
 def test_edit_listener_receives_diff_summary():
@@ -133,25 +225,42 @@ def test_edit_listener_receives_diff_summary():
         events.append((directive.action, diff))
 
     bridge.add_edit_listener(_listener)
-    bridge.queue_edit(EditDirective(action="insert", target_range=(5, 5), content="!!!"))
+    snapshot = bridge.generate_snapshot()
+    diff = _make_diff(editor.state.text, "hello!!! world")
+    bridge.queue_edit(
+        {
+            "action": "patch",
+            "diff": diff,
+            "document_version": snapshot["version"],
+            "content_hash": snapshot["content_hash"],
+        }
+    )
 
     assert events
-    assert events[0][0] == "insert"
-    assert events[0][1] == "+3 chars"
+    assert events[0][0] == "patch"
+    assert events[0][1].startswith("patch:")
 
 
-def test_last_edit_context_tracks_replacement_segments():
+def test_last_edit_context_tracks_patch_metadata():
     editor = RecordingEditor()
     bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+    diff = _make_diff(editor.state.text, "HELLO world")
 
-    bridge.queue_edit(EditDirective(action="replace", target_range=(0, 5), content="hi"))
+    bridge.queue_edit(
+        {
+            "action": "patch",
+            "diff": diff,
+            "document_version": snapshot["version"],
+            "content_hash": snapshot["content_hash"],
+        }
+    )
 
     context = bridge.last_edit_context
     assert context is not None
-    assert context.action == "replace"
-    assert context.target_range == (0, 5)
-    assert context.replaced_text == "hello"
-    assert context.content == "hi"
+    assert context.action == "patch"
+    assert context.diff == diff
+    assert context.spans
 
 
 def test_queue_edit_applies_patch_and_updates_metrics():
@@ -166,7 +275,14 @@ def test_queue_edit_applies_patch_and_updates_metrics():
 +hello brave world
 """
 
-    bridge.queue_edit({"action": "patch", "diff": diff, "document_version": snapshot["version"]})
+    bridge.queue_edit(
+        {
+            "action": "patch",
+            "diff": diff,
+            "document_version": snapshot["version"],
+            "content_hash": snapshot["content_hash"],
+        }
+    )
 
     assert editor.state.text == "hello brave world"
     assert bridge.last_diff_summary and bridge.last_diff_summary.startswith("patch:")
@@ -189,7 +305,14 @@ def test_queue_edit_patch_conflict_raises_and_tracks_failure():
     )
 
     with pytest.raises(RuntimeError):
-        bridge.queue_edit({"action": "patch", "diff": diff, "document_version": snapshot["version"]})
+        bridge.queue_edit(
+            {
+                "action": "patch",
+                "diff": diff,
+                "document_version": snapshot["version"],
+                "content_hash": snapshot["content_hash"],
+            }
+        )
 
     assert editor.state.text == "hello world"
     assert bridge.patch_metrics.conflicts == 1
@@ -208,7 +331,14 @@ def test_patch_apply_emits_success_telemetry(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(bridge_module, "telemetry_emit", _emit)
 
     diff = _make_diff(editor.state.text, "hello brave world")
-    bridge.queue_edit({"action": "patch", "diff": diff, "document_version": snapshot["version"]})
+    bridge.queue_edit(
+        {
+            "action": "patch",
+            "diff": diff,
+            "document_version": snapshot["version"],
+            "content_hash": snapshot["content_hash"],
+        }
+    )
 
     event = next((payload for name, payload in captured if name == "patch.apply"), None)
     assert event is not None
@@ -230,12 +360,82 @@ def test_patch_apply_emits_conflict_telemetry(monkeypatch: pytest.MonkeyPatch):
 
     diff = _make_diff("HELLO WORLD", "HELLO BRAVE WORLD")
     with pytest.raises(RuntimeError):
-        bridge.queue_edit({"action": "patch", "diff": diff, "document_version": snapshot["version"]})
+        bridge.queue_edit(
+            {
+                "action": "patch",
+                "diff": diff,
+                "document_version": snapshot["version"],
+                "content_hash": snapshot["content_hash"],
+            }
+        )
 
     event = next((payload for name, payload in captured if name == "patch.apply"), None)
     assert event is not None
     assert event["status"] == "conflict"
     assert event.get("reason")
+
+
+def test_edit_rejected_event_emitted(monkeypatch: pytest.MonkeyPatch):
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(bridge_module, "telemetry_emit", _emit)
+
+    diff = _make_diff("HELLO WORLD", "HELLO BRAVE WORLD")
+    with pytest.raises(RuntimeError):
+        bridge.queue_edit(
+            {
+                "action": "patch",
+                "diff": diff,
+                "document_version": snapshot["version"],
+                "content_hash": snapshot["content_hash"],
+            }
+        )
+
+    edit_event = next((payload for name, payload in captured if name == "edit_rejected"), None)
+    assert edit_event is not None
+    assert edit_event["document_id"] == snapshot["document_id"]
+    assert edit_event["cause"] == bridge.CAUSE_HASH_MISMATCH
+
+
+def test_patch_failure_provides_metadata():
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+
+    captured: list[Mapping[str, Any] | None] = []
+
+    def _listener(_directive: EditDirective, _message: str, metadata: Mapping[str, Any] | None = None) -> None:
+        captured.append(metadata)
+
+    bridge.add_failure_listener(_listener)
+
+    diff = _make_diff("HELLO WORLD", "HELLO BRAVE WORLD")
+    with pytest.raises(RuntimeError):
+        bridge.queue_edit(
+            {
+                "action": "patch",
+                "diff": diff,
+                "document_version": snapshot["version"],
+                "content_hash": snapshot["content_hash"],
+            }
+        )
+
+    assert captured, "expected failure metadata"
+    metadata = captured[-1]
+    assert metadata is not None
+    assert metadata["status"] == "conflict"
+    assert metadata["cause"] == DocumentBridge.CAUSE_HASH_MISMATCH
+    assert metadata["document_id"] == snapshot["document_id"]
+    assert metadata["version_id"] == snapshot["version_id"]
+    assert metadata.get("tab_id") is None
+    assert bridge.last_failure_metadata == metadata
 
 
 def test_patch_apply_emits_stale_telemetry(monkeypatch: pytest.MonkeyPatch):
@@ -253,7 +453,14 @@ def test_patch_apply_emits_stale_telemetry(monkeypatch: pytest.MonkeyPatch):
     editor.state.update_text("HELLO WORLD")
 
     with pytest.raises(DocumentVersionMismatchError):
-        bridge.queue_edit({"action": "patch", "diff": _make_diff("hello", "hola"), "document_version": snapshot["version"]})
+        bridge.queue_edit(
+            {
+                "action": "patch",
+                "diff": _make_diff("hello", "hola"),
+                "document_version": snapshot["version"],
+                "content_hash": snapshot["content_hash"],
+            }
+        )
 
     event = next((payload for name, payload in captured if name == "patch.apply"), None)
     assert event is not None
@@ -312,20 +519,117 @@ def test_queue_edit_range_patch_detects_mismatch():
     assert bridge.patch_metrics.conflicts == 1
 
 
+def test_range_patch_chunk_hash_mismatch_rejected():
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+    manifest = snapshot.get("chunk_manifest") or {}
+    chunks = manifest.get("chunks") or []
+    assert chunks, "expected chunk manifest entries for snapshot"
+    first_chunk = chunks[0]
+    chunk_id = first_chunk.get("id")
+    assert chunk_id, "expected chunk id in manifest"
+    tampered_hash = "deadbeef"
+
+    with pytest.raises(DocumentVersionMismatchError) as exc:
+        bridge.queue_edit(
+            {
+                "action": "patch",
+                "ranges": [
+                    {
+                        "start": 0,
+                        "end": 5,
+                        "replacement": "HELLO",
+                        "match_text": "hello",
+                        "chunk_id": chunk_id,
+                        "chunk_hash": tampered_hash,
+                    }
+                ],
+                "document_version": snapshot["version"],
+                "content_hash": snapshot["content_hash"],
+            }
+        )
+
+    assert exc.value.cause == bridge.CAUSE_CHUNK_HASH_MISMATCH
+    assert bridge.patch_metrics.conflicts == 1
+
+
+def test_post_edit_inspector_rejection_restores_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+    bridge.configure_safe_editing(enabled=True)
+    snapshot = bridge.generate_snapshot()
+    original_text = editor.state.text
+
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(bridge_module, "telemetry_emit", _emit)
+
+    def _fake_inspect(**_: Any) -> InspectionResult:
+        return InspectionResult(
+            ok=False,
+            reason="duplicate_paragraphs",
+            detail="Paragraph repeated",
+            diagnostics={"duplicate": True},
+        )
+
+    monkeypatch.setattr(bridge._post_edit_inspector, "inspect", _fake_inspect)
+
+    diff = _make_diff(original_text, "HELLO brave world")
+    with pytest.raises(DocumentVersionMismatchError) as exc:
+        bridge.queue_edit(
+            {
+                "action": "patch",
+                "diff": diff,
+                "document_version": snapshot["version"],
+                "content_hash": snapshot["content_hash"],
+            }
+        )
+
+    assert exc.value.cause == bridge.CAUSE_INSPECTOR_FAILURE
+    assert editor.state.text == original_text, "inspector rejection should roll back the edit"
+
+    metadata = bridge.last_failure_metadata
+    assert metadata is not None
+    assert metadata["status"] == "rejected"
+    assert metadata["cause"] == bridge.CAUSE_INSPECTOR_FAILURE
+
+    edit_event = next((payload for name, payload in captured if name == "edit_rejected"), None)
+    assert edit_event is not None
+    assert edit_event["cause"] == bridge.CAUSE_INSPECTOR_FAILURE
+
+
 def test_queue_edit_applies_multiple_patch_directives():
     editor = RecordingEditor()
     bridge = DocumentBridge(editor=editor)
     snapshot = bridge.generate_snapshot()
 
     diff_one = _make_diff(editor.state.text, "hello brave world")
-    bridge.queue_edit({"action": "patch", "diff": diff_one, "document_version": snapshot["version"]})
+    bridge.queue_edit(
+        {
+            "action": "patch",
+            "diff": diff_one,
+            "document_version": snapshot["version"],
+            "content_hash": snapshot["content_hash"],
+        }
+    )
 
     assert editor.state.text == "hello brave world"
     assert bridge.patch_metrics.total == 1
 
     snapshot_two = bridge.generate_snapshot()
     diff_two = _make_diff(editor.state.text, "HELLO brave world!!!")
-    bridge.queue_edit({"action": "patch", "diff": diff_two, "document_version": snapshot_two["version"]})
+    bridge.queue_edit(
+        {
+            "action": "patch",
+            "diff": diff_two,
+            "document_version": snapshot_two["version"],
+            "content_hash": snapshot_two["content_hash"],
+        }
+    )
 
     assert editor.state.text == "HELLO brave world!!!"
     assert bridge.patch_metrics.total == 2
@@ -347,7 +651,14 @@ def test_queue_edit_patch_handles_snippet_line_numbers():
 +BETA
 """
 
-    bridge.queue_edit({"action": "patch", "diff": diff, "document_version": snapshot["version"]})
+    bridge.queue_edit(
+        {
+            "action": "patch",
+            "diff": diff,
+            "document_version": snapshot["version"],
+            "content_hash": snapshot["content_hash"],
+        }
+    )
 
     assert "BETA" in editor.state.text
     assert bridge.patch_metrics.total == 1
@@ -360,14 +671,24 @@ def test_bridge_publishes_document_changed_events() -> None:
     bus.subscribe(DocumentChangedEvent, lambda event: events.append(event))
 
     bridge = DocumentBridge(editor=editor, cache_bus=bus)
-    bridge.queue_edit(EditDirective(action="insert", target_range=(5, 5), content="!!!"))
+    snapshot = bridge.generate_snapshot()
+    diff = _make_diff(editor.state.text, "hello!!! world")
+    bridge.queue_edit(
+        {
+            "action": "patch",
+            "diff": diff,
+            "document_version": snapshot["version"],
+            "content_hash": snapshot["content_hash"],
+        }
+    )
 
     assert events
     changed = events[-1]
     assert isinstance(changed, DocumentChangedEvent)
     assert changed.document_id == editor.state.document_id
     assert changed.version_id == editor.state.version_id
-    assert changed.edited_ranges[0] == (5, 5)
+    assert changed.edited_ranges[0][0] == 5
+    assert changed.edited_ranges[0][1] >= 5
 
 
 def test_bridge_notifies_document_closed() -> None:

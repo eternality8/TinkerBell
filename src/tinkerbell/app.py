@@ -144,6 +144,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         cli_overrides["embedding_backend"] = args.embedding_backend
     if args.embedding_model is not None:
         cli_overrides["embedding_model_name"] = args.embedding_model
+    if args.safe_ai_edits is not None:
+        cli_overrides["safe_ai_edits"] = args.safe_ai_edits
+    if args.safe_ai_duplicate_threshold is not None:
+        cli_overrides["safe_ai_duplicate_threshold"] = args.safe_ai_duplicate_threshold
+    if args.safe_ai_token_drift is not None:
+        cli_overrides["safe_ai_token_drift"] = args.safe_ai_token_drift
     metadata_override: Dict[str, Any] | None = None
     if "metadata" in cli_overrides and isinstance(cli_overrides.get("metadata"), Mapping):
         metadata_override = dict(cli_overrides["metadata"])
@@ -418,6 +424,33 @@ def _parse_cli_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, lis
         action="store_const",
         const=False,
         help="Disable plot/entity scaffolding for this session.",
+    )
+    parser.add_argument(
+        "--enable-safe-ai-edits",
+        dest="safe_ai_edits",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Enable post-edit inspections and auto-revert guardrails for this session.",
+    )
+    parser.add_argument(
+        "--disable-safe-ai-edits",
+        dest="safe_ai_edits",
+        action="store_const",
+        const=False,
+        help="Disable post-edit inspections for this session.",
+    )
+    parser.add_argument(
+        "--safe-ai-duplicate-threshold",
+        dest="safe_ai_duplicate_threshold",
+        type=int,
+        help="Override the duplicate paragraph threshold before rejecting an edit.",
+    )
+    parser.add_argument(
+        "--safe-ai-token-drift",
+        dest="safe_ai_token_drift",
+        type=float,
+        help="Override the token drift tolerance (0-1) before rejecting an edit.",
     )
     parser.add_argument(
         "--embedding-mode",

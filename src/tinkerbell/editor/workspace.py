@@ -130,6 +130,12 @@ class DocumentWorkspace:
             bridge=bridge,
             untitled_index=untitled_idx,
         )
+        set_tab_context = getattr(bridge, "set_tab_context", None)
+        if callable(set_tab_context):
+            try:
+                set_tab_context(tab_id=tab_id)
+            except Exception:  # pragma: no cover - best-effort telemetry metadata
+                pass
         tab.update_title(title or "Untitled")
         self._tabs[tab_id] = tab
         self._order.append(tab_id)

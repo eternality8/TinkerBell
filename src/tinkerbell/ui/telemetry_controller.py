@@ -345,7 +345,7 @@ class TelemetryController:
         if chat_panel is not None:
             setter = getattr(chat_panel, "set_guardrail_state", None)
             if callable(setter):
-                setter(status, detail=detail)
+                setter(status, detail=detail, category="chunk_flow")
 
     def _set_analysis_indicator(self, advice: AnalysisAdvice | None, *, document_label: str | None = None) -> None:
         status_bar = self._status_bar

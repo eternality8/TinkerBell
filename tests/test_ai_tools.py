@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from contextlib import contextmanager
 from typing import Any, Mapping
 
@@ -26,6 +27,7 @@ from tinkerbell.ai.tools.search_replace import SearchReplaceTool
 from tinkerbell.ai.tools.tool_usage_advisor import ToolUsageAdvisorTool
 from tinkerbell.ai.tools.validation import validate_snippet
 from tinkerbell.chat.commands import DIRECTIVE_SCHEMA
+from tinkerbell.documents.range_normalizer import compose_normalized_replacement, normalize_text_range
 from tinkerbell.editor.syntax import yaml_json
 from tinkerbell.services.bridge import DocumentVersionMismatchError
 
@@ -132,7 +134,13 @@ class _SnapshotProviderStub:
 
 class _SearchReplaceBridgeStub:
     def __init__(self, *, text: str, selection: tuple[int, int] = (0, 0), version: str = "base") -> None:
-        self.snapshot = {"text": text, "selection": selection, "version": version}
+        self.snapshot = {
+            "text": text,
+            "selection": selection,
+            "version": version,
+            "content_hash": self._hash_text(text),
+            "document_id": "search-doc",
+        }
         self.queue_calls: list[Mapping[str, Any]] = []
         self.last_snapshot_version: str | None = version
 
@@ -143,6 +151,10 @@ class _SearchReplaceBridgeStub:
     def queue_edit(self, directive: Mapping[str, Any]):  # type: ignore[override]
         self.queue_calls.append(directive)
         self.last_snapshot_version = "updated"
+
+    @staticmethod
+    def _hash_text(value: str) -> str:
+        return hashlib.sha1(value.encode("utf-8")).hexdigest()
 
 
 class _PatchBridgeStub(_EditBridgeStub):
@@ -199,12 +211,17 @@ def test_document_edit_tool_accepts_json_payload_and_reports_status():
     bridge = _EditBridgeStub()
     bridge.last_diff_summary = "+2 chars"
     bridge.last_snapshot_version = "digest-123"
-    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
+    bridge.snapshot["text"] = "hello"
+    tool = DocumentEditTool(bridge=bridge)
 
     status = tool.run('{"action":"insert","content":"Hi","target_range":[0,0]}')
 
     assert bridge.calls and isinstance(bridge.calls[0], dict)
-    assert bridge.calls[0]["action"] == "insert"
+    payload = bridge.calls[0]
+    assert payload["action"] == "patch"
+    ranges = payload["ranges"]
+    assert ranges[0]["replacement"] == "Hi"
+    assert ranges[0]["start"] == 0
     assert "applied: +2 chars" in status
     assert "digest-123" in status
 
@@ -212,12 +229,13 @@ def test_document_edit_tool_accepts_json_payload_and_reports_status():
 def test_document_edit_tool_accepts_keyword_arguments():
     bridge = _EditBridgeStub()
     bridge.last_diff_summary = "Δ0"
-    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
+    bridge.snapshot["text"] = "hello world"
+    tool = DocumentEditTool(bridge=bridge)
 
     status = tool.run(action="replace", content="Hello", target_range=(0, 5))
 
-    assert bridge.calls and bridge.calls[0]["action"] == "replace"
-    assert status.startswith("applied") or status == "queued"
+    assert bridge.calls and bridge.calls[0]["action"] == "patch"
+    assert status.startswith("applied") or status.startswith("queued")
 
 
 def test_document_edit_tool_requires_payload():
@@ -235,7 +253,10 @@ def test_document_edit_tool_replaces_paragraph_with_formatting():
     bridge = _EditBridgeStub()
     bridge.last_diff_summary = "+12 chars"
     bridge.last_snapshot_version = "digest-abc"
-    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
+    bridge.snapshot["text"] = (
+        "Existing intro paragraph that will be replaced in this test to verify formatting handling."
+    )
+    tool = DocumentEditTool(bridge=bridge)
 
     replacement = "New intro paragraph.\n\n- bullet α\n- bullet β ✨"
     status = tool.run(
@@ -245,32 +266,87 @@ def test_document_edit_tool_replaces_paragraph_with_formatting():
         rationale="Refresh intro with bullets",
     )
 
-    assert bridge.calls and bridge.calls[0]["content"] == replacement
-    assert bridge.calls[0]["target_range"] == {"start": 10, "end": 64}
+    assert bridge.calls and bridge.calls[0]["action"] == "patch"
+    ranges = bridge.calls[0]["ranges"]
+    base_text = bridge.snapshot["text"]
+    normalized = normalize_text_range(base_text, 10, 64, replacement=replacement)
+    expected_replacement = compose_normalized_replacement(
+        base_text,
+        normalized,
+        replacement,
+        original_start=10,
+        original_end=64,
+    )
+    assert ranges[0]["start"] == normalized.start
+    assert ranges[0]["end"] == normalized.end
+    assert ranges[0]["match_text"] == normalized.slice_text
+    assert ranges[0]["replacement"] == expected_replacement
     assert "applied" in status and "digest-abc" in status
+
+def test_document_edit_tool_supports_document_scope_literal():
+    bridge = _PatchBridgeStub(text="Alpha\nBeta\n", selection=(0, 0), version="digest-42")
+    tool = DocumentEditTool(bridge=bridge)
+
+    status = tool.run(action="replace", content="Gamma", target_range="document")
+
+    assert bridge.calls
+    payload = bridge.calls[0]
+    assert payload["action"] == "patch"
+    assert payload["document_version"] == "digest-42"
+    ranges = payload["ranges"]
+    assert ranges[0]["start"] == 0
+    assert ranges[0]["end"] == len("Alpha\nBeta\n")
+    assert ranges[0]["match_text"] == "Alpha\nBeta\n"
+    assert ranges[0]["replacement"] == "Gamma"
+    assert status.startswith("applied") or status.startswith("queued")
+
+def test_document_edit_tool_rejects_unknown_range_literal():
+    bridge = _PatchBridgeStub(text="Hello", selection=(0, 0))
+    tool = DocumentEditTool(bridge=bridge)
+
+    with pytest.raises(ValueError, match="target_range string must be 'document'"):
+        tool.run(action="replace", content="World", target_range="page")
 
 
 def test_document_edit_tool_handles_special_characters_in_sentence():
     bridge = _EditBridgeStub()
-    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
+    bridge.snapshot["text"] = "Original sentence spanning multiple characters for testing."
+    tool = DocumentEditTool(bridge=bridge)
 
-    payload = (
-        '{"action":"replace","target_range":[25,52],'
-        '"content":"“smart quotes” & emojis 🎉\\nNext line"}'
+    replacement = "“smart quotes” & emojis 🎉\nNext line"
+    payload = json.dumps(
+        {
+            "action": "replace",
+            "target_range": [25, 52],
+            "content": replacement,
+        }
     )
 
     tool.run(payload)
 
     assert bridge.calls
     recorded = bridge.calls[-1]
-    assert recorded["content"].startswith("“smart quotes” & emojis 🎉")
-    assert recorded["content"].endswith("Next line")
-    assert recorded["target_range"] == [25, 52]
+    assert recorded["action"] == "patch"
+    ranges = recorded["ranges"]
+    base_text = bridge.snapshot["text"]
+    normalized = normalize_text_range(base_text, 25, 52, replacement=replacement)
+    expected_replacement = compose_normalized_replacement(
+        base_text,
+        normalized,
+        replacement,
+        original_start=25,
+        original_end=52,
+    )
+    assert ranges[0]["start"] == normalized.start
+    assert ranges[0]["end"] == normalized.end
+    assert ranges[0]["match_text"] == normalized.slice_text
+    assert ranges[0]["replacement"] == expected_replacement
 
 
 def test_document_edit_tool_routes_to_specific_tab():
     bridge = _EditBridgeStub()
-    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
+    bridge.snapshot["text"] = "Hi"
+    tool = DocumentEditTool(bridge=bridge)
 
     tool.run(action="insert", content="Hi", target_range=(0, 0), tab_id="tab-123")
 
@@ -279,7 +355,8 @@ def test_document_edit_tool_routes_to_specific_tab():
 
 def test_document_edit_tool_resolves_tab_reference_in_argument():
     bridge = _EditBridgeStub()
-    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
+    bridge.snapshot["text"] = "Hi"
+    tool = DocumentEditTool(bridge=bridge)
 
     tool.run(action="insert", content="Hi", target_range=(0, 0), tab_id="Tab 2")
 
@@ -288,7 +365,8 @@ def test_document_edit_tool_resolves_tab_reference_in_argument():
 
 def test_document_edit_tool_resolves_tab_reference_from_payload():
     bridge = _EditBridgeStub()
-    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
+    bridge.snapshot["text"] = "Hi"
+    tool = DocumentEditTool(bridge=bridge)
 
     payload = {"action": "insert", "content": "Hi", "target_range": [0, 0], "tab": "README.md"}
     tool.run(payload)
@@ -298,7 +376,8 @@ def test_document_edit_tool_resolves_tab_reference_from_payload():
 
 def test_document_edit_tool_embeds_tab_when_bridge_lacks_routing():
     bridge = _LegacyBridgeStub()
-    tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
+    bridge.snapshot["text"] = "Hi"
+    tool = DocumentEditTool(bridge=bridge)
 
     tool.run(action="insert", content="Hi", target_range=(0, 0), tab_id="tab-legacy")
 
@@ -332,6 +411,20 @@ def test_document_edit_tool_rejects_patch_without_snapshot_version():
     bridge = _EditBridgeStub()
     bridge.last_snapshot_version = "digest-present"
     tool = DocumentEditTool(bridge=bridge)
+def test_document_edit_tool_normalizes_ranges_before_patch_application():
+    bridge = _EditBridgeStub()
+    bridge.snapshot["text"] = "alpha beta"
+    tool = DocumentEditTool(bridge=bridge)
+
+    tool.run(action="replace", content="BETA", target_range={"start": 2, "end": 5})
+
+    assert bridge.calls, "patch payload was not enqueued"
+    patch_range = bridge.calls[-1]["ranges"][0]
+    assert patch_range["start"] == 0
+    assert patch_range["end"] == 5
+    assert patch_range["match_text"] == "alpha"
+    assert patch_range["replacement"] == "alBETA"
+
 
     diff = """--- a/doc.txt\n+++ b/doc.txt\n@@ -1 +1 @@\n-old\n+new\n"""
 
@@ -341,7 +434,7 @@ def test_document_edit_tool_rejects_patch_without_snapshot_version():
 
 def test_document_edit_tool_rejects_inline_edits_when_not_allowed():
     bridge = _EditBridgeStub()
-    tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentEditTool(bridge=bridge, patch_only=False)
 
     with pytest.raises(ValueError, match="diff-only"):
         tool.run(action="annotate", content="Note", target_range=(0, 0))
@@ -706,8 +799,11 @@ def test_search_replace_tool_updates_document_scope():
     assert result.scope == "document"
     assert bridge.queue_calls
     payload = bridge.queue_calls[-1]
-    assert payload["target_range"] == (0, len("Hello world world"))
-    assert "earth" in payload["content"]
+    assert payload["action"] == "patch"
+    assert payload["document_version"] == "digest-0"
+    assert payload["content_hash"] == bridge.snapshot["content_hash"]
+    assert payload["diff"].startswith("--- a/")
+    assert "earth" in payload["diff"]
     assert result.document_version == "updated"
     assert "earth" in result.preview
     assert result.diff_preview and result.diff_preview.startswith("---")
@@ -716,11 +812,13 @@ def test_search_replace_tool_updates_document_scope():
     metadata = payload["metadata"]
     assert metadata["matches"] == 2
     assert metadata["limited"] is False
+    assert metadata["scope"] == "document"
+    assert metadata["target_range"] == {"start": 0, "end": len("Hello world world")}
 
 
 def test_tools_expose_expected_summarizable_flags():
     bridge = _EditBridgeStub()
-    edit_tool = DocumentEditTool(bridge=bridge, allow_inline_edits=True)
+    edit_tool = DocumentEditTool(bridge=bridge)
     snapshot_tool = DocumentSnapshotTool(provider=_SnapshotProviderStub())
     patch_tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
     list_tool = ListTabsTool(provider=bridge)
@@ -775,6 +873,7 @@ def test_search_replace_tool_honors_replacement_cap_and_reports_limited():
     assert result.diff_preview
     assert bridge.queue_calls
     payload = bridge.queue_calls[-1]
+    assert payload["action"] == "patch"
     metadata = payload["metadata"]
     assert metadata["limited"] is True
     assert metadata["matches"] == 2

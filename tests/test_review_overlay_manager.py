@@ -202,7 +202,7 @@ def test_apply_diff_overlay_tracks_tab_ids() -> None:
         metadata={"spans": [["bad"]], "diff_preview": "Δ preview"},
     )
 
-    harness.manager.apply_diff_overlay(trace, document=doc, range_hint=(0, 5))
+    harness.manager.apply_diff_overlay(trace, document=doc, range_hint={"start": 0, "end": 5})
 
     overlay = tab.editor.diff_overlay
     assert overlay is not None

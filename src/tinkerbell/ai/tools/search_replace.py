@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, Mapping, Protocol
+
+from .diff_builder import DiffBuilderTool
+from ...documents.ranges import TextRange
 
 
 class SearchReplaceBridge(Protocol):
@@ -45,6 +49,7 @@ class SearchReplaceTool:
     bridge: SearchReplaceBridge
     preview_chars: int = 240
     default_max_replacements: int = 200
+    diff_builder: DiffBuilderTool = field(default_factory=DiffBuilderTool)
     summarizable: ClassVar[bool] = False
 
     def __post_init__(self) -> None:
@@ -80,6 +85,7 @@ class SearchReplaceTool:
         segment_start, segment_end = selection_range if use_selection else (0, len(text))
         active_scope = "selection" if use_selection else "document"
         segment_text = text[segment_start:segment_end]
+        range_hint = TextRange(segment_start, segment_end)
 
         regex = self._compile_pattern(pattern, is_regex=is_regex, match_case=match_case, whole_word=whole_word)
         count_limit = self._normalize_replacement_limit(max_replacements)
@@ -108,22 +114,31 @@ class SearchReplaceTool:
         applied = False
 
         if replacements and not dry_run:
-            payload: dict[str, Any] = {
-                "action": "replace",
-                "target_range": (segment_start, segment_end),
-                "content": updated_segment if active_scope == "selection" else updated_document,
+            document_version = self._resolve_document_version(snapshot, directive_version)
+            content_hash = self._resolve_content_hash(snapshot, text)
+            diff_text = self.diff_builder.run(
+                text,
+                updated_document,
+                filename=self._resolve_document_label(snapshot),
+                context=5,
+            )
+            patch_payload: dict[str, Any] = {
+                "action": "patch",
+                "diff": diff_text,
+                "document_version": document_version,
+                "content_hash": content_hash,
                 "metadata": {
                     "matches": replacements,
                     "limited": limited,
                     "max_replacements": count_limit,
+                    "scope": active_scope,
+                    "target_range": range_hint.to_dict(),
                 },
             }
-            if directive_version:
-                payload["document_version"] = directive_version
 
-            self.bridge.queue_edit(payload)
+            self.bridge.queue_edit(patch_payload)
             applied = True
-            directive_version = getattr(self.bridge, "last_snapshot_version", None) or directive_version
+            directive_version = getattr(self.bridge, "last_snapshot_version", None) or document_version
 
         return SearchReplaceResult(
             replacements=replacements,
@@ -131,7 +146,7 @@ class SearchReplaceTool:
             applied=applied,
             dry_run=dry_run,
             scope=active_scope,
-            target_range=(segment_start, segment_end),
+            target_range=range_hint.to_tuple(),
             document_version=directive_version,
             max_replacements=count_limit,
             limited=limited,
@@ -240,6 +255,20 @@ class SearchReplaceTool:
         start = max(0, focus - 40)
         end = min(len(text), start + self.preview_chars)
         return text[start:end]
+
+    @staticmethod
+    def _resolve_document_version(snapshot: Mapping[str, Any], fallback: str | None) -> str:
+        candidate = snapshot.get("version") or fallback
+        if not candidate:
+            raise ValueError("Snapshot did not provide document_version for patch application")
+        return str(candidate)
+
+    @staticmethod
+    def _resolve_content_hash(snapshot: Mapping[str, Any], text: str) -> str:
+        token = snapshot.get("content_hash")
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _clamp_range(selection: tuple[int, int] | list[int], length: int) -> tuple[int, int]:

@@ -50,7 +50,7 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     api_input = dialog.findChild(QLineEdit, "api_key_input")
     model_combo = dialog.findChild(QComboBox, "model_combo")
     organization_input = dialog.findChild(QLineEdit, "organization_input")
-    theme_input = dialog.findChild(QLineEdit, "theme_input")
+    theme_combo = dialog.findChild(QComboBox, "theme_combo")
     temperature_input = dialog.findChild(QDoubleSpinBox, "temperature_input")
     tool_checkbox = dialog.findChild(QCheckBox, "tool_activity_checkbox")
     timeout_input = dialog.findChild(QDoubleSpinBox, "request_timeout_input")
@@ -62,12 +62,15 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     prompt_input = dialog.findChild(QSpinBox, "context_policy_prompt_override_input")
     reserve_toggle = dialog.findChild(QCheckBox, "context_policy_reserve_override_toggle")
     reserve_override_input = dialog.findChild(QSpinBox, "context_policy_reserve_override_input")
+    safe_ai_checkbox = dialog.findChild(QCheckBox, "safe_ai_edits_checkbox")
+    duplicate_input = dialog.findChild(QSpinBox, "safe_ai_duplicate_threshold_input")
+    drift_input = dialog.findChild(QDoubleSpinBox, "safe_ai_token_drift_input")
 
     assert base_input is not None
     assert api_input is not None
     assert model_combo is not None
     assert organization_input is not None
-    assert theme_input is not None
+    assert theme_combo is not None
     assert temperature_input is not None
     assert tool_checkbox is not None
     assert timeout_input is not None
@@ -79,17 +82,24 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert prompt_input is not None
     assert reserve_toggle is not None
     assert reserve_override_input is not None
+    assert safe_ai_checkbox is not None
+    assert duplicate_input is not None
+    assert drift_input is not None
 
     base_input.setText("https://example.com/v2")
     api_input.setText("new-key")
     model_combo.setEditText("gpt-custom")
     organization_input.setText("acme")
-    theme_input.setText("dracula")
+    theme_combo.setCurrentIndex(0)
+    selected_theme = theme_combo.currentData(Qt.ItemDataRole.UserRole) or theme_combo.currentText()
     temperature_input.setValue(0.85)
     tool_checkbox.setChecked(True)
     timeout_input.setValue(42.5)
     context_input.setValue(256_000)
     reserve_input.setValue(20_000)
+    safe_ai_checkbox.setChecked(True)
+    duplicate_input.setValue(5)
+    drift_input.setValue(0.12)
     policy_enable.setChecked(True)
     policy_dry_run.setChecked(False)
     prompt_toggle.setChecked(True)
@@ -103,12 +113,15 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert updated.api_key == "new-key"
     assert updated.model == "gpt-custom"
     assert updated.organization == "acme"
-    assert updated.theme == "dracula"
+    assert updated.theme == selected_theme
     assert updated.temperature == pytest.approx(0.85)
     assert updated.show_tool_activity_panel is True
     assert updated.request_timeout == pytest.approx(42.5)
     assert updated.max_context_tokens == 256_000
     assert updated.response_token_reserve == 20_000
+    assert updated.safe_ai_edits is True
+    assert updated.safe_ai_duplicate_threshold == 5
+    assert updated.safe_ai_token_drift == pytest.approx(0.12)
     assert updated.context_policy.enabled is True
     assert updated.context_policy.dry_run is False
     assert updated.context_policy.prompt_budget_override == 100_000

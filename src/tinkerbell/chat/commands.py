@@ -16,6 +16,8 @@ from typing import Any, Dict
 
 from jsonschema import Draft7Validator, ValidationError
 
+from ..documents.ranges import TextRange
+
 
 class ActionType(str, Enum):
     """Supported edit directive actions."""
@@ -429,6 +431,24 @@ def _looks_numeric(token: str) -> bool:
     except (TypeError, ValueError):
         return False
 
+_TEXT_RANGE_OBJECT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 0},
+    },
+    "required": ["start", "end"],
+    "additionalProperties": False,
+}
+
+_TEXT_RANGE_SEQUENCE_SCHEMA: Dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "integer"},
+    "minItems": 2,
+    "maxItems": 2,
+}
+
+
 DIRECTIVE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "required": ["action"],
@@ -442,20 +462,9 @@ DIRECTIVE_SCHEMA: Dict[str, Any] = {
         "rationale": {"type": "string"},
         "target_range": {
             "anyOf": [
-                {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "minItems": 2,
-                    "maxItems": 2,
-                },
-                {
-                    "type": "object",
-                    "properties": {
-                        "start": {"type": "integer", "minimum": 0},
-                        "end": {"type": "integer", "minimum": 0},
-                    },
-                    "additionalProperties": False,
-                },
+                _TEXT_RANGE_OBJECT_SCHEMA,
+                _TEXT_RANGE_SEQUENCE_SCHEMA,
+                {"type": "string", "enum": ["document"]},
                 {"type": "null"},
             ]
         },
@@ -598,6 +607,8 @@ def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             if alias in normalized:
                 normalized["target_range"] = normalized.pop(alias)
                 break
+    if "target_range" in normalized:
+        normalized["target_range"] = _normalize_target_range_value(normalized["target_range"])
 
     target_range = normalized.get("target_range")
     if isinstance(target_range, tuple):
@@ -608,6 +619,17 @@ def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["tab_reference"] = tab_reference
 
     return normalized
+
+
+def _normalize_target_range_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, TextRange):
+        return value.to_dict()
+    try:
+        return TextRange.from_value(value).to_dict()
+    except (TypeError, ValueError):
+        return value
 
 
 def resolve_tab_reference(

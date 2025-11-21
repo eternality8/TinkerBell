@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, cast
+from typing import Any, Awaitable, Callable, ClassVar, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, cast
 
 from openai.types.chat import ChatCompletionToolParam
 
@@ -41,6 +41,7 @@ from ..memory.chunk_index import ChunkIndex
 from ..memory.plot_state import DocumentPlotStateStore
 from ..memory.character_map import CharacterMapStore
 from ..services import ToolPayload, build_pointer, summarize_tool_content, telemetry as telemetry_service
+from ...services.bridge import DocumentVersionMismatchError
 from ..services.trace_compactor import TraceCompactor
 from ...chat.message_model import ToolPointerMessage
 from ..services.context_policy import BudgetDecision, ContextBudgetPolicy
@@ -468,6 +469,7 @@ class AIController:
     _latest_snapshot_cache: dict[str, Mapping[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _cache_bus: DocumentCacheBus | None = field(default=None, init=False, repr=False)
     _event_logger: ChatEventLogger | None = field(default=None, init=False, repr=False)
+    _RETRYABLE_VERSION_TOOLS: ClassVar[frozenset[str]] = frozenset({"document_apply_patch", "search_replace"})
 
     def __post_init__(self) -> None:
         if self.tools:
@@ -3042,7 +3044,11 @@ class AIController:
             summarizable = getattr(registration, "summarizable", True) if registration is not None else True
             started_at = time.time()
             start_perf = time.perf_counter()
-            content, resolved_arguments, raw_result = await self._execute_tool_call(call, registration, on_event)
+            content, resolved_arguments, raw_result, retry_context = await self._execute_tool_call(
+                call,
+                registration,
+                on_event,
+            )
             duration_ms = max(0.0, (time.perf_counter() - start_perf) * 1000.0)
             argument_tokens = self._estimate_text_tokens(call.arguments or "")
             result_tokens = self._estimate_text_tokens(content)
@@ -3065,6 +3071,8 @@ class AIController:
                 summarizable=summarizable,
                 started_at=started_at,
             )
+            if retry_context:
+                record["retry"] = dict(retry_context)
             records.append(record)
             token_cost += call_token_cost
         return messages, records, token_cost
@@ -3212,23 +3220,33 @@ class AIController:
         if registration is None:
             message = f"Tool '{call.name or 'unknown'}' is not registered."
             await self._emit_tool_result_event(call, message, None, on_event)
-            return message, resolved_arguments, None
+            return message, resolved_arguments, None, None
 
         block_reason = self._plot_loop_block(call.name)
         if block_reason:
             payload = {"status": "plot_loop_blocked", "reason": block_reason}
             await self._emit_tool_result_event(call, block_reason, payload, on_event)
-            return block_reason, resolved_arguments, payload
+            return block_reason, resolved_arguments, payload, None
 
+        retry_context: dict[str, Any] | None = None
         try:
             result = await self._invoke_tool_impl(registration.impl, resolved_arguments)
+        except DocumentVersionMismatchError as exc:
+            if not self._supports_version_retry(call.name):
+                raise
+            result, retry_context = await self._handle_version_mismatch_retry(
+                call,
+                registration,
+                resolved_arguments,
+                exc,
+            )
         except Exception as exc:  # pragma: no cover - defensive guard
             LOGGER.exception("Tool %s failed", call.name)
             result = f"Tool '{call.name}' failed: {exc}"
 
         serialized = self._serialize_tool_result(result)
         await self._emit_tool_result_event(call, serialized, result, on_event)
-        return serialized, resolved_arguments, result
+        return serialized, resolved_arguments, result, retry_context
 
     async def _emit_tool_result_event(
         self,
@@ -3248,6 +3266,115 @@ class AIController:
                 tool_call_id=call.call_id,
             ),
             on_event,
+        )
+
+    async def _handle_version_mismatch_retry(
+        self,
+        call: _ToolCallRequest,
+        registration: ToolRegistration,
+        resolved_arguments: Any,
+        error: DocumentVersionMismatchError,
+    ) -> tuple[Any, dict[str, Any]]:
+        tab_id = self._extract_tab_id(resolved_arguments)
+        snapshot = await self._refresh_document_snapshot(tab_id)
+        document_id = self._snapshot_document_id(snapshot)
+        base_context: dict[str, Any] = {
+            "tool": call.name or "unknown",
+            "tab_id": tab_id,
+            "document_id": document_id,
+            "cause": error.cause or "hash_mismatch",
+            "attempts": 2,
+        }
+        LOGGER.warning(
+            "Retrying %s after DocumentVersionMismatchError (cause=%s)",
+            call.name,
+            error.cause,
+        )
+        try:
+            result = await self._invoke_tool_impl(registration.impl, resolved_arguments)
+        except DocumentVersionMismatchError as retry_exc:
+            failure_context = dict(base_context)
+            failure_context["status"] = "failed"
+            failure_context["reason"] = "retry_exhausted"
+            failure_context["cause"] = retry_exc.cause or failure_context.get("cause")
+            self._emit_version_retry_event(failure_context)
+            message = self._format_retry_failure_message(call.name, retry_exc)
+            return message, failure_context
+
+        success_context = dict(base_context)
+        success_context["status"] = "success"
+        self._emit_version_retry_event(success_context)
+        return result, success_context
+
+    @classmethod
+    def _supports_version_retry(cls, tool_name: str | None) -> bool:
+        if not tool_name:
+            return False
+        return tool_name.strip().lower() in cls._RETRYABLE_VERSION_TOOLS
+
+    @staticmethod
+    def _extract_tab_id(arguments: Any) -> str | None:
+        if not isinstance(arguments, Mapping):
+            return None
+        candidate = arguments.get("tab_id")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+        metadata = arguments.get("metadata")
+        if isinstance(metadata, Mapping):
+            tab_candidate = metadata.get("tab_id")
+            if isinstance(tab_candidate, str) and tab_candidate.strip():
+                return tab_candidate.strip()
+        return None
+
+    async def _refresh_document_snapshot(self, tab_id: str | None) -> Mapping[str, Any] | None:
+        registration = self.tools.get("document_snapshot")
+        if registration is None:
+            return None
+        runner = getattr(registration.impl, "run", registration.impl)
+        if not callable(runner):  # pragma: no cover - defensive guard
+            return None
+        try:
+            result = runner(tab_id=tab_id, delta_only=False, include_diff=False)
+        except TypeError:
+            try:
+                result = runner()
+            except Exception:  # pragma: no cover - defensive guard
+                LOGGER.debug("Snapshot refresh failed", exc_info=True)
+                return None
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Snapshot refresh failed", exc_info=True)
+            return None
+        if inspect.isawaitable(result):
+            result = await result
+        return dict(result) if isinstance(result, Mapping) else None
+
+    @staticmethod
+    def _snapshot_document_id(snapshot: Mapping[str, Any] | None) -> str | None:
+        if not isinstance(snapshot, Mapping):
+            return None
+        document_id = snapshot.get("document_id")
+        if isinstance(document_id, str):
+            text = document_id.strip()
+            return text or None
+        return None
+
+    def _emit_version_retry_event(self, payload: Mapping[str, Any]) -> None:
+        if not payload:
+            return
+        event_payload = dict(payload)
+        event_payload.setdefault("event_source", "controller")
+        telemetry_service.emit("document_edit.retry", event_payload)
+
+    @staticmethod
+    def _format_retry_failure_message(
+        tool_name: str | None,
+        error: DocumentVersionMismatchError,
+    ) -> str:
+        label = tool_name or "document_edit"
+        cause = f" (cause={error.cause})" if getattr(error, "cause", None) else ""
+        return (
+            f"Tool '{label}' failed: document snapshot was stale even after an automatic retry{cause}. "
+            "Call document_snapshot again and rebuild your diff before retrying."
         )
 
     def _build_tool_record(

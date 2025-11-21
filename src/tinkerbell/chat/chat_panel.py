@@ -18,9 +18,10 @@ the headless tests simple while remaining Qt-friendly for the full app.
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, List, Optional, Protocol, Sequence, cast
+from typing import Any, Callable, Iterable, List, Mapping, Optional, Protocol, Sequence, cast
 
 from .message_model import ChatMessage, ToolTrace
 
@@ -39,6 +40,7 @@ QWidgetBase: Any = None
 QAbstractItemView: Any = None
 Qt: Any = None
 QEvent: Any = None
+QColor: Any = None
 
 # Fallback Qt constants for environments where PySide6 isn't available during tests.
 FALLBACK_ENTER_KEYS = (0x01000004, 0x01000005)  # Qt.Key_Return, Qt.Key_Enter
@@ -47,6 +49,7 @@ FALLBACK_KEY_PRESS_EVENT = 6  # QEvent.KeyPress
 
 try:  # pragma: no cover - PySide6 optional in CI
     from PySide6.QtCore import Qt as _Qt, QEvent as _QtEvent
+    from PySide6.QtGui import QColor as _QtColor
     from PySide6.QtWidgets import (
         QApplication as _QtApplication,
         QFrame as _QtFrame,
@@ -78,6 +81,7 @@ try:  # pragma: no cover - PySide6 optional in CI
     QAbstractItemView = _QtAbstractItemView
     Qt = _Qt
     QEvent = _QtEvent
+    QColor = _QtColor
 except Exception:  # pragma: no cover - runtime fallback keeps dependencies optional
 
     class _StubQWidget:  # type: ignore[too-many-ancestors]
@@ -170,6 +174,8 @@ class ChatPanel(QWidgetBase):
         self._tool_activity_visible = bool(show_tool_activity_panel)
         self._guardrail_state: str = ""
         self._guardrail_detail: str = ""
+        self._guardrail_entries: dict[str, tuple[str, str]] = {}
+        self._guardrail_priority: tuple[str, ...] = ("safe_edit", "chunk_flow", "default")
         self._analysis_badge: str = ""
         self._analysis_detail: str = ""
 
@@ -206,26 +212,30 @@ class ChatPanel(QWidgetBase):
 
     @property
     def guardrail_state(self) -> tuple[str, str]:
-        """Expose the guardrail badge text/detail for tests and UI."""
+        """Expose the active guardrail badge text/detail for tests and UI."""
 
         return (self._guardrail_state, self._guardrail_detail)
 
-    def set_guardrail_state(self, status: Optional[str], *, detail: Optional[str] = None) -> None:
-        """Update the chunk-flow guardrail badge shown above the tool traces."""
+    def set_guardrail_state(
+        self,
+        status: Optional[str],
+        *,
+        detail: Optional[str] = None,
+        category: Optional[str] = None,
+    ) -> None:
+        """Update the guardrail badge for a specific category (chunk flow, safe edit)."""
 
         normalized = (status or "").strip()
         detail_text = (detail or "").strip()
-        self._guardrail_state = normalized
-        self._guardrail_detail = detail_text
-        label = self._guardrail_label
-        if label is None:
-            return
-        try:
-            label.setText(self._format_guardrail_text())
-            label.setToolTip(detail_text or normalized)
-            label.setVisible(bool(normalized))
-        except Exception:  # pragma: no cover - Qt defensive guard
-            pass
+        category_key = self._normalize_guardrail_category(category)
+        if not normalized:
+            if category is None:
+                self._guardrail_entries.clear()
+            else:
+                self._guardrail_entries.pop(category_key, None)
+        else:
+            self._guardrail_entries[category_key] = (normalized, detail_text)
+        self._apply_guardrail_state()
 
     def set_analysis_badge(self, text: Optional[str], *, detail: Optional[str] = None) -> None:
         """Update the preflight analysis badge."""
@@ -275,6 +285,7 @@ class ChatPanel(QWidgetBase):
         self._refresh_history_widget()
         self._refresh_tool_trace_widget()
         self._refresh_suggestion_widget()
+        self._apply_guardrail_state()
 
     def consume_turn_snapshot(self) -> Optional[ChatTurnSnapshot]:
         """Return the pending turn snapshot once, clearing it afterwards."""
@@ -960,28 +971,162 @@ class ChatPanel(QWidgetBase):
             self._update_tool_trace_header(total_steps=total_steps, start_index=start_index)
             for offset, trace in enumerate(visible_traces, start=start_index + 1):
                 trace.step_index = trace.step_index or offset
-                name = trace.name or "tool"
-                metadata = trace.metadata or {}
-                badges: list[str] = []
-                if str(name).endswith("patch"):
-                    badges.append("patch")
-                if metadata.get("compacted"):
-                    badges.append("compacted")
-                badge = f" [{', '.join(badges)}]" if badges else ""
-                duration = f" · {trace.duration_ms} ms" if getattr(trace, "duration_ms", 0) else ""
-                step_label = f"Step {trace.step_index or offset}"
-                item_text = f"{step_label} · {name}{badge}{duration}: {trace.output_summary}"
-                preview = metadata.get("diff_preview") if metadata else None
-                if isinstance(preview, str) and preview.strip():
-                    first_line = preview.strip().splitlines()[0]
-                    snippet = first_line[:80]
-                    item_text = f"{item_text} – {snippet}"
+                step_number = trace.step_index or offset
+                item_text, status = self._format_tool_trace_entry(trace, step_number)
                 if QListWidgetItem is not None:
-                    QListWidgetItem(item_text, widget)
+                    item = QListWidgetItem(item_text, widget)
+                    self._apply_tool_trace_color(item, status)
                 else:
                     widget.addItem(item_text)
         finally:
             widget.blockSignals(False)
+
+    def _format_tool_trace_entry(self, trace: ToolTrace, step_number: int) -> tuple[str, str]:
+        name = trace.name or "tool"
+        metadata = trace.metadata or {}
+        badges: list[str] = []
+        if str(name).endswith("patch"):
+            badges.append("patch")
+        if metadata.get("compacted"):
+            badges.append("compacted")
+        badge = f" [{', '.join(badges)}]" if badges else ""
+        duration = f" · {trace.duration_ms} ms" if getattr(trace, "duration_ms", 0) else ""
+        step_label = f"Step {step_number}"
+        base_text = f"{step_label} · {name}{badge}{duration}: {trace.output_summary or ''}"
+        preview = metadata.get("diff_preview") if metadata else None
+        if isinstance(preview, str):
+            preview_text = preview.strip()
+            if preview_text:
+                first_line = preview_text.splitlines()[0]
+                snippet = first_line[:80]
+                base_text = f"{base_text} – {snippet}"
+        status = self._classify_tool_trace_status(trace)
+        icon = self._tool_trace_icon(status)
+        if icon:
+            base_text = f"{icon} {base_text}"
+        return base_text, status
+
+    def _tool_trace_icon(self, status: str) -> str:
+        if status == "success":
+            return "✓"
+        if status == "failure":
+            return "✕"
+        if status == "pending":
+            return "…"
+        return ""
+
+    def _tool_trace_color(self, status: str) -> Optional[str]:
+        if status == "success":
+            return "#2ea043"
+        if status == "failure":
+            return "#f85149"
+        if status == "pending":
+            return "#d29922"
+        return None
+
+    def _apply_tool_trace_color(self, item: Any, status: str) -> None:
+        if Qt is None or QColor is None:
+            return
+        color_value = self._tool_trace_color(status)
+        if not color_value:
+            return
+        try:
+            color = QColor(color_value)
+            item.setData(Qt.ForegroundRole, color)
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+
+    def _classify_tool_trace_status(self, trace: ToolTrace) -> str:
+        summary = (trace.output_summary or "").strip()
+        summary_lower = summary.lower()
+        if summary_lower in {"(running…)", "(running...)", "running…", "running...", "running"}:
+            return "pending"
+
+        metadata = trace.metadata if isinstance(trace.metadata, Mapping) else {}
+        structured = self._extract_structured_status(metadata)
+        if structured:
+            normalized = structured.lower()
+            if normalized in {"error", "failed", "failure", "blocked", "denied", "timeout", "exception", "aborted", "rejected"}:
+                return "failure"
+            if normalized in {"ok", "success", "ready", "done", "complete", "completed", "applied", "cached"}:
+                return "success"
+
+        if metadata.get("error") or metadata.get("exception") or metadata.get("failure_reason"):
+            return "failure"
+
+        if str(trace.name or "").startswith("edit:"):
+            return "success"
+
+        if self._looks_like_failure(summary_lower):
+            return "failure"
+        if self._looks_like_success(summary_lower):
+            return "success"
+        return "neutral"
+
+    def _extract_structured_status(self, metadata: Mapping[str, Any]) -> Optional[str]:
+        status_value = metadata.get("status")
+        if status_value:
+            return str(status_value)
+
+        parsed = metadata.get("parsed_output")
+        status_value = self._lookup_status_field(parsed)
+        if status_value:
+            return status_value
+
+        raw_output = metadata.get("raw_output")
+        if isinstance(raw_output, Mapping):
+            status_value = self._lookup_status_field(raw_output)
+            if status_value:
+                return status_value
+        if isinstance(raw_output, str):
+            parsed_raw = self._parse_jsonish(raw_output)
+            if parsed_raw is not None:
+                status_value = self._lookup_status_field(parsed_raw)
+                if status_value:
+                    return status_value
+        return None
+
+    def _lookup_status_field(self, payload: Any) -> Optional[str]:
+        if isinstance(payload, Mapping):
+            for key in ("status", "state", "outcome", "result"):
+                value = payload.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, (int, float)):
+                    return str(value)
+        if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+            for entry in payload:
+                status_value = self._lookup_status_field(entry)
+                if status_value:
+                    return status_value
+        return None
+
+    def _parse_jsonish(self, text: str) -> Any:
+        snippet = text.strip()
+        if not snippet:
+            return None
+        if snippet[0] not in "{[":
+            return None
+        if len(snippet) > 4000:
+            return None
+        try:
+            return json.loads(snippet)
+        except Exception:  # pragma: no cover - best effort
+            return None
+
+    def _looks_like_failure(self, summary_lower: str) -> bool:
+        if not summary_lower:
+            return False
+        keywords = ("error", "failed", "failure", "denied", "blocked", "timeout", "exception", "rejected", "aborted")
+        return any(token in summary_lower for token in keywords)
+
+    def _looks_like_success(self, summary_lower: str) -> bool:
+        if not summary_lower:
+            return False
+        keywords = ("ok", "success", "ready", "done", "complete", "applied", "cached")
+        return any(summary_lower.startswith(token) or f" {token}" in summary_lower for token in keywords)
 
     def _update_tool_trace_header(self, *, total_steps: int, start_index: int) -> None:
         label = self._tool_trace_label
@@ -1065,7 +1210,35 @@ class ChatPanel(QWidgetBase):
     def _format_guardrail_text(self) -> str:
         if not self._guardrail_state:
             return ""
-        return f"Chunk Flow: {self._guardrail_state}"
+        return f"Guardrail: {self._guardrail_state}"
+
+    def _apply_guardrail_state(self) -> None:
+        status, detail = self._select_guardrail_entry()
+        self._guardrail_state = status
+        self._guardrail_detail = detail
+        label = self._guardrail_label
+        if label is None:
+            return
+        try:
+            label.setText(self._format_guardrail_text())
+            label.setToolTip(detail or status)
+            label.setVisible(bool(status))
+        except Exception:  # pragma: no cover - Qt defensive guard
+            pass
+
+    def _select_guardrail_entry(self) -> tuple[str, str]:
+        for category in self._guardrail_priority:
+            entry = self._guardrail_entries.get(category)
+            if entry and entry[0]:
+                return entry
+        for entry in self._guardrail_entries.values():
+            if entry and entry[0]:
+                return entry
+        return ("", "")
+
+    def _normalize_guardrail_category(self, category: Optional[str]) -> str:
+        normalized = (category or "default").strip().lower()
+        return normalized or "default"
 
     def _configure_tool_trace_widget(self) -> None:
         widget = self._tool_trace_widget

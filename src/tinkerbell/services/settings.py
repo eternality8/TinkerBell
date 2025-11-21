@@ -46,10 +46,15 @@ _BOOL_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_PHASE3_OUTLINE_TOOLS": "phase3_outline_tools",
     "TINKERBELL_ENABLE_SUBAGENTS": "enable_subagents",
     "TINKERBELL_ENABLE_PLOT_SCAFFOLDING": "enable_plot_scaffolding",
+    "TINKERBELL_SAFE_AI_EDITS": "safe_ai_edits",
 }
 _FLOAT_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_REQUEST_TIMEOUT": "request_timeout",
     "TINKERBELL_TEMPERATURE": "temperature",
+    "TINKERBELL_TOKEN_DRIFT": "safe_ai_token_drift",
+}
+_INT_ENV_OVERRIDES: Mapping[str, str] = {
+    "TINKERBELL_DUPLICATE_THRESHOLD": "safe_ai_duplicate_threshold",
 }
 _TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
 _API_KEY_FIELD = "api_key_ciphertext"
@@ -121,6 +126,9 @@ class Settings:
     phase3_outline_tools: bool = False
     enable_subagents: bool = False
     enable_plot_scaffolding: bool = False
+    safe_ai_edits: bool = False
+    safe_ai_duplicate_threshold: int = 2
+    safe_ai_token_drift: float = 0.05
     chunk_profile: str = "auto"
     chunk_overlap_chars: int = 256
     chunk_max_inline_tokens: int = 1_800
@@ -345,6 +353,18 @@ class SettingsStore:
             value = os.environ.get(env_name)
             if value is not None:
                 overrides[field_name] = value.strip().lower() in _TRUE_VALUES
+        for env_name, field_name in _INT_ENV_OVERRIDES.items():
+            value = os.environ.get(env_name)
+            if value is None:
+                continue
+            try:
+                overrides[field_name] = int(value, 10)
+            except ValueError:
+                LOGGER.warning(
+                    "Environment override %s=%s is not a valid integer",
+                    env_name,
+                    value,
+                )
         for env_name, field_name in _FLOAT_ENV_OVERRIDES.items():
             value = os.environ.get(env_name)
             if value is None:

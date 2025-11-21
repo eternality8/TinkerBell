@@ -17,6 +17,7 @@ from tinkerbell.chat.message_model import ChatMessage, EditDirective, ToolTrace
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.ui.main_window import MainWindow, WindowContext
 from tinkerbell.services.importers import FileImporter, ImportResult, ImporterError
+from tinkerbell.services.bridge import DocumentBridge
 from tinkerbell.services.settings import Settings, SettingsStore
 from tinkerbell.services.telemetry import ContextUsageEvent
 from tinkerbell.theme import theme_manager
@@ -167,6 +168,21 @@ def test_chat_panel_visibility_controlled_by_settings():
     assert window.chat_panel.tool_activity_visible is True
 
 
+def test_safe_ai_settings_apply_to_existing_bridges():
+    settings = Settings(
+        safe_ai_edits=True,
+        safe_ai_duplicate_threshold=4,
+        safe_ai_token_drift=0.15,
+    )
+
+    window = _make_window(settings=settings)
+
+    bridge = window._workspace.require_active_tab().bridge  # type: ignore[attr-defined]
+    assert getattr(bridge, "_safe_edit_settings").enabled is True
+    assert getattr(bridge, "_safe_edit_settings").duplicate_threshold == 4
+    assert getattr(bridge, "_safe_edit_settings").token_drift == pytest.approx(0.15)
+
+
 def test_document_edit_tool_runs_in_patch_only_mode():
     controller = _StubAIController()
     _make_window(controller, settings=Settings(api_key="key"))
@@ -216,6 +232,56 @@ def test_settings_dialog_toggle_updates_tool_panel(monkeypatch: pytest.MonkeyPat
     assert window.chat_panel.tool_activity_visible is True
     assert window._context.settings is updated
 
+
+def test_settings_dialog_updates_safe_ai_edits(monkeypatch: pytest.MonkeyPatch):
+    initial = Settings(safe_ai_edits=False)
+    window = _make_window(settings=initial)
+    updated = Settings(
+        safe_ai_edits=True,
+        safe_ai_duplicate_threshold=6,
+        safe_ai_token_drift=0.2,
+    )
+
+    monkeypatch.setattr(
+        window,
+        "_show_settings_dialog",
+        lambda current: SimpleNamespace(accepted=True, settings=updated),
+    )
+
+    window._handle_settings_requested()
+
+    bridge = window._workspace.require_active_tab().bridge  # type: ignore[attr-defined]
+    assert getattr(bridge, "_safe_edit_settings").enabled is True
+    assert getattr(bridge, "_safe_edit_settings").duplicate_threshold == 6
+    assert getattr(bridge, "_safe_edit_settings").token_drift == pytest.approx(0.2)
+
+
+def test_safe_edit_failure_surfaces_guardrail_notice():
+    window = _make_window()
+    directive = EditDirective(
+        action="patch",
+        content="",
+        target_range=SelectionRange(0, 0),
+    )
+    metadata = {
+        "reason": "Paragraph repeated 3 times after edit",
+        "cause": DocumentBridge.CAUSE_INSPECTOR_FAILURE,
+        "diagnostics": {
+            "duplicate": {"count": 3, "paragraph": "Alpha beta"},
+            "window": {"start": 10, "end": 42},
+        },
+    }
+
+    window._handle_edit_failure(directive, "Patch rejected", metadata)
+
+    guardrail_status = window._status_bar.guardrail_notice_state  # noqa: SLF001
+    assert guardrail_status[0].startswith("Safe Edit")
+    assert "Paragraph repeated" in guardrail_status[1]
+    chat_guardrail = window.chat_panel.guardrail_state
+    assert chat_guardrail[0].startswith("Safe Edit")
+    assert window.last_status_message.startswith("Safe edit blocked patch")
+    history = window.chat_panel.history()
+    assert history[-1].content.startswith("Safe edit guardrail rejected the patch.")
 
 def test_selection_updates_chat_suggestions_and_metadata():
     window = _make_window()
@@ -642,7 +708,7 @@ def test_main_window_diff_overlay_helpers() -> None:
     trace = ToolTrace(name="edit:patch", input_summary="", output_summary="Δ", metadata={"spans": [(0, 1)], "diff_preview": "@@"})
     manager = window._review_overlay_manager
     assert manager is not None
-    manager.apply_diff_overlay(trace, document=document, range_hint=(0, 1))
+    manager.apply_diff_overlay(trace, document=document, range_hint={"start": 0, "end": 1})
 
     tab = window.editor_widget.workspace.active_tab
     assert tab is not None

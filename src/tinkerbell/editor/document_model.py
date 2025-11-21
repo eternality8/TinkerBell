@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from ..documents.ranges import TextRange
+
 
 def _utcnow() -> datetime:
     """Return the current UTC time as a timezone-aware datetime."""
@@ -51,6 +53,31 @@ class SelectionRange:
         """Return the selection as a tuple for serialization."""
 
         return (self.start, self.end)
+
+    def to_dict(self) -> dict[str, int]:
+        """Return the selection as a mapping compatible with TextRange payloads."""
+
+        return {"start": self.start, "end": self.end}
+
+    def to_text_range(self) -> TextRange:
+        """Convert the selection into a :class:`TextRange`."""
+
+        return TextRange(self.start, self.end)
+
+    @classmethod
+    def from_text_range(cls, value: TextRange | Any) -> "SelectionRange":
+        """Construct a selection from any TextRange-compatible input."""
+
+        text_range = TextRange.from_value(value)
+        return cls(text_range.start, text_range.end)
+
+    @classmethod
+    def from_value(cls, value: Any) -> "SelectionRange":
+        """Coerce ``value`` into a :class:`SelectionRange`."""
+
+        if isinstance(value, SelectionRange):
+            return cls(value.start, value.end)
+        return cls.from_text_range(value)
 
 
 @dataclass(slots=True)

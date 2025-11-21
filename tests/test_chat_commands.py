@@ -26,7 +26,7 @@ def test_parse_accepts_json_string() -> None:
     result = parse_agent_payload(payload)
 
     assert result["action"] == ActionType.INSERT.value
-    assert result["target_range"] == [0, 0]
+    assert result["target_range"] == {"start": 0, "end": 0}
 
 
 def test_parse_strips_code_fence_and_aliases_target() -> None:

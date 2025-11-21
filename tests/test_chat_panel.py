@@ -47,11 +47,19 @@ def test_guardrail_indicator_tracks_state():
 
     assert panel.guardrail_state == ("", "")
 
-    panel.set_guardrail_state("Warning", detail="Doc fetched full snapshot")
+    panel.set_guardrail_state("Chunk Warning", detail="Doc fetched full snapshot", category="chunk_flow")
 
-    assert panel.guardrail_state == ("Warning", "Doc fetched full snapshot")
+    assert panel.guardrail_state == ("Chunk Warning", "Doc fetched full snapshot")
 
-    panel.set_guardrail_state(None)
+    panel.set_guardrail_state("Safe Edit Blocked", detail="Paragraph repeated", category="safe_edit")
+
+    assert panel.guardrail_state == ("Safe Edit Blocked", "Paragraph repeated")
+
+    panel.set_guardrail_state(None, category="safe_edit")
+
+    assert panel.guardrail_state == ("Chunk Warning", "Doc fetched full snapshot")
+
+    panel.set_guardrail_state(None, category="chunk_flow")
 
     assert panel.guardrail_state == ("", "")
 
@@ -318,6 +326,41 @@ def test_copy_tool_trace_details_without_traces_returns_false():
     panel = _make_panel()
 
     assert panel.copy_tool_trace_details() is False
+
+
+def test_tool_trace_entry_marks_failure_from_summary():
+    panel = _make_panel()
+    trace = ToolTrace(name="search", input_summary="", output_summary="Error: missing document")
+
+    text, status = panel._format_tool_trace_entry(trace, 2)
+
+    assert status == "failure"
+    assert text.startswith("✕ Step 2")
+
+
+def test_tool_trace_entry_marks_success_from_structured_status():
+    panel = _make_panel()
+    trace = ToolTrace(
+        name="manual:document_outline",
+        input_summary="outline",
+        output_summary="pending",
+        metadata={"parsed_output": {"status": "ok"}},
+    )
+
+    text, status = panel._format_tool_trace_entry(trace, 5)
+
+    assert status == "success"
+    assert text.startswith("✓ Step 5")
+
+
+def test_tool_trace_entry_marks_pending_for_running_summary():
+    panel = _make_panel()
+    trace = ToolTrace(name="search", input_summary="", output_summary="(running…)")
+
+    text, status = panel._format_tool_trace_entry(trace, 1)
+
+    assert status == "pending"
+    assert text.startswith("… Step 1")
 
 
 def test_chat_panel_suggestions_update_composer():

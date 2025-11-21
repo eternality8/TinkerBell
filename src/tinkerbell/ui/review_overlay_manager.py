@@ -11,6 +11,7 @@ from ..chat.message_model import ToolTrace
 from ..editor.document_model import DocumentState
 from ..editor.editor_widget import DiffOverlayState
 from ..editor.workspace import DocumentTab, DocumentWorkspace
+from ..documents.ranges import TextRange
 from .ai_review_controller import AIReviewController, PendingReviewSession
 
 LOGGER = logging.getLogger(__name__)
@@ -51,7 +52,7 @@ class ReviewOverlayManager:
         trace: ToolTrace,
         *,
         document: DocumentState,
-        range_hint: tuple[int, int],
+        range_hint: TextRange | Mapping[str, Any] | Sequence[int] | tuple[int, int] | None,
         tab_id: str | None = None,
         spans_override: tuple[tuple[int, int], ...] | None = None,
         label_override: str | None = None,
@@ -59,10 +60,11 @@ class ReviewOverlayManager:
         target_id = tab_id or self.find_tab_id_for_document(document)
         if not target_id:
             return
+        normalized_range = self._coerce_text_range(range_hint)
         metadata = trace.metadata if isinstance(trace.metadata, Mapping) else {}
         spans = spans_override if spans_override is not None else self.coerce_overlay_spans(
             metadata.get("spans"),
-            fallback_range=range_hint,
+            fallback_range=normalized_range,
         )
         diff_payload = metadata.get("diff_preview") if isinstance(metadata, Mapping) else None
         label = label_override or str(diff_payload or trace.output_summary or trace.name)
@@ -275,7 +277,7 @@ class ReviewOverlayManager:
     def coerce_overlay_spans(
         raw_spans: Any,
         *,
-        fallback_range: tuple[int, int] | None,
+        fallback_range: TextRange | Mapping[str, Any] | Sequence[int] | tuple[int, int] | None,
     ) -> tuple[tuple[int, int], ...]:
         spans: list[tuple[int, int]] = []
         if isinstance(raw_spans, Sequence):
@@ -292,12 +294,25 @@ class ReviewOverlayManager:
                 if end < start:
                     start, end = end, start
                 spans.append((start, end))
-        if not spans and fallback_range is not None and fallback_range[0] != fallback_range[1]:
-            start, end = fallback_range
+        fallback_tuple: tuple[int, int] | None = None
+        if fallback_range is not None:
+            normalized_range = ReviewOverlayManager._coerce_text_range(fallback_range)
+            fallback_tuple = normalized_range.to_tuple() if normalized_range is not None else None
+        if not spans and fallback_tuple is not None and fallback_tuple[0] != fallback_tuple[1]:
+            start, end = fallback_tuple
             if end < start:
                 start, end = end, start
             spans.append((start, end))
         return tuple(spans)
+
+    @staticmethod
+    def _coerce_text_range(range_hint: TextRange | Mapping[str, Any] | Sequence[int] | tuple[int, int] | None) -> TextRange | None:
+        if range_hint is None:
+            return None
+        try:
+            return TextRange.from_value(range_hint)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def merge_overlay_spans(

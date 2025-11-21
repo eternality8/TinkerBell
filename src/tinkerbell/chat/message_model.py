@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Literal, Optional
 
+from ..documents.ranges import TextRange
+
 
 def _utcnow() -> datetime:
     """Return the current UTC time as a timezone-aware datetime."""
@@ -89,10 +91,13 @@ class EditDirective:
     """Structured command emitted by the agent to modify the document."""
 
     action: str
-    target_range: tuple[int, int]
+    target_range: TextRange
     content: str
     rationale: Optional[str] = None
     diff: Optional[str] = None
     selection_fingerprint: Optional[str] = None
     match_text: Optional[str] = None
     expected_text: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "target_range", TextRange.from_value(self.target_range))

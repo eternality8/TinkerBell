@@ -161,6 +161,7 @@ Phase 5 hardens diff tooling so every edit is anchored to an explicit snapshot s
 - `patch.apply` – emitted by `DocumentBridge` when a patch succeeds, conflicts, or arrives stale. Includes the duration in milliseconds, `range_count` (for streamed diffs), diff summary, and whether the bridge had to fall back because of a conflict. Dashboards can now plot success/conflict ratios directly from telemetry instead of scraping logs.
 
 These events piggyback on the existing telemetry bus, so the status bar debug widgets and `scripts/export_context_usage.py` will surface them automatically once the sinks are subscribed.
+Details for each payload (fields, status values, and sample diagnostics) now live in `docs/operations/telemetry.md` for downstream ingestion pipelines.
 
 ## 3c. Chunk-first selective read guardrails (Phase 5)
 
@@ -192,6 +193,7 @@ Phase 5 tightens the read flow so the agent stays on the "selection snapshot →
 - **Deterministic override order** – Settings are merged as **UI defaults → CLI `--set key=value` flags → environment variables**. CLI overrides accept ints/floats/bools plus JSON blobs for structured fields, letting you tweak `max_tool_iterations`, request timeouts, or metadata without touching disk.
 - **Settings inspector** – Running `uv run tinkerbell --dump-settings` prints the fully merged configuration (API keys redacted), the resolved settings path, the secret backend, applied CLI overrides, and the `TINKERBELL_*` variables that influenced the run.
 - **Custom locations** – Pass `--settings-path` when launching or dumping to point at alternate profiles (useful for smoke tests or portable builds). The CLI honors the same override order, so env vars still win if both are supplied.
+- **Safe AI editing flag** – Guardrail inspections ship behind `safe_ai_edits` (default `False`). Toggle it in **Settings → Experimental → Safe AI edits**, or pass `--enable-safe-ai-edits` / `--disable-safe-ai-edits` on the CLI for one-off sessions. Environment overrides use `TINKERBELL_SAFE_AI_EDITS=1` along with `TINKERBELL_DUPLICATE_THRESHOLD` / `TINKERBELL_TOKEN_DRIFT` to tune the duplicate paragraph and token-drift thresholds. Every `DocumentBridge` instance picks up the flag at runtime (existing tabs reconfigure immediately), so QA can roll out guardrails gradually and disable them quickly if needed.
 
 ## 7. Desktop UX helpers (Phase 1)
 
@@ -204,6 +206,7 @@ Phase 5 tightens the read flow so the agent stays on the "selection snapshot →
 - **Token + diff baselines** – `benchmarks/phase0_token_counts.md` now tracks both the original tokenizer sanity checks and the new Phase 1 diff latency table. Run `uv run python benchmarks/measure_diff_latency.py` to reproduce the War and Peace / Large JSON runtimes cited there.
 - **Automation hook** – The benchmark helper accepts `--case LABEL=PATH` (and `--json`) so CI jobs or future profiling scripts can extend the dataset without editing the file.
 - **Pointer impact follow-up** – Sprint 3 enables pointer-driven compaction by default, and the benchmark harness now prints `diff_tokens`, `pointer_tokens`, and `tokens_saved` for every oversized tool payload. War and Peace’s 88K-token diff collapses to ~250 tokens, so the controller stays comfortably below the watchdog ceiling.
+- **Patch pipeline timing** – `benchmarks/measure_diff_latency.py --mode pipeline` now spins up a `DocumentApplyPatchTool → DocumentBridge` flow (with and without safe edits) so we can track guardrail overhead. Use `--duplicate-threshold` and `--token-drift` to mirror QA settings, or `--mode diff` when you only need the legacy baseline.
 
 ## 9. Sprint 2 – Summaries & pointers
 

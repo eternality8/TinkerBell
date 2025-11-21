@@ -72,10 +72,13 @@ class SettingsRuntime:
         chat_panel_handler: Callable[[Settings], None],
         phase3_handler: Callable[[Settings], None],
         plot_scaffolding_handler: Callable[[Settings], None],
+        safe_edit_handler: Callable[[Settings], None] | None = None,
     ) -> None:
         chat_panel_handler(settings)
         phase3_handler(settings)
         plot_scaffolding_handler(settings)
+        if safe_edit_handler is not None:
+            safe_edit_handler(settings)
         self._apply_debug_logging_setting(settings)
         self._apply_event_logging_setting(settings)
         self.apply_theme_setting(settings)

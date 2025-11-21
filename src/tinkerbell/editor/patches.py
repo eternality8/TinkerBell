@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 _PATCH_HEADER_RE = re.compile(
     r"@@\s+-?(?P<old_start>\d+)(?:,(?P<old_len>\d+))?\s+\+(?P<new_start>\d+)(?:,(?P<new_len>\d+))?\s+@@"
@@ -56,6 +56,8 @@ class RangePatch:
     end: int
     replacement: str
     match_text: str
+    chunk_id: Optional[str] = None
+    chunk_hash: Optional[str] = None
 
 
 @dataclass(slots=True)

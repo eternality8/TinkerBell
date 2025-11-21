@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
 import time
 from copy import deepcopy
@@ -18,8 +19,11 @@ from ..ai.memory.cache_bus import (
 )
 from ..chat.commands import ActionType, parse_agent_payload, validate_directive
 from ..chat.message_model import EditDirective
+from ..documents.ranges import TextRange
+from ..documents.range_normalizer import normalize_text_range
 from ..editor.document_model import DocumentState, DocumentVersion
 from ..editor.patches import PatchApplyError, PatchResult, RangePatch, apply_streamed_ranges, apply_unified_diff
+from ..editor.post_edit_inspector import InspectionResult, PostEditInspector
 from .telemetry import emit as telemetry_emit
 
 
@@ -46,6 +50,9 @@ class EditorAdapter(Protocol):
     def apply_patch_result(self, result: PatchResult) -> DocumentState:
         ...
 
+    def restore_document(self, document: DocumentState) -> DocumentState:
+        ...
+
 
 @dataclass(slots=True)
 class _QueuedEdit:
@@ -53,6 +60,7 @@ class _QueuedEdit:
 
     directive: EditDirective
     context_version: Optional[str] = None
+    content_hash: Optional[str] = None
     payload: Optional[Mapping[str, Any]] = None
     diff: Optional[str] = None
     ranges: tuple["PatchRangePayload", ...] = ()
@@ -75,11 +83,14 @@ class EditContext:
     """Details about the most recently applied directive."""
 
     action: str
-    target_range: tuple[int, int]
+    target_range: TextRange
     replaced_text: str
     content: str
     diff: Optional[str] = None
     spans: tuple[tuple[int, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "target_range", TextRange.from_value(self.target_range, fallback=(0, 0)))
 
 
 @dataclass(slots=True)
@@ -102,14 +113,39 @@ class PatchMetrics:
         self.conflicts += 1
 
 
+@dataclass(slots=True)
+class SafeEditSettings:
+    """Runtime configuration for post-edit inspections."""
+
+    enabled: bool = False
+    duplicate_threshold: int = 2
+    token_drift: float = 0.05
+
+
 class DocumentVersionMismatchError(RuntimeError):
     """Raised when an edit references a stale document version."""
+
+    def __init__(self, message: str, *, cause: str | None = None) -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 class DocumentBridge:
     """Orchestrates safe document snapshots, conflict detection, and queued edits."""
 
     PATCH_EVENT_NAME = "patch.apply"
+    EDIT_REJECTED_EVENT_NAME = "edit_rejected"
+    CAUSE_HASH_MISMATCH = "hash_mismatch"
+    CAUSE_CHUNK_HASH_MISMATCH = "chunk_hash_mismatch"
+    CAUSE_INSPECTOR_FAILURE = "inspector_failure"
+    _HASH_FAILURE_REASONS = {
+        "context_mismatch",
+        "context_overflow",
+        "range_mismatch",
+        "range_overlap",
+        "range_overflow",
+        "unexpected_eof",
+    }
 
     def __init__(
         self,
@@ -128,9 +164,17 @@ class DocumentBridge:
         self._main_thread_executor = main_thread_executor
         self._edit_listeners: list[EditAppliedListener] = []
         self._failure_listeners: list[Callable[[EditDirective, str], None]] = []
+        self._failure_listener_capabilities: dict[Callable[..., Any], bool] = {}
         self._patch_metrics = PatchMetrics()
         self._cache_bus = cache_bus or get_document_cache_bus()
         self._chunk_manifest_cache: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._tab_id: Optional[str] = None
+        self._last_failure_metadata: Optional[dict[str, Any]] = None
+        self._safe_edit_settings = SafeEditSettings()
+        self._post_edit_inspector = PostEditInspector(
+            duplicate_threshold=self._safe_edit_settings.duplicate_threshold,
+            token_drift=self._safe_edit_settings.token_drift,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -210,6 +254,14 @@ class DocumentBridge:
 
         return self._patch_metrics
 
+    @property
+    def last_failure_metadata(self) -> Optional[Mapping[str, Any]]:
+        """Expose structured details about the most recent failure if any."""
+
+        if self._last_failure_metadata is None:
+            return None
+        return dict(self._last_failure_metadata)
+
     def add_edit_listener(self, listener: EditAppliedListener) -> None:
         """Register a callback fired after each successful directive."""
 
@@ -227,12 +279,14 @@ class DocumentBridge:
         """Attach a callback invoked when directive application fails."""
 
         self._failure_listeners.append(listener)
+        self._failure_listener_capabilities[listener] = self._supports_failure_metadata(listener)
 
     def remove_failure_listener(self, listener: Callable[[EditDirective, str], None]) -> None:
         """Detach a previously registered failure listener if present."""
 
         try:
             self._failure_listeners.remove(listener)
+            self._failure_listener_capabilities.pop(listener, None)
         except ValueError:  # pragma: no cover - defensive guard
             pass
 
@@ -240,6 +294,36 @@ class DocumentBridge:
         """Configure a callable used to marshal edits onto the UI thread."""
 
         self._main_thread_executor = executor
+
+    def set_tab_context(self, *, tab_id: str | None) -> None:
+        """Annotate telemetry emitted by this bridge with the owning tab identifier."""
+
+        if isinstance(tab_id, str):
+            value = tab_id.strip()
+            self._tab_id = value or None
+            return
+        self._tab_id = None
+
+    def configure_safe_editing(
+        self,
+        *,
+        enabled: bool,
+        duplicate_threshold: int | None = None,
+        token_drift: float | None = None,
+    ) -> None:
+        """Toggle the post-edit inspector and update thresholds."""
+
+        self._safe_edit_settings.enabled = bool(enabled)
+        if duplicate_threshold is not None:
+            value = max(2, int(duplicate_threshold))
+            self._safe_edit_settings.duplicate_threshold = value
+        if token_drift is not None:
+            value = max(0.0, float(token_drift))
+            self._safe_edit_settings.token_drift = value
+        self._post_edit_inspector.configure(
+            duplicate_threshold=self._safe_edit_settings.duplicate_threshold,
+            token_drift=self._safe_edit_settings.token_drift,
+        )
 
     def queue_edit(self, directive: EditDirective | Mapping[str, Any]) -> None:
         """Validate, normalize, and enqueue a directive for application."""
@@ -265,57 +349,26 @@ class DocumentBridge:
     def _apply_edit(self, queued: _QueuedEdit) -> None:
         document_before = self.editor.to_document()
         pre_edit_snapshot = deepcopy(document_before)
-        if queued.context_version and not self._is_version_current(document_before, queued.context_version):
-            message = "Directive is stale relative to the current document state"
-            if queued.directive.action == ActionType.PATCH.value:
-                self._patch_metrics.record_conflict()
-                self._emit_patch_event(
-                    status="stale",
-                    version=document_before.version_info(),
-                    diff_summary=None,
-                    reason=message,
-                    range_count=len(queued.ranges) if queued.ranges else None,
-                    streamed=bool(queued.ranges),
-                )
-            self._record_failure(queued.directive, message)
-            raise DocumentVersionMismatchError(message)
+        version_metadata = document_before.version_info()
+        if queued.directive.action != ActionType.PATCH.value:
+            raise ValueError("DocumentBridge only processes patch directives")
 
-        if queued.directive.action == ActionType.PATCH.value:
-            self._apply_patch_directive(queued, document_before)
-            return
-
-        before_text = document_before.text
         try:
-            updated_state = self._execute_on_main_thread(lambda: self.editor.apply_ai_edit(queued.directive))
-        except Exception as exc:  # pragma: no cover - defensive logging
-            _LOGGER.exception("Failed to apply directive: action=%s", queued.directive.action)
-            self._record_failure(queued.directive, str(exc))
-            raise RuntimeError(f"Failed to apply directive: {queued.directive.action}") from exc
+            self._validate_patch_context(document_before, queued)
+        except DocumentVersionMismatchError as exc:
+            self._record_patch_rejection(
+                queued,
+                version_metadata,
+                status="stale",
+                reason=str(exc),
+                cause=exc.cause or self.CAUSE_HASH_MISMATCH,
+                range_count=len(queued.ranges) if queued.ranges else None,
+                streamed=bool(queued.ranges),
+                record_conflict=True,
+            )
+            raise
 
-        start, end = queued.directive.target_range
-        replaced_segment = before_text[start:end]
-        self._last_edit_context = EditContext(
-            action=queued.directive.action,
-            target_range=(start, end),
-            replaced_text=replaced_segment,
-            content=queued.directive.content,
-        )
-        self._last_diff = self._summarize_diff(before_text, updated_state.text)
-        version = updated_state.version_info()
-        self._last_snapshot_token = self._format_version_token(version)
-        self._last_document_version = version
-        _LOGGER.debug(
-            "Applied directive action=%s range=%s diff=%s",
-            queued.directive.action,
-            queued.directive.target_range,
-            self._last_diff,
-        )
-        self._notify_listeners(queued.directive, pre_edit_snapshot)
-        self._publish_document_changed(
-            version,
-            spans=(queued.directive.target_range,),
-            source=queued.directive.action,
-        )
+        self._apply_patch_directive(queued, document_before)
 
     def _execute_on_main_thread(self, func: Callable[[], DocumentState]) -> DocumentState:
         if self._main_thread_executor is not None:
@@ -331,12 +384,102 @@ class DocumentBridge:
             except Exception:  # pragma: no cover - defensive logging
                 _LOGGER.exception("Edit listener failed")
 
-    def _record_failure(self, directive: EditDirective, message: str) -> None:
+    def _record_failure(
+        self,
+        directive: EditDirective,
+        message: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] | None = dict(metadata) if metadata else {}
+        range_payload = directive.target_range.to_dict()
+        payload.setdefault("target_range", range_payload)
+        if self._tab_id:
+            payload.setdefault("tab_id", self._tab_id)
+        dispatch_payload = dict(payload) if payload is not None else None
+        self._last_failure_metadata = dict(dispatch_payload) if dispatch_payload is not None else None
         for listener in list(self._failure_listeners):
+            accepts_metadata = self._failure_listener_capabilities.get(listener)
+            if accepts_metadata is None:
+                accepts_metadata = self._supports_failure_metadata(listener)
+                self._failure_listener_capabilities[listener] = accepts_metadata
             try:
-                listener(directive, message)
+                if accepts_metadata:
+                    listener(directive, message, dict(dispatch_payload) if dispatch_payload is not None else None)
+                else:
+                    listener(directive, message)
             except Exception:  # pragma: no cover - defensive guard
                 _LOGGER.exception("Edit failure listener raised")
+
+    def _record_patch_rejection(
+        self,
+        queued: _QueuedEdit,
+        version: DocumentVersion,
+        *,
+        status: str,
+        reason: str,
+        cause: str | None,
+        range_count: int | None,
+        streamed: bool | None,
+        record_conflict: bool,
+        diagnostics: Mapping[str, Any] | None = None,
+    ) -> None:
+        summary = reason or "edit rejected"
+        self._last_diff = f"failed: {summary}"
+        failure_metadata = self._build_failure_metadata(
+            version=version,
+            status=status,
+            reason=summary,
+            cause=cause,
+            range_count=range_count,
+            streamed=streamed,
+            diagnostics=diagnostics,
+        )
+        self._record_failure(queued.directive, self._last_diff, failure_metadata)
+        if record_conflict:
+            self._patch_metrics.record_conflict()
+        self._emit_patch_event(
+            status=status,
+            version=version,
+            diff_summary=None,
+            reason=summary,
+            range_count=range_count,
+            streamed=streamed,
+            cause=cause,
+        )
+        self._emit_edit_rejected_event(
+            version=version,
+            action=queued.directive.action,
+            reason=summary,
+            cause=cause,
+            range_count=range_count,
+            streamed=streamed,
+            diagnostics=diagnostics,
+        )
+
+    def _validate_patch_context(self, document: DocumentState, queued: _QueuedEdit) -> None:
+        if not queued.context_version:
+            raise DocumentVersionMismatchError(
+                "Patch directives must include document_version metadata",
+                cause=self.CAUSE_HASH_MISMATCH,
+            )
+        if not self._is_version_current(document, queued.context_version):
+            raise DocumentVersionMismatchError(
+                "Patch directive references a stale document snapshot",
+                cause=self.CAUSE_HASH_MISMATCH,
+            )
+        expected_hash = queued.content_hash
+        if expected_hash is None and queued.payload is not None:
+            expected_hash = self._extract_content_hash(queued.payload)
+        if not expected_hash:
+            raise DocumentVersionMismatchError(
+                "Patch directives must include content_hash metadata",
+                cause=self.CAUSE_HASH_MISMATCH,
+            )
+        if document.content_hash != expected_hash:
+            raise DocumentVersionMismatchError(
+                "Patch directive content_hash no longer matches the live document",
+                cause=self.CAUSE_HASH_MISMATCH,
+            )
 
     def _apply_patch_directive(self, queued: _QueuedEdit, document_before: DocumentState) -> None:
         diff_text = queued.diff or queued.directive.diff or ""
@@ -347,29 +490,69 @@ class DocumentBridge:
         start_time = time.perf_counter()
         pre_edit_snapshot = deepcopy(document_before)
         pre_version = document_before.version_info()
+        range_count = len(queued.ranges) if use_ranges else None
+        range_hint: tuple[int, int] | None = None
         try:
             if use_ranges:
-                patch_result = self._apply_range_payloads(queued.ranges, document_before)
+                expanded_ranges = self._expand_patch_ranges(document_before, queued.ranges)
+                range_count = len(expanded_ranges)
+                range_hint = self._range_hint_from_expanded_ranges(document_before.text, expanded_ranges)
+                if range_hint is not None:
+                    queued.directive.target_range = TextRange.from_value(range_hint)
+                self._validate_range_chunk_hashes(document_before, expanded_ranges)
+                patch_result = self._apply_range_payloads(expanded_ranges, document_before)
             else:
                 patch_result = apply_unified_diff(document_before.text, diff_text)
-        except PatchApplyError as exc:
-            self._patch_metrics.record_conflict()
-            reason = getattr(exc, "reason", str(exc))
-            summary = f"failed: {reason}"
-            self._last_diff = summary
-            self._record_failure(queued.directive, summary)
-            self._emit_patch_event(
-                status="conflict",
-                version=pre_version,
-                diff_summary=None,
-                reason=reason,
-                range_count=len(queued.ranges) if use_ranges else None,
-                streamed=use_ranges,
+        except DocumentVersionMismatchError as exc:
+            self._record_patch_rejection(
+                queued,
+                pre_version,
+                status="stale",
+                reason=str(exc),
+                cause=exc.cause or self.CAUSE_HASH_MISMATCH,
+                range_count=range_count,
+                streamed=True,
+                record_conflict=True,
             )
+            raise
+        except PatchApplyError as exc:
+            reason = getattr(exc, "reason", str(exc))
+            cause = self.CAUSE_HASH_MISMATCH if reason in self._HASH_FAILURE_REASONS else None
+            self._record_patch_rejection(
+                queued,
+                pre_version,
+                status="conflict",
+                reason=reason,
+                cause=cause,
+                range_count=range_count,
+                streamed=use_ranges,
+                record_conflict=True,
+            )
+            if use_ranges and cause == self.CAUSE_HASH_MISMATCH:
+                raise DocumentVersionMismatchError("Streamed patch validation failed", cause=cause) from exc
             raise RuntimeError(f"Patch application failed: {exc}") from exc
 
         updated_state = self._execute_on_main_thread(lambda: self.editor.apply_patch_result(patch_result))
-        target_range = self._derive_patch_range(patch_result.spans, len(updated_state.text))
+        inspection = self._run_post_edit_inspection(
+            document_before=document_before,
+            patch_result=patch_result,
+            range_hint=range_hint,
+        )
+        if inspection is not None and not inspection.ok:
+            self._handle_post_edit_rejection(
+                queued=queued,
+                version=pre_version,
+                pre_edit_snapshot=pre_edit_snapshot,
+                range_count=range_count,
+                streamed=use_ranges,
+                inspection=inspection,
+            )
+            raise DocumentVersionMismatchError(
+                inspection.detail or inspection.reason or "Post-edit inspection rejected edit",
+                cause=self.CAUSE_INSPECTOR_FAILURE,
+            )
+
+        target_range = range_hint or self._derive_patch_range(patch_result.spans, len(updated_state.text))
         self._last_edit_context = EditContext(
             action=queued.directive.action,
             target_range=target_range,
@@ -391,6 +574,7 @@ class DocumentBridge:
             duration_ms=elapsed * 1000.0,
             range_count=len(patch_result.spans),
             streamed=use_ranges,
+            cause=None,
         )
 
         _LOGGER.debug("Applied patch directive diff=%s spans=%s", patch_result.summary, patch_result.spans)
@@ -400,6 +584,7 @@ class DocumentBridge:
             spans=patch_result.spans,
             source=queued.directive.action,
         )
+        self._last_failure_metadata = None
 
     def _emit_patch_event(
         self,
@@ -411,6 +596,7 @@ class DocumentBridge:
         range_count: int | None = None,
         streamed: bool | None = None,
         reason: str | None = None,
+        cause: str | None = None,
     ) -> None:
         event_name = self.PATCH_EVENT_NAME
         if not event_name:
@@ -421,6 +607,8 @@ class DocumentBridge:
             "content_hash": version.content_hash,
             "status": status,
         }
+        if self._tab_id:
+            payload["tab_id"] = self._tab_id
         if diff_summary:
             payload["diff_summary"] = diff_summary
         if duration_ms is not None:
@@ -431,6 +619,149 @@ class DocumentBridge:
             payload["streamed"] = bool(streamed)
         if reason:
             payload["reason"] = reason
+        if cause:
+            payload["cause"] = cause
+        telemetry_emit(event_name, payload)
+
+    def _run_post_edit_inspection(
+        self,
+        *,
+        document_before: DocumentState,
+        patch_result: PatchResult,
+        range_hint: tuple[int, int] | None,
+    ) -> InspectionResult | None:
+        if not self._safe_edit_settings.enabled:
+            return None
+        try:
+            return self._post_edit_inspector.inspect(
+                before_text=document_before.text,
+                after_text=patch_result.text,
+                spans=patch_result.spans,
+                range_hint=range_hint,
+            )
+        except Exception:  # pragma: no cover - inspector failures should not block edits
+            _LOGGER.debug("Post-edit inspector failed", exc_info=True)
+            return None
+
+    def _handle_post_edit_rejection(
+        self,
+        *,
+        queued: _QueuedEdit,
+        version: DocumentVersion,
+        pre_edit_snapshot: DocumentState,
+        range_count: int | None,
+        streamed: bool | None,
+        inspection: InspectionResult,
+    ) -> None:
+        self._restore_document_snapshot(pre_edit_snapshot)
+        reason = inspection.detail or inspection.reason or "Edit rejected"
+        self._record_patch_rejection(
+            queued,
+            version,
+            status="rejected",
+            reason=reason,
+            cause=self.CAUSE_INSPECTOR_FAILURE,
+            range_count=range_count,
+            streamed=streamed,
+            record_conflict=False,
+            diagnostics=inspection.diagnostics,
+        )
+
+    def _restore_document_snapshot(self, snapshot: DocumentState) -> DocumentState:
+        snapshot_copy = deepcopy(snapshot)
+        restorer = getattr(self.editor, "restore_document", None)
+        if callable(restorer):
+            restored = self._execute_on_main_thread(lambda: restorer(deepcopy(snapshot_copy)))
+        else:
+            def _load() -> DocumentState:
+                self.editor.load_document(deepcopy(snapshot_copy))
+                return self.editor.to_document()
+
+            restored = self._execute_on_main_thread(_load)
+        version = restored.version_info()
+        self._last_document_version = version
+        self._last_snapshot_token = self._format_version_token(version)
+        return restored
+
+    def _build_failure_metadata(
+        self,
+        *,
+        version: DocumentVersion | None,
+        status: str | None = None,
+        reason: str | None = None,
+        cause: str | None = None,
+        range_count: int | None = None,
+        streamed: bool | None = None,
+        diagnostics: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        if version is not None:
+            metadata["document_id"] = version.document_id
+            metadata["version_id"] = version.version_id
+            metadata["content_hash"] = version.content_hash
+        if status:
+            metadata["status"] = status
+        if reason:
+            metadata["reason"] = reason
+        if cause:
+            metadata["cause"] = cause
+        if range_count is not None:
+            metadata["range_count"] = range_count
+        if streamed is not None:
+            metadata["streamed"] = bool(streamed)
+        if diagnostics:
+            metadata["diagnostics"] = dict(diagnostics)
+        return metadata
+
+    @staticmethod
+    def _supports_failure_metadata(listener: Callable[..., Any]) -> bool:
+        try:
+            signature = inspect.signature(listener)
+        except (TypeError, ValueError):  # pragma: no cover - assume flexible
+            return True
+        params = list(signature.parameters.values())
+        if not params:
+            return False
+        if any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params):
+            return True
+        positional = [
+            param
+            for param in params
+            if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        return len(positional) >= 3
+
+    def _emit_edit_rejected_event(
+        self,
+        *,
+        version: DocumentVersion,
+        action: str,
+        reason: str,
+        cause: str | None,
+        range_count: int | None,
+        streamed: bool | None,
+        diagnostics: Mapping[str, Any] | None = None,
+    ) -> None:
+        event_name = self.EDIT_REJECTED_EVENT_NAME
+        if not event_name:
+            return
+        payload: dict[str, Any] = {
+            "document_id": version.document_id,
+            "version_id": version.version_id,
+            "content_hash": version.content_hash,
+            "action": action,
+            "reason": reason,
+        }
+        if cause:
+            payload["cause"] = cause
+        if self._tab_id:
+            payload["tab_id"] = self._tab_id
+        if range_count is not None:
+            payload["range_count"] = range_count
+        if streamed is not None:
+            payload["streamed"] = bool(streamed)
+        if diagnostics:
+            payload["diagnostics"] = dict(diagnostics)
         telemetry_emit(event_name, payload)
 
     def _apply_range_payloads(
@@ -444,10 +775,38 @@ class DocumentBridge:
                 end=entry.end,
                 replacement=entry.replacement,
                 match_text=entry.match_text,
+                chunk_id=entry.chunk_id,
+                chunk_hash=entry.chunk_hash,
             )
             for entry in ranges
         ]
         return apply_streamed_ranges(document_before.text, range_specs)
+
+    def _validate_range_chunk_hashes(
+        self,
+        document: DocumentState,
+        ranges: Sequence[PatchRangePayload],
+    ) -> None:
+        if not ranges:
+            return
+        text = document.text
+        length = len(text)
+        for entry in ranges:
+            if not entry.chunk_hash:
+                continue
+            bounds = self._parse_chunk_bounds(entry.chunk_id)
+            if bounds is None:
+                continue
+            start, end = bounds
+            start = max(0, min(start, length))
+            end = max(start, min(end, length))
+            actual_slice = text[start:end]
+            actual_hash = self._hash_text(actual_slice)
+            if actual_hash != entry.chunk_hash:
+                raise DocumentVersionMismatchError(
+                    "Chunk hash mismatch detected before applying streamed patch",
+                    cause=self.CAUSE_CHUNK_HASH_MISMATCH,
+                )
 
     def notify_document_closed(self, *, reason: str | None = None) -> None:
         self._chunk_manifest_cache.clear()
@@ -474,12 +833,111 @@ class DocumentBridge:
         end = min(length, max(span[1] for span in spans))
         return (start, end)
 
+    def _expand_patch_ranges(
+        self,
+        document: DocumentState,
+        ranges: Sequence["PatchRangePayload"],
+    ) -> tuple["PatchRangePayload", ...]:
+        if not ranges:
+            return ()
+        text = document.text or ""
+        length = len(text)
+        expanded: list[PatchRangePayload] = []
+        for entry in ranges:
+            expanded.append(self._expand_single_range(text, length, entry))
+        return tuple(expanded)
+
+    def _range_hint_from_expanded_ranges(
+        self,
+        text: str,
+        ranges: Sequence["PatchRangePayload"],
+    ) -> tuple[int, int] | None:
+        if not ranges:
+            return None
+        length = len(text or "")
+        starts = [max(0, min(entry.start, length)) for entry in ranges]
+        if not starts:
+            return None
+        start = min(starts)
+        end_candidates = [self._logical_range_end(text, entry) for entry in ranges]
+        end = max(end_candidates) if end_candidates else start
+        if end < start:
+            end = start
+        return (start, end)
+
+    def _logical_range_end(self, text: str, entry: "PatchRangePayload") -> int:
+        if not text:
+            return entry.end
+        length = len(text)
+        end = max(0, min(entry.end, length))
+        if end == 0:
+            return 0
+        idx = end - 1
+        last_char = text[idx]
+        if last_char not in {"\n", "\r"}:
+            return end
+        cursor = end
+        while cursor < length and text[cursor] in {" ", "\t", "\r"}:
+            cursor += 1
+        if cursor < length and text[cursor] == "\n":
+            return idx
+        return end
+
+    def _expand_single_range(
+        self,
+        text: str,
+        length: int,
+        entry: "PatchRangePayload",
+    ) -> "PatchRangePayload":
+        if not text or entry.chunk_id or entry.chunk_hash:
+            return entry
+        normalized = normalize_text_range(text, entry.start, entry.end, replacement=entry.replacement)
+        if normalized.start == entry.start and normalized.end == entry.end:
+            return entry
+        return PatchRangePayload(
+            start=normalized.start,
+            end=normalized.end,
+            replacement=entry.replacement,
+            match_text=normalized.slice_text,
+            chunk_id=entry.chunk_id,
+            chunk_hash=entry.chunk_hash,
+        )
+
+    def _range_hint_from_payload(
+        self,
+        ranges: Sequence["PatchRangePayload"],
+        payload: Mapping[str, Any],
+    ) -> tuple[int, int]:
+        if ranges:
+            start = min(entry.start for entry in ranges)
+            end = max(entry.end for entry in ranges)
+            return (start, end)
+        metadata = payload.get("metadata")
+        if isinstance(metadata, Mapping):
+            hint = self._coerce_text_range_hint(metadata.get("target_range"))
+            if hint is not None:
+                return hint
+        hint = self._coerce_text_range_hint(payload.get("target_range"))
+        if hint is not None:
+            return hint
+        return (0, 0)
+
+    @staticmethod
+    def _coerce_text_range_hint(value: Any) -> tuple[int, int] | None:
+        if value is None:
+            return None
+        try:
+            text_range = TextRange.from_value(value)
+        except (TypeError, ValueError):
+            return None
+        return text_range.to_tuple()
+
     def _normalize_directive(self, directive: EditDirective | Mapping[str, Any]) -> _QueuedEdit:
         if isinstance(directive, EditDirective):
             payload: dict[str, Any] = {
                 "action": directive.action,
                 "content": directive.content,
-                "target_range": directive.target_range,
+                "target_range": directive.target_range.to_dict(),
             }
             if directive.rationale is not None:
                 payload["rationale"] = directive.rationale
@@ -494,7 +952,7 @@ class DocumentBridge:
             raise ValueError(validation.message)
 
         document = self.editor.to_document()
-        action = str(payload.get("action", ""))
+        action = str(payload.get("action", "")).lower()
         rationale = payload.get("rationale")
         context_version = self._extract_context_version(payload)
 
@@ -508,9 +966,13 @@ class DocumentBridge:
                 raise ValueError("Patch directives must include a diff string or ranges payload")
             if not context_version:
                 raise ValueError("Patch directives must include the originating document version")
+            content_hash = self._extract_content_hash(payload)
+            if not content_hash:
+                raise ValueError("Patch directives must include the originating content_hash")
+            range_hint = self._range_hint_from_payload(ranges, payload)
             directive = EditDirective(
                 action=action,
-                target_range=(0, 0),
+                target_range=range_hint,
                 content="",
                 rationale=str(rationale) if rationale is not None else None,
                 diff=diff_text if diff_text.strip() else None,
@@ -520,28 +982,14 @@ class DocumentBridge:
             return _QueuedEdit(
                 directive=directive,
                 context_version=context_version,
+                content_hash=content_hash,
                 payload=payload,
                 diff=diff_text if diff_text.strip() else None,
                 ranges=ranges,
             )
-
-        start, end = self._normalize_target_range(payload.get("target_range"), document)
-        fingerprint = payload.get("selection_fingerprint")
-        if isinstance(fingerprint, str) and fingerprint:
-            actual = self._hash_text(document.text[start:end])
-            if actual != fingerprint:
-                raise RuntimeError("Selection fingerprint mismatch; refresh the snapshot before editing")
-
-        normalized = EditDirective(
-            action=action,
-            target_range=(start, end),
-            content=str(payload["content"]),
-            rationale=str(rationale) if rationale is not None else None,
-            selection_fingerprint=str(fingerprint) if fingerprint else None,
-            match_text=str(match_text_value) if isinstance(match_text_value, str) else None,
-            expected_text=str(expected_text_value) if isinstance(expected_text_value, str) else None,
+        raise ValueError(
+            "DocumentBridge only accepts patch directives; convert inline edits into patches before queueing."
         )
-        return _QueuedEdit(directive=normalized, context_version=context_version, payload=payload)
 
     def _normalize_target_range(self, target_range: Any, document: DocumentState) -> tuple[int, int]:
         selection = document.selection.as_tuple()
@@ -610,6 +1058,14 @@ class DocumentBridge:
         return None
 
     @staticmethod
+    def _extract_content_hash(payload: Mapping[str, Any]) -> Optional[str]:
+        token = payload.get("content_hash")
+        if token is None:
+            return None
+        token_str = str(token).strip()
+        return token_str or None
+
+    @staticmethod
     def _format_version_token(version: DocumentVersion) -> str:
         return f"{version.document_id}:{version.version_id}:{version.content_hash}"
 
@@ -636,6 +1092,20 @@ class DocumentBridge:
             return "Δ0"
         sign = "+" if delta > 0 else "-"
         return f"{sign}{abs(delta)} chars"
+
+    @staticmethod
+    def _parse_chunk_bounds(chunk_id: str | None) -> tuple[int, int] | None:
+        if not chunk_id:
+            return None
+        parts = chunk_id.split(":")
+        if len(parts) < 4:
+            return None
+        try:
+            start = int(parts[-2])
+            end = int(parts[-1])
+        except ValueError:
+            return None
+        return (start, end)
 
     @staticmethod
     def _compute_line_offsets(text: str) -> list[int]:

@@ -12,7 +12,13 @@ class _ChatProbe:
     def __init__(self) -> None:
         self.state: tuple[str, str] = ("", "")
 
-    def set_guardrail_state(self, status: str | None, *, detail: str | None = None) -> None:
+    def set_guardrail_state(
+        self,
+        status: str | None,
+        *,
+        detail: str | None = None,
+        category: str | None = None,
+    ) -> None:
         normalized = (status or "").strip()
         detail_text = (detail or "").strip()
         self.state = (normalized, detail_text)

@@ -41,7 +41,7 @@ class _StreamingBridgeStub:
             payload = {
                 "action": directive.action,
                 "content": directive.content,
-                "target_range": directive.target_range,
+                "target_range": directive.target_range.to_tuple(),
                 "diff": directive.diff,
             }
         payload["tab_id"] = tab_id
@@ -116,14 +116,25 @@ def test_document_apply_patch_streams_ranges_and_attaches_metadata(streaming_too
 
     assert isinstance(status, str)
     assert bridge.snapshot_requests[0]["include_text"] is False
-    window_request = bridge.snapshot_requests[-1]
-    assert window_request["window"]["start"] == 0
+    assert any(entry.get("include_text") for entry in bridge.snapshot_requests[1:]), (
+        "streamed diffs should fetch document text for normalization"
+    )
     payload = bridge.calls[-1]
     ranges = payload["ranges"]
     assert isinstance(ranges, list) and ranges
     assert ranges[0]["replacement"] == "Omega"
     assert ranges[0]["match_text"].lower() == "alpha"
     assert "streamed_diff" in payload.get("metadata", {})
+
+
+def test_document_apply_patch_streaming_copies_snapshot_version_and_hash(streaming_tool):
+    tool, bridge = streaming_tool
+
+    tool.run(patches=[{"start": 0, "end": 5, "replacement": "OMEGA"}])
+
+    payload = bridge.calls[-1]
+    assert payload["document_version"] == bridge.snapshot["version"]
+    assert payload["content_hash"] == bridge.snapshot["content_hash"]
 
 
 def test_document_apply_patch_sorts_multi_range_payload(streaming_tool):
@@ -138,6 +149,22 @@ def test_document_apply_patch_sorts_multi_range_payload(streaming_tool):
     payload = bridge.calls[-1]
     starts = [entry["start"] for entry in payload["ranges"]]
     assert starts == sorted(starts), "ranges should be normalized and sorted"
+
+
+def test_document_apply_patch_streaming_normalizes_ranges_before_queueing():
+    bridge = _StreamingBridgeStub(text="alpha beta")
+    edit_tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+
+    status = tool.run(patches=[{"start": 2, "end": 5, "replacement": "BETA"}])
+
+    assert isinstance(status, str)
+    payload = bridge.calls[-1]
+    entry = payload["ranges"][0]
+    assert entry["start"] == 0
+    assert entry["end"] == 5
+    assert entry["match_text"] == "alpha"
+    assert entry["replacement"] == "alBETA"
 
 
 def test_document_apply_patch_requires_range_or_anchor_when_selection_unknown():
@@ -157,6 +184,17 @@ def test_document_apply_patch_realigns_stale_range_with_match_text():
     assert "queued" in status
     diff = bridge.calls[-1]["diff"]
     assert "+Alpha beta" in diff
+
+
+def test_document_apply_patch_widens_ranges_before_building_diff():
+    tool, bridge = _patch_tool("alpha beta", selection=(0, 0))
+
+    status = tool.run(content="BETA", target_range=(2, 5))
+
+    assert "queued" in status
+    diff = bridge.calls[-1]["diff"]
+    assert "-alpha" in diff
+    assert "+alBETA" in diff
 
 
 def test_document_apply_patch_rejects_stale_selection_without_anchor():

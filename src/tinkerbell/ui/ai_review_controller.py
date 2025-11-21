@@ -13,6 +13,7 @@ from ..chat.message_model import EditDirective
 from ..editor.document_model import DocumentState
 from ..editor.editor_widget import DiffOverlayState
 from ..editor.workspace import DocumentTab, DocumentWorkspace
+from ..documents.ranges import TextRange
 from ..widgets.status_bar import StatusBar
 
 LOGGER = logging.getLogger(__name__)
@@ -29,8 +30,11 @@ class EditSummary:
     directive: EditDirective
     diff: str
     spans: tuple[tuple[int, int], ...]
-    range_hint: tuple[int, int]
+    range_hint: TextRange
     created_at: datetime = field(default_factory=_utcnow)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "range_hint", TextRange.from_value(self.range_hint, fallback=(0, 0)))
 
 
 @dataclass(slots=True)
