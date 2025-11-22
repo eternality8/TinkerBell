@@ -38,6 +38,73 @@ Open a sample, ask the agent to outline or retrieve, and observe the tool payloa
 
 Additional reproduction ideas plus prompt language live in `test_data/phase3/README.md`.
 
+## Caret-free AI tools (Workstream 1)
+
+Workstream 1 removes every caret/selection mutation hook from the AI editing stack. Agents are now required to describe edits in terms of explicit ranges or `replace_all=true`, and the runtime refuses to infer intent from the live caret.
+
+### API changes
+
+- `document_apply_patch` and the inline `document_edit` auto-convert path now reject edits that omit `target_span` (or legacy `target_range`), `match_text`, `selection_fingerprint`, or `replace_all=true`. Snapshot `selection_text` no longer counts as an anchor unless a matching fingerprint is provided.
+- The new `selection_range` tool is the sole read-only surface for inspecting the user’s highlight. It returns `{start_line, end_line, content_hash}` tied to the current snapshot so partners can persist their own fingerprints.
+- DocumentBridge + EditorWidget now preserve the user’s caret/selection after every AI edit or diff application. The bridge always calls into the adapter with `preserve_selection=True`, eliminating the last caret mutation API.
+- Caret-based schema fields (`insert_at_cursor`, `cursor_offset`, `selection_start`, `selection_end`) are rejected at normalization time. Deprecated callers trigger the `caret_call_blocked` telemetry event plus a validation error instructing them to refresh their snapshot.
+
+### Migration checklist for partners
+
+1. **Capture an authoritative snapshot** – Call `document_snapshot` (or the controller-provided stub) to grab `document_version`, `content_hash`, and the surrounding text window.
+2. **Opt in to selection metadata when needed** – Call `selection_range` immediately after `document_snapshot` to capture `{start_line, end_line, content_hash}` for the user’s highlight. Pair it with the snapshot’s `selection_hash` when you need to round-trip fingerprints.
+3. **Build edits with explicit spans** – Convert model output into a diff by supplying either
+  - `target_span` (`{start_line, end_line}`) copied from the `selection_range` tool results,
+  - legacy `target_range` (`[start, end]` offsets) when spans are unavailable (the compatibility adapter still accepts them),
+  - `match_text`/`expected_text` anchors extracted from the snapshot window, or
+  - `replace_all=true` for full-document rewrites (requires hashing the entire snapshot).
+4. **Attach fingerprints or anchors** – Include `selection_fingerprint=selection_hash` whenever you plan to rely on the user’s original highlight. Otherwise, send `match_text` so the bridge can re-locate the slice deterministically.
+5. **Handle guardrails** – When the runtime raises `caret_call_blocked` or `Edits must include target_span...`, refresh the snapshot/selection pair and rebuild the edit rather than retrying with caret metadata.
+
+### Partner changelog
+
+- **Caret preservation** – `DocumentBridge` now applies patches with `preserve_selection=True`, so the UI never jumps to the AI edit location. Any downstream automation that previously looked for caret jumps must switch to telemetry (`patch.anchor`) or diff spans for auditing.
+- **Selection tool adoption** – `selection_range` is the only supported source of `{start_line, end_line, content_hash}` metadata. The payload should be stored alongside `document_snapshot` output so you can replay fingerprints later (see the checklist above).
+- **Telemetry signals** – Monitor `caret_call_blocked` vs. `selection_snapshot_requested` to confirm all partners have migrated. Dashboards should alert if blocked calls remain once the feature flag is forced on.
+
+### Telemetry & monitoring
+
+- `caret_call_blocked` surfaces every legacy caret attempt (name, tab, range metadata, reason) so dashboards can spot lagging clients.
+- `selection_snapshot_requested` fires when the new `selection_range` tool runs; compare it with `caret_call_blocked` to confirm migrations are complete.
+- `patch.anchor` now reports `anchor_source = match_text | fingerprint | range_only`, making it obvious when clients omit fingerprints and forcing them through explicit anchors.
+
+Rollouts should watch the `caret_call_blocked` → `selection_snapshot_requested` ratio decline before flipping the feature flag to 100%.
+
+## Workstream 3 – Snapshot + plot-state validation
+
+Workstream 3 hardens the diff pipeline by forcing every edit to reference a specific snapshot and by surfacing plot-outline drift the moment an edit drops tracked entities or beats.
+
+### Schema & runtime changes
+
+- `document_apply_patch` and `document_edit` now require the trio `{document_version, version_id, content_hash}` on every request. Missing fields raise `ValueError("…is required; call document_snapshot…")`; mismatches raise `DocumentVersionMismatchError` with `cause="hash_mismatch"` so callers know to refresh metadata.
+- `DocumentSnapshotTool` always returns these fields (and computes `version_id`/`content_hash` when the bridge omits them) so partners can stash a single payload and replay it into subsequent edit calls.
+- When plot scaffolding is enabled, `DocumentApplyPatchTool` asks `DocumentPlotStateStore` for the latest entity/beat roster before and after the edit. If a tracked entry disappears, the tool appends `warning: plot_outline_drift …` to the status string and emits `plot_state.warning` telemetry.
+- The controller’s version-mismatch retry path now refreshes `document_snapshot`, injects the new metadata into the original call, and retries once automatically. If the second attempt still fails, the caller receives the explicit “stale even after an automatic retry” error.
+
+### Client retry protocol
+
+1. **Capture authoritative metadata** – Call `document_snapshot` immediately before a patch/edit. Persist `{document_version, version_id, content_hash, selection_hash}` alongside the planned `target_span` (preferred), fallback `target_range`, or `match_text` anchors.
+2. **Send metadata back verbatim** – Pass those values into `document_apply_patch`/`document_edit`. Do not trim whitespace or coerce numbers into other types; hashes and version tokens must match exactly.
+3. **Handle mismatch errors deterministically** – If you receive `DocumentVersionMismatchError` (or see the controller log a retry), drop the in-flight edit, refresh `document_snapshot`, rebuild your diff from the new payload, and resubmit it with the updated metadata. Never reuse hashes from a previous attempt.
+4. **Honor controller retries** – When the controller reports “stale even after an automatic retry”, surface that guidance to the agent/operator. The controller already used a fresh snapshot; the only safe recovery is to re-run `document_snapshot` (optionally `selection_range`) and regenerate the edit instructions.
+
+### Plot-state warning handling
+
+- Watch for `status` strings ending in `warning: plot_outline_drift (entities=…, beats=…)`. Bubble these warnings into your UX (toast, inline banner, etc.) so authors understand which tracked characters/beats vanished.
+- Offer a single-click remediation: fetch `document_plot_state` to review the latest outline and decide whether to restore the missing entity or intentionally accept the change. If the user confirms the removal, update the plot store via `plot_state_update` so future edits stop flagging it.
+- Log `plot_state.warning` and `document_edit.retry` telemetry alongside your own audit trail so ops teams can trend drift frequency versus retries.
+
+### Testing checklist
+
+- `tests/test_document_apply_patch.py` exercises hash/ID enforcement and plot warning propagation. Extend these tests whenever you add new metadata fields.
+- `tests/test_editor_widget.py::test_ai_rewrite_turn_retries_on_stale_snapshot` verifies the controller retry path end-to-end.
+- For manual QA, run a turn that removes a tracked character from `DocumentPlotStateStore`; confirm the edit status includes the warning and that telemetry captures the `entities`/`beats` arrays.
+
 ## Phase 4 – Character & plot scaffolding (experimental)
 
 Phase 4.3 adds an opt-in memory layer that captures lightweight character/entity and plot beat summaries from subagent jobs. The goal is to give the controller+agents continuity hints without persisting sensitive data or bloating prompts.
@@ -139,17 +206,17 @@ Phase 5 hardens diff tooling so every edit is anchored to an explicit snapshot s
 
 ### Recommended workflow
 
-1. Call `document_snapshot` with `include_text=true` and capture `selection_text`, `selection_hash`, `document_version`, and the exact `target_range` you plan to edit.
-2. When building a patch, include at least one of `target_range` or `match_text`. Prefer to send both so the bridge can double-check offsets.
+1. Call `document_snapshot` with `include_text=true` and capture `selection_text`, `selection_hash`, `document_version`, plus the `{start_line, end_line}` span from the `selection_range` tool (store offsets as a fallback `target_range`).
+2. When building a patch, include at least one of `target_span` or `match_text`. Prefer to send both (and optionally the legacy `target_range`) so the bridge can double-check offsets.
 3. Copy `selection_hash` into the `selection_fingerprint` field and copy the literal snippet into `match_text` (and `expected_text` if the schema requires it for your caller).
 4. If the snapshot slice no longer matches the document, let the tools raise their guardrail errors and immediately refresh the snapshot instead of guessing offsets.
-5. Reserve caret inserts (`target_range` start == end) for explicit `action="insert"` directives. Replace operations now require anchors or a non-empty target range.
+5. Reserve caret inserts (`target_range` start == end / `target_span` covering zero lines) for explicit `action="insert"` directives. Replace operations now require anchors or a non-empty span.
 
 ### Error handling quick reference
 
 | Message fragment | Meaning | Next step |
 | --- | --- | --- |
-| `Edits must include target_range or match_text` | The edit lacked both a range and an anchor. | Re-run `document_snapshot` and send either the captured range or `match_text`/`selection_fingerprint` bundle. |
+| `Edits must include target_span (preferred), target_range, match_text, or replace_all=true` | The edit lacked both a span and an anchor. | Re-run `document_snapshot` and send the captured `target_span` (or fallback `target_range`), `match_text`/`selection_fingerprint`, or set `replace_all=true` for full-document edits. |
 | `selection_fingerprint does not match the latest snapshot` | The hash no longer matches the live document. | Refresh the snapshot and rebuild the patch from the new selection window. |
 | `Snapshot selection_text no longer matches document content` | The auto-anchor pulled from the snapshot was stale. | Provide explicit `match_text` from the user-visible context or fetch a new snapshot. |
 | `match_text matched multiple ranges` | Anchoring text was ambiguous in the current document. | Narrow the selection and resend the edit with a more specific snippet. |

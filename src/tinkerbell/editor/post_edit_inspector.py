@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Sequence
+from typing import Mapping, Sequence
 
 
 @dataclass(slots=True)
@@ -25,10 +26,27 @@ class _Paragraph:
     end: int
 
 
+@dataclass(slots=True)
+class _Window:
+    text: str
+    normalized: str
+    start: int
+    end: int
+    hash: str
+    line_count: int
+    line_index: int
+
+
 class PostEditInspector:
     """Detects duplicate paragraphs and boundary corruption after patches."""
 
     _PARAGRAPH_BREAK = re.compile(r"\n\s*\n+")
+    _SPLIT_TOKEN_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+        (re.compile(r"[a-z]{2}\n#"), "Word split before heading marker"),
+        (re.compile(r"[a-z]{2}\n[A-Z]"), "Word split across newline without whitespace"),
+    )
+    _WINDOW_LINE_TARGET = 10
+    _MIN_WINDOW_LINES = 4
 
     def __init__(
         self,
@@ -78,7 +96,20 @@ class PostEditInspector:
         }
         diagnostics["token_counts"] = token_counts
 
-        duplicate = self._detect_duplicate_run(after_window)
+        duplicate_window = self._detect_duplicate_window_run(after_window)
+        if duplicate_window and not self._window_run_in_text(before_window, duplicate_window["hash"]):
+            diagnostics["duplicate"] = duplicate_window
+            detail = (
+                f"Window repeated {duplicate_window['count']} times after edit (lines={duplicate_window['line_count']})"
+            )
+            return InspectionResult(
+                ok=False,
+                reason="duplicate_windows",
+                detail=detail,
+                diagnostics=diagnostics,
+            )
+
+        duplicate = self._detect_duplicate_paragraph_run(after_window)
         if duplicate and not self._duplicate_run_in_text(before_window, duplicate["normalized"], duplicate["count"]):
             diagnostics["duplicate"] = duplicate
             detail = f"Paragraph repeated {duplicate['count']} times after edit"
@@ -96,6 +127,17 @@ class PostEditInspector:
             return InspectionResult(
                 ok=False,
                 reason="boundary_dropped",
+                detail=detail,
+                diagnostics=diagnostics,
+            )
+
+        pattern_split = self._detect_split_token_patterns(after_window)
+        if pattern_split is not None:
+            diagnostics["split_pattern"] = pattern_split
+            detail = pattern_split.get("detail") or "Split token heuristic triggered"
+            return InspectionResult(
+                ok=False,
+                reason="split_token_regex",
                 detail=detail,
                 diagnostics=diagnostics,
             )
@@ -135,7 +177,7 @@ class PostEditInspector:
             return (min(starts), max(ends))
         return (0, min(text_length, 4_096))
 
-    def _detect_duplicate_run(self, text: str) -> Mapping[str, object] | None:
+    def _detect_duplicate_paragraph_run(self, text: str) -> Mapping[str, object] | None:
         paragraphs = self._extract_paragraphs(text)
         last_norm = ""
         run = 0
@@ -173,6 +215,40 @@ class PostEditInspector:
                 run = 0
         return False
 
+    def _detect_duplicate_window_run(self, text: str) -> Mapping[str, object] | None:
+        windows = self._build_line_windows(text)
+        seen: dict[str, _Window] = {}
+        max_gap = self._WINDOW_LINE_TARGET + self._MIN_WINDOW_LINES
+        for window in windows:
+            if window.line_count < self._MIN_WINDOW_LINES or not window.hash:
+                continue
+            previous = seen.get(window.hash)
+            if previous is not None:
+                line_gap = window.line_index - previous.line_index
+                if line_gap <= max_gap:
+                    return {
+                        "hash": window.hash,
+                        "line_count": window.line_count,
+                        "count": 2,
+                        "start": previous.start,
+                        "end": window.end,
+                        "line_gap": line_gap,
+                    }
+            else:
+                seen[window.hash] = window
+        return None
+
+    def _window_run_in_text(self, text: str, window_hash: str) -> bool:
+        if not window_hash:
+            return False
+        windows = self._build_line_windows(text)
+        matches = sum(
+            1
+            for window in windows
+            if window.hash == window_hash and window.line_count >= self._MIN_WINDOW_LINES
+        )
+        return matches >= self._duplicate_threshold
+
     def _detect_boundary_loss(self, before: str, after: str) -> Mapping[str, object] | None:
         before_breaks = self._count_boundaries(before)
         after_breaks = self._count_boundaries(after)
@@ -195,6 +271,21 @@ class PostEditInspector:
             issue = self._check_boundary(text, start, end)
             if issue is not None:
                 return issue
+        return None
+
+    def _detect_split_token_patterns(self, text: str) -> Mapping[str, object] | None:
+        if not text:
+            return None
+        for pattern, description in self._SPLIT_TOKEN_PATTERNS:
+            match = pattern.search(text)
+            if match is None:
+                continue
+            return {
+                "pattern": pattern.pattern,
+                "match": match.group(0),
+                "start": match.start(),
+                "detail": description,
+            }
         return None
 
     def _check_boundary(self, text: str, start: int, end: int) -> Mapping[str, object] | None:
@@ -237,6 +328,53 @@ class PostEditInspector:
             if paragraph is not None:
                 segments.append(paragraph)
         return segments
+
+    def _build_line_windows(self, text: str, lines_per_window: int | None = None) -> list[_Window]:
+        if not text:
+            return []
+        target = lines_per_window or self._WINDOW_LINE_TARGET
+        target = max(self._MIN_WINDOW_LINES, int(target))
+        segments = text.splitlines(keepends=True)
+        if not segments:
+            return []
+        offsets: list[tuple[int, int]] = []
+        cursor = 0
+        for segment in segments:
+            start = cursor
+            cursor += len(segment)
+            offsets.append((start, cursor))
+        windows: list[_Window] = []
+        if len(segments) < self._MIN_WINDOW_LINES:
+            window = self._build_window(segments, 0, offsets[-1][1], line_index=0)
+            return [window] if window is not None else []
+        step = 1
+        for start_idx in range(0, len(segments), step):
+            end_idx = min(len(segments), start_idx + target)
+            if end_idx - start_idx < self._MIN_WINDOW_LINES:
+                continue
+            start = offsets[start_idx][0]
+            end = offsets[end_idx - 1][1]
+            window = self._build_window(segments[start_idx:end_idx], start, end, line_index=start_idx)
+            if window is not None:
+                windows.append(window)
+        return windows
+
+    def _build_window(self, buffer: Sequence[str], start: int, end: int, *, line_index: int) -> _Window | None:
+        text = "".join(buffer).strip()
+        if not text:
+            return None
+        normalized = " ".join(text.split())
+        lowered = normalized.lower()
+        window_hash = hashlib.sha1(lowered.encode("utf-8")).hexdigest() if lowered else ""
+        return _Window(
+            text=text,
+            normalized=lowered,
+            start=start,
+            end=end,
+            hash=window_hash,
+            line_count=len(buffer),
+            line_index=line_index,
+        )
 
     def _build_paragraph(self, text: str, start: int, end: int) -> _Paragraph | None:
         stripped = text.strip()

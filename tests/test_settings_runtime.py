@@ -6,6 +6,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from tinkerbell.services.settings import Settings
+from tinkerbell.services.unsaved_cache import UnsavedCache
 from tinkerbell.ui.models.window_state import WindowContext
 from tinkerbell.ui.settings_runtime import SettingsRuntime
 
@@ -77,7 +78,7 @@ class _FakeTask:
 
 def _runtime_bundle(initial_settings: Settings | None = None):
     initial = initial_settings or Settings(api_key="init-key", base_url="https://api", model="gpt-4o-mini")
-    context = WindowContext(settings=initial)
+    context = WindowContext(settings=initial, unsaved_cache=UnsavedCache())
     editor = _EditorStub()
     telemetry = _TelemetryStub()
     embedding = _EmbeddingStub()
@@ -159,12 +160,13 @@ def test_apply_runtime_settings_creates_controller_and_refreshes_runtime(monkeyp
     runtime.apply_runtime_settings(
         settings,
         chat_panel_handler=lambda s: handlers.setdefault("chat", s is settings),
+        outline_handler=lambda s: handlers.setdefault("outline", True),
         phase3_handler=lambda s: handlers.setdefault("phase3", True),
         plot_scaffolding_handler=lambda s: handlers.setdefault("plot", True),
         safe_edit_handler=lambda s: handlers.setdefault("safe", True),
     )
 
-    assert handlers == {"chat": True, "phase3": True, "plot": True, "safe": True}
+    assert handlers == {"chat": True, "outline": True, "phase3": True, "plot": True, "safe": True}
     assert context.ai_controller is controller
     assert bundle["register_state"]["count"] == 1
     assert telemetry.flags[-1] is True
@@ -198,6 +200,7 @@ def test_apply_runtime_settings_disables_controller_without_credentials() -> Non
     runtime.apply_runtime_settings(
         updated,
         chat_panel_handler=lambda s: None,
+        outline_handler=lambda s: None,
         phase3_handler=lambda s: None,
         plot_scaffolding_handler=lambda s: None,
         safe_edit_handler=lambda s: None,
@@ -222,6 +225,7 @@ def test_event_logging_toggle_updates_controller() -> None:
     runtime.apply_runtime_settings(
         updated,
         chat_panel_handler=lambda s: None,
+        outline_handler=lambda s: None,
         phase3_handler=lambda s: None,
         plot_scaffolding_handler=lambda s: None,
         safe_edit_handler=lambda s: None,
@@ -239,6 +243,7 @@ def test_safe_edit_handler_invoked() -> None:
     runtime.apply_runtime_settings(
         base,
         chat_panel_handler=lambda s: None,
+        outline_handler=lambda s: None,
         phase3_handler=lambda s: None,
         plot_scaffolding_handler=lambda s: None,
         safe_edit_handler=lambda s: invoked.append(s),

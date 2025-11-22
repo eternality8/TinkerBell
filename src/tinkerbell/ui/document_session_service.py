@@ -8,6 +8,7 @@ from typing import Any, Callable, Mapping, Sequence
 from ..editor.document_model import DocumentMetadata, DocumentState, SelectionRange
 from ..editor.workspace import DocumentTab, DocumentWorkspace
 from ..services.settings import Settings
+from ..services.unsaved_cache import UnsavedCache
 from ..utils import file_io
 from .ai_review_controller import AIReviewController
 from .review_overlay_manager import ReviewOverlayManager
@@ -152,8 +153,9 @@ class DocumentSessionService:
         if settings is None:
             return
 
-        if self._cleanup_orphan_snapshots(settings):
-            self.persist_settings(settings)
+        cache = self._unsaved_cache()
+        if self._cleanup_orphan_snapshots(settings, cache=cache):
+            self.persist_unsaved_cache(cache)
 
         if self._restore_workspace_tabs(settings):
             self.sync_workspace_state(persist=False)
@@ -167,7 +169,8 @@ class DocumentSessionService:
             self.sync_workspace_state(persist=False)
             return
 
-        self._restore_unsaved_snapshot(settings)
+        if cache is not None:
+            self._restore_unsaved_snapshot(cache)
         self.sync_workspace_state(persist=False)
 
     def persist_settings(self, settings: Settings | None) -> None:
@@ -178,6 +181,17 @@ class DocumentSessionService:
             return
         try:
             store.save(settings)
+        except Exception:
+            pass
+
+    def persist_unsaved_cache(self, cache: UnsavedCache | None) -> None:
+        if cache is None:
+            return
+        store = getattr(self._context, "unsaved_cache_store", None)
+        if store is None:
+            return
+        try:
+            store.save(cache)
         except Exception:
             pass
 
@@ -196,6 +210,9 @@ class DocumentSessionService:
         if persist:
             self.persist_settings(settings)
 
+    def _unsaved_cache(self) -> UnsavedCache | None:
+        return getattr(self._context, "unsaved_cache", None)
+
     # ------------------------------------------------------------------
     # Snapshot restore helpers surfaced to MainWindow
     # ------------------------------------------------------------------
@@ -206,12 +223,12 @@ class DocumentSessionService:
         tab_id: str | None = None,
         silent: bool = False,
     ) -> bool:
-        settings = self._context.settings
-        if settings is None:
+        cache = self._unsaved_cache()
+        if cache is None:
             return False
         monitor = self._require_document_monitor()
         normalized_key = monitor.snapshot_key(path, tab_id=tab_id)
-        snapshot = (settings.unsaved_snapshots or {}).get(normalized_key)
+        snapshot = (cache.unsaved_snapshots or {}).get(normalized_key)
         if not isinstance(snapshot, dict) or "text" not in snapshot:
             return False
         resolved_path = Path(normalized_key)
@@ -221,14 +238,14 @@ class DocumentSessionService:
         return True
 
     def apply_untitled_snapshot(self, tab_id: str) -> bool:
-        settings = self._context.settings
-        if settings is None:
+        cache = self._unsaved_cache()
+        if cache is None:
             return False
         snapshot = None
-        if settings.untitled_snapshots:
-            snapshot = (settings.untitled_snapshots or {}).get(tab_id)
+        if cache.untitled_snapshots:
+            snapshot = (cache.untitled_snapshots or {}).get(tab_id)
         if snapshot is None:
-            snapshot = settings.unsaved_snapshot
+            snapshot = cache.unsaved_snapshot
         if not isinstance(snapshot, dict) or "text" not in snapshot:
             return False
         self._load_snapshot_document(snapshot, path=None, tab_id=tab_id)
@@ -278,8 +295,8 @@ class DocumentSessionService:
             self._status_updater("Failed to restore last session file")
         return False
 
-    def _restore_unsaved_snapshot(self, settings: Settings) -> bool:
-        snapshot = settings.unsaved_snapshot
+    def _restore_unsaved_snapshot(self, cache: UnsavedCache) -> bool:
+        snapshot = cache.unsaved_snapshot
         if not isinstance(snapshot, dict) or "text" not in snapshot:
             return False
         monitor = self._require_document_monitor()
@@ -404,7 +421,9 @@ class DocumentSessionService:
             self.persist_settings(settings)
         self._status_updater("Last session file missing")
 
-    def _cleanup_orphan_snapshots(self, settings: Settings) -> bool:
+    def _cleanup_orphan_snapshots(self, settings: Settings, *, cache: UnsavedCache | None) -> bool:
+        if cache is None:
+            return False
         entries = [entry for entry in (settings.open_tabs or []) if isinstance(entry, Mapping)]
         active_paths: set[str] = set()
         active_tab_ids: set[str] = set()
@@ -418,23 +437,23 @@ class DocumentSessionService:
                 if normalized:
                     active_paths.add(normalized)
 
-        snapshots = dict(settings.unsaved_snapshots or {})
+        snapshots = dict(cache.unsaved_snapshots or {})
         removed_file_snapshots = False
         for key in list(snapshots):
             if key not in active_paths:
                 snapshots.pop(key, None)
                 removed_file_snapshots = True
         if removed_file_snapshots:
-            settings.unsaved_snapshots = snapshots
+            cache.unsaved_snapshots = snapshots
 
-        untitled = dict(settings.untitled_snapshots or {})
+        untitled = dict(cache.untitled_snapshots or {})
         removed_untitled_snapshots = False
         for tab_id in list(untitled):
             if tab_id not in active_tab_ids:
                 untitled.pop(tab_id, None)
                 removed_untitled_snapshots = True
         if removed_untitled_snapshots:
-            settings.untitled_snapshots = untitled
+            cache.untitled_snapshots = untitled
 
         return removed_file_snapshots or removed_untitled_snapshots
 

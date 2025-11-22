@@ -44,10 +44,16 @@ class EditorAdapter(Protocol):
     def to_document(self) -> DocumentState:
         ...
 
-    def apply_ai_edit(self, directive: EditDirective) -> DocumentState:
+    def apply_ai_edit(self, directive: EditDirective, *, preserve_selection: bool = False) -> DocumentState:
         ...
 
-    def apply_patch_result(self, result: PatchResult) -> DocumentState:
+    def apply_patch_result(
+        self,
+        result: PatchResult,
+        selection_hint: tuple[int, int] | None = None,
+        *,
+        preserve_selection: bool = False,
+    ) -> DocumentState:
         ...
 
     def restore_document(self, document: DocumentState) -> DocumentState:
@@ -125,9 +131,16 @@ class SafeEditSettings:
 class DocumentVersionMismatchError(RuntimeError):
     """Raised when an edit references a stale document version."""
 
-    def __init__(self, message: str, *, cause: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        cause: str | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.cause = cause
+        self.details = dict(details) if isinstance(details, Mapping) else None
 
 
 class DocumentBridge:
@@ -135,6 +148,9 @@ class DocumentBridge:
 
     PATCH_EVENT_NAME = "patch.apply"
     EDIT_REJECTED_EVENT_NAME = "edit_rejected"
+    AUTO_REVERT_EVENT_NAME = "auto_revert"
+    DUPLICATE_DETECTED_EVENT_NAME = "duplicate_detected"
+    HASH_MISMATCH_EVENT_NAME = "hash_mismatch"
     CAUSE_HASH_MISMATCH = "hash_mismatch"
     CAUSE_CHUNK_HASH_MISMATCH = "chunk_hash_mismatch"
     CAUSE_INSPECTOR_FAILURE = "inspector_failure"
@@ -455,6 +471,16 @@ class DocumentBridge:
             streamed=streamed,
             diagnostics=diagnostics,
         )
+        if cause in {self.CAUSE_HASH_MISMATCH, self.CAUSE_CHUNK_HASH_MISMATCH}:
+            self._emit_hash_mismatch_event(
+                version=version,
+                status=status,
+                reason=summary,
+                cause=cause,
+                range_count=range_count,
+                streamed=streamed,
+                diagnostics=diagnostics,
+            )
 
     def _validate_patch_context(self, document: DocumentState, queued: _QueuedEdit) -> None:
         if not queued.context_version:
@@ -532,24 +558,29 @@ class DocumentBridge:
                 raise DocumentVersionMismatchError("Streamed patch validation failed", cause=cause) from exc
             raise RuntimeError(f"Patch application failed: {exc}") from exc
 
-        updated_state = self._execute_on_main_thread(lambda: self.editor.apply_patch_result(patch_result))
+        updated_state = self._execute_on_main_thread(
+            lambda: self.editor.apply_patch_result(patch_result, preserve_selection=True)
+        )
+        diff_summary = patch_result.summary
         inspection = self._run_post_edit_inspection(
             document_before=document_before,
             patch_result=patch_result,
             range_hint=range_hint,
         )
         if inspection is not None and not inspection.ok:
-            self._handle_post_edit_rejection(
+            rejection_details = self._handle_post_edit_rejection(
                 queued=queued,
                 version=pre_version,
                 pre_edit_snapshot=pre_edit_snapshot,
                 range_count=range_count,
                 streamed=use_ranges,
                 inspection=inspection,
+                diff_summary=diff_summary,
             )
             raise DocumentVersionMismatchError(
-                inspection.detail or inspection.reason or "Post-edit inspection rejected edit",
+                self._format_auto_revert_message(rejection_details),
                 cause=self.CAUSE_INSPECTOR_FAILURE,
+                details=rejection_details,
             )
 
         target_range = range_hint or self._derive_patch_range(patch_result.spans, len(updated_state.text))
@@ -561,7 +592,7 @@ class DocumentBridge:
             diff=diff_text if not use_ranges else None,
             spans=patch_result.spans,
         )
-        self._last_diff = patch_result.summary
+        self._last_diff = diff_summary
         version = updated_state.version_info(edited_ranges=patch_result.spans)
         self._last_snapshot_token = self._format_version_token(version)
         self._last_document_version = version
@@ -570,7 +601,7 @@ class DocumentBridge:
         self._emit_patch_event(
             status="success",
             version=version,
-            diff_summary=patch_result.summary,
+            diff_summary=diff_summary,
             duration_ms=elapsed * 1000.0,
             range_count=len(patch_result.spans),
             streamed=use_ranges,
@@ -623,6 +654,84 @@ class DocumentBridge:
             payload["cause"] = cause
         telemetry_emit(event_name, payload)
 
+    def _format_auto_revert_message(self, details: Mapping[str, Any] | None) -> str:
+        if not isinstance(details, Mapping):
+            return (
+                "Auto-revert triggered. Document was restored to the previous snapshot; refresh "
+                "document_snapshot and retry with an updated diff."
+            )
+        reason = str(details.get("reason") or "inspection_failure")
+        detail = str(details.get("detail") or "Edit rejected")
+        remediation = details.get("remediation")
+        message = f"Auto-revert triggered ({reason}). {detail}"
+        if remediation:
+            message = f"{message} {remediation}".strip()
+        return message
+
+    def _emit_auto_revert_event(
+        self,
+        *,
+        version: DocumentVersion,
+        diff_summary: str | None,
+        reason: str,
+        detail: str,
+        diagnostics: Mapping[str, Any] | None,
+    ) -> None:
+        event_name = self.AUTO_REVERT_EVENT_NAME
+        if not event_name:
+            return
+        payload: dict[str, Any] = {
+            "document_id": version.document_id,
+            "version_id": version.version_id,
+            "content_hash": version.content_hash,
+            "reason": reason,
+            "detail": detail,
+        }
+        if diff_summary:
+            payload["diff_summary"] = diff_summary
+        if self._tab_id:
+            payload["tab_id"] = self._tab_id
+        if diagnostics:
+            payload["diagnostics"] = dict(diagnostics)
+        telemetry_emit(event_name, payload)
+
+    def _emit_duplicate_detected_event(
+        self,
+        *,
+        version: DocumentVersion,
+        reason: str,
+        diagnostics: Mapping[str, Any] | None,
+    ) -> None:
+        event_name = self.DUPLICATE_DETECTED_EVENT_NAME
+        if not event_name or not isinstance(diagnostics, Mapping):
+            return
+        duplicate_payload = diagnostics.get("duplicate")
+        if not isinstance(duplicate_payload, Mapping):
+            return
+        payload: dict[str, Any] = {
+            "document_id": version.document_id,
+            "version_id": version.version_id,
+            "content_hash": version.content_hash,
+            "reason": reason,
+            "duplicate": dict(duplicate_payload),
+        }
+        if self._tab_id:
+            payload["tab_id"] = self._tab_id
+        telemetry_emit(event_name, payload)
+
+    def _auto_revert_remediation(self, reason: str | None) -> str:
+        mapping = {
+            "duplicate_paragraphs": "Retry with replace_all=true or delete the original text before inserting the rewrite to avoid duplicated passages.",
+            "duplicate_windows": "Retry with replace_all=true or narrow the edit range so the rewrite replaces the previous text instead of appending it.",
+            "boundary_dropped": "Ensure the edit preserves blank lines between paragraphs or include surrounding context in the diff.",
+            "split_tokens": "Insert whitespace around the edited span so tokens are not merged across boundaries before retrying.",
+            "split_token_regex": "Add a newline or space before markdown tokens (e.g., '#') so headings are not fused with preceding words.",
+        }
+        return mapping.get(
+            reason or "",
+            "Refresh document_snapshot and rebuild the diff before retrying to ensure the edit targets the latest content.",
+        )
+
     def _run_post_edit_inspection(
         self,
         *,
@@ -652,20 +761,44 @@ class DocumentBridge:
         range_count: int | None,
         streamed: bool | None,
         inspection: InspectionResult,
-    ) -> None:
+        diff_summary: str | None,
+    ) -> dict[str, Any]:
         self._restore_document_snapshot(pre_edit_snapshot)
-        reason = inspection.detail or inspection.reason or "Edit rejected"
+        diagnostics = dict(inspection.diagnostics or {})
+        reason_code = inspection.reason or "inspector_failure"
+        detail = inspection.detail or reason_code or "Edit rejected"
+        remediation = self._auto_revert_remediation(reason_code)
+        self._emit_auto_revert_event(
+            version=version,
+            diff_summary=diff_summary,
+            reason=reason_code,
+            detail=detail,
+            diagnostics=diagnostics,
+        )
+        if diagnostics.get("duplicate"):
+            self._emit_duplicate_detected_event(
+                version=version,
+                reason=reason_code,
+                diagnostics=diagnostics,
+            )
         self._record_patch_rejection(
             queued,
             version,
             status="rejected",
-            reason=reason,
+            reason=detail,
             cause=self.CAUSE_INSPECTOR_FAILURE,
             range_count=range_count,
             streamed=streamed,
             record_conflict=False,
-            diagnostics=inspection.diagnostics,
+            diagnostics=diagnostics,
         )
+        return {
+            "code": "auto_revert",
+            "reason": reason_code,
+            "detail": detail,
+            "remediation": remediation,
+            "diagnostics": diagnostics,
+        }
 
     def _restore_document_snapshot(self, snapshot: DocumentState) -> DocumentState:
         snapshot_copy = deepcopy(snapshot)
@@ -754,6 +887,41 @@ class DocumentBridge:
         }
         if cause:
             payload["cause"] = cause
+        if self._tab_id:
+            payload["tab_id"] = self._tab_id
+        if range_count is not None:
+            payload["range_count"] = range_count
+        if streamed is not None:
+            payload["streamed"] = bool(streamed)
+        if diagnostics:
+            payload["diagnostics"] = dict(diagnostics)
+        telemetry_emit(event_name, payload)
+
+    def _emit_hash_mismatch_event(
+        self,
+        *,
+        version: DocumentVersion,
+        status: str,
+        reason: str,
+        cause: str,
+        range_count: int | None,
+        streamed: bool | None,
+        diagnostics: Mapping[str, Any] | None = None,
+    ) -> None:
+        event_name = self.HASH_MISMATCH_EVENT_NAME
+        if not event_name or not cause:
+            return
+        stage = "chunk_hash" if cause == self.CAUSE_CHUNK_HASH_MISMATCH else "bridge"
+        payload: dict[str, Any] = {
+            "document_id": version.document_id,
+            "version_id": version.version_id,
+            "content_hash": version.content_hash,
+            "status": status,
+            "cause": cause,
+            "reason": reason,
+            "stage": stage,
+            "source": "document_bridge",
+        }
         if self._tab_id:
             payload["tab_id"] = self._tab_id
         if range_count is not None:

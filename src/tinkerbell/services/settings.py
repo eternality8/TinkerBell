@@ -44,6 +44,7 @@ _BOOL_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_DEBUG_EVENT_LOGGING": "debug_event_logging",
     "TINKERBELL_TOOL_ACTIVITY_PANEL": "show_tool_activity_panel",
     "TINKERBELL_PHASE3_OUTLINE_TOOLS": "phase3_outline_tools",
+    "TINKERBELL_ENABLE_OUTLINE_GENERATION": "enable_outline_generation",
     "TINKERBELL_ENABLE_SUBAGENTS": "enable_subagents",
     "TINKERBELL_ENABLE_PLOT_SCAFFOLDING": "enable_plot_scaffolding",
     "TINKERBELL_SAFE_AI_EDITS": "safe_ai_edits",
@@ -124,6 +125,7 @@ class Settings:
     debug_event_logging: bool = False
     show_tool_activity_panel: bool = False
     phase3_outline_tools: bool = False
+    enable_outline_generation: bool = False
     enable_subagents: bool = False
     enable_plot_scaffolding: bool = False
     safe_ai_edits: bool = False

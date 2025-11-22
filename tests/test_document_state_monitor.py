@@ -6,7 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from tinkerbell.ai.memory.cache_bus import DocumentCacheBus, DocumentChangedEvent
 from tinkerbell.editor.document_model import DocumentMetadata, DocumentState, SelectionRange
+from tinkerbell.services.unsaved_cache import UnsavedCache
 from tinkerbell.ui.document_state_monitor import DocumentStateMonitor
 
 
@@ -64,13 +66,6 @@ class _StubTab:
         return self._document
 
 
-class _SettingsStub:
-    def __init__(self) -> None:
-        self.unsaved_snapshots: dict[str, dict[str, Any]] = {}
-        self.untitled_snapshots: dict[str, dict[str, Any]] = {}
-        self.unsaved_snapshot: dict[str, Any] | None = None
-
-
 def _make_document(
     *,
     text: str = "Hello world",
@@ -91,7 +86,7 @@ def _make_monitor(document: DocumentState | None = None) -> tuple[DocumentStateM
     chat_panel = _StubChatPanel()
     status_bar = _StubStatusBar()
     tracker = SimpleNamespace()
-    tracker.settings = _SettingsStub()
+    tracker.cache = UnsavedCache()
     tracker.persisted = []
     tracker.sync_calls = []
     tracker.snapshots = []
@@ -102,9 +97,10 @@ def _make_monitor(document: DocumentState | None = None) -> tuple[DocumentStateM
     tracker.status_bar = status_bar
     tracker.workspace = workspace
     tracker.editor = editor
+    tracker.bus = DocumentCacheBus()
 
-    def _persist(settings: Any) -> None:
-        tracker.persisted.append(settings)
+    def _persist(cache: Any) -> None:
+        tracker.persisted.append(cache)
 
     def _sync_workspace(persist: bool) -> None:
         tracker.sync_calls.append(persist)
@@ -126,8 +122,8 @@ def _make_monitor(document: DocumentState | None = None) -> tuple[DocumentStateM
         workspace=workspace,
         chat_panel=chat_panel,
         status_bar=status_bar,
-        settings_provider=lambda: tracker.settings,
-        settings_persister=_persist,
+        unsaved_cache_provider=lambda: tracker.cache,
+        unsaved_cache_persister=_persist,
         refresh_window_title=lambda state=None: tracker.titles.append(state),
         sync_workspace_state=_sync_workspace,
         current_path_getter=_get_path,
@@ -138,6 +134,7 @@ def _make_monitor(document: DocumentState | None = None) -> tuple[DocumentStateM
         window_app_name="App",
         untitled_document_name="Untitled",
         untitled_snapshot_key="__untitled__",
+        cache_bus_resolver=lambda: tracker.bus,
     )
 
     return monitor, tracker
@@ -192,16 +189,40 @@ def test_handle_editor_text_changed_persists_and_clears_snapshots() -> None:
 
     monitor.handle_editor_text_changed("", doc)
 
-    assert tracker.settings.untitled_snapshots["tab-1"]["text"] == "Draft text"
+    assert tracker.cache.untitled_snapshots["tab-1"]["text"] == "Draft text"
     assert tracker.sync_calls == [False]
-    assert tracker.persisted[-1] is tracker.settings
+    assert tracker.persisted[-1] is tracker.cache
     assert tracker.diff_events == [doc]
 
     doc.dirty = False
     monitor.handle_editor_text_changed("", doc)
 
-    assert "tab-1" not in tracker.settings.untitled_snapshots
+    assert "tab-1" not in tracker.cache.untitled_snapshots
     assert tracker.diff_events[-1] is doc  # manual edit hook still invoked
+
+
+def test_handle_editor_text_changed_publishes_cache_event() -> None:
+    doc = _make_document(text="Outline me")
+    monitor, tracker = _make_monitor(document=doc)
+    events: list[DocumentChangedEvent] = []
+
+    tracker.bus.subscribe(DocumentChangedEvent, lambda event: events.append(event))
+
+    monitor.handle_editor_text_changed("", doc)
+
+    assert len(events) == 1
+    assert events[0].document_id == doc.document_id
+    assert events[0].version_id == doc.version_id
+
+    # No duplicate when version is unchanged
+    monitor.handle_editor_text_changed("", doc)
+    assert len(events) == 1
+
+    doc.update_text(doc.text + "!")
+    monitor.handle_editor_text_changed("", doc)
+
+    assert len(events) == 2
+    assert events[-1].version_id == doc.version_id
 
 
 def test_handle_active_tab_changed_updates_path_and_title() -> None:

@@ -7,9 +7,11 @@ from typing import Any, Mapping
 
 import pytest
 
-from tinkerbell.ai.tools.document_apply_patch import DocumentApplyPatchTool
+from tinkerbell.ai.tools import document_apply_patch as document_apply_patch_module
+from tinkerbell.ai.tools.document_apply_patch import DocumentApplyPatchTool, NeedsRangeError
 from tinkerbell.ai.tools.document_edit import DocumentEditTool
 from tinkerbell.chat.message_model import EditDirective
+from tinkerbell.services.bridge import DocumentVersionMismatchError
 
 
 class _StreamingBridgeStub:
@@ -19,10 +21,12 @@ class _StreamingBridgeStub:
             "text": text,
             "selection": (0, 0),
             "version": version,
+            "version_id": 1,
             "document_id": "doc-stream",
             "path": "doc.md",
             "content_hash": "hash-1",
             "length": len(text),
+            "line_offsets": self._build_line_offsets(text),
         }
         self.calls: list[dict[str, Any]] = []
         self.snapshot_requests: list[dict[str, Any]] = []
@@ -70,6 +74,7 @@ class _StreamingBridgeStub:
         doc_text = text if isinstance(text, str) else ""
         length = len(doc_text)
         snapshot["length"] = length
+        snapshot["line_offsets"] = self._build_line_offsets(self._text)
         if isinstance(window, Mapping):
             start = max(0, min(int(window.get("start", 0)), length))
             end = max(start, min(int(window.get("end", length)), length))
@@ -83,6 +88,17 @@ class _StreamingBridgeStub:
         else:
             snapshot.setdefault("window", {"start": 0, "end": length})
         return snapshot
+
+    @staticmethod
+    def _build_line_offsets(text: str) -> list[int]:
+        offsets = [0]
+        cursor = 0
+        for segment in text.splitlines(keepends=True):
+            cursor += len(segment)
+            offsets.append(cursor)
+        if offsets[-1] < len(text):
+            offsets.append(len(text))
+        return offsets
 
     def get_last_diff_summary(self, tab_id: str | None = None) -> str | None:  # noqa: ARG002 - unused
         return self.last_diff_summary
@@ -106,10 +122,17 @@ def _patch_tool(text: str, *, selection: tuple[int, int] = (0, 0)) -> tuple[Docu
     return DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool), bridge
 
 
+def _run_with_meta(tool: DocumentApplyPatchTool, **kwargs: Any) -> str:
+    payload = {"document_version": "digest-1", "version_id": 1, "content_hash": "hash-1"}
+    payload.update(kwargs)
+    return tool.run(**payload)
+
+
 def test_document_apply_patch_streams_ranges_and_attaches_metadata(streaming_tool):
     tool, bridge = streaming_tool
 
-    status = tool.run(
+    status = _run_with_meta(
+        tool,
         patches=[{"start": 0, "end": 5, "replacement": "Omega"}],
         rationale="stream",
     )
@@ -130,7 +153,7 @@ def test_document_apply_patch_streams_ranges_and_attaches_metadata(streaming_too
 def test_document_apply_patch_streaming_copies_snapshot_version_and_hash(streaming_tool):
     tool, bridge = streaming_tool
 
-    tool.run(patches=[{"start": 0, "end": 5, "replacement": "OMEGA"}])
+    _run_with_meta(tool, patches=[{"start": 0, "end": 5, "replacement": "OMEGA"}])
 
     payload = bridge.calls[-1]
     assert payload["document_version"] == bridge.snapshot["version"]
@@ -144,7 +167,7 @@ def test_document_apply_patch_sorts_multi_range_payload(streaming_tool):
         {"start": 0, "end": 5, "replacement": "OMEGA"},
     ]
 
-    tool.run(patches=patches)
+    _run_with_meta(tool, patches=patches)
 
     payload = bridge.calls[-1]
     starts = [entry["start"] for entry in payload["ranges"]]
@@ -156,7 +179,7 @@ def test_document_apply_patch_streaming_normalizes_ranges_before_queueing():
     edit_tool = DocumentEditTool(bridge=bridge)
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
-    status = tool.run(patches=[{"start": 2, "end": 5, "replacement": "BETA"}])
+    status = _run_with_meta(tool, patches=[{"start": 2, "end": 5, "replacement": "BETA"}])
 
     assert isinstance(status, str)
     payload = bridge.calls[-1]
@@ -167,19 +190,91 @@ def test_document_apply_patch_streaming_normalizes_ranges_before_queueing():
     assert entry["replacement"] == "alBETA"
 
 
+def test_document_apply_patch_accepts_target_span():
+    text = "Alpha\nBeta\nGamma\n"
+    tool, bridge = _patch_tool(text, selection=(0, 0))
+
+    status = _run_with_meta(
+        tool,
+        content="Beta replacement\n",
+        target_span={"start_line": 1, "end_line": 1},
+    )
+
+    assert "queued" in status or "applied" in status
+    payload = bridge.calls[-1]
+    range_payload = payload["ranges"][0]
+    assert range_payload["start"] == len("Alpha\n")
+    assert range_payload["end"] == len("Alpha\nBeta\n")
+    assert "Beta replacement" in payload["diff"]
+
+
+def test_document_apply_patch_emits_legacy_adapter_event(monkeypatch: pytest.MonkeyPatch):
+    tool, bridge = _patch_tool("Hello world")
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(event: str, payload: dict | None = None) -> None:
+        captured.append((event, payload))
+
+    monkeypatch.setattr(document_apply_patch_module, "telemetry_emit", _emit)
+
+    _run_with_meta(tool, content="Hi", target_range=(0, 5))
+
+    events = [name for name, _ in captured]
+    assert "target_range.legacy_adapter" in events
+    legacy_payload = next(payload for name, payload in captured if name == "target_range.legacy_adapter")
+    assert legacy_payload["start_line"] == 0
+    assert legacy_payload["end_line"] == 0
+    assert legacy_payload["range_end"] == 5
+
+
+def test_document_apply_patch_requires_spans_when_configured():
+    tool, _ = _patch_tool("Hello world")
+    tool.configure_line_span_policy(require_line_spans=True, adapt_legacy_ranges=False)
+
+    with pytest.raises(ValueError, match="target_span"):
+        _run_with_meta(tool, content="Hi", target_range=(0, 2))
+
+
+def test_document_apply_patch_allows_span_when_required():
+    tool, bridge = _patch_tool("Alpha Beta")
+    tool.configure_line_span_policy(require_line_spans=True, adapt_legacy_ranges=False)
+
+    status = _run_with_meta(
+        tool,
+        content="Alpha",
+        target_span=(0, 0),
+    )
+
+    assert "queued" in status
+    assert bridge.calls, "Edit should have been queued when target_span provided"
+
+
 def test_document_apply_patch_requires_range_or_anchor_when_selection_unknown():
     tool, bridge = _patch_tool("Hello world", selection=(0, 0))
 
-    with pytest.raises(ValueError, match="target_range or match_text"):
-        tool.run(content="Hi there")
+    with pytest.raises(ValueError, match="target_span .*target_range.*match_text"):
+        _run_with_meta(tool, content="Hi there")
 
     assert bridge.calls == []
+
+
+def test_document_apply_patch_forces_replace_all_when_content_matches_document():
+    tool, bridge = _patch_tool("abcdefghij", selection=(0, 0))
+
+    status = _run_with_meta(tool, content="jihgfedcba", operation="replace")
+
+    assert "queued" in status or "applied" in status
+    payload = bridge.calls[-1]
+    ranges = payload["ranges"]
+    assert ranges[0]["start"] == 0
+    assert ranges[0]["end"] == len("abcdefghij")
+    assert ranges[0]["match_text"] == "abcdefghij"
 
 
 def test_document_apply_patch_realigns_stale_range_with_match_text():
     tool, bridge = _patch_tool("Alpha BETA Gamma", selection=(0, 5))
 
-    status = tool.run(content="beta", target_range=(0, 5), match_text="BETA")
+    status = _run_with_meta(tool, content="beta", target_range=(0, 5), match_text="BETA")
 
     assert "queued" in status
     diff = bridge.calls[-1]["diff"]
@@ -189,7 +284,7 @@ def test_document_apply_patch_realigns_stale_range_with_match_text():
 def test_document_apply_patch_widens_ranges_before_building_diff():
     tool, bridge = _patch_tool("alpha beta", selection=(0, 0))
 
-    status = tool.run(content="BETA", target_range=(2, 5))
+    status = _run_with_meta(tool, content="BETA", target_range=(2, 5))
 
     assert "queued" in status
     diff = bridge.calls[-1]["diff"]
@@ -197,12 +292,13 @@ def test_document_apply_patch_widens_ranges_before_building_diff():
     assert "+alBETA" in diff
 
 
-def test_document_apply_patch_rejects_stale_selection_without_anchor():
+def test_document_apply_patch_ignores_stale_selection_without_anchor():
     tool, bridge = _patch_tool("Alpha beta", selection=(0, 5))
     bridge.snapshot["selection_text"] = "stale"
 
-    with pytest.raises(ValueError, match="selection_text no longer matches"):
-        tool.run(content="BETA", target_range=(0, 5))
+    status = _run_with_meta(tool, content="BETA", target_range=(0, 5))
+
+    assert "queued" in status
 
 
 def test_document_apply_patch_rejects_selection_fingerprint_mismatch():
@@ -211,11 +307,83 @@ def test_document_apply_patch_rejects_selection_fingerprint_mismatch():
     bridge.snapshot["selection_hash"] = hashlib.sha1(b"Alpha").hexdigest()
 
     with pytest.raises(ValueError, match="selection_fingerprint"):
-        tool.run(content="ALPHA", target_range=(0, 5), selection_fingerprint="mismatch")
+        _run_with_meta(tool, content="ALPHA", target_range=(0, 5), selection_fingerprint="mismatch")
+
+
+def test_document_apply_patch_rejects_stale_selection_when_fingerprint_used():
+    tool, bridge = _patch_tool("Alpha beta", selection=(0, 5))
+    bridge.snapshot["selection_text"] = "Alpha"
+    fingerprint = hashlib.sha1(b"Alpha").hexdigest()
+    bridge.snapshot["selection_hash"] = fingerprint
+    bridge.snapshot["text"] = "beta only"  # Snapshot selection_text no longer matches live content
+    bridge.snapshot["length"] = len("beta only")
+
+    with pytest.raises(ValueError, match="selection_text no longer matches"):
+        _run_with_meta(tool, content="BETA", selection_fingerprint=fingerprint)
 
 
 def test_document_apply_patch_rejects_ambiguous_match_text():
     tool, _ = _patch_tool("beta one beta two", selection=(0, 4))
 
     with pytest.raises(ValueError, match="matched multiple"):
-        tool.run(content="BETA", target_range=(4, 7), match_text="beta")
+        _run_with_meta(tool, content="BETA", target_range=(4, 7), match_text="beta")
+
+
+def test_document_apply_patch_rejects_large_insert_without_range():
+    tool, bridge = _patch_tool("Short text", selection=(0, 0))
+    long_text = "x" * 2000
+
+    with pytest.raises(NeedsRangeError, match="needs_range"):
+        _run_with_meta(tool, content=long_text, operation="replace")
+
+    assert bridge.calls == []
+
+
+def test_document_apply_patch_needs_range_emits_event(monkeypatch: pytest.MonkeyPatch):
+    tool, _ = _patch_tool("Short text", selection=(0, 0))
+    long_text = "y" * 1500
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(document_apply_patch_module, "telemetry_emit", _emit)
+
+    with pytest.raises(NeedsRangeError):
+        _run_with_meta(tool, content=long_text, operation="replace", tab_id="tab-range")
+
+    event = next((payload for name, payload in captured if name == "needs_range"), None)
+    assert event is not None
+    assert event["tab_id"] == "tab-range"
+    assert event["selection_span"] == {"start": 0, "end": 0}
+    assert event["content_length"] == len(long_text)
+
+
+def test_document_apply_patch_rejects_hash_mismatch():
+    tool, bridge = _patch_tool("Alpha beta", selection=(0, 5))
+
+    with pytest.raises(DocumentVersionMismatchError) as exc:
+        _run_with_meta(
+            tool,
+            content="BETA",
+            target_range=(0, 5),
+            content_hash="hash-mismatch",
+        )
+
+    assert exc.value.cause == "hash_mismatch"
+    assert bridge.calls == []
+
+
+def test_document_apply_patch_forces_replace_all_with_length_tolerance():
+    text = "A" * 200
+    replacement = "B" * 198  # Within ±5% of document length
+    tool, bridge = _patch_tool(text, selection=(0, 0))
+
+    status = _run_with_meta(tool, content=replacement)
+
+    assert "queued" in status or "applied" in status
+    payload = bridge.calls[-1]
+    range_payload = payload["ranges"][0]
+    assert range_payload["start"] == 0
+    assert range_payload["end"] == len(text)
+    assert range_payload["match_text"] == text

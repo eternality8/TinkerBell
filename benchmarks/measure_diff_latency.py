@@ -60,7 +60,7 @@ class _BenchmarkEditor:
     def to_document(self) -> DocumentState:
         return self.state
 
-    def apply_ai_edit(self, directive: EditDirective) -> DocumentState:  # pragma: no cover - not used in benchmark
+    def apply_ai_edit(self, directive: EditDirective, *, preserve_selection: bool = False) -> DocumentState:  # pragma: no cover - not used in benchmark
         start, end = directive.target_range
         text = self.state.text
         content = directive.content or ""
@@ -73,7 +73,7 @@ class _BenchmarkEditor:
         self.state.update_text(new_text)
         return self.state
 
-    def apply_patch_result(self, result: PatchResult) -> DocumentState:
+    def apply_patch_result(self, result: PatchResult, selection_hint=None, *, preserve_selection: bool = False) -> DocumentState:
         self.state.update_text(result.text)
         return self.state
 

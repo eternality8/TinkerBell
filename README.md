@@ -115,14 +115,15 @@ This pulls `sentence-transformers>=3.0`, `torch>=2.2`, and `numpy>=1.26`. Window
 
 Phase 3 outline/retrieval tooling relies on an embedding index that can speak either native OpenAI embeddings or any LangChain-compatible provider. The runtime picks the backend from **Settings → AI → Embeddings** and mirrors the choice into telemetry/status widgets.
 
-1. **Enable the tools** – Toggle **Settings → Experimental → Phase 3 outline tools** (or launch with `--enable-phase3-outline-tools`) so the outline worker + embedding runtime spin up.
-2. **Pick a mode + backend** – The settings dialog exposes a mode selector (`Same API`, `Custom API`, `Local`) plus a backend dropdown. The remote modes map to the OpenAI/LangChain stack (`auto`, `openai`, `langchain`, or `disabled`), while `Local` forces `sentence-transformers`. CLI/env overrides remain available for the backend:
+1. **Enable outline generation** – Toggle **Settings → Experimental → Outline generation** (or pass `--enable-outline-generation`) to start the background Outline Builder worker without forcing the full Phase 3 toolchain. This keeps Document Status + preflight analysis fed with fresh outlines even when you leave the Phase 3 tools off. Automation can also export `TINKERBELL_ENABLE_OUTLINE_GENERATION=1` for one-off sessions.
+2. **Enable the tools** – Toggle **Settings → Experimental → Phase 3 outline tools** (or launch with `--enable-phase3-outline-tools`) when you want the manual `/outline` & `/find` commands plus the guardrail-aware tool loop. The worker flag above is automatically implied if you enable the tools.
+3. **Pick a mode + backend** – The settings dialog exposes a mode selector (`Same API`, `Custom API`, `Local`) plus a backend dropdown. The remote modes map to the OpenAI/LangChain stack (`auto`, `openai`, `langchain`, or `disabled`), while `Local` forces `sentence-transformers`. CLI/env overrides remain available for the backend:
 	 - CLI: `uv run tinkerbell --embedding-backend langchain --embedding-model deepseek-embedding`
 	 - Env vars: `TINKERBELL_EMBEDDING_BACKEND=langchain`, `TINKERBELL_EMBEDDING_MODEL=deepseek-embedding`
-3. **Provide credentials or a model path** – Remote backends reuse the global API key/base URL/org (or `metadata.embedding_api.*` when the custom mode is enabled). Local mode expects a SentenceTransformers repo or folder plus optional device/dtype/cache overrides.
+4. **Provide credentials or a model path** – Remote backends reuse the global API key/base URL/org (or `metadata.embedding_api.*` when the custom mode is enabled). Local mode expects a SentenceTransformers repo or folder plus optional device/dtype/cache overrides.
 	- The app auto-detects common LangChain families (OpenAI, DeepSeek, GLM/Zhipu, Moonshot/Kimi). It inspects `embedding_model_name` (or `settings.metadata["langchain_provider_family"]` / `TINKERBELL_LANGCHAIN_PROVIDER_FAMILY`) and wires the correct base URL, tokenizer hint, and embedding dimensionality. Provider-specific API keys can live in `settings.metadata["<family>_api_key"]` or env vars such as `DEEPSEEK_API_KEY`, `GLM_API_KEY`, and `MOONSHOT_API_KEY`. Override URLs per family with `settings.metadata["<family>_base_url"]` when needed. Unknown models fall back to the stock OpenAI configuration until you supply manual overrides.
-4. **Test the backend** – Click **Test Embeddings** in the dialog to run a short encode roundtrip. Remote errors usually signal invalid credentials or missing LangChain providers; local errors usually mean the embeddings extra is not installed (`uv sync --extra embeddings`) or the model path/device is unavailable.
-5. **Advanced overrides** – When you need a non-OpenAI LangChain class, drop this into `settings.metadata` (or export `TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS/KWARGS`):
+5. **Test the backend** – Click **Test Embeddings** in the dialog to run a short encode roundtrip. Remote errors usually signal invalid credentials or missing LangChain providers; local errors usually mean the embeddings extra is not installed (`uv sync --extra embeddings`) or the model path/device is unavailable.
+6. **Advanced overrides** – When you need a non-OpenAI LangChain class, drop this into `settings.metadata` (or export `TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS/KWARGS`):
 
 	 ```jsonc
 	 {
@@ -136,7 +137,7 @@ Phase 3 outline/retrieval tooling relies on an embedding index that can speak ei
 	 ```
 
 	 The kwargs blob can be stored as a dict in `settings.metadata` or as a JSON string in `TINKERBELL_LANGCHAIN_EMBEDDINGS_KWARGS`. All fields merge with the automatically supplied `model` argument.
-6. **Observe the runtime** – The status bar shows `Embeddings: OpenAI/LangChain/SentenceTransformers/Error` labels, and every `ContextUsageEvent` now includes `embedding_backend`, `embedding_model`, and `embedding_status` so exports/audits can segment remote vs. local runs.
+7. **Observe the runtime** – The status bar shows `Embeddings: OpenAI/LangChain/SentenceTransformers/Error` labels, and every `ContextUsageEvent` now includes `embedding_backend`, `embedding_model`, and `embedding_status` so exports/audits can segment remote vs. local runs.
 
 #### Bring-your-own SentenceTransformers models (local mode)
 
@@ -180,6 +181,7 @@ You can supply OpenAI-compatible credentials in three interchangeable ways:
 	 - `TINKERBELL_REQUEST_TIMEOUT` (seconds before an AI request fails; defaults to `90`)
 	 - `TINKERBELL_ENABLE_SUBAGENTS` (set to `1`/`true` to opt into the Phase 4 subagent sandbox for the current session)
 	 - `TINKERBELL_ENABLE_PLOT_SCAFFOLDING` (set to `1`/`true` to expose the experimental character/plot memory tool for the current session)
+	 - `TINKERBELL_ENABLE_OUTLINE_GENERATION` (set to `1`/`true` when you want the Outline Builder worker running even if the Phase 3 tools stay off)
 3. **Programmatic injection** – Instantiate `Settings` or `ClientSettings` yourself if you embed TinkerBell in a larger Python workflow.
 4. **CLI overrides** – Pass `--set key=value` flags to the launcher to override persisted settings for a single session:
 
@@ -189,7 +191,7 @@ uv run tinkerbell --set base_url=https://proxy.example.com --set max_tool_iterat
 
 Add `--settings-path` when you want to point at a custom `settings.json` file.
 
-Use `--enable-subagents` / `--disable-subagents` and `--enable-plot-scaffolding` / `--disable-plot-scaffolding` (or their respective `TINKERBELL_ENABLE_SUBAGENTS` / `TINKERBELL_ENABLE_PLOT_SCAFFOLDING` env vars) to toggle the experimental Phase 4 features without editing the persisted settings; the status bar immediately reflects the active state.
+Use `--enable-outline-generation` / `--disable-outline-generation`, `--enable-subagents` / `--disable-subagents`, and `--enable-plot-scaffolding` / `--disable-plot-scaffolding` (or their respective env vars) to toggle the experimental workers without editing the persisted settings; the status bar immediately reflects each active state.
 
 Precedence is deterministic: **environment variables override CLI flags, which in turn override the values saved via the UI**. This matches the debugging workflow where you might hardcode safe defaults, tweak them per-session with CLI overrides, and fall back to environment variables for quick emergency switches (e.g., rotating API keys).
 

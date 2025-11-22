@@ -17,6 +17,7 @@ from typing import Any, Dict
 from jsonschema import Draft7Validator, ValidationError
 
 from ..documents.ranges import TextRange
+from ..services.telemetry import emit as telemetry_emit
 
 
 class ActionType(str, Enum):
@@ -143,6 +144,12 @@ _FIND_BOOLEAN_FLAGS = {
     "--no-outline-context": False,
     "--without-outline": False,
 }
+_DEPRECATED_CARET_FIELDS = (
+    "insert_at_cursor",
+    "cursor_offset",
+    "selection_start",
+    "selection_end",
+)
 
 
 def is_manual_command(text: str) -> bool:
@@ -474,6 +481,7 @@ DIRECTIVE_SCHEMA: Dict[str, Any] = {
         "document_digest": {"type": "string"},
         "metadata": {"type": "object"},
         "tab_id": {"type": "string", "minLength": 1},
+        "replace_all": {"type": "boolean"},
         "selection_fingerprint": {"type": "string", "minLength": 1},
         "match_text": {"type": "string"},
         "expected_text": {"type": "string"},
@@ -544,6 +552,18 @@ def validate_directive(payload: Mapping[str, Any]) -> ValidationResult:
     content = candidate.get("content")
     if isinstance(content, str) and not content.strip():
         return ValidationResult(ok=False, message="content must not be empty")
+
+    deprecated_fields = _collect_deprecated_caret_fields(candidate)
+    if deprecated_fields:
+        _emit_caret_block_event(candidate, deprecated_fields, source="directive_schema")
+        field_list = ", ".join(sorted(deprecated_fields))
+        return ValidationResult(
+            ok=False,
+            message=(
+                f"Deprecated caret parameters ({field_list}) are no longer supported. "
+                "Call document_snapshot/selection_range and send target_range or replace_all=true."
+            ),
+        )
 
     action = candidate.get("action")
     if action == ActionType.PATCH.value:
@@ -619,6 +639,31 @@ def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["tab_reference"] = tab_reference
 
     return normalized
+
+
+def _collect_deprecated_caret_fields(payload: Mapping[str, Any]) -> set[str]:
+    hits: set[str] = set()
+    for field in _DEPRECATED_CARET_FIELDS:
+        if field in payload:
+            hits.add(field)
+    metadata = payload.get("metadata")
+    if isinstance(metadata, Mapping):
+        for field in _DEPRECATED_CARET_FIELDS:
+            if field in metadata:
+                hits.add(field)
+    return hits
+
+
+def _emit_caret_block_event(payload: Mapping[str, Any], fields: set[str], *, source: str) -> None:
+    if not fields:
+        return
+    telemetry_payload = {
+        "document_id": payload.get("document_id"),
+        "tab_id": payload.get("tab_id"),
+        "source": source,
+        "blocked_fields": sorted(fields),
+    }
+    telemetry_emit("caret_call_blocked", telemetry_payload)
 
 
 def _normalize_target_range_value(value: Any) -> Any:

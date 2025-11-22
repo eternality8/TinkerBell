@@ -70,11 +70,13 @@ class SettingsRuntime:
         settings: Settings,
         *,
         chat_panel_handler: Callable[[Settings], None],
+        outline_handler: Callable[[Settings], None],
         phase3_handler: Callable[[Settings], None],
         plot_scaffolding_handler: Callable[[Settings], None],
         safe_edit_handler: Callable[[Settings], None] | None = None,
     ) -> None:
         chat_panel_handler(settings)
+        outline_handler(settings)
         phase3_handler(settings)
         plot_scaffolding_handler(settings)
         if safe_edit_handler is not None:
@@ -340,7 +342,7 @@ class SettingsRuntime:
             value = int(raw)
         except (TypeError, ValueError):  # pragma: no cover - validated via tests
             value = 8
-        return max(1, min(value, 50))
+        return max(1, min(value, 200))
 
     def _apply_subagent_runtime_config(self, controller: Any, settings: Settings) -> None:
         configurator = getattr(controller, "configure_subagents", None)

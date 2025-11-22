@@ -41,3 +41,12 @@ This reference captures the telemetry events emitted by the AI editing guardrail
 2. **Normalize cause codes** – Downstream dashboards should treat `hash_mismatch` as the general “stale snapshot” bucket, `chunk_hash_mismatch` as manifest drift, and `inspector_failure` as duplicate/boundary catches.
 3. **Correlate with UI badges** – The chat panel/status bar consume the same payloads, so dashboards built from these events will mirror what operators already see live.
 4. **Benchmark tie-in** – When running `benchmarks/measure_diff_latency.py --mode pipeline`, watch for matching `patch.apply`/`edit_rejected` events to confirm safe-edit thresholds before rolling changes into production.
+
+## 5. Guardrail & selection signals
+
+| Event | When it fires | Key fields |
+| --- | --- | --- |
+| `hash_mismatch` | Emitted by `DocumentApplyPatchTool` preflight validators (`stage=document_version`, `version_id`, or `content_hash`) and by `DocumentBridge` when the live buffer diverges or a streamed chunk hash fails validation (`stage=bridge`/`chunk_hash`). | `document_id`, `version_id`, `content_hash`, `stage`, `cause` (`hash_mismatch` or `chunk_hash_mismatch`), `reason`, optional `tab_id`, `range_count`, `streamed`, `details` (provided vs. expected tokens). |
+| `needs_range` | Raised when large (>1 KB) inserts omit explicit bounds, triggering a `NeedsRangeError`. | `document_id`, `tab_id`, `selection_span`, `content_length`, `threshold`, `source="document_apply_patch"`, `reason`. |
+| `caret_call_blocked` | Recorded whenever the caller omits `target_span`/`match_text` and tries to rely on the caret. | `document_id`, `tab_id`, `range_provided`, `replace_all`, `selection_span`, optional `range_payload`, `reason`. |
+| `selection_snapshot_requested` | Fired by `SelectionRangeTool` so rollout dashboards can compare read-only selection usage vs. blocked caret calls. | `document_id`, `tab_id`, `start_line`, `end_line`, `selection_span`, `selection_length`, `content_hash`. |

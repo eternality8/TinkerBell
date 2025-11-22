@@ -98,6 +98,7 @@ class EditDirective:
     selection_fingerprint: Optional[str] = None
     match_text: Optional[str] = None
     expected_text: Optional[str] = None
+    replace_all: Optional[bool] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "target_range", TextRange.from_value(self.target_range))

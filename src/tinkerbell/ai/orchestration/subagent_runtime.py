@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Mapping
 
@@ -15,6 +16,8 @@ from ..agents.subagents import SubagentManager
 
 if TYPE_CHECKING:  # pragma: no cover - typing helpers
     from .controller import ToolRegistration
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -37,14 +40,22 @@ class SubagentRuntimeManager:
     ) -> SubagentRuntimeConfig:
         runtime = (config or SubagentRuntimeConfig()).clamp()
         self.config = runtime
+        LOGGER.debug(
+            "Configuring subagent runtime (enabled=%s, plot_scaffolding=%s)",
+            runtime.enabled,
+            runtime.plot_scaffolding_enabled,
+        )
         if not runtime.enabled:
+            LOGGER.debug("Subagent runtime disabled; clearing manager state")
             self.manager = None
             return runtime
 
         if self.cache is None:
             self.cache = SubagentResultCache()
+            LOGGER.debug("Initialized subagent result cache")
 
         if self.manager is None:
+            LOGGER.debug("Creating SubagentManager instance")
             self.manager = SubagentManager(
                 client,
                 tool_resolver=self.tool_resolver,
@@ -53,6 +64,7 @@ class SubagentRuntimeManager:
                 result_cache=self.cache,
             )
         else:
+            LOGGER.debug("Updating existing SubagentManager instance")
             self.manager.update_client(client)
             self.manager.update_config(runtime)
             self.manager.update_budget_policy(budget_policy)
@@ -61,8 +73,10 @@ class SubagentRuntimeManager:
         if runtime.plot_scaffolding_enabled:
             if self.plot_state_store is None:
                 self.plot_state_store = PlotStateMemory()
+                LOGGER.debug("Initialized plot state memory store")
             if self.character_map_store is None:
                 self.character_map_store = CharacterMapStore()
+                LOGGER.debug("Initialized character map store")
             extras = (
                 "plot_outline",
                 "document_plot_state",
@@ -75,6 +89,10 @@ class SubagentRuntimeManager:
                 if tool not in current:
                     current.append(tool)
             runtime.allowed_tools = tuple(current)
+            LOGGER.debug(
+                "Augmented subagent allowed tools with plot scaffolding extras: %s",
+                extras,
+            )
 
         return runtime
 
@@ -85,9 +103,11 @@ class SubagentRuntimeManager:
     def ensure_plot_state_store(self) -> PlotStateMemory:
         if self.plot_state_store is None:
             self.plot_state_store = PlotStateMemory()
+            LOGGER.debug("Lazily created plot state store")
         return self.plot_state_store
 
     def ensure_character_map_store(self) -> CharacterMapStore:
         if self.character_map_store is None:
             self.character_map_store = CharacterMapStore()
+            LOGGER.debug("Lazily created character map store")
         return self.character_map_store

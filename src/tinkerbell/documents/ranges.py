@@ -139,4 +139,120 @@ class TextRange(Sequence[int]):
         return cls(0, 0)
 
 
-__all__ = ["TextRange"]
+@dataclass(slots=True, frozen=True)
+class LineRange(Sequence[int]):
+    """Line-based representation of a selection using inclusive bounds."""
+
+    start_line: int
+    end_line: int
+
+    def __post_init__(self) -> None:
+        start = self._coerce_index(self.start_line, "start_line")
+        end = self._coerce_index(self.end_line, "end_line")
+        if end < start:
+            start, end = end, start
+        object.__setattr__(self, "start_line", start)
+        object.__setattr__(self, "end_line", end)
+
+    @staticmethod
+    def _coerce_index(value: Any, label: str) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"LineRange {label} must be an integer") from exc
+        if number < 0:
+            return 0
+        return number
+
+    def __len__(self) -> int:
+        return 2
+
+    def __getitem__(self, index: int | slice) -> int | tuple[int, ...]:
+        if isinstance(index, slice):
+            return self.to_tuple()[index]
+        if index == 0:
+            return self.start_line
+        if index == 1:
+            return self.end_line
+        raise IndexError("LineRange index out of range")
+
+    def __iter__(self) -> Iterator[int]:
+        yield self.start_line
+        yield self.end_line
+
+    @property
+    def line_count(self) -> int:
+        """Return the number of lines covered by the span (inclusive)."""
+
+        return (self.end_line - self.start_line) + 1
+
+    def to_tuple(self) -> tuple[int, int]:
+        """Return the span as a ``(start_line, end_line)`` tuple."""
+
+        return (self.start_line, self.end_line)
+
+    def to_list(self) -> list[int]:
+        """Return the span as a JSON-friendly list."""
+
+        return [self.start_line, self.end_line]
+
+    def to_dict(self) -> dict[str, int]:
+        """Return the span as an object with ``start_line``/``end_line`` keys."""
+
+        return {"start_line": self.start_line, "end_line": self.end_line}
+
+    def clamp(self, *, lower: int = 0, upper: int | None = None) -> "LineRange":
+        """Clamp the span to ``[lower, upper]`` bounds when provided."""
+
+        start = max(lower, self.start_line)
+        end = max(lower, self.end_line)
+        if upper is not None:
+            start = min(start, upper)
+            end = min(end, upper)
+        return LineRange(start, end)
+
+    @classmethod
+    def from_value(
+        cls,
+        value: Any,
+        *,
+        fallback: tuple[int, int] | None = None,
+    ) -> "LineRange":
+        """Coerce ``value`` into a :class:`LineRange`."""
+
+        if isinstance(value, LineRange):
+            return value
+        if value is None:
+            if fallback is None:
+                raise ValueError("LineRange value is required")
+            return cls(*fallback)
+        if isinstance(value, Mapping):
+            start = value.get("start_line")
+            end = value.get("end_line")
+            if start is None or end is None:
+                if fallback is None:
+                    raise ValueError("LineRange mappings require start_line and end_line")
+                if start is None:
+                    start = fallback[0]
+                if end is None:
+                    end = fallback[1]
+            return cls(start, end)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            seq = list(value)
+            if len(seq) != 2:
+                raise ValueError("LineRange sequences must have exactly two entries")
+            return cls(seq[0], seq[1])
+        start = getattr(value, "start_line", None)
+        end = getattr(value, "end_line", None)
+        if start is not None and end is not None:
+            return cls(start, end)
+        raise TypeError("Unsupported LineRange input")
+
+    @classmethod
+    def zero(cls) -> "LineRange":
+        """Return a caret-aligned line span at index 0."""
+
+        return cls(0, 0)
+
+
+__all__ = ["TextRange", "LineRange"]

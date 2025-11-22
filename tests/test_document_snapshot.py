@@ -23,10 +23,10 @@ class _EditorStub:
     def load_document(self, document: DocumentState) -> None:  # pragma: no cover - unused in tests
         self.state = deepcopy(document)
 
-    def apply_ai_edit(self, directive):  # pragma: no cover - unused in tests
+    def apply_ai_edit(self, directive, *, preserve_selection: bool = False):  # pragma: no cover - unused in tests
         return self.state
 
-    def apply_patch_result(self, result):  # pragma: no cover - unused in tests
+    def apply_patch_result(self, result, selection_hint=None, *, preserve_selection: bool = False):  # pragma: no cover - unused in tests
         return self.state
 
 

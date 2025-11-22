@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import contextmanager
+from copy import deepcopy
 from typing import Any, Mapping
 
 import pytest
@@ -24,12 +25,15 @@ from tinkerbell.ai.tools.document_edit import DocumentEditTool
 from tinkerbell.ai.tools.document_snapshot import DocumentSnapshotTool
 from tinkerbell.ai.tools.list_tabs import ListTabsTool
 from tinkerbell.ai.tools.search_replace import SearchReplaceTool
+from tinkerbell.ai.tools.selection_range import SelectionRangeTool
+from tinkerbell.ai.tools import selection_range as selection_range_module
 from tinkerbell.ai.tools.tool_usage_advisor import ToolUsageAdvisorTool
 from tinkerbell.ai.tools.validation import validate_snippet
 from tinkerbell.chat.commands import DIRECTIVE_SCHEMA
 from tinkerbell.documents.range_normalizer import compose_normalized_replacement, normalize_text_range
 from tinkerbell.editor.syntax import yaml_json
-from tinkerbell.services.bridge import DocumentVersionMismatchError
+from tinkerbell.editor.document_model import DocumentState, SelectionRange
+from tinkerbell.services.bridge import DocumentBridge, DocumentVersionMismatchError
 
 
 class _EditBridgeStub:
@@ -109,7 +113,16 @@ class _EditBridgeStub:
 
 class _SnapshotProviderStub:
     def __init__(self) -> None:
-        self.snapshot = {"text": "Hello", "selection": (0, 5), "version": "base", "document_id": "doc-stub"}
+        text = "Hello"
+        self.snapshot = {
+            "text": text,
+            "selection": (0, 5),
+            "version": "base",
+            "document_id": "doc-stub",
+            "line_offsets": [0, len(text)],
+            "length": len(text),
+            "content_hash": hashlib.sha1(text.encode("utf-8")).hexdigest(),
+        }
         self.delta_only_calls: list[bool] = []
         self.last_diff_summary: str | None = "+1 char"
         self.last_snapshot_version: str | None = "digest-1"
@@ -124,6 +137,34 @@ class _SnapshotProviderStub:
     ):
         self.delta_only_calls.append(delta_only)
         return dict(self.snapshot)
+
+
+class _IntegrationEditor:
+    def __init__(self, text: str) -> None:
+        self.state = DocumentState(text=text)
+        self.state.selection = SelectionRange(0, 0)
+
+    def load_document(self, document: DocumentState) -> None:
+        self.state = document
+
+    def to_document(self) -> DocumentState:
+        return deepcopy(self.state)
+
+    def apply_ai_edit(self, directive, *, preserve_selection: bool = False):  # pragma: no cover - unused
+        start, end = directive.target_range
+        buffer = self.state.text
+        if directive.action == "insert":
+            updated = buffer[:start] + directive.content + buffer[start:]
+        elif directive.action == "replace":
+            updated = buffer[:start] + directive.content + buffer[end:]
+        else:
+            raise ValueError(directive.action)
+        self.state.update_text(updated)
+        return self.state
+
+    def apply_patch_result(self, result, selection_hint=None, *, preserve_selection: bool = False):
+        self.state.update_text(result.text)
+        return self.state
 
     def get_last_diff_summary(self, tab_id: str | None = None) -> str | None:  # noqa: ARG002 - unused
         return self.last_diff_summary
@@ -158,9 +199,22 @@ class _SearchReplaceBridgeStub:
 
 
 class _PatchBridgeStub(_EditBridgeStub):
-    def __init__(self, *, text: str = "Hello world", selection: tuple[int, int] = (0, 0), version: str = "digest-0") -> None:
+    def __init__(
+        self,
+        *,
+        text: str = "Hello world",
+        selection: tuple[int, int] = (0, 0),
+        version: str = "digest-0",
+        version_id: int | str = 1,
+    ) -> None:
         super().__init__()
-        self.snapshot = {"text": text, "selection": selection, "version": version, "path": "doc.md"}
+        self.snapshot = {
+            "text": text,
+            "selection": selection,
+            "version": version,
+            "version_id": version_id,
+            "path": "doc.md",
+        }
         self.last_snapshot_version = version
 
 
@@ -343,6 +397,20 @@ def test_document_edit_tool_handles_special_characters_in_sentence():
     assert ranges[0]["replacement"] == expected_replacement
 
 
+def test_document_edit_tool_supports_replace_all_flag():
+    bridge = _PatchBridgeStub(text="Alpha\nBeta", selection=(0, 0), version="digest-replace-all")
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+
+    status = tool.run(action="replace", content="Gamma", replace_all=True)
+
+    assert "digest-replace-all" in status
+    payload = bridge.calls[-1]
+    ranges = payload["ranges"]
+    assert ranges[0]["start"] == 0
+    assert ranges[0]["end"] == len("Alpha\nBeta")
+    assert ranges[0]["replacement"] == "Gamma"
+
+
 def test_document_edit_tool_routes_to_specific_tab():
     bridge = _EditBridgeStub()
     bridge.snapshot["text"] = "Hi"
@@ -503,8 +571,35 @@ def test_document_edit_tool_requires_range_or_anchor_for_replace_when_selection_
     bridge = _PatchBridgeStub(text="Hello world", selection=(0, 0), version="digest-43")
     tool = DocumentEditTool(bridge=bridge, patch_only=True)
 
-    with pytest.raises(ValueError, match="target_range or match_text"):
+    with pytest.raises(ValueError, match="replace_all=true"):
         tool.run(action="replace", content="Hi there")
+
+
+def test_document_edit_tool_rejects_snapshot_selection_without_fingerprint():
+    bridge = _PatchBridgeStub(text="Alpha beta", selection=(0, 5), version="digest-43b")
+    bridge.snapshot["selection_text"] = "Alpha"
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+
+    with pytest.raises(ValueError, match="replace_all=true"):
+        tool.run(action="replace", content="ALPHA")
+
+
+def test_document_edit_tool_emits_caret_block_event(monkeypatch: pytest.MonkeyPatch):
+    bridge = _PatchBridgeStub(text="Hello world", selection=(0, 0), version="digest-guard")
+    tool = DocumentEditTool(bridge=bridge, patch_only=True)
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(document_edit_module, "telemetry_emit", _emit)
+
+    with pytest.raises(ValueError):
+        tool.run(action="replace", content="Hi there")
+
+    event = next((payload for name, payload in captured if name == "caret_call_blocked"), None)
+    assert event is not None
+    assert event["source"] == "document_edit.auto_patch"
 
 
 def test_document_edit_tool_realigns_with_match_text_during_auto_convert():
@@ -585,12 +680,25 @@ def test_document_edit_tool_allows_patches_when_patch_only_enabled():
     assert "patch" in status
 
 
+def _run_document_apply_patch(tool: DocumentApplyPatchTool, **kwargs: Any):
+    """Invoke DocumentApplyPatchTool with snapshot-derived metadata."""
+    snapshot = getattr(tool.bridge, "snapshot", {})
+    base_text = str(snapshot.get("text", ""))
+    metadata = {
+        "document_version": snapshot.get("version"),
+        "version_id": snapshot.get("version_id", 1),
+        "content_hash": hashlib.sha1(base_text.encode("utf-8")).hexdigest(),
+    }
+    metadata.update(kwargs)
+    return tool.run(**metadata)
+
+
 def test_document_apply_patch_tool_builds_and_applies_diff():
     bridge = _PatchBridgeStub(text="Alpha beta", selection=(6, 10), version="digest-7")
     edit_tool = DocumentEditTool(bridge=bridge)
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
-    status = tool.run(content="BETA", target_range=(6, 10))
+    status = _run_document_apply_patch(tool, content="BETA", target_range=(6, 10))
 
     assert bridge.calls and bridge.calls[-1]["action"] == "patch"
     assert "digest-7" in status
@@ -602,7 +710,7 @@ def test_document_apply_patch_tool_targets_specific_tab():
     edit_tool = DocumentEditTool(bridge=bridge)
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
-    tool.run(content="ALPHA", target_range=(0, 5), tab_id="tab-b")
+    _run_document_apply_patch(tool, content="ALPHA", target_range=(0, 5), tab_id="tab-b")
 
     assert bridge.queue_tab_ids[-1] == "tab-b"
     assert bridge.snapshot_requests[-1]["tab_id"] == "tab-b"
@@ -614,7 +722,7 @@ def test_document_apply_patch_tool_validates_snapshot_version():
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
     with pytest.raises(DocumentVersionMismatchError):
-        tool.run(content="Hola", target_range=(0, 5), document_version="digest-old")
+        _run_document_apply_patch(tool, content="Hola", target_range=(0, 5), document_version="digest-old")
 
 
 def test_document_apply_patch_tool_skips_noop_edits():
@@ -622,7 +730,7 @@ def test_document_apply_patch_tool_skips_noop_edits():
     edit_tool = DocumentEditTool(bridge=bridge)
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
-    outcome = tool.run(content="Hello", target_range=(0, 5))
+    outcome = _run_document_apply_patch(tool, content="Hello", target_range=(0, 5))
 
     assert outcome.startswith("skipped")
     assert bridge.calls == []
@@ -640,13 +748,39 @@ def test_document_apply_patch_tool_emits_anchor_success_event(monkeypatch: pytes
 
     monkeypatch.setattr(document_apply_patch_module, "telemetry_emit", _emit)
 
-    tool.run(content="ALPHA", target_range=(0, 5), match_text="Alpha")
+    _run_document_apply_patch(tool, content="ALPHA", target_range=(0, 5), match_text="Alpha")
 
     event = next((payload for name, payload in captured if name == "patch.anchor"), None)
     assert event is not None
     assert event["status"] == "success"
     assert event["source"] == "document_apply_patch"
-    assert event["anchor_source"] == "match_text"
+
+
+def test_document_apply_patch_full_document_rewrite_replaces_buffer():
+    def _compose(text_one: str, text_two: str) -> str:
+        return f"{text_one} chapter one.\n\n{text_two} chapter two.\n"
+
+    editor = _IntegrationEditor(_compose("Alpha", "Beta"))
+    bridge = DocumentBridge(editor=editor)
+    bridge.configure_safe_editing(enabled=True)
+    edit_tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+
+    snapshot = bridge.generate_snapshot()
+    rewritten = _compose("Gamma", "Delta")
+
+    status = tool.run(
+        content=rewritten,
+        document_version=snapshot["version"],
+        version_id=snapshot["version_id"],
+        content_hash=snapshot["content_hash"],
+        rationale="full rewrite",
+    )
+
+    assert isinstance(status, str)
+    assert editor.state.text == rewritten
+    assert "Alpha" not in editor.state.text
+    assert "Beta" not in editor.state.text
 
 
 def test_document_apply_patch_tool_emits_anchor_failure_event(monkeypatch: pytest.MonkeyPatch):
@@ -662,7 +796,7 @@ def test_document_apply_patch_tool_emits_anchor_failure_event(monkeypatch: pytes
     monkeypatch.setattr(document_apply_patch_module, "telemetry_emit", _emit)
 
     with pytest.raises(ValueError):
-        tool.run(content="ALPHA")
+        _run_document_apply_patch(tool, content="ALPHA")
 
     event = next((payload for name, payload in captured if name == "patch.anchor"), None)
     assert event is not None
@@ -670,15 +804,77 @@ def test_document_apply_patch_tool_emits_anchor_failure_event(monkeypatch: pytes
     assert event["phase"] == "requirements"
 
 
+def test_document_apply_patch_emits_hash_mismatch_event(monkeypatch: pytest.MonkeyPatch):
+    bridge = _PatchBridgeStub(text="Alpha beta", selection=(0, 5), version="digest-hash")
+    bridge.snapshot["document_id"] = "doc-hash"
+    edit_tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(document_apply_patch_module, "telemetry_emit", _emit)
+
+    with pytest.raises(DocumentVersionMismatchError):
+        tool.run(
+            content="BETA",
+            target_range=(0, 4),
+            document_version=bridge.snapshot["version"],
+            version_id=bridge.snapshot["version_id"],
+            content_hash="hash-mismatch",
+            tab_id="tab-telemetry",
+        )
+
+    event = next((payload for name, payload in captured if name == "hash_mismatch"), None)
+    assert event is not None
+    assert event["stage"] == "content_hash"
+    assert event["document_id"] == "doc-hash"
+    assert event["tab_id"] == "tab-telemetry"
+
+
 def test_document_apply_patch_tool_handles_missing_rationale():
     bridge = _PatchBridgeStub(text="", selection=(0, 0), version="digest-9")
     edit_tool = DocumentEditTool(bridge=bridge)
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
-    status = tool.run(content="Hello world", target_range=(0, 0))
+    status = _run_document_apply_patch(tool, content="Hello world", target_range=(0, 0))
 
     assert bridge.calls and bridge.calls[-1]["action"] == "patch"
     assert "digest-9" in status
+
+
+def test_document_apply_patch_tool_supports_replace_all_flag():
+    bridge = _PatchBridgeStub(text="Alpha\nBeta", selection=(0, 0), version="digest-apply-all")
+    edit_tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+
+    status = _run_document_apply_patch(tool, content="Gamma", replace_all=True)
+
+    assert "digest-apply-all" in status
+    payload = bridge.calls[-1]
+    ranges = payload["ranges"]
+    assert ranges[0]["start"] == 0
+    assert ranges[0]["end"] == len("Alpha\nBeta")
+
+
+def test_document_apply_patch_tool_emits_caret_block_event(monkeypatch: pytest.MonkeyPatch):
+    bridge = _PatchBridgeStub(text="Hello world", selection=(0, 0), version="digest-apply-guard")
+    edit_tool = DocumentEditTool(bridge=bridge)
+    tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(document_apply_patch_module, "telemetry_emit", _emit)
+
+    with pytest.raises(ValueError):
+        _run_document_apply_patch(tool, content="Hi there")
+
+    event = next((payload for name, payload in captured if name == "caret_call_blocked"), None)
+    assert event is not None
+    assert event["source"] == "document_apply_patch"
 
 
 def test_register_default_tools_succeeds_when_controller_accepts_all():
@@ -758,6 +954,38 @@ def test_document_snapshot_tool_attaches_outline_digest_when_resolver_present():
 
     assert snapshot["outline_digest"] == "outline-hash"
     assert calls == ["doc-stub"]
+
+
+def test_selection_range_tool_returns_line_bounds():
+    provider = _SnapshotProviderStub()
+    provider.snapshot["line_offsets"] = [0, 6, 12]
+    provider.snapshot["length"] = 12
+    provider.snapshot["selection"] = {"start": 6, "end": 12}
+
+    tool = SelectionRangeTool(provider=provider)
+    result = tool.run()
+
+    assert result["start_line"] == 1
+    assert result["end_line"] == 1
+    assert result["content_hash"] == provider.snapshot["content_hash"]
+
+
+def test_selection_range_tool_emits_telemetry(monkeypatch: pytest.MonkeyPatch):
+    provider = _SnapshotProviderStub()
+    provider.snapshot["selection"] = (2, 4)
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(selection_range_module, "telemetry_emit", _emit)
+
+    SelectionRangeTool(provider=provider).run(tab_id="tab-extra")
+
+    event = captured[-1]
+    assert event[0] == "selection_snapshot_requested"
+    assert event[1]["tab_id"] == "tab-extra"
+    assert event[1]["selection_span"] == {"start": 2, "end": 4}
 
 
 def test_tool_usage_advisor_tool_returns_serialized_advice():

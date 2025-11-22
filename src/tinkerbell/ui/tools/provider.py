@@ -83,6 +83,7 @@ class ToolProvider:
             directive_schema_provider=self.directive_schema_provider,
             phase3_outline_enabled=self.phase3_outline_enabled,
             plot_scaffolding_enabled=self.plot_scaffolding_enabled,
+             plot_state_store_resolver=self.plot_state_store_resolver,
             ensure_outline_tool=self.ensure_outline_tool,
             ensure_find_sections_tool=self.ensure_find_sections_tool,
             ensure_plot_state_tool=self.ensure_plot_state_tool,

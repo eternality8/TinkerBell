@@ -266,9 +266,10 @@ class EditorWidget(QWidgetBase):
         self.set_text(new_text)
         self.apply_selection(SelectionRange(begin, begin + len(replacement)))
 
-    def apply_ai_edit(self, directive: EditDirective) -> DocumentState:
+    def apply_ai_edit(self, directive: EditDirective, *, preserve_selection: bool = False) -> DocumentState:
         """Apply an agent-issued edit directive (insert/replace/annotate)."""
 
+        saved_selection = SelectionRange(self._state.selection.start, self._state.selection.end)
         action = directive.action.lower()
         start, end = self._clamp_range(*directive.target_range)
         caret_position: int | None = None
@@ -287,14 +288,23 @@ class EditorWidget(QWidgetBase):
             caret_position = insert_at + len(annotation)
         else:
             raise ValueError(f"Unsupported directive action: {directive.action}")
-        if caret_position is not None:
+        if preserve_selection:
+            self.apply_selection(saved_selection)
+        elif caret_position is not None:
             self.apply_selection(SelectionRange(caret_position, caret_position))
         self._mark_change_source("programmatic")
         return self.to_document()
 
-    def apply_patch_result(self, result: PatchResult, selection_hint: tuple[int, int] | None = None) -> DocumentState:
+    def apply_patch_result(
+        self,
+        result: PatchResult,
+        selection_hint: tuple[int, int] | None = None,
+        *,
+        preserve_selection: bool = False,
+    ) -> DocumentState:
         """Apply a diff-based patch result while emitting a single undo snapshot."""
 
+        saved_selection = SelectionRange(self._state.selection.start, self._state.selection.end)
         previous = self._text_buffer
         if previous == result.text:
             return self.to_document()
@@ -317,7 +327,10 @@ class EditorWidget(QWidgetBase):
         else:
             end = len(result.text)
 
-        self.apply_selection(SelectionRange(end, end))
+        if preserve_selection:
+            self.apply_selection(saved_selection)
+        else:
+            self.apply_selection(SelectionRange(end, end))
         self._mark_change_source("programmatic")
         return self.to_document()
 

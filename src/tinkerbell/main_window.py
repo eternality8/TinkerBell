@@ -4179,8 +4179,17 @@ class MainWindow(QMainWindow):
         try:
             loop = self._resolve_async_loop()
             if loop is not None:
-                return DocumentEmbeddingIndex(storage_dir=storage_dir, provider=provider, loop=loop)
-            return DocumentEmbeddingIndex(storage_dir=storage_dir, provider=provider)
+                return DocumentEmbeddingIndex(
+                    storage_dir=storage_dir,
+                    provider=provider,
+                    loop=loop,
+                    activity_callback=self._handle_embedding_activity,
+                )
+            return DocumentEmbeddingIndex(
+                storage_dir=storage_dir,
+                provider=provider,
+                activity_callback=self._handle_embedding_activity,
+            )
         except Exception as exc:
             _LOGGER.warning("Failed to initialize embedding index: %s", exc)
             return None
@@ -4199,6 +4208,7 @@ class MainWindow(QMainWindow):
         self._embedding_snapshot_metadata = {}
         self._propagate_embedding_index_to_worker()
         self._dispose_embedding_resource()
+        self._handle_embedding_activity(False, None)
         if keep_status:
             return
         fallback_backend = "disabled" if self._phase3_outline_enabled else "unavailable"
@@ -4233,6 +4243,18 @@ class MainWindow(QMainWindow):
                 close()
             except Exception:
                 pass
+
+    def _handle_embedding_activity(self, active: bool, detail: str | None) -> None:
+        status_bar = getattr(self, "_status_bar", None)
+        if status_bar is None:
+            return
+        setter = getattr(status_bar, "set_embedding_processing", None)
+        if not callable(setter):
+            return
+        try:
+            setter(active, detail=detail)
+        except Exception:
+            _LOGGER.debug("Failed to update embedding activity indicator", exc_info=True)
 
     def _set_embedding_state(self, state: EmbeddingRuntimeState, *, hide_status: bool = False) -> None:
         self._embedding_state = state
@@ -4406,7 +4428,7 @@ class MainWindow(QMainWindow):
             value = int(raw)
         except (TypeError, ValueError):
             value = 8
-        return max(1, min(value, 50))
+        return max(1, min(value, 200))
 
     def _apply_debug_logging_setting(self, settings: Settings) -> None:
         new_debug = bool(getattr(settings, "debug_logging", False))

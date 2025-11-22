@@ -260,6 +260,8 @@ class StatusBar:
         self._outline_detail: str = ""
         self._embedding_status: str = ""
         self._embedding_detail: str = ""
+        self._embedding_processing: bool = False
+        self._embedding_processing_detail: str = ""
         self._review_controls = DiffReviewControls()
         self._subagent_status: str = ""
         self._subagent_detail: str = ""
@@ -365,12 +367,17 @@ class StatusBar:
 
         self._embedding_status = (status or "").strip()
         self._embedding_detail = (detail or "").strip()
-        if self._embedding_label is not None:
-            self._update_label(self._embedding_label, self._format_embedding_text())
-            try:
-                self._embedding_label.setToolTip(self._embedding_detail)
-            except Exception:
-                pass
+        self._refresh_embedding_label()
+
+    def set_embedding_processing(self, active: bool, *, detail: str | None = None) -> None:
+        """Toggle the embeddings processing indicator."""
+
+        self._embedding_processing = bool(active)
+        if detail is not None:
+            self._embedding_processing_detail = detail.strip()
+        elif not active:
+            self._embedding_processing_detail = ""
+        self._refresh_embedding_label()
 
     def set_subagent_status(self, status: str | None, *, detail: str | None = None) -> None:
         """Show whether the subagent sandbox is active plus optional detail text."""
@@ -610,6 +617,17 @@ class StatusBar:
         except Exception:
             pass
 
+    def _refresh_embedding_label(self) -> None:
+        label = self._embedding_label
+        if label is None:
+            return
+        self._update_label(label, self._format_embedding_text())
+        try:
+            tooltip = self._format_embedding_tooltip()
+            label.setToolTip(tooltip)
+        except Exception:
+            pass
+
     def _format_cursor_text(self) -> str:
         line, column = self._cursor
         return f"Ln {line}, Col {column}"
@@ -623,7 +641,25 @@ class StatusBar:
         return f"Outline: {self._outline_status}" if self._outline_status else ""
 
     def _format_embedding_text(self) -> str:
-        return f"Embeddings: {self._embedding_status}" if self._embedding_status else ""
+        parts: list[str] = []
+        base = ""
+        if self._embedding_status:
+            base = f"Embeddings: {self._embedding_status}"
+        elif self._embedding_processing:
+            base = "Embeddings"
+        if base:
+            parts.append(base)
+        if self._embedding_processing:
+            parts.append("Processing...")
+        return " · ".join(parts)
+
+    def _format_embedding_tooltip(self) -> str:
+        parts: list[str] = []
+        if self._embedding_detail:
+            parts.append(self._embedding_detail)
+        if self._embedding_processing:
+            parts.append(self._embedding_processing_detail or "Embeddings are processing.")
+        return " ".join(part for part in parts if part).strip()
 
     def _format_subagent_text(self) -> str:
         return f"Subagents: {self._subagent_status}" if self._subagent_status else ""

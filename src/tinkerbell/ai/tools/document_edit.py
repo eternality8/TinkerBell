@@ -249,13 +249,32 @@ class DocumentEditTool:
         selection_fingerprint = mapping_payload.get("selection_fingerprint")
         selection_text = self._resolve_snapshot_selection_text(snapshot)
         selection_hash = self._resolve_selection_hash(snapshot, selection_text)
-        anchor_present = bool(anchor_text) or bool(selection_text) or bool(selection_fingerprint)
+        anchor_present = bool(anchor_text) or bool(selection_fingerprint)
         selection_span = self._selection_span(selection)
         anchor_source = self._anchor_source(anchor_text, selection_text, selection_fingerprint)
         target_range = mapping_payload.get("target_range")
+        replace_all = bool(mapping_payload.get("replace_all"))
+        selection_authoritative = bool(selection_fingerprint)
         try:
-            self._enforce_range_requirements(action_type, target_range, selection, anchor_present)
+            self._enforce_range_requirements(
+                action_type,
+                target_range,
+                selection,
+                anchor_present,
+                selection_authoritative,
+                replace_all,
+            )
         except ValueError as exc:
+            self._emit_caret_guard_event(
+                snapshot=snapshot,
+                tab_id=tab_id,
+                action=action_type,
+                selection_span=selection_span,
+                target_range=target_range,
+                replace_all=replace_all,
+                reason=str(exc),
+                anchor_present=anchor_present,
+            )
             self._emit_anchor_event(
                 snapshot=snapshot,
                 tab_id=tab_id,
@@ -263,11 +282,11 @@ class DocumentEditTool:
                 phase="requirements",
                 anchor_source=anchor_source,
                 selection_span=selection_span,
-                range_provided=target_range is not None,
+                range_provided=(target_range is not None) or replace_all,
                 reason=str(exc),
             )
             raise
-        start, end = self._resolve_range(target_range, selection, len(base_text))
+        start, end = self._resolve_range(target_range, selection, len(base_text), replace_all)
         try:
             start, end = self._align_range_with_snapshot(
                 base_text,
@@ -287,7 +306,7 @@ class DocumentEditTool:
                 phase="alignment",
                 anchor_source=anchor_source,
                 selection_span=selection_span,
-                range_provided=target_range is not None,
+                range_provided=(target_range is not None) or replace_all,
                 reason=str(exc),
             )
             raise
@@ -298,7 +317,7 @@ class DocumentEditTool:
             phase="alignment",
             anchor_source=anchor_source,
             selection_span=selection_span,
-            range_provided=target_range is not None,
+            range_provided=(target_range is not None) or replace_all,
             resolved_range=(start, end),
         )
         if action_type != ActionType.INSERT.value and start == end:
@@ -309,7 +328,7 @@ class DocumentEditTool:
                 phase="caret-guard",
                 anchor_source=anchor_source,
                 selection_span=selection_span,
-                range_provided=target_range is not None,
+                range_provided=(target_range is not None) or replace_all,
                 reason="Replace directives require a non-empty target_range",
             )
             raise ValueError("Caret inserts must use the 'insert' action or include an explicit intent flag")
@@ -375,6 +394,7 @@ class DocumentEditTool:
             "selection_fingerprint": payload.selection_fingerprint,
             "match_text": getattr(payload, "match_text", None),
             "expected_text": getattr(payload, "expected_text", None),
+            "replace_all": getattr(payload, "replace_all", None),
         }
 
     @staticmethod
@@ -407,12 +427,16 @@ class DocumentEditTool:
         target_range: Any,
         selection: Sequence[int],
         anchor_present: bool,
+        selection_authoritative: bool,
+        replace_all: bool,
     ) -> None:
         if action == ActionType.INSERT.value:
             return
+        if replace_all:
+            return
         if target_range is not None:
             return
-        if len(selection) == 2:
+        if selection_authoritative and len(selection) == 2:
             try:
                 sel_start = int(selection[0])
                 sel_end = int(selection[1])
@@ -423,7 +447,7 @@ class DocumentEditTool:
         if anchor_present:
             return
         raise ValueError(
-            "Replace edits must include target_range or match_text; call document_snapshot and provide the selected region."
+            "Replace edits must include target_span (preferred), target_range, match_text, or replace_all=true; call document_snapshot and provide the selected region."
         )
 
     def _align_range_with_snapshot(
@@ -449,7 +473,8 @@ class DocumentEditTool:
 
         anchor_candidate = anchor_text
         from_snapshot = False
-        if anchor_candidate is None and selection_text is not None:
+        use_snapshot_anchor = bool(fingerprint) and selection_text is not None
+        if anchor_candidate is None and use_snapshot_anchor:
             anchor_candidate = selection_text
             from_snapshot = True
 
@@ -512,6 +537,39 @@ class DocumentEditTool:
             payload["reason"] = reason
         telemetry_emit(self.anchor_event, payload)
 
+    def _emit_caret_guard_event(
+        self,
+        *,
+        snapshot: Mapping[str, Any],
+        tab_id: str | None,
+        action: str,
+        selection_span: tuple[int, int] | None,
+        target_range: Any,
+        replace_all: bool,
+        reason: str,
+        anchor_present: bool,
+    ) -> None:
+        telemetry_emit(
+            "caret_call_blocked",
+            {
+                "document_id": snapshot.get("document_id"),
+                "tab_id": tab_id,
+                "source": "document_edit.auto_patch",
+                "action": action,
+                "range_provided": (target_range is not None) or replace_all,
+                "replace_all": replace_all,
+                "anchor_present": anchor_present,
+                "selection_span": self._span_payload(selection_span),
+                "reason": reason,
+            },
+        )
+
+    @staticmethod
+    def _span_payload(span: tuple[int, int] | None) -> dict[str, int] | None:
+        if span is None:
+            return None
+        return {"start": span[0], "end": span[1]}
+
     @staticmethod
     def _selection_span(selection: Sequence[int]) -> tuple[int, int] | None:
         if len(selection) != 2:
@@ -536,8 +594,6 @@ class DocumentEditTool:
             return "fingerprint"
         if anchor_text:
             return "match_text"
-        if selection_text:
-            return "selection_text"
         return "range_only"
 
     @staticmethod
@@ -545,7 +601,10 @@ class DocumentEditTool:
         target_range: Mapping[str, Any] | Sequence[int] | tuple[int, int] | str | None,
         selection: Sequence[int],
         length: int,
+        replace_all: bool = False,
     ) -> tuple[int, int]:
+        if replace_all:
+            return (0, max(0, int(length)))
         document_scope = False
         if target_range is None:
             start, end = selection if len(selection) == 2 else (0, 0)

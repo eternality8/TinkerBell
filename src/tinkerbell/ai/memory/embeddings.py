@@ -10,6 +10,7 @@ import math
 import sqlite3
 import time
 from concurrent.futures import Future
+from threading import RLock
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Protocol, Sequence
@@ -157,119 +158,128 @@ class EmbeddingStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._lock = RLock()
         self._create_schema()
 
     def _create_schema(self) -> None:
-        with self._conn:
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS chunk_embeddings (
-                    document_id TEXT NOT NULL,
-                    chunk_id TEXT NOT NULL,
-                    version_id INTEGER NOT NULL,
-                    content_hash TEXT NOT NULL,
-                    chunk_hash TEXT NOT NULL,
-                    start_offset INTEGER NOT NULL,
-                    end_offset INTEGER NOT NULL,
-                    outline_node_id TEXT,
-                    token_count INTEGER NOT NULL,
-                    outline_hash TEXT,
-                    provider TEXT NOT NULL,
-                    dims INTEGER NOT NULL,
-                    vector TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    dirty INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (document_id, chunk_id)
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS chunk_embeddings (
+                        document_id TEXT NOT NULL,
+                        chunk_id TEXT NOT NULL,
+                        version_id INTEGER NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        chunk_hash TEXT NOT NULL,
+                        start_offset INTEGER NOT NULL,
+                        end_offset INTEGER NOT NULL,
+                        outline_node_id TEXT,
+                        token_count INTEGER NOT NULL,
+                        outline_hash TEXT,
+                        provider TEXT NOT NULL,
+                        dims INTEGER NOT NULL,
+                        vector TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        dirty INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (document_id, chunk_id)
+                    )
+                    """
                 )
-                """
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_doc ON chunk_embeddings(document_id)"
-            )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_doc ON chunk_embeddings(document_id)"
+                )
 
     def upsert_many(self, records: Sequence[ChunkEmbeddingRecord]) -> None:
         if not records:
             return
         payloads = [self._record_to_tuple(record) for record in records]
-        with self._conn:
-            self._conn.executemany(
-                """
-                INSERT INTO chunk_embeddings (
-                    document_id, chunk_id, version_id, content_hash, chunk_hash,
-                    start_offset, end_offset, outline_node_id, token_count, outline_hash,
-                    provider, dims, vector, created_at, updated_at, dirty
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(document_id, chunk_id) DO UPDATE SET
-                    version_id=excluded.version_id,
-                    content_hash=excluded.content_hash,
-                    chunk_hash=excluded.chunk_hash,
-                    start_offset=excluded.start_offset,
-                    end_offset=excluded.end_offset,
-                    outline_node_id=excluded.outline_node_id,
-                    token_count=excluded.token_count,
-                    outline_hash=excluded.outline_hash,
-                    provider=excluded.provider,
-                    dims=excluded.dims,
-                    vector=excluded.vector,
-                    updated_at=excluded.updated_at,
-                    dirty=excluded.dirty
-                """,
-                payloads,
-            )
+        with self._lock:
+            with self._conn:
+                self._conn.executemany(
+                    """
+                    INSERT INTO chunk_embeddings (
+                        document_id, chunk_id, version_id, content_hash, chunk_hash,
+                        start_offset, end_offset, outline_node_id, token_count, outline_hash,
+                        provider, dims, vector, created_at, updated_at, dirty
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(document_id, chunk_id) DO UPDATE SET
+                        version_id=excluded.version_id,
+                        content_hash=excluded.content_hash,
+                        chunk_hash=excluded.chunk_hash,
+                        start_offset=excluded.start_offset,
+                        end_offset=excluded.end_offset,
+                        outline_node_id=excluded.outline_node_id,
+                        token_count=excluded.token_count,
+                        outline_hash=excluded.outline_hash,
+                        provider=excluded.provider,
+                        dims=excluded.dims,
+                        vector=excluded.vector,
+                        updated_at=excluded.updated_at,
+                        dirty=excluded.dirty
+                    """,
+                    payloads,
+                )
 
     def fetch_document(self, document_id: str) -> list[ChunkEmbeddingRecord]:
-        cursor = self._conn.execute(
-            "SELECT * FROM chunk_embeddings WHERE document_id = ? ORDER BY start_offset",
-            (document_id,),
-        )
-        rows = cursor.fetchall()
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM chunk_embeddings WHERE document_id = ? ORDER BY start_offset",
+                (document_id,),
+            )
+            rows = cursor.fetchall()
         return [self._row_to_record(row) for row in rows]
 
     def prune_missing(self, document_id: str, keep_ids: set[str]) -> None:
-        with self._conn:
-            if not keep_ids:
-                self._conn.execute("DELETE FROM chunk_embeddings WHERE document_id = ?", (document_id,))
-                return
-            placeholders = ",".join("?" for _ in keep_ids)
-            params: list[Any] = [document_id, *keep_ids]
-            self._conn.execute(
-                f"DELETE FROM chunk_embeddings WHERE document_id = ? AND chunk_id NOT IN ({placeholders})",
-                params,
-            )
+        with self._lock:
+            with self._conn:
+                if not keep_ids:
+                    self._conn.execute("DELETE FROM chunk_embeddings WHERE document_id = ?", (document_id,))
+                    return
+                placeholders = ",".join("?" for _ in keep_ids)
+                params: list[Any] = [document_id, *keep_ids]
+                self._conn.execute(
+                    f"DELETE FROM chunk_embeddings WHERE document_id = ? AND chunk_id NOT IN ({placeholders})",
+                    params,
+                )
 
     def mark_dirty_all(self, document_id: str) -> None:
-        with self._conn:
-            self._conn.execute(
-                "UPDATE chunk_embeddings SET dirty = 1 WHERE document_id = ?",
-                (document_id,),
-            )
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE chunk_embeddings SET dirty = 1 WHERE document_id = ?",
+                    (document_id,),
+                )
 
     def mark_dirty_ranges(self, document_id: str, ranges: Sequence[tuple[int, int]]) -> None:
         if not ranges:
             self.mark_dirty_all(document_id)
             return
-        with self._conn:
-            for start, end in ranges:
-                self._conn.execute(
-                    """
-                    UPDATE chunk_embeddings
-                    SET dirty = 1
-                    WHERE document_id = ?
-                      AND NOT (end_offset <= ? OR start_offset >= ?)
-                    """,
-                    (document_id, start, end),
-                )
+        with self._lock:
+            with self._conn:
+                for start, end in ranges:
+                    self._conn.execute(
+                        """
+                        UPDATE chunk_embeddings
+                        SET dirty = 1
+                        WHERE document_id = ?
+                          AND NOT (end_offset <= ? OR start_offset >= ?)
+                        """,
+                        (document_id, start, end),
+                    )
 
     def delete_document(self, document_id: str) -> None:
-        with self._conn:
-            self._conn.execute("DELETE FROM chunk_embeddings WHERE document_id = ?", (document_id,))
+        with self._lock:
+            with self._conn:
+                self._conn.execute("DELETE FROM chunk_embeddings WHERE document_id = ?", (document_id,))
 
     def close(self) -> None:
-        try:
-            self._conn.close()
-        except Exception:  # pragma: no cover - defensive close
-            LOGGER.debug("Failed to close embedding store", exc_info=True)
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:  # pragma: no cover - defensive close
+                LOGGER.debug("Failed to close embedding store", exc_info=True)
 
     def _record_to_tuple(self, record: ChunkEmbeddingRecord) -> tuple[Any, ...]:
         return (
@@ -328,6 +338,7 @@ class DocumentEmbeddingIndex:
         loop: asyncio.AbstractEventLoop | None = None,
         mode: str | None = None,
         provider_label: str | None = None,
+        activity_callback: Callable[[bool, str | None], None] | None = None,
     ) -> None:
         self._provider = provider
         self._loop = loop or asyncio.get_event_loop()
@@ -340,6 +351,8 @@ class DocumentEmbeddingIndex:
         self._batch_size = max(1, batch_size or provider_batch)
         self._embedding_mode = mode
         self._provider_label = provider_label
+        self._activity_callback = activity_callback
+        self._activity_depth = 0
         self._cache_bus.subscribe(DocumentChangedEvent, self._handle_changed, weak=True)
         self._cache_bus.subscribe(DocumentClosedEvent, self._handle_closed, weak=True)
 
@@ -371,123 +384,127 @@ class DocumentEmbeddingIndex:
         specs = self._build_chunk_specs(document, nodes)
         if not specs:
             return EmbeddingIngestResult(processed=0, embedded=0, reused=0, status="no_chunks")
-        existing = await self._run_blocking(self._store.fetch_document, document.document_id)
-        existing_map = {record.chunk_id: record for record in existing}
-        dirty_specs: list[_ChunkSpec] = []
-        reuse_specs: list[_ChunkSpec] = []
-        for spec in specs:
-            record = existing_map.get(spec.chunk_id)
-            if record is None or record.chunk_hash != spec.chunk_hash or record.dirty:
-                dirty_specs.append(spec)
-            else:
-                reuse_specs.append(spec)
-        dirty_count = len(dirty_specs)
-        reused_count = len(reuse_specs)
-        reused_records = [
-            existing_map[spec.chunk_id].with_metadata(
-                version_id=document.version_id,
-                content_hash=document.content_hash,
-                chunk_hash=spec.chunk_hash,
-                start_offset=spec.start,
-                end_offset=spec.end,
-                outline_node_id=spec.outline_node_id,
-                token_count=spec.token_count,
-                outline_hash=outline_hash,
-            )
-            for spec in reuse_specs
-        ]
-        if reused_records:
-            await self._run_blocking(self._store.upsert_many, reused_records)
-        if reused_count:
-            emit(
-                "embedding.cache.hit",
-                {
-                    "document_id": document.document_id,
-                    "version_id": document.version_id,
-                    "outline_hash": outline_hash,
-                    "chunk_count": reused_count,
-                    "processed_chunks": len(specs),
-                    "document_length": document_length,
-                    **self._telemetry_context(),
-                },
-            )
-        embedded_count = 0
-        provider_name = self._provider.name
-        now = time.time()
-        for batch in _chunk_list(dirty_specs, self._batch_size):
-            await self._rate_limiter.acquire(len(batch))
-            vectors: Sequence[Sequence[float]]
-            try:
-                vectors = await self._provider.embed_documents([spec.text for spec in batch])
-            except Exception as exc:  # pragma: no cover - provider exceptions
-                LOGGER.exception("Embedding provider failed for %s: %s", document.document_id, exc)
+        self._begin_activity(detail=f"Updating {document.document_id}")
+        try:
+            existing = await self._run_blocking(self._store.fetch_document, document.document_id)
+            existing_map = {record.chunk_id: record for record in existing}
+            dirty_specs: list[_ChunkSpec] = []
+            reuse_specs: list[_ChunkSpec] = []
+            for spec in specs:
+                record = existing_map.get(spec.chunk_id)
+                if record is None or record.chunk_hash != spec.chunk_hash or record.dirty:
+                    dirty_specs.append(spec)
+                else:
+                    reuse_specs.append(spec)
+            dirty_count = len(dirty_specs)
+            reused_count = len(reuse_specs)
+            reused_records = [
+                existing_map[spec.chunk_id].with_metadata(
+                    version_id=document.version_id,
+                    content_hash=document.content_hash,
+                    chunk_hash=spec.chunk_hash,
+                    start_offset=spec.start,
+                    end_offset=spec.end,
+                    outline_node_id=spec.outline_node_id,
+                    token_count=spec.token_count,
+                    outline_hash=outline_hash,
+                )
+                for spec in reuse_specs
+            ]
+            if reused_records:
+                await self._run_blocking(self._store.upsert_many, reused_records)
+            if reused_count:
+                emit(
+                    "embedding.cache.hit",
+                    {
+                        "document_id": document.document_id,
+                        "version_id": document.version_id,
+                        "outline_hash": outline_hash,
+                        "chunk_count": reused_count,
+                        "processed_chunks": len(specs),
+                        "document_length": document_length,
+                        **self._telemetry_context(),
+                    },
+                )
+            embedded_count = 0
+            provider_name = self._provider.name
+            now = time.time()
+            for batch in _chunk_list(dirty_specs, self._batch_size):
+                await self._rate_limiter.acquire(len(batch))
+                vectors: Sequence[Sequence[float]]
+                try:
+                    vectors = await self._provider.embed_documents([spec.text for spec in batch])
+                except Exception as exc:  # pragma: no cover - provider exceptions
+                    LOGGER.exception("Embedding provider failed for %s: %s", document.document_id, exc)
+                    emit(
+                        "embedding.cache.miss",
+                        {
+                            "document_id": document.document_id,
+                            "version_id": document.version_id,
+                            "outline_hash": outline_hash,
+                            "status": "provider_error",
+                            "error": str(exc)[:200],
+                            "embedded": embedded_count,
+                            "dirty_chunks": dirty_count,
+                            "document_length": document_length,
+                            **self._telemetry_context(),
+                        },
+                    )
+                    return EmbeddingIngestResult(
+                        processed=len(specs),
+                        embedded=embedded_count,
+                        reused=len(reuse_specs),
+                        status="provider_error",
+                    )
+                new_records = []
+                for spec, vector in zip(batch, vectors):
+                    normalized = tuple(float(value) for value in vector)
+                    new_records.append(
+                        ChunkEmbeddingRecord(
+                            document_id=document.document_id,
+                            chunk_id=spec.chunk_id,
+                            version_id=document.version_id,
+                            content_hash=document.content_hash,
+                            chunk_hash=spec.chunk_hash,
+                            start_offset=spec.start,
+                            end_offset=spec.end,
+                            outline_node_id=spec.outline_node_id,
+                            token_count=spec.token_count,
+                            outline_hash=outline_hash,
+                            provider=provider_name,
+                            dims=len(normalized),
+                            vector=normalized,
+                            created_at=now,
+                            updated_at=time.time(),
+                            dirty=False,
+                        )
+                    )
+                await self._run_blocking(self._store.upsert_many, new_records)
+                embedded_count += len(new_records)
+            keep_ids = {spec.chunk_id for spec in specs}
+            await self._run_blocking(self._store.prune_missing, document.document_id, keep_ids)
+            if dirty_count:
                 emit(
                     "embedding.cache.miss",
                     {
                         "document_id": document.document_id,
                         "version_id": document.version_id,
                         "outline_hash": outline_hash,
-                        "status": "provider_error",
-                        "error": str(exc)[:200],
                         "embedded": embedded_count,
                         "dirty_chunks": dirty_count,
+                        "status": "ok",
                         "document_length": document_length,
                         **self._telemetry_context(),
                     },
                 )
-                return EmbeddingIngestResult(
-                    processed=len(specs),
-                    embedded=embedded_count,
-                    reused=len(reuse_specs),
-                    status="provider_error",
-                )
-            new_records = []
-            for spec, vector in zip(batch, vectors):
-                normalized = tuple(float(value) for value in vector)
-                new_records.append(
-                    ChunkEmbeddingRecord(
-                        document_id=document.document_id,
-                        chunk_id=spec.chunk_id,
-                        version_id=document.version_id,
-                        content_hash=document.content_hash,
-                        chunk_hash=spec.chunk_hash,
-                        start_offset=spec.start,
-                        end_offset=spec.end,
-                        outline_node_id=spec.outline_node_id,
-                        token_count=spec.token_count,
-                        outline_hash=outline_hash,
-                        provider=provider_name,
-                        dims=len(normalized),
-                        vector=normalized,
-                        created_at=now,
-                        updated_at=time.time(),
-                        dirty=False,
-                    )
-                )
-            await self._run_blocking(self._store.upsert_many, new_records)
-            embedded_count += len(new_records)
-        keep_ids = {spec.chunk_id for spec in specs}
-        await self._run_blocking(self._store.prune_missing, document.document_id, keep_ids)
-        if dirty_count:
-            emit(
-                "embedding.cache.miss",
-                {
-                    "document_id": document.document_id,
-                    "version_id": document.version_id,
-                    "outline_hash": outline_hash,
-                    "embedded": embedded_count,
-                    "dirty_chunks": dirty_count,
-                    "status": "ok",
-                    "document_length": document_length,
-                    **self._telemetry_context(),
-                },
+            return EmbeddingIngestResult(
+                processed=len(specs),
+                embedded=embedded_count,
+                reused=len(reuse_specs),
+                status="ok",
             )
-        return EmbeddingIngestResult(
-            processed=len(specs),
-            embedded=embedded_count,
-            reused=len(reuse_specs),
-            status="ok",
-        )
+        finally:
+            self._end_activity()
 
     async def similarity_search(
         self,
@@ -541,6 +558,27 @@ class DocumentEmbeddingIndex:
             return
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         future.add_done_callback(_log_future_exception)
+
+    def _begin_activity(self, *, detail: str | None = None) -> None:
+        self._activity_depth += 1
+        if self._activity_depth == 1:
+            self._emit_activity(True, detail)
+
+    def _end_activity(self) -> None:
+        if self._activity_depth == 0:
+            return
+        self._activity_depth -= 1
+        if self._activity_depth == 0:
+            self._emit_activity(False, None)
+
+    def _emit_activity(self, active: bool, detail: str | None) -> None:
+        callback = self._activity_callback
+        if callback is None:
+            return
+        try:
+            callback(active, detail)
+        except Exception:  # pragma: no cover - activity reporting must never raise
+            LOGGER.debug("Embedding activity callback failed", exc_info=True)
 
     def _build_chunk_specs(self, document: DocumentState, nodes: Sequence[OutlineNode]) -> list[_ChunkSpec]:
         text = document.text or ""

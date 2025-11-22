@@ -21,8 +21,10 @@ from .document_snapshot import DocumentSnapshotTool
 from .list_tabs import ListTabsTool
 from .plot_state_update import PlotStateUpdateTool
 from .search_replace import SearchReplaceTool
+from .selection_range import SelectionRangeTool
 from .tool_usage_advisor import ToolUsageAdvisorTool
 from .validation import validate_snippet
+from ..memory.plot_state import DocumentPlotStateStore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +55,7 @@ class ToolRegistryContext:
     directive_schema_provider: Callable[[], Mapping[str, Any]]
     phase3_outline_enabled: bool = False
     plot_scaffolding_enabled: bool = False
+    plot_state_store_resolver: Callable[[], DocumentPlotStateStore | None] | None = None
     ensure_outline_tool: Callable[[], DocumentOutlineTool | None] | None = None
     ensure_find_sections_tool: Callable[[], DocumentFindSectionsTool | None] | None = None
     ensure_plot_state_tool: Callable[[], PlotOutlineTool | None] | None = None
@@ -183,6 +186,29 @@ def register_default_tools(
                 },
             )
 
+        try:
+            selection_tool = SelectionRangeTool(provider=context.bridge)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            _record_failure("selection_range", exc)
+        else:
+            _safe_register(
+                "selection_range",
+                selection_tool,
+                description=(
+                    "Return the zero-based line numbers for the active selection without mutating the caret."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "tab_id": {
+                            "type": "string",
+                            "description": "Optional explicit tab identifier; defaults to the active tab.",
+                        }
+                    },
+                    "additionalProperties": False,
+                },
+            )
+
         if chunk_index_instance is not None:
             try:
                 chunk_tool = DocumentChunkTool(
@@ -293,7 +319,11 @@ def register_default_tools(
             )
 
             try:
-                apply_patch_tool = DocumentApplyPatchTool(bridge=context.bridge, edit_tool=edit_tool)
+                apply_patch_tool = DocumentApplyPatchTool(
+                    bridge=context.bridge,
+                    edit_tool=edit_tool,
+                    plot_state_store_resolver=context.plot_state_store_resolver,
+                )
             except Exception as exc:
                 _record_failure("document_apply_patch", exc)
             else:
@@ -308,7 +338,7 @@ def register_default_tools(
                         "document_apply_patch",
                         apply_patch_tool,
                         description=(
-                            "Replace a target_range with new content by automatically building and applying a unified diff."
+                            "Replace a target_span with new content by automatically building and applying a unified diff."
                         ),
                         parameters={
                             "type": "object",
@@ -317,10 +347,59 @@ def register_default_tools(
                                     "type": "string",
                                     "description": "Replacement text that should occupy the specified target_range.",
                                 },
+                                "operation": {
+                                    "type": "string",
+                                    "enum": ["replace"],
+                                    "description": "Declared intent for the edit; document_apply_patch currently supports only 'replace'.",
+                                },
+                                "replace_all": {
+                                    "type": "boolean",
+                                    "description": "When true, overwrite the entire document instead of a bounded range.",
+                                },
                                 "target_range": DIRECTIVE_SCHEMA["properties"]["target_range"],
+                                "target_span": {
+                                    "anyOf": [
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "start_line": {"type": "integer", "minimum": 0},
+                                                "end_line": {"type": "integer", "minimum": 0},
+                                            },
+                                            "required": ["start_line", "end_line"],
+                                            "additionalProperties": False,
+                                        },
+                                        {
+                                            "type": "array",
+                                            "items": {"type": "integer"},
+                                            "minItems": 2,
+                                            "maxItems": 2,
+                                        },
+                                    ],
+                                    "description": "Preferred way to describe the edit span using inclusive line bounds.",
+                                },
                                 "document_version": {
                                     "type": "string",
                                     "description": "Document snapshot version captured before drafting the edit.",
+                                },
+                                "version_id": {
+                                    "type": ["integer", "string"],
+                                    "description": "Monotonic version_id returned by document_snapshot; guards against stale outlines.",
+                                },
+                                "content_hash": {
+                                    "type": "string",
+                                    "description": "Content hash from document_snapshot; must match the live buffer when applying the patch.",
+                                },
+                                "match_text": {
+                                    "type": "string",
+                                    "description": "Optional anchor text used to realign the edit if offsets drift.",
+                                },
+                                "expected_text": {
+                                    "type": "string",
+                                    "description": "Alternate anchor text (must match match_text when provided).",
+                                },
+                                "selection_fingerprint": {
+                                    "type": "string",
+                                    "description": "Hash of the selection returned by document_snapshot to validate intent.",
                                 },
                                 "rationale": {
                                     "type": "string",
@@ -335,8 +414,29 @@ def register_default_tools(
                                     "type": "string",
                                     "description": "Optional tab identifier; defaults to the active tab when omitted.",
                                 },
+                                "patches": {
+                                    "type": "array",
+                                    "description": "Streamed diff payload consisting of start/end and replacement values.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "start": {"type": "integer", "minimum": 0},
+                                            "end": {"type": "integer", "minimum": 0},
+                                            "replacement": {"type": "string"},
+                                            "match_text": {"type": "string"},
+                                            "chunk_id": {"type": "string"},
+                                            "chunk_hash": {"type": "string"},
+                                        },
+                                        "required": ["start", "end", "replacement"],
+                                        "additionalProperties": False,
+                                    },
+                                },
                             },
-                            "required": ["content"],
+                            "required": ["document_version", "version_id", "content_hash"],
+                            "anyOf": [
+                                {"required": ["content"]},
+                                {"required": ["patches"]},
+                            ],
                             "additionalProperties": False,
                         },
                     )

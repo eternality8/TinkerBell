@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tinkerbell.services import telemetry as telemetry_service
+from tinkerbell.services.unsaved_cache import UnsavedCache
 from tinkerbell.ui.models.window_state import WindowContext
 from tinkerbell.ui.telemetry_controller import TelemetryController
 from tinkerbell.widgets.status_bar import StatusBar
@@ -39,7 +40,7 @@ def test_chunk_flow_events_update_indicators() -> None:
     chat_probe = _ChatProbe()
     controller = TelemetryController(
         status_bar=status_bar,
-        context=WindowContext(),
+        context=WindowContext(unsaved_cache=UnsavedCache()),
         initial_subagent_enabled=False,
         chat_panel=chat_probe,
     )

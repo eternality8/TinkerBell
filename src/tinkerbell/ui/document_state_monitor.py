@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -11,8 +12,12 @@ from typing import Any, Callable, Optional
 from ..chat.message_model import ToolTrace
 from ..editor.document_model import DocumentState, SelectionRange
 from ..editor.workspace import DocumentTab
-from ..services.settings import Settings
+from ..services.unsaved_cache import UnsavedCache
 from ..utils import file_io
+from ..ai.memory.cache_bus import DocumentCacheBus, DocumentChangedEvent, get_document_cache_bus
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -23,8 +28,8 @@ class DocumentStateMonitor:
     workspace: Any
     chat_panel: Any
     status_bar: Any
-    settings_provider: Callable[[], Settings | None]
-    settings_persister: Callable[[Settings | None], None]
+    unsaved_cache_provider: Callable[[], UnsavedCache | None]
+    unsaved_cache_persister: Callable[[UnsavedCache | None], None]
     refresh_window_title: Callable[[DocumentState | None], None]
     sync_workspace_state: Callable[[bool], None]
     current_path_getter: Callable[[], Path | None]
@@ -35,9 +40,11 @@ class DocumentStateMonitor:
     window_app_name: str
     untitled_document_name: str
     untitled_snapshot_key: str = "__untitled__"
+    cache_bus_resolver: Callable[[], DocumentCacheBus | None] = get_document_cache_bus
 
     _outline_digest_cache: dict[str, str] = field(default_factory=dict)
     _unsaved_snapshot_digests: dict[str, str] = field(default_factory=dict)
+    _published_versions: dict[str, int] = field(default_factory=dict)
     _snapshot_persistence_block: int = 0
     _last_autosave_at: datetime | None = None
 
@@ -70,10 +77,12 @@ class DocumentStateMonitor:
         if self._snapshot_persistence_block > 0:
             self.update_autosave_indicator(document=state)
             self.maybe_clear_diff_overlay(state)
+            self._publish_document_change(state)
             return
         self._persist_unsaved_snapshot(state)
         self.update_autosave_indicator(document=state)
         self.maybe_clear_diff_overlay(state)
+        self._publish_document_change(state)
 
     def handle_editor_selection_changed(self, selection: SelectionRange) -> None:
         self._refresh_chat_suggestions(selection=selection)
@@ -124,34 +133,34 @@ class DocumentStateMonitor:
     def clear_unsaved_snapshot(
         self,
         *,
-        settings: Settings | None = None,
+        cache: UnsavedCache | None = None,
         path: Path | str | None = None,
         tab_id: str | None = None,
         persist: bool = True,
     ) -> None:
         key = self.snapshot_key(path, tab_id=tab_id)
-        target_settings = settings or self.settings_provider()
+        target_cache = cache or self.unsaved_cache_provider()
         changed = False
 
-        if target_settings is not None:
+        if target_cache is not None:
             if path is None and tab_id is not None:
-                snapshots = dict(target_settings.untitled_snapshots or {})
+                snapshots = dict(target_cache.untitled_snapshots or {})
                 if snapshots.pop(tab_id, None) is not None:
-                    target_settings.untitled_snapshots = snapshots
+                    target_cache.untitled_snapshots = snapshots
                     changed = True
             elif path is None and tab_id is None:
-                if target_settings.unsaved_snapshot is not None:
-                    target_settings.unsaved_snapshot = None
+                if target_cache.unsaved_snapshot is not None:
+                    target_cache.unsaved_snapshot = None
                     changed = True
             else:
-                snapshots = dict(target_settings.unsaved_snapshots or {})
+                snapshots = dict(target_cache.unsaved_snapshots or {})
                 if snapshots.pop(key, None) is not None:
-                    target_settings.unsaved_snapshots = snapshots
+                    target_cache.unsaved_snapshots = snapshots
                     changed = True
 
         self._unsaved_snapshot_digests.pop(key, None)
-        if changed and persist and target_settings is not None:
-            self.settings_persister(target_settings)
+        if changed and persist and target_cache is not None:
+            self.unsaved_cache_persister(target_cache)
 
     def suspend_snapshot_persistence(self) -> Any:
         @contextmanager
@@ -259,9 +268,46 @@ class DocumentStateMonitor:
         except Exception:  # pragma: no cover - UI optional in tests
             pass
 
+    def _publish_document_change(self, state: DocumentState | None) -> None:
+        if state is None:
+            return
+        bus = self._resolve_cache_bus()
+        if bus is None:
+            return
+        try:
+            version = state.version_info()
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Unable to resolve document version for cache event", exc_info=True)
+            return
+        last_version = self._published_versions.get(version.document_id)
+        if last_version == version.version_id:
+            return
+        self._published_versions[version.document_id] = version.version_id
+        event = DocumentChangedEvent(
+            document_id=version.document_id,
+            version_id=version.version_id,
+            content_hash=version.content_hash,
+            edited_ranges=((0, len(state.text or "")),),
+            source="document-monitor",
+        )
+        try:
+            bus.publish(event)
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Document cache publish failed", exc_info=True)
+
+    def _resolve_cache_bus(self) -> DocumentCacheBus | None:
+        resolver = self.cache_bus_resolver
+        if callable(resolver):
+            try:
+                return resolver()
+            except Exception:  # pragma: no cover - defensive guard
+                LOGGER.debug("Cache bus resolver failed", exc_info=True)
+                return None
+        return None
+
     def _persist_unsaved_snapshot(self, state: DocumentState | None = None) -> None:
-        settings = self.settings_provider()
-        if settings is None:
+        cache = self.unsaved_cache_provider()
+        if cache is None:
             return
 
         document = state or self.editor.to_document()
@@ -271,7 +317,7 @@ class DocumentStateMonitor:
         key = self.snapshot_key(path, tab_id=tab_id)
 
         if not document.dirty:
-            self.clear_unsaved_snapshot(settings=settings, path=path, tab_id=tab_id)
+            self.clear_unsaved_snapshot(cache=cache, path=path, tab_id=tab_id)
             return
 
         snapshot = {
@@ -281,40 +327,40 @@ class DocumentStateMonitor:
         }
         digest = file_io.compute_text_digest(snapshot["text"])
         if self._unsaved_snapshot_digests.get(key) == digest:
-            existing = self._get_snapshot_entry(settings, path=path, tab_id=tab_id)
+            existing = self._get_snapshot_entry(cache, path=path, tab_id=tab_id)
             if existing == snapshot:
                 return
 
         if path is None:
             if tab_id is not None:
-                snapshots = dict(settings.untitled_snapshots or {})
+                snapshots = dict(cache.untitled_snapshots or {})
                 snapshots[tab_id] = snapshot
-                settings.untitled_snapshots = snapshots
+                cache.untitled_snapshots = snapshots
             else:
-                settings.unsaved_snapshot = snapshot
+                cache.unsaved_snapshot = snapshot
         else:
-            snapshots = dict(settings.unsaved_snapshots or {})
+            snapshots = dict(cache.unsaved_snapshots or {})
             snapshots[key] = snapshot
-            settings.unsaved_snapshots = snapshots
+            cache.unsaved_snapshots = snapshots
 
         self._unsaved_snapshot_digests[key] = digest
         self.sync_workspace_state(False)
-        self.settings_persister(settings)
+        self.unsaved_cache_persister(cache)
         self.update_autosave_indicator(autosaved=True, document=document)
 
     def _get_snapshot_entry(
         self,
-        settings: Settings,
+        cache: UnsavedCache,
         *,
         path: Path | str | None,
         tab_id: str | None,
     ) -> dict[str, Any] | None:
         if path is None:
             if tab_id is not None:
-                return (settings.untitled_snapshots or {}).get(tab_id)
-            return settings.unsaved_snapshot
+                return (cache.untitled_snapshots or {}).get(tab_id)
+            return cache.unsaved_snapshot
         key = self.snapshot_key(path)
-        return (settings.unsaved_snapshots or {}).get(key)
+        return (cache.unsaved_snapshots or {}).get(key)
 
     def _format_autosave_label(self, document: DocumentState) -> tuple[str, str]:
         name = self.document_display_name(document)

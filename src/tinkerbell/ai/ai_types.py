@@ -49,7 +49,7 @@ class AgentConfig:
     def clamp(self) -> AgentConfig:
         """Clamp values into safe operating ranges and return ``self``."""
 
-        self.max_iterations = max(1, min(int(self.max_iterations or 1), 50))
+        self.max_iterations = max(1, min(int(self.max_iterations or 1), 200))
         self.retry_policy.planner_max_retries = max(0, int(self.retry_policy.planner_max_retries))
         self.retry_policy.tool_retry_limit = max(0, int(self.retry_policy.tool_retry_limit))
         self.retry_policy.validation_retry_limit = max(0, int(self.retry_policy.validation_retry_limit))

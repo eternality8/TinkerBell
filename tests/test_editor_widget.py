@@ -64,6 +64,18 @@ def test_ai_edits_collapse_selection_after_application():
     assert selection.start == selection.end == len("hi")
 
 
+def test_ai_edits_preserve_selection_when_requested():
+    widget = EditorWidget()
+    widget.load_document(DocumentState(text="hello world", selection=SelectionRange(2, 4)))
+
+    insert = EditDirective(action="insert", target_range=(5, 5), content=" brave")
+    widget.apply_ai_edit(insert, preserve_selection=True)
+
+    selection = widget.to_document().selection
+    assert selection.start == 2
+    assert selection.end == 4
+
+
 def test_editor_widget_rejects_zero_length_replace():
     widget = EditorWidget()
     widget.load_document(DocumentState(text="alpha beta"))
@@ -140,6 +152,18 @@ def test_patch_result_collapses_selection_to_span_end():
     assert selection.start == selection.end == 11
 
 
+def test_patch_result_preserves_selection_when_requested():
+    widget = EditorWidget()
+    widget.load_document(DocumentState(text="hello world", selection=SelectionRange(1, 3)))
+
+    result = PatchResult(text="HELLO world", spans=((0, 5),), summary="patch: +0")
+    widget.apply_patch_result(result, preserve_selection=True)
+
+    selection = widget.to_document().selection
+    assert selection.start == 1
+    assert selection.end == 3
+
+
 def test_undo_redo_preserves_text_range_history():
     widget = EditorWidget()
     widget.load_document(DocumentState(text="alpha beta"))
@@ -196,6 +220,8 @@ def test_ai_rewrite_turn_retries_on_stale_snapshot(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(bridge, "queue_edit", _flaky_queue)
 
+    initial_snapshot = snapshot_tool.run()
+
     call = _ToolCallRequest(
         call_id="call-ai-turn",
         name="document_apply_patch",
@@ -205,6 +231,9 @@ def test_ai_rewrite_turn_retries_on_stale_snapshot(monkeypatch: pytest.MonkeyPat
                 "content": "hello brave world",
                 "target_range": {"start": 0, "end": len("hello world")},
                 "tab_id": "tab-ai",
+                "document_version": initial_snapshot["version"],
+                "version_id": initial_snapshot["version_id"],
+                "content_hash": initial_snapshot["content_hash"],
             }
         ),
         parsed=None,

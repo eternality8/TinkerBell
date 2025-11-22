@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -819,6 +820,16 @@ class SettingsDialog(QDialog):
         self._phase3_outline_hint = QLabel("Experimental outlines/retrieval with status bar indicators and telemetry.")
         self._phase3_outline_hint.setObjectName("phase3_outline_hint")
         self._prepare_hint_label(self._phase3_outline_hint)
+        self._outline_generation_checkbox = QCheckBox("Enable background outline generation")
+        self._outline_generation_checkbox.setObjectName("outline_generation_checkbox")
+        self._outline_generation_checkbox.setChecked(
+            bool(getattr(self._original, "enable_outline_generation", False))
+        )
+        self._outline_generation_hint = QLabel(
+            "Runs the Outline Builder worker so analysis + Document Status stay up to date even without Phase 3."
+        )
+        self._outline_generation_hint.setObjectName("outline_generation_hint")
+        self._prepare_hint_label(self._outline_generation_hint)
         self._subagent_checkbox = QCheckBox("Enable Phase 4 subagent sandbox (selection scouts)")
         self._subagent_checkbox.setObjectName("subagent_enable_checkbox")
         self._subagent_checkbox.setChecked(bool(getattr(self._original, "enable_subagents", False)))
@@ -861,7 +872,7 @@ class SettingsDialog(QDialog):
         self._safe_ai_checkbox.toggled.connect(self._update_safe_ai_controls)
         self._max_tool_iterations_input = QSpinBox()
         self._max_tool_iterations_input.setObjectName("max_tool_iterations_input")
-        self._max_tool_iterations_input.setRange(1, 25)
+        self._max_tool_iterations_input.setRange(1, 200)
         self._max_tool_iterations_input.setValue(
             max(1, int(getattr(self._original, "max_tool_iterations", 8) or 8))
         )
@@ -1009,6 +1020,13 @@ class SettingsDialog(QDialog):
         phase3_layout.addWidget(self._phase3_outline_checkbox)
         phase3_layout.addWidget(self._phase3_outline_hint)
 
+        outline_container = QWidget()
+        outline_layout = QVBoxLayout(outline_container)
+        outline_layout.setContentsMargins(0, 0, 0, 0)
+        outline_layout.setSpacing(2)
+        outline_layout.addWidget(self._outline_generation_checkbox)
+        outline_layout.addWidget(self._outline_generation_hint)
+
         subagent_container = QWidget()
         subagent_layout = QVBoxLayout(subagent_container)
         subagent_layout.setContentsMargins(0, 0, 0, 0)
@@ -1100,6 +1118,7 @@ class SettingsDialog(QDialog):
                 ("Event Logs", self._event_log_checkbox),
                 ("Tool Traces", self._tool_panel_checkbox),
                 ("Phase 3 Tools", phase3_container),
+                ("Outline Generation", outline_container),
                 ("Phase 4 Subagents", subagent_container),
                 ("Plot Scaffolding", plot_container),
                 ("Safe AI Edits", safe_ai_container),
@@ -1238,6 +1257,7 @@ class SettingsDialog(QDialog):
         debug_event_logging = self._event_log_checkbox.isChecked()
         show_tool_activity_panel = self._tool_panel_checkbox.isChecked()
         phase3_outline_tools = self._phase3_outline_checkbox.isChecked()
+        enable_outline_generation = self._outline_generation_checkbox.isChecked()
         enable_subagents = self._subagent_checkbox.isChecked()
         enable_plot_scaffolding = self._plot_scaffolding_checkbox.isChecked()
         safe_ai_edits = self._safe_ai_checkbox.isChecked()
@@ -1263,6 +1283,7 @@ class SettingsDialog(QDialog):
             debug_event_logging=debug_event_logging,
             show_tool_activity_panel=show_tool_activity_panel,
             phase3_outline_tools=phase3_outline_tools,
+            enable_outline_generation=enable_outline_generation,
             enable_subagents=enable_subagents,
             enable_plot_scaffolding=enable_plot_scaffolding,
             safe_ai_edits=safe_ai_edits,
@@ -1983,9 +2004,7 @@ def test_embedding_settings(settings: Settings) -> ValidationResult:
     metadata = getattr(settings, "metadata", {}) or {}
     cache_root = (Path(tempfile.gettempdir()) / "tinkerbell-embedding-test").resolve()
     cache_root.mkdir(parents=True, exist_ok=True)
-    loop = asyncio.new_event_loop()
     controller: EmbeddingController | None = None
-    previous_loop: asyncio.AbstractEventLoop | None
     try:
         previous_loop = asyncio.get_event_loop_policy().get_event_loop() if asyncio.get_event_loop_policy() else None
     except RuntimeError:
@@ -2008,8 +2027,58 @@ def test_embedding_settings(settings: Settings) -> ValidationResult:
         provider, state = controller._build_embedding_provider(backend, model_name, embedding_settings, metadata, mode)
         if provider is None:
             return ValidationResult(False, state.error or "Unable to build embedding provider.")
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(controller._validator.validate(provider, mode=mode))
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        def _run_validation_with_new_loop(
+            *, restore_loop: asyncio.AbstractEventLoop | None,
+        ) -> "EmbeddingValidationResult":
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            validation_coro = controller._validator.validate(provider, mode=mode)
+            task = loop.create_task(validation_coro)
+            try:
+                return loop.run_until_complete(task)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        loop.run_until_complete(task)
+                    except Exception:
+                        pass
+                loop.close()
+                if restore_loop is not None:
+                    try:
+                        asyncio.set_event_loop(restore_loop)
+                    except Exception:
+                        pass
+
+        def _run_validation_in_thread() -> "EmbeddingValidationResult":
+            result_holder: list["EmbeddingValidationResult"] = []
+            error_holder: list[BaseException] = []
+            finished = threading.Event()
+
+            def _worker() -> None:
+                try:
+                    result_holder.append(_run_validation_with_new_loop(restore_loop=None))
+                except BaseException as exc:  # pragma: no cover - propagates to caller
+                    error_holder.append(exc)
+                finally:
+                    finished.set()
+
+            thread = threading.Thread(target=_worker, name="embedding-validation-test", daemon=True)
+            thread.start()
+            finished.wait()
+            if error_holder:
+                raise error_holder[0]
+            return result_holder[0]
+
+        if running_loop is not None:
+            result = _run_validation_in_thread()
+        else:
+            result = _run_validation_with_new_loop(restore_loop=previous_loop)
         if result.status == "ready":
             return ValidationResult(True, result.detail or "Embeddings validated successfully.")
         return ValidationResult(False, result.error or "Embedding validation failed.")
@@ -2021,9 +2090,4 @@ def test_embedding_settings(settings: Settings) -> ValidationResult:
                 controller._dispose_embedding_resource()
         except Exception:
             pass
-        try:
-            asyncio.set_event_loop(previous_loop)
-        except Exception:
-            pass
-        loop.close()
 

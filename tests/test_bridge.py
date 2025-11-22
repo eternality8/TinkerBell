@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+from copy import deepcopy
 from typing import Any, Mapping
 
 import pytest
@@ -32,7 +33,7 @@ class RecordingEditor:
     def to_document(self) -> DocumentState:
         return self.state
 
-    def apply_ai_edit(self, directive: EditDirective) -> DocumentState:
+    def apply_ai_edit(self, directive: EditDirective, *, preserve_selection: bool = False) -> DocumentState:
         self.applied.append(directive)
         start, end = directive.target_range
         text = self.state.text
@@ -49,7 +50,7 @@ class RecordingEditor:
         self.state.update_text(text)
         return self.state
 
-    def apply_patch_result(self, result: PatchResult) -> DocumentState:
+    def apply_patch_result(self, result: PatchResult, selection_hint=None, *, preserve_selection: bool = False) -> DocumentState:
         self.state.update_text(result.text)
         return self.state
 
@@ -467,6 +468,34 @@ def test_patch_apply_emits_stale_telemetry(monkeypatch: pytest.MonkeyPatch):
     assert event["status"] == "stale"
 
 
+def test_hash_mismatch_event_emitted_on_rejection(monkeypatch: pytest.MonkeyPatch):
+    editor = RecordingEditor()
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(bridge_module, "telemetry_emit", _emit)
+    editor.state.update_text("HELLO WORLD")
+
+    with pytest.raises(DocumentVersionMismatchError):
+        bridge.queue_edit(
+            {
+                "action": "patch",
+                "diff": _make_diff("alpha", "beta"),
+                "document_version": snapshot["version"],
+                "content_hash": snapshot["content_hash"],
+            }
+        )
+
+    event = next((payload for name, payload in captured if name == "hash_mismatch"), None)
+    assert event is not None
+    assert event["stage"] == "bridge"
+    assert event["cause"] == bridge.CAUSE_HASH_MISMATCH
+
+
 def test_queue_edit_applies_streamed_ranges():
     editor = RecordingEditor()
     bridge = DocumentBridge(editor=editor)
@@ -568,12 +597,14 @@ def test_post_edit_inspector_rejection_restores_snapshot(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(bridge_module, "telemetry_emit", _emit)
 
+    diagnostics_payload = {"duplicate": {"normalized": "hello", "count": 2}}
+
     def _fake_inspect(**_: Any) -> InspectionResult:
         return InspectionResult(
             ok=False,
             reason="duplicate_paragraphs",
             detail="Paragraph repeated",
-            diagnostics={"duplicate": True},
+            diagnostics=diagnostics_payload,
         )
 
     monkeypatch.setattr(bridge._post_edit_inspector, "inspect", _fake_inspect)
@@ -590,6 +621,9 @@ def test_post_edit_inspector_rejection_restores_snapshot(monkeypatch: pytest.Mon
         )
 
     assert exc.value.cause == bridge.CAUSE_INSPECTOR_FAILURE
+    assert exc.value.details is not None
+    assert exc.value.details.get("code") == "auto_revert"
+    assert exc.value.details.get("reason") == "duplicate_paragraphs"
     assert editor.state.text == original_text, "inspector rejection should roll back the edit"
 
     metadata = bridge.last_failure_metadata
@@ -600,6 +634,53 @@ def test_post_edit_inspector_rejection_restores_snapshot(monkeypatch: pytest.Mon
     edit_event = next((payload for name, payload in captured if name == "edit_rejected"), None)
     assert edit_event is not None
     assert edit_event["cause"] == bridge.CAUSE_INSPECTOR_FAILURE
+
+    auto_event = next((payload for name, payload in captured if name == "auto_revert"), None)
+    assert auto_event is not None
+    assert auto_event["reason"] == "duplicate_paragraphs"
+    assert auto_event.get("diff_summary")
+
+    duplicate_event = next((payload for name, payload in captured if name == "duplicate_detected"), None)
+    assert duplicate_event is not None
+    duplicate_details = duplicate_event.get("duplicate")
+    assert isinstance(duplicate_details, dict)
+    assert duplicate_details.get("count") == 2
+
+
+def test_post_edit_inspector_auto_reverts_duplicate_inserts() -> None:
+    class _InspectorEditor(RecordingEditor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.state.update_text("Alpha one.\n\nBeta two.\n\n")
+
+        def to_document(self) -> DocumentState:  # type: ignore[override]
+            return deepcopy(self.state)
+
+    editor = _InspectorEditor()
+    bridge = DocumentBridge(editor=editor)
+    bridge.configure_safe_editing(enabled=True)
+    before = editor.state.text
+    snapshot = bridge.generate_snapshot()
+    after = before + "Beta two.\n\nBeta two.\n\n"
+    diff = _make_diff(before, after)
+
+    with pytest.raises(DocumentVersionMismatchError) as exc:
+        bridge.queue_edit(
+            {
+                "action": "patch",
+                "diff": diff,
+                "document_version": snapshot["version"],
+                "content_hash": snapshot["content_hash"],
+            }
+        )
+
+    assert exc.value.cause == bridge.CAUSE_INSPECTOR_FAILURE
+    assert exc.value.details is not None
+    assert exc.value.details.get("code") == "auto_revert"
+    assert editor.state.text == before
+    metadata = bridge.last_failure_metadata
+    assert metadata is not None
+    assert metadata["cause"] == bridge.CAUSE_INSPECTOR_FAILURE
 
 
 def test_queue_edit_applies_multiple_patch_directives():
@@ -689,6 +770,34 @@ def test_bridge_publishes_document_changed_events() -> None:
     assert changed.version_id == editor.state.version_id
     assert changed.edited_ranges[0][0] == 5
     assert changed.edited_ranges[0][1] >= 5
+
+
+def test_bridge_applies_patches_without_moving_selection() -> None:
+    class _SelectionTrackingEditor(RecordingEditor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.preserve_calls: list[bool] = []
+
+        def apply_patch_result(self, result: PatchResult, selection_hint=None, *, preserve_selection: bool = False) -> DocumentState:  # type: ignore[override]
+            self.preserve_calls.append(preserve_selection)
+            return super().apply_patch_result(result, selection_hint, preserve_selection=preserve_selection)
+
+    editor = _SelectionTrackingEditor()
+    bridge = DocumentBridge(editor=editor)
+    snapshot = bridge.generate_snapshot()
+    diff = _make_diff(editor.state.text, "hello brave world")
+
+    bridge.queue_edit(
+        {
+            "action": "patch",
+            "diff": diff,
+            "document_version": snapshot["version"],
+            "content_hash": snapshot["content_hash"],
+        }
+    )
+
+    assert editor.preserve_calls
+    assert editor.preserve_calls[-1] is True
 
 
 def test_bridge_notifies_document_closed() -> None:

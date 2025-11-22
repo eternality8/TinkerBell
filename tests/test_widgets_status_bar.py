@@ -58,6 +58,20 @@ def test_status_bar_embedding_status_tracks_detail() -> None:
     assert bar.embedding_state == ("", "")
 
 
+def test_status_bar_embedding_processing_indicator_extends_label() -> None:
+    bar = StatusBar()
+    bar.set_embedding_status("Ready", detail="text-embedding-3-small")
+
+    bar.set_embedding_processing(True, detail="doc-123")
+
+    assert bar._embedding_processing is True  # noqa: SLF001 - verifying private state for indicator
+    assert "Processing..." in bar._format_embedding_text()  # noqa: SLF001
+
+    bar.set_embedding_processing(False)
+
+    assert bar._embedding_processing is False  # noqa: SLF001
+
+
 def test_status_bar_subagent_status_tracks_tooltip() -> None:
     bar = StatusBar()
 

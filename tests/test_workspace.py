@@ -48,11 +48,11 @@ class _StubEditor:
     def apply_theme(self, _theme) -> None:
         return None
 
-    def apply_ai_edit(self, directive) -> DocumentState:  # pragma: no cover - not exercised
+    def apply_ai_edit(self, directive, *, preserve_selection: bool = False) -> DocumentState:  # pragma: no cover - not exercised
         self._document.update_text(directive.content)
         return self._document
 
-    def apply_patch_result(self, result, selection_hint=None) -> DocumentState:  # pragma: no cover - not exercised
+    def apply_patch_result(self, result, selection_hint=None, *, preserve_selection: bool = False) -> DocumentState:  # pragma: no cover - not exercised
         self._document.update_text(result.text)
         return self._document
 

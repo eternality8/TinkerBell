@@ -40,6 +40,29 @@ async def test_embedding_index_creates_embeddings(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_embedding_index_emits_activity_events(tmp_path) -> None:
+    provider = _DeterministicProvider()
+    events: list[tuple[bool, str | None]] = []
+    index = DocumentEmbeddingIndex(
+        storage_dir=tmp_path,
+        provider=provider,
+        loop=asyncio.get_running_loop(),
+        activity_callback=lambda active, detail: events.append((active, detail)),
+    )
+    document = _build_document("doc-activity", _SOURCE_TEXT)
+    nodes = _build_nodes(document)
+
+    await index.ingest_outline(document=document, nodes=nodes, outline_hash="outline-v1")
+
+    assert events
+    assert events[0][0] is True
+    assert events[-1][0] is False
+    assert any(detail and "doc-activity" in detail for _, detail in events if detail)
+
+    await index.aclose()
+
+
+@pytest.mark.asyncio
 async def test_embedding_index_reuses_cached_chunks(tmp_path) -> None:
     provider = _DeterministicProvider()
     index = DocumentEmbeddingIndex(

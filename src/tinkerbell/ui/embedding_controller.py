@@ -744,12 +744,14 @@ class EmbeddingController:
                     loop=loop,
                     mode=mode,
                     provider_label=provider_label,
+                    activity_callback=self._handle_embedding_activity,
                 )
             return DocumentEmbeddingIndex(
                 storage_dir=storage_dir,
                 provider=provider,
                 mode=mode,
                 provider_label=provider_label,
+                activity_callback=self._handle_embedding_activity,
             )
         except Exception as exc:
             LOGGER.warning("Failed to initialize embedding index: %s", exc)
@@ -804,6 +806,7 @@ class EmbeddingController:
         self._embedding_snapshot_metadata = {}
         self.propagate_index_to_worker()
         self._dispose_embedding_resource()
+        self._handle_embedding_activity(False, None)
         if keep_status:
             return
         fallback_backend = "disabled" if self._phase3_outline_enabled else "unavailable"
@@ -838,6 +841,18 @@ class EmbeddingController:
                 close()
             except Exception:
                 pass
+
+    def _handle_embedding_activity(self, active: bool, detail: str | None) -> None:
+        status_bar = self._status_bar
+        if status_bar is None:
+            return
+        setter = getattr(status_bar, "set_embedding_processing", None)
+        if not callable(setter):
+            return
+        try:
+            setter(active, detail=detail)
+        except Exception:
+            LOGGER.debug("Failed to update embedding activity indicator", exc_info=True)
 
     def _set_embedding_state(self, state: EmbeddingRuntimeState, *, hide_status: bool = False) -> None:
         self._embedding_state = state

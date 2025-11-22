@@ -114,6 +114,7 @@ class MainWindow(QMainWindow):
         self._context = context
         initial_settings = context.settings
         self._phase3_outline_enabled = bool(getattr(initial_settings, "phase3_outline_tools", False))
+        self._outline_generation_enabled = bool(getattr(initial_settings, "enable_outline_generation", False))
         self._plot_scaffolding_enabled = bool(getattr(initial_settings, "enable_plot_scaffolding", False))
         show_tool_panel = bool(getattr(initial_settings, "show_tool_activity_panel", False))
         self._editor = TabbedEditorWidget()
@@ -145,8 +146,8 @@ class MainWindow(QMainWindow):
             workspace=self._workspace,
             chat_panel=self._chat_panel,
             status_bar=self._status_bar,
-            settings_provider=lambda: self._context.settings,
-            settings_persister=self._document_session.persist_settings,
+            unsaved_cache_provider=lambda: self._context.unsaved_cache,
+            unsaved_cache_persister=self._document_session.persist_unsaved_cache,
             refresh_window_title=self._refresh_window_title,
             sync_workspace_state=lambda persist: self._document_session.sync_workspace_state(persist=persist),
             current_path_getter=self._document_session.get_current_path,
@@ -294,9 +295,7 @@ class MainWindow(QMainWindow):
         if initial_settings is not None:
             self._settings_runtime.apply_theme_setting(initial_settings)
         self._embedding_controller.refresh_runtime(initial_settings)
-        if self._phase3_outline_enabled and self._outline_runtime is not None:
-            self._outline_runtime.ensure_started()
-            self._embedding_controller.propagate_index_to_worker()
+        self._update_outline_runtime_state()
 
     # ------------------------------------------------------------------
     # Qt lifecycle hooks
@@ -532,6 +531,7 @@ class MainWindow(QMainWindow):
 
     def _set_auto_patch_tool(self, tool: DocumentApplyPatchTool) -> None:
         self._auto_patch_tool = tool
+        self._configure_auto_patch_span_policy()
 
     def _register_default_ai_tools(self, *, register_fn: Callable[..., Any] | None = None) -> None:
         context = self._tool_registry_context()
@@ -1706,10 +1706,11 @@ class MainWindow(QMainWindow):
         detail_suffix = f" ({', '.join(detail_bits)})" if detail_bits else ""
 
         if action == ActionType.PATCH.value:
-            guardrail_notice = self._describe_safe_edit_guardrail(context, reason)
+            guardrail_notice = self._describe_patch_guardrail(context, reason)
             if guardrail_notice is not None:
                 status_text, detail_text, toast_text = guardrail_notice
-                self.update_status(f"Safe edit blocked patch{detail_suffix}")
+                status_message = status_text if not detail_suffix else f"{status_text}{detail_suffix}"
+                self.update_status(status_message)
                 self._emit_guardrail_notice(status_text, detail_text)
                 if toast_text:
                     self._post_assistant_notice(toast_text)
@@ -1728,6 +1729,27 @@ class MainWindow(QMainWindow):
                 self._post_assistant_notice(
                     f"Edit failed ({', '.join(detail_bits)}): {reason}"
                 )
+
+    def _describe_patch_guardrail(
+        self,
+        metadata: Mapping[str, Any] | None,
+        reason: str,
+    ) -> tuple[str, str, str] | None:
+        safe_notice = self._describe_safe_edit_guardrail(metadata, reason)
+        if safe_notice is not None:
+            return safe_notice
+        if not metadata:
+            return None
+        cause = str(metadata.get("cause") or "").strip()
+        reason_text = self._condense_whitespace(str(metadata.get("reason") or reason or ""))
+        if cause == DocumentBridge.CAUSE_HASH_MISMATCH:
+            return self._build_snapshot_guardrail_notice(reason_text)
+        if cause == DocumentBridge.CAUSE_CHUNK_HASH_MISMATCH:
+            return self._build_chunk_guardrail_notice(reason_text)
+        status_hint = str(metadata.get("status") or "").strip().lower()
+        if status_hint == "stale":
+            return self._build_snapshot_guardrail_notice(reason_text)
+        return None
 
     def _describe_safe_edit_guardrail(
         self,
@@ -1781,6 +1803,36 @@ class MainWindow(QMainWindow):
         toast_lines.append("Request a fresh snapshot before retrying.")
         toast_text = " ".join(line for line in toast_lines if line)
         return (status_text, detail_text or status_text, toast_text)
+
+    def _build_snapshot_guardrail_notice(self, reason_text: str) -> tuple[str, str, str]:
+        detail = reason_text or "Document snapshot no longer matches the live buffer."
+        guidance = "Refresh document_snapshot (AI ▸ Snapshot) before retrying."
+        return self._build_guardrail_notice(prefix="Snapshot mismatch", detail=detail, guidance=guidance)
+
+    def _build_chunk_guardrail_notice(self, reason_text: str) -> tuple[str, str, str]:
+        detail = reason_text or "Streamed chunk content changed before the patch could apply."
+        guidance = "Request a fresh snapshot (with chunk manifest) and rebuild the streamed patch before retrying."
+        return self._build_guardrail_notice(prefix="Chunk hash mismatch", detail=detail, guidance=guidance)
+
+    def _build_guardrail_notice(
+        self,
+        *,
+        prefix: str,
+        detail: str,
+        guidance: str,
+    ) -> tuple[str, str, str]:
+        detail_text = self._condense_whitespace(detail) or prefix
+        guidance_text = self._condense_whitespace(guidance)
+        reason_label = self._summarize_guardrail_reason(detail_text)
+        suffix = ""
+        if reason_label:
+            maybe_prefixed = reason_label.lower().startswith(prefix.lower())
+            suffix = "" if maybe_prefixed else f" – {reason_label}"
+        status_text = f"Guardrail: {prefix}{suffix}"
+        combined_detail = f"{detail_text} {guidance_text}".strip()
+        toast_lines = ["Patch blocked by guardrail.", detail_text, guidance_text]
+        toast_text = " ".join(line for line in toast_lines if line)
+        return status_text, combined_detail, toast_text
 
     def _emit_guardrail_notice(self, status: str | None, detail: str | None) -> None:
         if self._status_bar is not None:
@@ -1983,6 +2035,7 @@ class MainWindow(QMainWindow):
         self._settings_runtime.apply_runtime_settings(
             result.settings,
             chat_panel_handler=self._apply_chat_panel_settings,
+            outline_handler=self._apply_outline_generation_setting,
             phase3_handler=self._apply_phase3_outline_setting,
             plot_scaffolding_handler=self._apply_plot_scaffolding_setting,
             safe_edit_handler=self._apply_safe_edit_settings,
@@ -2218,6 +2271,28 @@ class MainWindow(QMainWindow):
             base_dir = Path.home() / ".tinkerbell"
         return base_dir / "cache" / "outline_builder"
 
+    def _apply_outline_generation_setting(self, settings: Settings) -> None:
+        enabled = bool(getattr(settings, "enable_outline_generation", False))
+        if enabled == self._outline_generation_enabled:
+            return
+        self._outline_generation_enabled = enabled
+        self._update_outline_runtime_state()
+
+    def _update_outline_runtime_state(self) -> None:
+        runtime = self._outline_runtime
+        if runtime is None:
+            return
+        should_run = self._phase3_outline_enabled or self._outline_generation_enabled
+        if should_run:
+            runtime.ensure_started()
+            self._embedding_controller.propagate_index_to_worker()
+            return
+        runtime.shutdown()
+        if self._document_monitor is not None:
+            self._document_monitor.reset_outline_digest_cache()
+        if self._status_bar is not None:
+            self._status_bar.set_outline_status("")
+
     def _apply_phase3_outline_setting(self, settings: Settings) -> None:
         enabled = bool(getattr(settings, "phase3_outline_tools", False))
         if enabled == self._phase3_outline_enabled:
@@ -2228,22 +2303,16 @@ class MainWindow(QMainWindow):
         if self._tool_provider is not None:
             self._tool_provider.set_phase3_outline_enabled(enabled)
         if enabled:
-            if self._outline_runtime is not None:
-                self._outline_runtime.ensure_started()
-            self._embedding_controller.propagate_index_to_worker()
-            if self._status_bar is not None:
-                self._status_bar.set_outline_status("")
             self._register_phase3_ai_tools()
-            return
-
-        if self._outline_runtime is not None:
-            self._outline_runtime.shutdown()
-        if self._tool_provider is not None:
-            self._tool_provider.reset_outline_tools()
-        self._document_monitor.reset_outline_digest_cache()
+        else:
+            if self._tool_provider is not None:
+                self._tool_provider.reset_outline_tools()
+            if self._document_monitor is not None:
+                self._document_monitor.reset_outline_digest_cache()
+            self._unregister_phase3_ai_tools()
         if self._status_bar is not None:
             self._status_bar.set_outline_status("")
-        self._unregister_phase3_ai_tools()
+        self._update_outline_runtime_state()
 
     def _apply_plot_scaffolding_setting(self, settings: Settings) -> None:
         enabled = bool(getattr(settings, "enable_plot_scaffolding", False))
@@ -2269,6 +2338,7 @@ class MainWindow(QMainWindow):
         self._safe_ai_config = config
         for tab in self._workspace.iter_tabs():
             self._configure_bridge_safe_edits(tab.bridge, config)
+        self._configure_auto_patch_span_policy()
 
     def _configure_bridge_safe_edits(self, bridge: Any, config: tuple[bool, int, float]) -> None:
         configure = getattr(bridge, "configure_safe_editing", None)
@@ -2283,6 +2353,21 @@ class MainWindow(QMainWindow):
             )
         except Exception:  # pragma: no cover - defensive guard
             _LOGGER.debug("Unable to configure safe AI edits", exc_info=True)
+
+    def _configure_auto_patch_span_policy(self) -> None:
+        tool = getattr(self, "_auto_patch_tool", None)
+        if tool is None:
+            return
+        config = getattr(self, "_safe_ai_config", (False, 2, 0.05))
+        require_spans = bool(config[0])
+        adapt_legacy = not require_spans
+        try:
+            tool.configure_line_span_policy(
+                require_line_spans=require_spans,
+                adapt_legacy_ranges=adapt_legacy,
+            )
+        except Exception:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Unable to configure document_apply_patch span policy", exc_info=True)
 
     @staticmethod
     def _coerce_safe_ai_config(settings: Settings | None) -> tuple[bool, int, float]:

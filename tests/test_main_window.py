@@ -19,8 +19,17 @@ from tinkerbell.ui.main_window import MainWindow, WindowContext
 from tinkerbell.services.importers import FileImporter, ImportResult, ImporterError
 from tinkerbell.services.bridge import DocumentBridge
 from tinkerbell.services.settings import Settings, SettingsStore
+from tinkerbell.services.unsaved_cache import UnsavedCache
 from tinkerbell.services.telemetry import ContextUsageEvent
 from tinkerbell.theme import theme_manager
+
+class _StubUnsavedCacheStore:
+    def __init__(self) -> None:
+        self.saved: list[UnsavedCache] = []
+
+    def save(self, cache: UnsavedCache) -> Path:
+        self.saved.append(cache)
+        return Path("unsaved_cache.json")
 
 
 def _ensure_qapp() -> None:
@@ -35,12 +44,33 @@ def _ensure_qapp() -> None:
         QApplication([])
 
 
-def _make_window(controller: Any | None = None, settings: Settings | None = None) -> MainWindow:
+def _make_window(
+    controller: Any | None = None,
+    settings: Settings | None = None,
+    *,
+    unsaved_cache: UnsavedCache | None = None,
+    unsaved_cache_store: _StubUnsavedCacheStore | None = None,
+) -> MainWindow:
     _ensure_qapp()
     resolved_settings = settings or Settings()
     if controller is not None and not (resolved_settings.api_key or "").strip():
         resolved_settings.api_key = "test-key"
-    return MainWindow(WindowContext(settings=resolved_settings, ai_controller=controller))
+    cache = unsaved_cache or UnsavedCache()
+    store = unsaved_cache_store or _StubUnsavedCacheStore()
+    return MainWindow(
+        WindowContext(
+            settings=resolved_settings,
+            ai_controller=controller,
+            unsaved_cache=cache,
+            unsaved_cache_store=store,
+        )
+    )
+
+
+def _window_cache(window: MainWindow) -> UnsavedCache:
+    cache = window._context.unsaved_cache
+    assert cache is not None
+    return cache
 
 
 def _install_fake_langchain_module(monkeypatch: pytest.MonkeyPatch, sink: dict[str, Any]) -> None:
@@ -191,6 +221,34 @@ def test_document_edit_tool_runs_in_patch_only_mode():
     assert getattr(edit_tool, "patch_only", None) is True
 
 
+def test_auto_patch_tool_requires_spans_when_safe_ai_enabled():
+    controller = _StubAIController()
+    _make_window(controller, settings=Settings(safe_ai_edits=True))
+    auto_patch_tool = controller.registered_tools["document_apply_patch"]["impl"]
+
+    assert auto_patch_tool.require_line_spans is True
+    assert auto_patch_tool.legacy_range_adapter_enabled is False
+
+
+def test_auto_patch_tool_updates_policy_when_settings_change():
+    controller = _StubAIController()
+    window = _make_window(controller, settings=Settings(safe_ai_edits=False))
+    auto_patch_tool = controller.registered_tools["document_apply_patch"]["impl"]
+
+    assert auto_patch_tool.require_line_spans is False
+    assert auto_patch_tool.legacy_range_adapter_enabled is True
+
+    window._apply_safe_edit_settings(Settings(safe_ai_edits=True))
+
+    assert auto_patch_tool.require_line_spans is True
+    assert auto_patch_tool.legacy_range_adapter_enabled is False
+
+    window._apply_safe_edit_settings(Settings(safe_ai_edits=False))
+
+    assert auto_patch_tool.require_line_spans is False
+    assert auto_patch_tool.legacy_range_adapter_enabled is True
+
+
 def test_tool_traces_capture_compaction_metadata():
     window = _make_window()
     trace = ToolTrace(
@@ -279,9 +337,33 @@ def test_safe_edit_failure_surfaces_guardrail_notice():
     assert "Paragraph repeated" in guardrail_status[1]
     chat_guardrail = window.chat_panel.guardrail_state
     assert chat_guardrail[0].startswith("Safe Edit")
-    assert window.last_status_message.startswith("Safe edit blocked patch")
+    assert window.last_status_message.startswith("Safe Edit")
     history = window.chat_panel.history()
     assert history[-1].content.startswith("Safe edit guardrail rejected the patch.")
+
+
+def test_hash_mismatch_failure_surfaces_guardrail_notice():
+    window = _make_window()
+    directive = EditDirective(
+        action="patch",
+        content="",
+        target_range=SelectionRange(0, 0),
+    )
+    metadata = {
+        "reason": "Provided content_hash does not match the latest snapshot.",
+        "cause": DocumentBridge.CAUSE_HASH_MISMATCH,
+        "status": "stale",
+    }
+
+    window._handle_edit_failure(directive, "Patch rejected", metadata)
+
+    guardrail_status = window._status_bar.guardrail_notice_state  # noqa: SLF001
+    assert guardrail_status[0].startswith("Guardrail: Snapshot")
+    assert "Refresh document_snapshot" in guardrail_status[1]
+    chat_guardrail = window.chat_panel.guardrail_state
+    assert chat_guardrail[0].startswith("Guardrail")
+    history = window.chat_panel.history()
+    assert "Refresh document_snapshot" in history[-1].content
 
 def test_selection_updates_chat_suggestions_and_metadata():
     window = _make_window()
@@ -618,8 +700,9 @@ def test_open_document_records_last_open_file(tmp_path: Path):
     window.open_document(target)
 
     assert settings.last_open_file == str(target.resolve())
-    assert settings.unsaved_snapshot is None
-    assert not settings.untitled_snapshots
+    cache = _window_cache(window)
+    assert cache.unsaved_snapshot is None
+    assert not cache.untitled_snapshots
 
 
 def test_unsaved_snapshot_persisted_for_untitled_document():
@@ -631,7 +714,8 @@ def test_unsaved_snapshot_persisted_for_untitled_document():
 
     window.editor_widget.set_text("Scratch pad")
 
-    snapshot = (settings.untitled_snapshots or {}).get(tab_id)
+    cache = _window_cache(window)
+    snapshot = (cache.untitled_snapshots or {}).get(tab_id)
     assert snapshot is not None
     assert snapshot["text"] == "Scratch pad"
     assert snapshot["language"] == window.editor_widget.to_document().metadata.language
@@ -760,9 +844,8 @@ def test_missing_last_session_file_is_cleared(tmp_path: Path):
 
 
 def test_unsaved_snapshot_restores_when_available():
-    settings = Settings(unsaved_snapshot={"text": "Draft", "language": "markdown", "selection": (1, 3)})
-
-    window = _make_window(settings=settings)
+    cache = UnsavedCache(unsaved_snapshot={"text": "Draft", "language": "markdown", "selection": (1, 3)})
+    window = _make_window(settings=Settings(), unsaved_cache=cache)
 
     document = window.editor_widget.to_document()
     assert document.text == "Draft"
@@ -794,12 +877,14 @@ def test_workspace_tabs_restore_from_settings(tmp_path: Path) -> None:
             },
         ],
         active_tab_id="file-1",
-        untitled_snapshots={"draft-1": {"text": "Draft", "language": "markdown", "selection": [0, 5]}},
-        unsaved_snapshots={normalized: {"text": "Edited", "language": "markdown", "selection": [0, 6]}},
         next_untitled_index=5,
     )
+    cache = UnsavedCache(
+        untitled_snapshots={"draft-1": {"text": "Draft", "language": "markdown", "selection": [0, 5]}},
+        unsaved_snapshots={normalized: {"text": "Edited", "language": "markdown", "selection": [0, 6]}},
+    )
 
-    window = _make_window(settings=settings)
+    window = _make_window(settings=settings, unsaved_cache=cache)
     workspace = window.editor_widget.workspace
 
     assert workspace.tab_count() == 2
@@ -824,7 +909,8 @@ def test_unsaved_snapshot_clears_after_save(tmp_path: Path, monkeypatch: pytest.
 
     window.save_document()
 
-    assert not settings.untitled_snapshots
+    cache = _window_cache(window)
+    assert not cache.untitled_snapshots
     assert target.read_text(encoding="utf-8") == "Unsaved draft"
 
 
@@ -838,17 +924,17 @@ def test_file_snapshot_persisted_for_dirty_document(tmp_path: Path):
     window.editor_widget.set_text("Hello world")
 
     normalized = str(target.resolve())
-    assert settings.unsaved_snapshots[normalized]["text"] == "Hello world"
+    cache = _window_cache(window)
+    assert cache.unsaved_snapshots[normalized]["text"] == "Hello world"
 
 
 def test_open_document_skips_orphan_snapshot(tmp_path: Path):
     target = tmp_path / "notes.md"
     target.write_text("Hello", encoding="utf-8")
     normalized = str(target.resolve())
-    settings = Settings(
-        unsaved_snapshots={normalized: {"text": "Draft", "language": "markdown", "selection": [0, 5]}}
-    )
-    window = _make_window(settings=settings)
+    settings = Settings()
+    cache = UnsavedCache(unsaved_snapshots={normalized: {"text": "Draft", "language": "markdown", "selection": [0, 5]}})
+    window = _make_window(settings=settings, unsaved_cache=cache)
 
     window.open_document(target)
 
@@ -856,7 +942,8 @@ def test_open_document_skips_orphan_snapshot(tmp_path: Path):
     assert document.text == "Hello"
     assert document.metadata.path == target
     assert document.dirty is False
-    assert normalized not in (settings.unsaved_snapshots or {})
+    cache = _window_cache(window)
+    assert normalized not in (cache.unsaved_snapshots or {})
     assert window.last_status_message == f"Loaded {target.name}"
 
 
@@ -870,7 +957,8 @@ def test_save_document_clears_file_snapshot(tmp_path: Path):
 
     window.save_document()
 
-    assert str(target.resolve()) not in settings.unsaved_snapshots
+    cache = _window_cache(window)
+    assert str(target.resolve()) not in cache.unsaved_snapshots
 
 
 def test_tab_close_request_drops_snapshot(tmp_path: Path) -> None:
@@ -882,13 +970,14 @@ def test_tab_close_request_drops_snapshot(tmp_path: Path) -> None:
     window.editor_widget.set_text("Updated text")
 
     normalized = str(target.resolve())
-    assert normalized in settings.unsaved_snapshots
+    cache = _window_cache(window)
+    assert normalized in cache.unsaved_snapshots
     tab_id = window.editor_widget.active_tab_id()
     assert tab_id is not None
 
     window.editor_widget.request_tab_close(tab_id)
 
-    assert normalized not in (settings.unsaved_snapshots or {})
+    assert normalized not in (cache.unsaved_snapshots or {})
 
 
 def test_last_tab_can_close_without_replacement() -> None:
@@ -912,15 +1001,16 @@ def test_revert_discards_unsaved_changes(tmp_path: Path):
     window.editor_widget.set_text("Edited text")
 
     normalized = str(target.resolve())
-    assert settings.unsaved_snapshots is not None
-    assert settings.unsaved_snapshots[normalized]["text"] == "Edited text"
+    cache = _window_cache(window)
+    assert cache.unsaved_snapshots is not None
+    assert cache.unsaved_snapshots[normalized]["text"] == "Edited text"
 
     window._handle_revert_requested()
 
     document = window.editor_widget.to_document()
     assert document.text == "Original text"
     assert document.dirty is False
-    assert normalized not in (settings.unsaved_snapshots or {})
+    assert normalized not in (cache.unsaved_snapshots or {})
     assert window.last_status_message == f"Reverted {target.name}"
 
 
@@ -937,17 +1027,16 @@ def test_startup_skips_orphan_snapshot(tmp_path: Path):
     target = tmp_path / "story.md"
     target.write_text("Once", encoding="utf-8")
     normalized = str(target.resolve())
-    settings = Settings(
-        last_open_file=normalized,
-        unsaved_snapshots={normalized: {"text": "Once upon", "language": "markdown", "selection": [0, 4]}},
-    )
+    settings = Settings(last_open_file=normalized)
+    cache = UnsavedCache(unsaved_snapshots={normalized: {"text": "Once upon", "language": "markdown", "selection": [0, 4]}})
 
-    window = _make_window(settings=settings)
+    window = _make_window(settings=settings, unsaved_cache=cache)
 
     document = window.editor_widget.to_document()
     assert document.text == "Once"
     assert document.metadata.path == target
-    assert normalized not in (settings.unsaved_snapshots or {})
+    cache = _window_cache(window)
+    assert normalized not in (cache.unsaved_snapshots or {})
     assert window.last_status_message == f"Loaded {target.name}"
 
 

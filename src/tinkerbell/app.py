@@ -24,6 +24,7 @@ from .services.settings import (
     redact_metadata,
     redact_secret,
 )
+from .services.unsaved_cache import UnsavedCache, UnsavedCacheStore
 from .theme import theme_manager
 from .utils import logging as logging_utils
 
@@ -59,6 +60,8 @@ def configure_logging(debug: bool = False, *, force: bool = False) -> None:
 
     level = logging.DEBUG if debug else logging.INFO
     logging_utils.setup_logging(level, force=force)
+    markdown_logger = logging.getLogger("markdown_it")
+    markdown_logger.setLevel(logging.WARNING)
     _LOGGER.debug("Logging configured (level=%s)", logging.getLevelName(level))
     _install_qt_message_handler()
 
@@ -128,6 +131,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     settings_path = args.settings_path or os.environ.get("TINKERBELL_SETTINGS_PATH")
     resolved_path = Path(settings_path).expanduser() if settings_path else None
     settings_store = SettingsStore(resolved_path)
+    cache_filename = f"{settings_store.path.stem}.unsaved.json"
+    cache_path = settings_store.path.with_name(cache_filename)
+    unsaved_cache_store = UnsavedCacheStore(cache_path)
     try:
         cli_overrides = _coerce_cli_overrides(args.overrides or [])
     except ValueError as exc:
@@ -136,6 +142,8 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.phase3_outline_tools is not None:
         cli_overrides["phase3_outline_tools"] = args.phase3_outline_tools
+    if args.enable_outline_generation is not None:
+        cli_overrides["enable_outline_generation"] = args.enable_outline_generation
     if args.enable_subagents is not None:
         cli_overrides["enable_subagents"] = args.enable_subagents
     if args.enable_plot_scaffolding is not None:
@@ -161,6 +169,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     overrides_mapping: Dict[str, Any] | None = cli_overrides or None
     settings = load_settings(resolved_path, store=settings_store, overrides=overrides_mapping)
+    try:
+        unsaved_cache = unsaved_cache_store.load()
+    except Exception as exc:  # pragma: no cover - defensive path
+        _LOGGER.warning("Failed to load unsaved cache from %s: %s", unsaved_cache_store.path, exc)
+        unsaved_cache = UnsavedCache()
+    _migrate_legacy_unsaved_snapshots(settings, unsaved_cache, settings_store, unsaved_cache_store)
 
     if args.dump_settings:
         _dump_settings(settings, settings_store, overrides=cli_overrides)
@@ -176,7 +190,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     runtime = create_qapp(settings)
     window = MainWindow(
-        WindowContext(settings=settings, ai_controller=ai_controller, settings_store=settings_store)
+        WindowContext(
+            settings=settings,
+            ai_controller=ai_controller,
+            settings_store=settings_store,
+            unsaved_cache=unsaved_cache,
+            unsaved_cache_store=unsaved_cache_store,
+        )
     )
     window.show()
 
@@ -197,6 +217,74 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in _TRUE_VALUES
+
+
+def _migrate_legacy_unsaved_snapshots(
+    settings: Settings | None,
+    cache: UnsavedCache | None,
+    settings_store: SettingsStore | None,
+    cache_store: UnsavedCacheStore | None,
+) -> None:
+    if settings is None or cache is None:
+        return
+
+    migrated_cache = False
+    mutated_settings = False
+
+    legacy_snapshot = getattr(settings, "unsaved_snapshot", None)
+    if isinstance(legacy_snapshot, Mapping) and legacy_snapshot:
+        if not cache.unsaved_snapshot:
+            cache.unsaved_snapshot = dict(legacy_snapshot)
+            migrated_cache = True
+        settings.unsaved_snapshot = None
+        mutated_settings = True
+
+    legacy_snapshots = getattr(settings, "unsaved_snapshots", None)
+    if isinstance(legacy_snapshots, Mapping) and legacy_snapshots:
+        merged_snapshots = dict(cache.unsaved_snapshots or {})
+        merged = False
+        for key, snapshot in legacy_snapshots.items():
+            if not isinstance(key, str):
+                continue
+            if key in merged_snapshots:
+                continue
+            if isinstance(snapshot, Mapping):
+                merged_snapshots[key] = dict(snapshot)
+                merged = True
+        if merged:
+            cache.unsaved_snapshots = merged_snapshots
+            migrated_cache = True
+        settings.unsaved_snapshots = {}
+        mutated_settings = True
+
+    legacy_untitled = getattr(settings, "untitled_snapshots", None)
+    if isinstance(legacy_untitled, Mapping) and legacy_untitled:
+        merged_untitled = dict(cache.untitled_snapshots or {})
+        merged = False
+        for key, snapshot in legacy_untitled.items():
+            if not isinstance(key, str):
+                continue
+            if key in merged_untitled:
+                continue
+            if isinstance(snapshot, Mapping):
+                merged_untitled[key] = dict(snapshot)
+                merged = True
+        if merged:
+            cache.untitled_snapshots = merged_untitled
+            migrated_cache = True
+        settings.untitled_snapshots = {}
+        mutated_settings = True
+
+    if migrated_cache and cache_store is not None:
+        try:
+            cache_store.save(cache)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            _LOGGER.warning("Failed to persist migrated unsaved cache: %s", exc)
+    if mutated_settings and settings_store is not None:
+        try:
+            settings_store.save(settings)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            _LOGGER.debug("Failed to clear legacy unsaved state from settings: %s", exc)
 
 
 def _drain_event_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -353,7 +441,7 @@ def _resolve_max_tool_iterations(settings: Settings | None) -> int:
         value = int(raw_value)
     except (TypeError, ValueError):
         value = 8
-    return max(1, min(value, 50))
+    return max(1, min(value, 200))
 
 
 def _parse_cli_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[str]]:
@@ -394,6 +482,21 @@ def _parse_cli_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, lis
         action="store_const",
         const=False,
         help="Disable Phase 3 outline + retrieval tooling for this session.",
+    )
+    parser.add_argument(
+        "--enable-outline-generation",
+        dest="enable_outline_generation",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Start the background outline worker without enabling Phase 3 tools.",
+    )
+    parser.add_argument(
+        "--disable-outline-generation",
+        dest="enable_outline_generation",
+        action="store_const",
+        const=False,
+        help="Stop the background outline worker for this session.",
     )
     parser.add_argument(
         "--enable-subagents",

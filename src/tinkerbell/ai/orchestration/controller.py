@@ -51,6 +51,7 @@ from .budget_manager import BudgetManager, ContextBudgetExceeded
 from .event_log import ChatEventLogger
 from .subagent_runtime import SubagentRuntimeManager
 from .telemetry_manager import TelemetryManager
+from ..tools.document_apply_patch import NeedsRangeError
 
 LOGGER = logging.getLogger(__name__)
 _PROMPT_HEADROOM = 4_096
@@ -1737,7 +1738,7 @@ class AIController:
             candidate = int(value) if value is not None else 8
         except (TypeError, ValueError):
             candidate = 8
-        return max(1, min(candidate, 50))
+        return max(1, min(candidate, 200))
 
     @staticmethod
     def _normalize_context_tokens(value: int | None) -> int:
@@ -2382,14 +2383,33 @@ class AIController:
     ) -> tuple[list[SubagentJob], list[dict[str, str]]]:
         runtime = self._subagent_runtime
         manager = runtime.manager if runtime else None
+        document_id = self._resolve_document_id(snapshot)
+        selection_span = self._selection_span(snapshot)
         if manager is None or not self.subagent_config.enabled:
+            LOGGER.debug(
+                "Subagent pipeline skipped (manager=%s, enabled=%s, document_id=%s, selection=%s)",
+                bool(manager),
+                self.subagent_config.enabled,
+                document_id,
+                selection_span,
+            )
             return [], []
 
         jobs = self._plan_subagent_jobs(prompt, snapshot, turn_context)
         if not jobs:
+            LOGGER.debug(
+                "Subagent pipeline planned zero jobs (document_id=%s, selection=%s)",
+                document_id,
+                selection_span,
+            )
             return [], []
 
         results = await manager.run_jobs(jobs)
+        LOGGER.debug(
+            "Subagent pipeline completed %s job(s) (document_id=%s)",
+            len(results),
+            document_id,
+        )
         summary_text = self._subagent_summary_message(results)
         messages: list[dict[str, str]] = []
         if summary_text:
@@ -2410,14 +2430,23 @@ class AIController:
         turn_context: Mapping[str, Any],
     ) -> list[SubagentJob]:
         config = self.subagent_config
+        document_id = self._resolve_document_id(snapshot) or "document"
         if not config.enabled:
+            LOGGER.debug("Subagent planning skipped: config disabled (document_id=%s)", document_id)
             return []
         selection_span = self._selection_span(snapshot)
         if selection_span is None:
+            LOGGER.debug("Subagent planning skipped: no selection span (document_id=%s)", document_id)
             return []
         start, end = selection_span
         span_length = end - start
         if span_length <= 0 or span_length < config.selection_min_chars:
+            LOGGER.debug(
+                "Subagent planning skipped: span length %s below threshold %s (document_id=%s)",
+                span_length,
+                config.selection_min_chars,
+                document_id,
+            )
             return []
         text, window_start, window_end = self._snapshot_text_segment(snapshot)
         selection_within_window = bool(text) and start >= window_start and end <= window_end
@@ -2432,16 +2461,30 @@ class AIController:
             hydrate_text=not selection_within_window,
         )
         if not selection_text and (chunk_context is None or not chunk_context.text):
+            LOGGER.debug(
+                "Subagent planning skipped: unable to hydrate selection text (document_id=%s, selection_len=%s)",
+                document_id,
+                span_length,
+            )
             return []
         context_text = chunk_context.text if chunk_context else None
         preview_source = (context_text or selection_text or "").strip()
         if not preview_source:
+            LOGGER.debug(
+                "Subagent planning skipped: empty preview source (document_id=%s, selection_len=%s)",
+                document_id,
+                span_length,
+            )
             return []
         preview = preview_source[: config.chunk_preview_chars].strip()
         if not preview:
+            LOGGER.debug(
+                "Subagent planning skipped: preview trimmed to empty string (document_id=%s)",
+                document_id,
+            )
             return []
 
-        document_id = chunk_context.document_id if chunk_context else (self._resolve_document_id(snapshot) or "document")
+        document_id = chunk_context.document_id if chunk_context else document_id
         version = snapshot.get("version") or snapshot.get("document_version")
         chunk_id = chunk_context.chunk_id if chunk_context else f"selection:{start}-{end}"
         char_range = chunk_context.char_range if chunk_context else (start, end)
@@ -2472,6 +2515,14 @@ class AIController:
             allowed_tools=allowed_tools,
             budget=budget,
             dedup_hash=chunk_hash,
+        )
+        LOGGER.debug(
+            "Subagent planning created job (document_id=%s, chunk_id=%s, selection_len=%s, token_estimate=%s, tools=%s)",
+            document_id,
+            chunk_id,
+            span_length,
+            token_estimate,
+            len(allowed_tools),
         )
         return [job]
 
@@ -2585,14 +2636,28 @@ class AIController:
         snapshot: Mapping[str, Any],
         jobs: Sequence[SubagentJob],
     ) -> str | None:
-        if not jobs or not self.subagent_config.plot_scaffolding_enabled:
+        document_id = self._resolve_document_id(snapshot)
+        if not jobs:
+            LOGGER.debug(
+                "Plot state update skipped: no subagent jobs (document_id=%s)",
+                document_id,
+            )
+            return None
+        if not self.subagent_config.plot_scaffolding_enabled:
+            LOGGER.debug(
+                "Plot state update skipped: plot scaffolding disabled (document_id=%s)",
+                document_id,
+            )
             return None
         runtime = self._subagent_runtime
         if runtime is None:
+            LOGGER.debug(
+                "Plot state update skipped: subagent runtime unavailable (document_id=%s)",
+                document_id,
+            )
             return None
         store = runtime.ensure_plot_state_store()
 
-        document_id = self._resolve_document_id(snapshot)
         ingested = 0
         for job in jobs:
             if job.state != SubagentJobState.SUCCEEDED or job.result is None:
@@ -2619,9 +2684,18 @@ class AIController:
             ingested += 1
 
         if not ingested:
+            LOGGER.debug(
+                "Plot state update skipped: no ingested summaries (document_id=%s)",
+                document_id,
+            )
             return None
 
         doc_label = document_id or jobs[0].chunk_ref.document_id or "document"
+        LOGGER.debug(
+            "Plot state updated via %s ingested chunk(s) (document_id=%s)",
+            ingested,
+            doc_label,
+        )
         return (
             f"Plot scaffolding refreshed for '{doc_label}'. Call PlotOutlineTool before editing for continuity "
             "and follow up with PlotStateUpdateTool after applying chunk edits."
@@ -2632,14 +2706,28 @@ class AIController:
         snapshot: Mapping[str, Any],
         jobs: Sequence[SubagentJob],
     ) -> str | None:
-        if not jobs or not self.subagent_config.plot_scaffolding_enabled:
+        document_id = self._resolve_document_id(snapshot)
+        if not jobs:
+            LOGGER.debug(
+                "Character map update skipped: no subagent jobs (document_id=%s)",
+                document_id,
+            )
+            return None
+        if not self.subagent_config.plot_scaffolding_enabled:
+            LOGGER.debug(
+                "Character map update skipped: plot scaffolding disabled (document_id=%s)",
+                document_id,
+            )
             return None
         runtime = self._subagent_runtime
         if runtime is None:
+            LOGGER.debug(
+                "Character map update skipped: subagent runtime unavailable (document_id=%s)",
+                document_id,
+            )
             return None
         store = runtime.ensure_character_map_store()
 
-        document_id = self._resolve_document_id(snapshot)
         ingested = 0
         for job in jobs:
             if job.state != SubagentJobState.SUCCEEDED or job.result is None:
@@ -2663,9 +2751,18 @@ class AIController:
             ingested += 1
 
         if not ingested:
+            LOGGER.debug(
+                "Character map update skipped: no ingested summaries (document_id=%s)",
+                document_id,
+            )
             return None
 
         doc_label = document_id or jobs[0].chunk_ref.document_id or "document"
+        LOGGER.debug(
+            "Character map updated via %s ingested chunk(s) (document_id=%s)",
+            ingested,
+            doc_label,
+        )
         return (
             f"Character concordance refreshed for '{doc_label}'. Call CharacterMapTool to review "
             "entity mentions before editing across scenes."
@@ -3229,6 +3326,7 @@ class AIController:
             return block_reason, resolved_arguments, payload, None
 
         retry_context: dict[str, Any] | None = None
+        serialized_override: str | None = None
         try:
             result = await self._invoke_tool_impl(registration.impl, resolved_arguments)
         except DocumentVersionMismatchError as exc:
@@ -3240,11 +3338,14 @@ class AIController:
                 resolved_arguments,
                 exc,
             )
+        except NeedsRangeError as exc:
+            result = self._format_needs_range_payload(call, resolved_arguments, exc)
+            serialized_override = self._format_needs_range_message(call.name, result)
         except Exception as exc:  # pragma: no cover - defensive guard
             LOGGER.exception("Tool %s failed", call.name)
             result = f"Tool '{call.name}' failed: {exc}"
 
-        serialized = self._serialize_tool_result(result)
+        serialized = serialized_override or self._serialize_tool_result(result)
         await self._emit_tool_result_event(call, serialized, result, on_event)
         return serialized, resolved_arguments, result, retry_context
 
@@ -3278,6 +3379,7 @@ class AIController:
         tab_id = self._extract_tab_id(resolved_arguments)
         snapshot = await self._refresh_document_snapshot(tab_id)
         document_id = self._snapshot_document_id(snapshot)
+        self._inject_snapshot_metadata(resolved_arguments, snapshot)
         base_context: dict[str, Any] = {
             "tool": call.name or "unknown",
             "tab_id": tab_id,
@@ -3305,6 +3407,20 @@ class AIController:
         success_context["status"] = "success"
         self._emit_version_retry_event(success_context)
         return result, success_context
+
+    @staticmethod
+    def _inject_snapshot_metadata(arguments: Any, snapshot: Mapping[str, Any] | None) -> None:
+        if not isinstance(arguments, MutableMapping) or not isinstance(snapshot, Mapping):
+            return
+        version = snapshot.get("version")
+        if isinstance(version, str) and version.strip():
+            arguments["document_version"] = version.strip()
+        version_id = snapshot.get("version_id")
+        if version_id is not None:
+            arguments["version_id"] = version_id
+        content_hash = snapshot.get("content_hash")
+        if isinstance(content_hash, str) and content_hash.strip():
+            arguments["content_hash"] = content_hash.strip()
 
     @classmethod
     def _supports_version_retry(cls, tool_name: str | None) -> bool:
@@ -3339,6 +3455,17 @@ class AIController:
             try:
                 result = runner()
             except Exception:  # pragma: no cover - defensive guard
+                LOGGER.debug("Snapshot refresh failed", exc_info=True)
+                return None
+        except ValueError as exc:
+            message = str(exc)
+            if tab_id is not None and "does not support tab_id" in message:
+                try:
+                    result = runner(delta_only=False, include_diff=False)
+                except Exception:  # pragma: no cover - defensive guard
+                    LOGGER.debug("Snapshot refresh failed", exc_info=True)
+                    return None
+            else:
                 LOGGER.debug("Snapshot refresh failed", exc_info=True)
                 return None
         except Exception:  # pragma: no cover - defensive guard
@@ -3376,6 +3503,38 @@ class AIController:
             f"Tool '{label}' failed: document snapshot was stale even after an automatic retry{cause}. "
             "Call document_snapshot again and rebuild your diff before retrying."
         )
+
+    def _format_needs_range_payload(
+        self,
+        call: _ToolCallRequest,
+        resolved_arguments: Any,
+        error: NeedsRangeError,
+    ) -> dict[str, Any]:
+        tab_id = self._extract_tab_id(resolved_arguments)
+        message = str(error) or "needs_range: Provide target_range or replace_all=true before retrying."
+        payload: dict[str, Any] = {
+            "error": getattr(error, "code", "needs_range"),
+            "needs_range": True,
+            "message": message,
+            "tab_id": tab_id,
+            "hint": (
+                "Call document_snapshot to capture the intended span and retry document_apply_patch with target_range"
+                " or replace_all=true."
+            ),
+        }
+        content_length = getattr(error, "content_length", None)
+        if content_length is not None:
+            payload["content_length"] = content_length
+        threshold = getattr(error, "threshold", None)
+        if threshold is not None:
+            payload["threshold"] = threshold
+        return payload
+
+    @staticmethod
+    def _format_needs_range_message(tool_name: str | None, payload: Mapping[str, Any]) -> str:
+        label = tool_name or "document_apply_patch"
+        message = str(payload.get("message") or "needs_range: Provide explicit range information before retrying.")
+        return f"Tool '{label}' failed: {message}"
 
     def _build_tool_record(
         self,

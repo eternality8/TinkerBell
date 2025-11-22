@@ -57,7 +57,7 @@ def planner_instructions() -> str:
         "7. Budget thoughts to stay within the planner token window and hand off clear instructions to the tool loop.\n"
         "8. When outline/retrieval responses include guardrails, pending status, or retry hints, echo the warning back to the user and adapt the plan instead of ignoring it.\n"
         "9. Default to selection-scoped snapshots; escalate to full-document reads only if the controller budget hints say so or every chunk attempt fails, and narrate why you had to fall back.\n"
-        "10. Copy `selection_text` + `selection_hash` from every DocumentSnapshot so you can pass them back via match_text/expected_text and selection_fingerprint when editing.\n"
+        "10. Pair every DocumentSnapshot with the `selection_range` tool: copy `{start_line, end_line}` into `target_span` and keep `selection_text` + `selection_hash` handy so you can pass them back via match_text/expected_text and selection_fingerprint when editing.\n"
         "11. When plot scaffolding is enabled, call PlotOutlineTool before touching a chunk and run PlotStateUpdateTool immediately after applying edits so continuity stays in sync.\n"
         "12. If DocumentApplyPatch/DocumentEdit complain about stale anchors or fingerprints, refresh DocumentSnapshot immediately instead of guessing offsets."
     )
@@ -85,11 +85,11 @@ def tool_use_instructions() -> str:
     """Guidance for the tool execution loop."""
 
     return (
-        "- DocumentSnapshot: request selection-scoped windows (specify `window`, `chunk_profile`, or `max_tokens`) to receive slim text plus a chunk_manifest describing reusable ranges; only ask for the full document when the controller explicitly authorizes it.\n"
+        "- DocumentSnapshot: request selection-scoped windows (specify `window`, `chunk_profile`, or `max_tokens`) to receive slim text plus a chunk_manifest describing reusable ranges; only ask for the full document when the controller explicitly authorizes it. Immediately follow up with `selection_range` to capture `{start_line, end_line, content_hash}` for span-aware edits.\n"
         "- Anchored edits: copy `selection_text` and `selection_hash` from each snapshot and include them as `match_text`/`expected_text` plus `selection_fingerprint` (hash) whenever you call DocumentApplyPatch or inline DocumentEdit. Refresh the snapshot when the bridge reports anchor mismatches.\n"
         "- DiffBuilder: convert \"before\"/\"after\" snippets into unified diffs; include context lines.\n"
         "- DocumentChunkTool: hydrate chunk_manifest entries when you need additional text instead of requesting a full snapshot. If the chunk payload returns a pointer, follow the instructions before editing.\n"
-        "- DocumentApplyPatch: send `target_range` + replacement text and the anchor metadata (`match_text`, `expected_text`, `selection_fingerprint`) from the current snapshot; it composes the diff + DocumentEdit for you and rejects stale anchors.\n"
+        "- DocumentApplyPatch: send `target_span` (preferred) from `selection_range` plus replacement text and the anchor metadata (`match_text`, `expected_text`, `selection_fingerprint`) from the current snapshot; fall back to `target_range` only when spans are unavailable. The tool composes the diff + DocumentEdit for you and rejects stale anchors.\n"
         "- DocumentEdit: prefer `action=\"patch\"` referencing the latest snapshot version; if you must call it inline, include the same anchor metadata and reserve caret inserts for explicit `action=\"insert\"`.\n"
         "- SearchReplace & Validation: use them to stage scoped regex replacements and lint JSON/YAML/Markdown before committing patches.\n"
         "- PlotOutlineTool: when the controller hints that plot scaffolding refreshed (or when continuity risks arise), call it before drafting edits to read cached character/entity + arc summaries plus overrides/dependencies.\n"

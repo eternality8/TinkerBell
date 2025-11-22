@@ -11,6 +11,7 @@ import pytest
 
 from tinkerbell.editor.document_model import DocumentMetadata, DocumentState, SelectionRange
 from tinkerbell.services.settings import Settings
+from tinkerbell.services.unsaved_cache import UnsavedCache
 from tinkerbell.ui.document_session_service import DocumentSessionService
 from tinkerbell.ui.models.window_state import WindowContext
 
@@ -99,13 +100,29 @@ class _StubSettingsStore:
         return Path("settings.json")
 
 
+class _StubUnsavedCacheStore:
+    def __init__(self) -> None:
+        self.saved: list[UnsavedCache] = []
+
+    def save(self, cache: UnsavedCache) -> Path:
+        self.saved.append(cache)
+        return Path("unsaved_cache.json")
+
+
 def _make_service(settings: Settings | None = None) -> tuple[DocumentSessionService, SimpleNamespace]:
     workspace = _StubWorkspace()
     editor = _StubEditor()
     monitor = _StubMonitor()
     store = _StubSettingsStore()
+    cache_store = _StubUnsavedCacheStore()
     settings_obj = settings or Settings()
-    context = WindowContext(settings=settings_obj, settings_store=store)
+    cache_obj = UnsavedCache()
+    context = WindowContext(
+        settings=settings_obj,
+        settings_store=store,
+        unsaved_cache=cache_obj,
+        unsaved_cache_store=cache_store,
+    )
     status_messages: list[str] = []
     opened_paths: list[Path] = []
 
@@ -126,6 +143,7 @@ def _make_service(settings: Settings | None = None) -> tuple[DocumentSessionServ
         editor=editor,
         monitor=monitor,
         store=store,
+        cache_store=cache_store,
         context=context,
         status_messages=status_messages,
         opened_paths=opened_paths,
@@ -196,27 +214,28 @@ def test_restore_last_session_document_cleans_orphan_snapshots(tmp_path: Path) -
     ghost = tmp_path / "ghost.md"
     ghost.write_text("ghost", encoding="utf-8")
     normalized = str(ghost.expanduser().resolve())
-    settings = Settings(
-        unsaved_snapshots={
-            normalized: {"text": "Lost", "language": "markdown", "selection": [0, 4]},
-            str(tmp_path / "stale.md"): {"text": "Stale", "language": "markdown", "selection": [0, 5]},
-        },
-        untitled_snapshots={"tab-stale": {"text": "scratch", "language": "markdown"}},
-    )
+    settings = Settings()
     service, tracker = _make_service(settings=settings)
+    cache = tracker.context.unsaved_cache
+    cache.unsaved_snapshots = {
+        normalized: {"text": "Lost", "language": "markdown", "selection": [0, 4]},
+        str(tmp_path / "stale.md"): {"text": "Stale", "language": "markdown", "selection": [0, 5]},
+    }
+    cache.untitled_snapshots = {"tab-stale": {"text": "scratch", "language": "markdown"}}
 
     service.restore_last_session_document()
 
-    assert settings.unsaved_snapshots == {}
-    assert settings.untitled_snapshots == {}
-    assert tracker.store.saved  # cleanup persisted to disk
+    assert cache.unsaved_snapshots == {}
+    assert cache.untitled_snapshots == {}
+    assert tracker.cache_store.saved  # cleanup persisted to disk
 
 
 def test_apply_pending_snapshot_for_path_restores_document(tmp_path: Path) -> None:
     service, tracker = _make_service(settings=Settings())
     path = tmp_path / "draft.md"
     key = str(path.expanduser())
-    tracker.context.settings.unsaved_snapshots[key] = {
+    cache = tracker.context.unsaved_cache
+    cache.unsaved_snapshots[key] = {
         "text": "Recovered text",
         "language": "markdown",
         "selection": (0, 8),
@@ -232,7 +251,8 @@ def test_apply_pending_snapshot_for_path_restores_document(tmp_path: Path) -> No
 
 def test_apply_untitled_snapshot_loads_tab_specific_snapshot() -> None:
     service, tracker = _make_service(settings=Settings())
-    tracker.context.settings.untitled_snapshots["tab-7"] = {
+    cache = tracker.context.unsaved_cache
+    cache.untitled_snapshots["tab-7"] = {
         "text": "Untitled text",
         "language": "text",
     }

@@ -1416,10 +1416,10 @@ class ChatPanel(QWidgetBase):
                 pass
             bubble_layout.addWidget(meta_label)
 
-        bubble_max_width = 420
+        bubble_max_width = 520
         if viewport_width:
-            safe_width = max(120, viewport_width - 24)
-            bubble_max_width = min(bubble_max_width, safe_width)
+            available = max(120, viewport_width - 24)
+            bubble_max_width = max(180, int(available * 0.92))
         bubble.setMaximumWidth(bubble_max_width)
         if message.role == "user":
             bubble.setStyleSheet("background-color: #2d7dff; color: white; border-radius: 16px;")

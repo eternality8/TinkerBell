@@ -13,6 +13,7 @@ from . import (
     document_plot_state,
     list_tabs,
     search_replace,
+    selection_range,
     tool_usage_advisor,
     validation,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "document_plot_state",
     "list_tabs",
     "search_replace",
+    "selection_range",
     "tool_usage_advisor",
     "validation",
 ]

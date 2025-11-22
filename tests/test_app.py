@@ -62,7 +62,7 @@ def test_build_ai_controller_clamps_iteration_limit() -> None:
     high_controller = app._build_ai_controller(high_settings)
 
     assert high_controller is not None
-    assert high_controller.max_tool_iterations == 50
+    assert high_controller.max_tool_iterations == 200
 
 
 def test_drain_event_loop_cancels_pending_tasks() -> None:

@@ -31,7 +31,7 @@ ai_tokenizers = [
   "tiktoken>=0.12,<0.13"
 ]
 embeddings = [
-  "sentence-transformers>=3.0,<4.0",
+  "sentence-transformers>=5.0,<6.0",
   "torch>=2.5,<3.0",
   "numpy>=1.26,<3.0"
 ]
