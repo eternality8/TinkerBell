@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from tinkerbell.ai.memory.cache_bus import DocumentCacheBus, DocumentCacheEvent, DocumentClosedEvent
-from tinkerbell.editor.document_model import DocumentMetadata, DocumentState
+from tinkerbell.editor.document_model import DocumentMetadata, DocumentState, SelectionRange
 from tinkerbell.editor.workspace import DocumentWorkspace
 from tinkerbell.services.bridge import DocumentBridge
 
@@ -17,9 +17,11 @@ class _StubEditor:
 
     def __init__(self) -> None:
         self._document = DocumentState()
+        self._selection = SelectionRange()
 
     def load_document(self, document: DocumentState) -> None:
         self._document = document
+        self._selection = SelectionRange()
 
     def to_document(self) -> DocumentState:
         return self._document
@@ -32,12 +34,6 @@ class _StubEditor:
 
     def add_text_listener(self, _listener) -> None:  # pragma: no cover - unused in tests
         return None
-
-    def add_selection_listener(self, _listener) -> None:  # pragma: no cover - unused in tests
-        return None
-
-    def apply_selection(self, selection) -> None:
-        self._document.selection = selection
 
     def set_preview_mode(self, _enabled: bool) -> None:
         return None
@@ -55,6 +51,12 @@ class _StubEditor:
     def apply_patch_result(self, result, selection_hint=None, *, preserve_selection: bool = False) -> DocumentState:  # pragma: no cover - not exercised
         self._document.update_text(result.text)
         return self._document
+
+    def selection_range(self) -> SelectionRange:
+        return SelectionRange(self._selection.start, self._selection.end)
+
+    def selection_span(self) -> tuple[int, int]:
+        return (self._selection.start, self._selection.end)
 
 
 def _make_workspace() -> DocumentWorkspace:

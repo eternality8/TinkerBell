@@ -43,7 +43,7 @@ class DocumentSnapshotTool:
     outline_digest_resolver: Callable[[str | None], str | None] | None = None
     chunk_index: ChunkIndex | None = None
     summarizable: ClassVar[bool] = True
-    DEFAULT_WINDOW: ClassVar[dict[str, Any]] = {"kind": "selection", "padding": 2048, "max_chars": 8192}
+    DEFAULT_WINDOW: ClassVar[dict[str, Any]] = {"kind": "document", "max_chars": 8192}
 
     def run(
         self,
@@ -235,7 +235,7 @@ class DocumentSnapshotTool:
             return dict(self.DEFAULT_WINDOW)
         if isinstance(window, str):
             normalized = window.strip().lower()
-            if not normalized or normalized in {"selection", "default"}:
+            if not normalized or normalized == "default":
                 return dict(self.DEFAULT_WINDOW)
             return normalized
         if isinstance(window, Mapping):

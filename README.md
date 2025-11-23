@@ -214,7 +214,7 @@ Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat m
 ## Everyday workflow
 
 1. **Open, create, or import a document** – Markdown, YAML, JSON, or plain text files are supported out of the box, and PDFs can be converted to text via **File → Import…**. Syntax detection drives highlighting and validation helpers.
-2. **Compose a prompt** – Select the text you want help with, describe the task (“Rewrite the introduction in an encouraging tone”), and hit **Send**. The selection summary and a fresh document snapshot are automatically attached.
+2. **Compose a prompt** – Select the text you want help with, describe the task (“Rewrite the introduction in an encouraging tone”), and hit **Send**. The controller automatically captures a span-scoped snapshot plus chunk-manifest metadata (calling `selection_range` only when those hints are missing) before the agent begins planning.
 3. **Watch the agent work** – Streaming responses land in the chat history. Enable the Tool Activity panel from **Settings → Show tool activity panel** whenever you need to inspect each LangChain tool invocation (snapshot, diff builder, edits, etc.).
 4. **Apply or rollback edits** – Structured payloads go through the bridge, which enforces document-version checks and emits diff summaries (e.g., `+128 chars`). Undo/redo is still available because edits use the regular editor APIs.
 5. **Iterate rapidly** – Refresh snapshots, toggle Markdown preview, or enable autosave intervals from settings. Each AI turn records metadata so future prompts understand the document state.
@@ -223,11 +223,11 @@ Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat m
 
 | Tool | Module | Purpose |
 | --- | --- | --- |
-| `DocumentSnapshotTool` | `tinkerbell.ai.tools.document_snapshot` | Returns the latest document text, metadata, selection, preview flag, and diff token so the agent can reason safely.
+| `DocumentSnapshotTool` | `tinkerbell.ai.tools.document_snapshot` | Returns the latest document text, metadata, span window (`snapshot_span`/`text_range`), chunk manifest, preview flag, and diff token so the agent can reason safely.
 | `DocumentEditTool` | `tinkerbell.ai.tools.document_edit` | Applies validated insert/replace/annotate directives and patch diffs through the bridge with undo support and diff summaries.
 | `DocumentApplyPatchTool` | `tinkerbell.ai.tools.document_apply_patch` | Uses the live snapshot to build a diff for the requested range/content, then routes it through `DocumentEdit` so the agent never forgets to apply the edit.
 | `DiffBuilderTool` | `tinkerbell.ai.tools.diff_builder` | Generates unified diffs from before/after snippets so agents never have to handcraft patch formatting.
-| `SearchReplaceTool` | `tinkerbell.ai.tools.search_replace` | Provides regex/literal transforms with capped replacements, diff previews, and optional dry-run summaries before edits are enqueued.
+| `SearchReplaceTool` | `tinkerbell.ai.tools.search_replace` | Provides regex/literal transforms with capped replacements, explicit target-range support, diff previews, and optional dry-run summaries before edits are enqueued.
 | `ValidationTool` | `tinkerbell.ai.tools.validation` | Checks YAML/JSON snippets via `ruamel.yaml`/`jsonschema`, lint-stubs Markdown for heading/fence issues, and exposes hooks for custom validators.
 | `ListTabsTool` | `tinkerbell.ai.tools.list_tabs` | Enumerates open tabs (`tab_id`, title, path, dirty flag) so agents can target any document without stealing focus.
 | `DocumentPlotStateTool` *(flagged)* | `tinkerbell.ai.tools.document_plot_state` | Returns cached character/entity rosters plus plot arc beats assembled from recent subagent summaries; available only when plot scaffolding is enabled.
@@ -241,7 +241,7 @@ You can register custom tools at runtime via `AIController.register_tool`, and t
 - **`document_edit`** — consumes either a native `EditDirective` or a JSON/mapping payload matching the schema exposed during registration. Prefer `action="patch"` plus a unified diff and `document_version`; legacy `insert`/`replace` actions remain available for small, cursor-relative tweaks. Provide `tab_id` whenever the edit should be applied to a background tab.
 - **`document_apply_patch`** — requires `content` (replacement text) and optionally `target_range`, `document_version`, `rationale`, `context_lines`, and `tab_id`. It snapshots the targeted document, builds a diff for the requested range, and immediately sends it through `document_edit` so diff construction + application happen in one step.
 - **`diff_builder`** — accepts `original`, `updated`, optional `filename`, and optional `context` (default 3) to produce a ready-to-send unified diff string compatible with `document_edit` patch directives.
-- **`search_replace`** — parameters include `pattern`, `replacement`, `is_regex`, `scope` (`document` or `selection`), `dry_run`, `max_replacements` (defaults to a guarded cap), `match_case`, and `whole_word`. Each call reports replacement counts, whether the cap was hit, and a unified diff preview; with `dry_run=True`, no edit occurs and only previews/diff metadata are returned.
+- **`search_replace`** — parameters include `pattern`, `replacement`, `is_regex`, optional `target_range` (`{start, end}` offsets), `dry_run`, `max_replacements` (defaults to a guarded cap), `match_case`, and `whole_word`. Each call reports replacement counts, whether the cap was hit, and a unified diff preview; with `dry_run=True`, no edit occurs and only previews/diff metadata are returned.
 - **`validate_snippet`** — requires `text` and `fmt` (`yaml`, `yml`, `json`, `markdown`, or `md`) and responds with a `ValidationOutcome` describing the first issue plus a count of remaining problems. JSON calls optionally accept a schema, Markdown checks flag heading jumps/unclosed fences, and you can register additional formats at runtime via `tinkerbell.ai.tools.validation.register_snippet_validator`.
 - **`list_tabs`** — no parameters; returns `{tabs: [...], active_tab_id, total}` so the agent can map natural-language references ("roadmap tab") to actual `tab_id` values before issuing snapshot/edit requests.
 - **`document_plot_state`** *(experimental)* — accepts optional `document_id`, `include_entities`, `include_arcs`, `max_entities`, and `max_beats` arguments. Returns `status="ok"` with cached entities/arcs when plot scaffolding is enabled and the active document has ingested subagent summaries; otherwise surfaces diagnostic statuses (`plot_state_disabled`, `plot_state_unavailable`, `no_plot_state`).
@@ -273,7 +273,7 @@ You can register custom tools at runtime via `AIController.register_tool`, and t
 
 - `DocumentState` snapshots now embed `{document_id, version_id, content_hash}` along with a combined `version` token.
 - `DocumentApplyPatchTool` refuses to run without a matching `document_version` and `DocumentBridge` raises `DocumentVersionMismatchError` when callers use stale snapshots.
-- Selection fingerprints and diff summaries keep optimistic concurrency obvious without leaking implementation details to end users.
+- Snapshot span fingerprints (chunk manifests + `snapshot_span`) and diff summaries keep optimistic concurrency obvious without leaking implementation details to end users.
 
 ### Cache registry & invalidation bus
 
@@ -285,7 +285,7 @@ You can register custom tools at runtime via `AIController.register_tool`, and t
 
 ## Safety, privacy, and reliability
 
-- **Document versioning & patch guards** – Every snapshot includes a SHA-1 digest and selection hash so stale edits are rejected before they touch the editor; patch directives must cite the version they were built against.
+- **Document versioning & patch guards** – Every snapshot includes a SHA-1 digest plus span metadata (`snapshot_span`, chunk manifest ranges) so stale edits are rejected before they touch the editor; patch directives must cite the version they were built against.
 - **Guarded parsing** – `chat.commands` normalizes and JSON-validates any agent payload (even if it arrives as a markdown code fence) before it becomes an `EditDirective`.
 - **Encrypted secrets** – API keys reside in `%USERPROFILE%\.tinkerbell\settings.json`, encrypted with Windows DPAPI when possible; other platforms fall back to Fernet with a locally stored key (`settings.key`).
 - **Error transparency** – All warnings bubble up via the status bar, chat notices, and structured logs, making it easy to debug misconfigurations or flaky endpoints.
@@ -306,6 +306,7 @@ You can register custom tools at runtime via `AIController.register_tool`, and t
 - **Tool traces**: Toggle **Show tool activity panel** in the Settings dialog (or set `TINKERBELL_TOOL_ACTIVITY_PANEL=1`) when you need the debug-only LangChain trace list; it's hidden by default to maximize editing space.
 - **Scripts**: `src/tinkerbell/scripts/seed_examples.py` seeds demonstration docs; extend it when adding new showcase flows.
 - **Token inspector**: `scripts/inspect_tokens.py` compares precise (tiktoken) vs. approximate counts so you can size prompts or reproduce the data in `benchmarks/phase0_token_counts.md`.
+- **Selection ownership guardrail**: Only `src/tinkerbell/editor/**` and `ai/tools/selection_range.py` may import `SelectionRange`. Everything else must request spans through `editor.selection_gateway.SelectionGateway` (or stub its `SelectionSnapshotProvider`) and treat selection data as read-only. `tests/test_selection_guard.py` enforces this rule—if you see its failure, remove the import and rely on tuples/TextRange inputs instead.
 
 ## Roadmap & contributing
 

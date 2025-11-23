@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from ..services.telemetry import ContextUsageEvent, PersistentTelemetrySink, TelemetrySink, default_telemetry_path
 
@@ -73,6 +73,9 @@ class TelemetryManager:
             analysis_cache_state=self._coerce_optional_str(context.get("analysis_cache_state")),
             analysis_generated_at=self._coerce_optional_float(context.get("analysis_generated_at")),
             analysis_rule_trace=self._normalize_string_tuple(context.get("analysis_rule_trace")),
+            scope_origin_counts=self._normalize_scope_counts(context.get("scope_origin_counts")),
+            scope_missing_count=self._coerce_optional_int(context.get("scope_missing_count")),
+            scope_total_length=self._coerce_optional_int(context.get("scope_total_length")),
         )
         try:
             self.sink.record(event)
@@ -123,6 +126,38 @@ class TelemetryManager:
             text = str(item).strip()
             if text:
                 normalized.append(text)
+        return tuple(normalized)
+
+    @staticmethod
+    def _normalize_scope_counts(value: Any) -> tuple[tuple[str, int], ...]:
+        if value in (None, ""):
+            return ()
+        items: Sequence[tuple[Any, Any]] | None = None
+        if isinstance(value, Mapping):
+            items = tuple(value.items())
+        elif isinstance(value, Sequence):
+            candidate: list[tuple[Any, Any]] = []
+            for entry in value:
+                if isinstance(entry, Mapping):
+                    candidate.append((entry.get("origin"), entry.get("count")))
+                elif isinstance(entry, Sequence) and len(entry) == 2:
+                    candidate.append((entry[0], entry[1]))
+            items = tuple(candidate)
+        if not items:
+            return ()
+        normalized: list[tuple[str, int]] = []
+        for origin_raw, count_raw in items:
+            origin = str(origin_raw).strip()
+            if not origin:
+                continue
+            try:
+                count = int(count_raw)
+            except (TypeError, ValueError):
+                continue
+            if count < 0:
+                continue
+            normalized.append((origin, count))
+        normalized.sort(key=lambda pair: pair[0])
         return tuple(normalized)
 
     @staticmethod

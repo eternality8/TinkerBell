@@ -61,6 +61,9 @@ class ContextUsageEvent:
     analysis_cache_state: str | None = None
     analysis_generated_at: float | None = None
     analysis_rule_trace: tuple[str, ...] = ()
+    scope_origin_counts: tuple[tuple[str, int], ...] = ()
+    scope_missing_count: int | None = None
+    scope_total_length: int | None = None
 
 
 class TelemetrySink(Protocol):
@@ -384,6 +387,7 @@ def _event_to_payload(event: ContextUsageEvent) -> dict[str, Any]:
     data["analysis_optional_tools"] = list(event.analysis_optional_tools)
     data["analysis_warning_codes"] = list(event.analysis_warning_codes)
     data["analysis_rule_trace"] = list(event.analysis_rule_trace)
+    data["scope_origin_counts"] = [[origin, count] for origin, count in event.scope_origin_counts]
     return data
 
 
@@ -428,6 +432,9 @@ def _event_from_payload(payload: object) -> ContextUsageEvent | None:
             analysis_cache_state=_coerce_optional_str(payload.get("analysis_cache_state")),
             analysis_generated_at=_coerce_optional_float(payload.get("analysis_generated_at")),
             analysis_rule_trace=_coerce_str_tuple(payload.get("analysis_rule_trace")),
+            scope_origin_counts=_parse_scope_origin_counts(payload.get("scope_origin_counts")),
+            scope_missing_count=payload.get("scope_missing_count"),
+            scope_total_length=payload.get("scope_total_length"),
         )
     except (TypeError, ValueError):
         return None
@@ -499,6 +506,49 @@ def _coerce_str_tuple(value: object) -> tuple[str, ...]:
         if text:
             normalized.append(text)
     return tuple(normalized)
+
+
+def _parse_scope_origin_counts(value: object) -> tuple[tuple[str, int], ...]:
+    if value in (None, ""):
+        return ()
+    items: list[tuple[str, int]] = []
+    raw_items: Iterable[Any]
+    if isinstance(value, Mapping):
+        raw_items = value.items()
+    elif isinstance(value, (list, tuple)):
+        raw_items = value
+    else:
+        return ()
+    for entry in raw_items:
+        origin: str | None = None
+        count_value: Any = None
+        if isinstance(entry, Mapping):
+            origin_candidate = entry.get("origin") or entry.get("scope_origin")
+            if isinstance(origin_candidate, str):
+                origin = origin_candidate.strip()
+            count_value = entry.get("count") if "count" in entry else entry.get("value")
+            if count_value is None:
+                count_value = entry.get("scope_count")
+        elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+            raw_origin, raw_count = entry
+            if isinstance(raw_origin, str):
+                origin = raw_origin.strip()
+            else:
+                origin = str(raw_origin).strip()
+            count_value = raw_count
+        else:
+            continue
+        if not origin:
+            continue
+        try:
+            count = int(count_value)
+        except (TypeError, ValueError):
+            continue
+        if count < 0:
+            continue
+        items.append((origin, count))
+    items.sort(key=lambda pair: pair[0])
+    return tuple(items)
 
 
 __all__ = [

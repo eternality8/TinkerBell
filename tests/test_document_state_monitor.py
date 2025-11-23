@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from tinkerbell.ai.memory.cache_bus import DocumentCacheBus, DocumentChangedEvent
-from tinkerbell.editor.document_model import DocumentMetadata, DocumentState, SelectionRange
+from tinkerbell.editor.document_model import DocumentMetadata, DocumentState
 from tinkerbell.services.unsaved_cache import UnsavedCache
 from tinkerbell.ui.document_state_monitor import DocumentStateMonitor
 
@@ -22,12 +22,8 @@ class _StubStatusBar:
 
 class _StubChatPanel:
     def __init__(self) -> None:
-        self.selection_summary: str | None = None
         self.suggestions: list[str] = []
         self.tool_traces: list[Any] = []
-
-    def set_selection_summary(self, summary: str | None) -> None:
-        self.selection_summary = summary
 
     def set_suggestions(self, suggestions: list[str]) -> None:
         self.suggestions = list(suggestions)
@@ -70,10 +66,8 @@ def _make_document(
     *,
     text: str = "Hello world",
     path: Path | None = None,
-    selection: tuple[int, int] | None = None,
 ) -> DocumentState:
     document = DocumentState(text=text, metadata=DocumentMetadata(path=path))
-    document.selection = SelectionRange(*(selection or (0, len(text))))
     document.dirty = True
     return document
 
@@ -140,17 +134,16 @@ def _make_monitor(document: DocumentState | None = None) -> tuple[DocumentStateM
     return monitor, tracker
 
 
-def test_refresh_chat_suggestions_uses_selection_summary() -> None:
-    doc = _make_document(text="Alpha beta", selection=(0, 5))
+def test_refresh_chat_suggestions_without_selection_context() -> None:
+    doc = _make_document(text="Alpha beta")
     monitor, tracker = _make_monitor(document=doc)
 
-    monitor.refresh_chat_suggestions(selection=SelectionRange(0, 5))
+    monitor.refresh_chat_suggestions()
 
-    assert tracker.chat_panel.selection_summary == "Alpha"
     assert tracker.chat_panel.suggestions[:3] == [
-        "Summarize the selected text.",
-        "Rewrite the selected text for clarity.",
-        "Extract action items from the selection.",
+        "Summarize the current document.",
+        "Suggest improvements to the document structure.",
+        "Highlight inconsistencies or missing sections.",
     ]
 
 

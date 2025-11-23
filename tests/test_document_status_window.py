@@ -107,7 +107,8 @@ def test_format_chunk_lines_returns_human_summary() -> None:
             ],
         },
         "window": {
-            "selection": {"start": 0, "end": 512},
+            "start": 0,
+            "end": 512,
         },
         "document_version": {
             "version": "v7",
@@ -118,7 +119,7 @@ def test_format_chunk_lines_returns_human_summary() -> None:
     lines = DocumentStatusWindow._format_chunk_lines(chunk_payload)
 
     assert "Chunks: 3 (profile precise)" in lines[0]
-    assert any(line.startswith("Selection:") for line in lines)
+    assert any(line.startswith("Window:") for line in lines)
     assert any(line.startswith("Manifest generated at") for line in lines)
     assert any(line.startswith("Document version:") for line in lines)
 
@@ -187,7 +188,6 @@ def test_document_status_window_qt_updates_badge_and_tabs() -> None:
             "label": "Novel Draft",
             "language": "en",
             "length": 1_024,
-            "selection": {"start": 10, "end": 42},
             "version_id": "v7",
             "content_hash": "hash",
         },
@@ -350,7 +350,6 @@ def test_build_document_meta_fields_formats_values() -> None:
         "label": "My Doc",
         "path": "C:/tmp/doc.txt",
         "length": 2048,
-        "selection": {"start": 10, "end": 42},
         "version_id": "v2",
         "content_hash": "abcd",
         "language": "en",
@@ -360,7 +359,6 @@ def test_build_document_meta_fields_formats_values() -> None:
 
     assert fields["document"] == "My Doc"
     assert fields["path"].endswith("doc.txt")
-    assert fields["selection"] == "10–42"
     assert fields["length"] == "2,048 chars"
     assert fields["version"] == "v2 / abcd"
     assert fields["language"] == "en"

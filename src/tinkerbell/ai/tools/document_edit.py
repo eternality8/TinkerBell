@@ -149,15 +149,31 @@ class DocumentEditTool:
             match_text = entry.get("match_text")
             if match_text is None:
                 raise ValueError("Patch ranges must include match_text for validation")
-            normalized.append(
-                {
-                    "start": int(entry["start"]),
-                    "end": int(entry["end"]),
-                    "replacement": str(replacement),
-                    "match_text": str(match_text),
-                    **{key: entry[key] for key in ("chunk_id", "chunk_hash") if key in entry},
-                }
-            )
+            scope_payload = entry.get("scope")
+            scope_mapping = dict(scope_payload) if isinstance(scope_payload, Mapping) else None
+            normalized_entry: dict[str, Any] = {
+                "start": int(entry["start"]),
+                "end": int(entry["end"]),
+                "replacement": str(replacement),
+                "match_text": str(match_text),
+                **{key: entry[key] for key in ("chunk_id", "chunk_hash") if key in entry},
+            }
+            if scope_mapping is not None:
+                normalized_entry["scope"] = scope_mapping
+            scope_origin = entry.get("scope_origin")
+            if not isinstance(scope_origin, str) and scope_mapping is not None:
+                scope_origin = scope_mapping.get("origin") if isinstance(scope_mapping, Mapping) else None
+            if isinstance(scope_origin, str) and scope_origin.strip():
+                normalized_entry["scope_origin"] = scope_origin.strip()
+            scope_length = entry.get("scope_length")
+            if scope_length is None and scope_mapping is not None:
+                scope_length = scope_mapping.get("length")
+            try:
+                if scope_length is not None:
+                    normalized_entry["scope_length"] = max(0, int(scope_length))
+            except (TypeError, ValueError):
+                pass
+            normalized.append(normalized_entry)
         return normalized
 
     @staticmethod
@@ -179,6 +195,72 @@ class DocumentEditTool:
         token_text = str(token).strip()
         return token_text or None
 
+    @staticmethod
+    def _build_scope_details(
+        *,
+        origin: str,
+        span: tuple[int, int],
+    ) -> dict[str, Any]:
+        start, end = span
+        start = max(0, int(start))
+        end = max(start, int(end))
+        payload: dict[str, Any] = {
+            "origin": origin,
+            "range": {"start": start, "end": end},
+            "length": max(0, end - start),
+        }
+        return payload
+
+    @staticmethod
+    def _range_scope_fields(scope: Mapping[str, Any]) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        origin = scope.get("origin")
+        if isinstance(origin, str) and origin.strip():
+            payload["scope_origin"] = origin.strip()
+        length = scope.get("length")
+        try:
+            if length is not None:
+                payload["scope_length"] = max(0, int(length))
+        except (TypeError, ValueError):
+            pass
+        range_payload = scope.get("range")
+        if isinstance(range_payload, Mapping):
+            start = range_payload.get("start")
+            end = range_payload.get("end")
+            try:
+                if start is not None and end is not None:
+                    payload["scope_range"] = {"start": int(start), "end": int(end)}
+            except (TypeError, ValueError):
+                pass
+        return payload
+
+    @staticmethod
+    def _merge_scope_metadata(
+        metadata: Mapping[str, Any] | None,
+        scope: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(metadata) if isinstance(metadata, Mapping) else {}
+        merged["scope"] = dict(scope)
+        origin = scope.get("origin")
+        if isinstance(origin, str) and origin.strip():
+            merged["scope_origin"] = origin.strip()
+        length = scope.get("length")
+        try:
+            if length is not None:
+                merged["scope_length"] = max(0, int(length))
+        except (TypeError, ValueError):
+            pass
+        range_payload = scope.get("range")
+        if isinstance(range_payload, Mapping):
+            start = range_payload.get("start")
+            end = range_payload.get("end")
+            try:
+                if start is not None and end is not None:
+                    merged["scope_range"] = {"start": int(start), "end": int(end)}
+            except (TypeError, ValueError):
+                pass
+        return merged
+
     def _format_status(self, action: str, diff: str | None, version: str | None) -> str:
         if diff and version:
             if action == ActionType.PATCH.value:
@@ -198,19 +280,7 @@ class DocumentEditTool:
         *,
         tab_id: str | None,
     ) -> Mapping[str, Any]:
-        try:
-            return self._auto_convert_to_patch(payload, tab_id=tab_id, include_text=False)
-        except ValueError as exc:
-            if not self._should_refresh_snapshot(exc):
-                raise
-            return self._auto_convert_to_patch(payload, tab_id=tab_id, include_text=True)
-
-    @staticmethod
-    def _should_refresh_snapshot(error: Exception) -> bool:
-        if not isinstance(error, ValueError):
-            return False
-        message = str(error)
-        return "Snapshot did not include selection_text" in message
+        return self._auto_convert_to_patch(payload, tab_id=tab_id, include_text=True)
 
     def _auto_convert_to_patch(
         self,
@@ -240,28 +310,20 @@ class DocumentEditTool:
         if not isinstance(content, str):
             raise ValueError("Content edits must include a string 'content' field")
 
-        selection = snapshot.get("selection") or (0, 0)
+        context_range = self._snapshot_window_range(snapshot, len(base_text))
         action_type = str(mapping_payload.get("action") or "").lower()
         anchor_text, anchor_from_user = self._normalize_anchor_text(
             mapping_payload.get("match_text"),
             mapping_payload.get("expected_text"),
         )
-        selection_fingerprint = mapping_payload.get("selection_fingerprint")
-        selection_text = self._resolve_snapshot_selection_text(snapshot)
-        selection_hash = self._resolve_selection_hash(snapshot, selection_text)
-        anchor_present = bool(anchor_text) or bool(selection_fingerprint)
-        selection_span = self._selection_span(selection)
-        anchor_source = self._anchor_source(anchor_text, selection_text, selection_fingerprint)
+        anchor_present = bool(anchor_text)
+        anchor_source = self._anchor_source(anchor_text)
         target_range = mapping_payload.get("target_range")
         replace_all = bool(mapping_payload.get("replace_all"))
-        selection_authoritative = bool(selection_fingerprint)
         try:
             self._enforce_range_requirements(
                 action_type,
                 target_range,
-                selection,
-                anchor_present,
-                selection_authoritative,
                 replace_all,
             )
         except ValueError as exc:
@@ -269,7 +331,7 @@ class DocumentEditTool:
                 snapshot=snapshot,
                 tab_id=tab_id,
                 action=action_type,
-                selection_span=selection_span,
+                context_range=context_range,
                 target_range=target_range,
                 replace_all=replace_all,
                 reason=str(exc),
@@ -281,22 +343,19 @@ class DocumentEditTool:
                 status="reject",
                 phase="requirements",
                 anchor_source=anchor_source,
-                selection_span=selection_span,
+                context_range=context_range,
                 range_provided=(target_range is not None) or replace_all,
                 reason=str(exc),
             )
             raise
-        start, end = self._resolve_range(target_range, selection, len(base_text), replace_all)
+        start, end = self._resolve_range(target_range, context_range, len(base_text), replace_all)
         try:
             start, end = self._align_range_with_snapshot(
                 base_text,
                 start,
                 end,
-                selection_text=selection_text,
                 anchor_text=anchor_text,
                 anchor_from_user=anchor_from_user,
-                selection_fingerprint=selection_fingerprint,
-                selection_hash=selection_hash,
             )
         except ValueError as exc:
             self._emit_anchor_event(
@@ -305,7 +364,7 @@ class DocumentEditTool:
                 status="reject",
                 phase="alignment",
                 anchor_source=anchor_source,
-                selection_span=selection_span,
+                context_range=context_range,
                 range_provided=(target_range is not None) or replace_all,
                 reason=str(exc),
             )
@@ -316,7 +375,7 @@ class DocumentEditTool:
             status="success",
             phase="alignment",
             anchor_source=anchor_source,
-            selection_span=selection_span,
+            context_range=context_range,
             range_provided=(target_range is not None) or replace_all,
             resolved_range=(start, end),
         )
@@ -327,7 +386,7 @@ class DocumentEditTool:
                 status="reject",
                 phase="caret-guard",
                 anchor_source=anchor_source,
-                selection_span=selection_span,
+                context_range=context_range,
                 range_provided=(target_range is not None) or replace_all,
                 reason="Replace directives require a non-empty target_range",
             )
@@ -363,6 +422,10 @@ class DocumentEditTool:
         if not content_hash:
             content_hash = self._hash_text(base_text)
 
+        scope_details = self._build_scope_details(
+            origin="document" if replace_all else "explicit_span",
+            span=(start, end),
+        )
         patch_payload: dict[str, Any] = {
             "action": ActionType.PATCH.value,
             "diff": diff,
@@ -374,12 +437,15 @@ class DocumentEditTool:
                     "end": end,
                     "replacement": normalized_replacement,
                     "match_text": match_text_payload,
+                    "scope": dict(scope_details),
+                    **self._range_scope_fields(scope_details),
                 }
             ],
         }
         rationale = mapping_payload.get("rationale")
         if rationale is not None:
             patch_payload["rationale"] = rationale
+        patch_payload["metadata"] = self._merge_scope_metadata(patch_payload.get("metadata"), scope_details)
         return self._prepare_patch_payload(patch_payload)
 
     @staticmethod
@@ -391,7 +457,6 @@ class DocumentEditTool:
             "content": payload.content,
             "target_range": payload.target_range.to_dict(),
             "rationale": payload.rationale,
-            "selection_fingerprint": payload.selection_fingerprint,
             "match_text": getattr(payload, "match_text", None),
             "expected_text": getattr(payload, "expected_text", None),
             "replace_all": getattr(payload, "replace_all", None),
@@ -408,46 +473,18 @@ class DocumentEditTool:
                 raise ValueError("match_text and expected_text must match when both are provided")
         return first, True
 
-    @staticmethod
-    def _resolve_snapshot_selection_text(snapshot: Mapping[str, Any]) -> str | None:
-        selection_text = snapshot.get("selection_text")
-        return selection_text if isinstance(selection_text, str) else None
-
-    def _resolve_selection_hash(self, snapshot: Mapping[str, Any], selection_text: str | None) -> str | None:
-        token = snapshot.get("selection_hash")
-        if isinstance(token, str) and token.strip():
-            return token.strip()
-        if selection_text:
-            return self._hash_text(selection_text)
-        return None
-
     def _enforce_range_requirements(
         self,
         action: str,
         target_range: Any,
-        selection: Sequence[int],
-        anchor_present: bool,
-        selection_authoritative: bool,
         replace_all: bool,
     ) -> None:
-        if action == ActionType.INSERT.value:
-            return
         if replace_all:
             return
         if target_range is not None:
             return
-        if selection_authoritative and len(selection) == 2:
-            try:
-                sel_start = int(selection[0])
-                sel_end = int(selection[1])
-            except (TypeError, ValueError):
-                sel_start = sel_end = 0
-            if (sel_start, sel_end) != (0, 0):
-                return
-        if anchor_present:
-            return
         raise ValueError(
-            "Replace edits must include target_span (preferred), target_range, match_text, or replace_all=true; call document_snapshot and provide the selected region."
+            "document_edit requires target_span (preferred), target_range, or scope='document'/replace_all=true; capture spans from document_snapshot or chunk manifests before editing."
         )
 
     def _align_range_with_snapshot(
@@ -456,39 +493,16 @@ class DocumentEditTool:
         start: int,
         end: int,
         *,
-        selection_text: str | None,
         anchor_text: str | None,
         anchor_from_user: bool,
-        selection_fingerprint: Any,
-        selection_hash: str | None,
     ) -> tuple[int, int]:
-        fingerprint = str(selection_fingerprint).strip() if isinstance(selection_fingerprint, str) else None
-        if fingerprint:
-            if not selection_hash:
-                raise ValueError("Snapshot did not include selection_text; refresh document_snapshot with include_text=true")
-            if fingerprint != selection_hash:
-                raise ValueError(
-                    "selection_fingerprint does not match the latest snapshot; refresh document_snapshot before editing"
-                )
-
         anchor_candidate = anchor_text
-        from_snapshot = False
-        use_snapshot_anchor = bool(fingerprint) and selection_text is not None
-        if anchor_candidate is None and use_snapshot_anchor:
-            anchor_candidate = selection_text
-            from_snapshot = True
-
         if anchor_candidate is None or anchor_candidate == "":
             return start, end
 
         selection_slice = base_text[start:end]
         if selection_slice == anchor_candidate:
             return start, end
-
-        if from_snapshot and not anchor_from_user:
-            raise ValueError(
-                "Snapshot selection_text no longer matches the document; provide match_text or refresh document_snapshot."
-            )
 
         relocated = self._locate_unique_anchor(base_text, anchor_candidate)
         if relocated is None:
@@ -502,7 +516,7 @@ class DocumentEditTool:
             return None
         duplicate = base_text.find(anchor, position + 1)
         if duplicate >= 0:
-            raise ValueError("match_text matched multiple ranges; narrow the selection or provide explicit offsets")
+            raise ValueError("match_text matched multiple ranges; narrow the target span or provide explicit offsets")
         return position, position + len(anchor)
 
     def _emit_anchor_event(
@@ -513,7 +527,7 @@ class DocumentEditTool:
         status: str,
         phase: str,
         anchor_source: str,
-        selection_span: tuple[int, int] | None,
+        context_range: tuple[int, int] | None,
         range_provided: bool,
         resolved_range: tuple[int, int] | None = None,
         reason: str | None = None,
@@ -529,8 +543,8 @@ class DocumentEditTool:
             "anchor_source": anchor_source,
             "range_provided": range_provided,
         }
-        if selection_span is not None:
-            payload["selection_span"] = {"start": selection_span[0], "end": selection_span[1]}
+        if context_range is not None:
+            payload["context_range"] = {"start": context_range[0], "end": context_range[1]}
         if resolved_range is not None:
             payload["resolved_range"] = {"start": resolved_range[0], "end": resolved_range[1]}
         if reason:
@@ -543,7 +557,7 @@ class DocumentEditTool:
         snapshot: Mapping[str, Any],
         tab_id: str | None,
         action: str,
-        selection_span: tuple[int, int] | None,
+        context_range: tuple[int, int] | None,
         target_range: Any,
         replace_all: bool,
         reason: str,
@@ -559,47 +573,60 @@ class DocumentEditTool:
                 "range_provided": (target_range is not None) or replace_all,
                 "replace_all": replace_all,
                 "anchor_present": anchor_present,
-                "selection_span": self._span_payload(selection_span),
+                "context_range": self._range_payload(context_range),
                 "reason": reason,
             },
         )
 
     @staticmethod
-    def _span_payload(span: tuple[int, int] | None) -> dict[str, int] | None:
+    def _range_payload(span: tuple[int, int] | None) -> dict[str, int] | None:
         if span is None:
             return None
         return {"start": span[0], "end": span[1]}
 
     @staticmethod
-    def _selection_span(selection: Sequence[int]) -> tuple[int, int] | None:
-        if len(selection) != 2:
-            return None
-        try:
-            start = int(selection[0])
-            end = int(selection[1])
-        except (TypeError, ValueError):
-            return None
-        if end < start:
-            start, end = end, start
-        return (start, end)
-
-    @staticmethod
     def _anchor_source(
         anchor_text: str | None,
-        selection_text: str | None,
-        selection_fingerprint: Any,
     ) -> str:
-        fingerprint = str(selection_fingerprint).strip() if isinstance(selection_fingerprint, str) else None
-        if fingerprint:
-            return "fingerprint"
         if anchor_text:
             return "match_text"
         return "range_only"
 
     @staticmethod
+    def _snapshot_window_range(snapshot: Mapping[str, Any], length: int) -> tuple[int, int]:
+        def _coerce(candidate: Any) -> tuple[int, int] | None:
+            if isinstance(candidate, Mapping):
+                start = candidate.get("start")
+                end = candidate.get("end")
+            elif isinstance(candidate, Sequence) and len(candidate) == 2 and not isinstance(candidate, (str, bytes)):
+                start, end = candidate
+            else:
+                return None
+            try:
+                start_i = int(start)
+                end_i = int(end)
+            except (TypeError, ValueError):
+                return None
+            if end_i < start_i:
+                start_i, end_i = end_i, start_i
+            return start_i, end_i
+
+        for key in ("text_range", "window"):
+            span = _coerce(snapshot.get(key))
+            if span is not None:
+                break
+        else:
+            span = (0, length)
+
+        start, end = span
+        start = max(0, min(start, length))
+        end = max(start, min(end, length))
+        return (start, end)
+
+    @staticmethod
     def _resolve_range(
         target_range: Mapping[str, Any] | Sequence[int] | tuple[int, int] | str | None,
-        selection: Sequence[int],
+        context_range: Sequence[int] | tuple[int, int] | None,
         length: int,
         replace_all: bool = False,
     ) -> tuple[int, int]:
@@ -607,7 +634,10 @@ class DocumentEditTool:
             return (0, max(0, int(length)))
         document_scope = False
         if target_range is None:
-            start, end = selection if len(selection) == 2 else (0, 0)
+            if context_range and len(context_range) == 2:
+                start, end = int(context_range[0]), int(context_range[1])
+            else:
+                start, end = (0, 0)
         elif isinstance(target_range, str):
             token = target_range.strip().lower()
             if not token or token not in _DOCUMENT_SCOPE_TOKENS:

@@ -55,23 +55,24 @@ def test_ai_edits_collapse_selection_after_application():
 
     insert = EditDirective(action="insert", target_range=(5, 5), content=" world")
     widget.apply_ai_edit(insert)
-    selection = widget.to_document().selection
+    selection = widget.selection_range()
     assert selection.start == selection.end == len("hello world")
 
     replace = EditDirective(action="replace", target_range=(0, 5), content="hi")
     widget.apply_ai_edit(replace)
-    selection = widget.to_document().selection
+    selection = widget.selection_range()
     assert selection.start == selection.end == len("hi")
 
 
 def test_ai_edits_preserve_selection_when_requested():
     widget = EditorWidget()
-    widget.load_document(DocumentState(text="hello world", selection=SelectionRange(2, 4)))
+    widget.load_document(DocumentState(text="hello world"))
+    widget._set_selection(SelectionRange(2, 4))
 
     insert = EditDirective(action="insert", target_range=(5, 5), content=" brave")
     widget.apply_ai_edit(insert, preserve_selection=True)
 
-    selection = widget.to_document().selection
+    selection = widget.selection_range()
     assert selection.start == 2
     assert selection.end == 4
 
@@ -109,20 +110,36 @@ def test_editor_widget_undo_redo_roundtrip():
 
 def test_editor_widget_selection_updates_document_state():
     widget = EditorWidget()
-    doc = DocumentState(text="content", selection=SelectionRange(0, 0))
-    widget.load_document(doc)
-    widget.apply_selection(SelectionRange(1, 4))
-    assert widget.to_document().selection.start == 1
-    assert widget.to_document().selection.end == 4
+    widget.load_document(DocumentState(text="content"))
+    widget._set_selection(SelectionRange(1, 4))
+    selection = widget.selection_range()
+    assert selection.start == 1
+    assert selection.end == 4
+
+
+def test_editor_widget_selection_listener_reports_line_column():
+    widget = EditorWidget()
+    widget.load_document(DocumentState(text="alpha\nbeta"))
+
+    captured: list[tuple[tuple[int, int], int, int]] = []
+
+    def _listener(selection: SelectionRange, line: int, column: int) -> None:
+        captured.append((selection.as_tuple(), line, column))
+
+    widget.add_selection_listener(_listener)
+    widget._set_selection(SelectionRange(6, 6))
+
+    assert captured
+    assert captured[-1] == ((6, 6), 2, 1)
 
 
 def test_editor_widget_accepts_text_range_selection_inputs():
     widget = EditorWidget()
     widget.load_document(DocumentState(text="content"))
 
-    widget.apply_selection(TextRange(2, 5))
+    widget._set_selection(TextRange(2, 5))
 
-    selection = widget.to_document().selection
+    selection = widget.selection_range()
     assert selection.start == 2
     assert selection.end == 5
 
@@ -148,39 +165,49 @@ def test_patch_result_collapses_selection_to_span_end():
     result = PatchResult(text="hello brave world", spans=((6, 11),), summary="patch: +5")
     widget.apply_patch_result(result)
 
-    selection = widget.to_document().selection
+    selection = widget.selection_range()
     assert selection.start == selection.end == 11
 
 
 def test_patch_result_preserves_selection_when_requested():
     widget = EditorWidget()
-    widget.load_document(DocumentState(text="hello world", selection=SelectionRange(1, 3)))
+    widget.load_document(DocumentState(text="hello world"))
+    widget._set_selection(SelectionRange(1, 3))
 
     result = PatchResult(text="HELLO world", spans=((0, 5),), summary="patch: +0")
     widget.apply_patch_result(result, preserve_selection=True)
 
-    selection = widget.to_document().selection
+    selection = widget.selection_range()
     assert selection.start == 1
     assert selection.end == 3
+
+
+def test_patch_result_uses_selection_hint_when_spans_missing():
+    widget = EditorWidget()
+    widget.load_document(DocumentState(text="hello"))
+
+    result = PatchResult(text="HELLO", spans=(), summary="patch: +0")
+    widget.apply_patch_result(result, selection_hint=(2, 2))
+
+    selection = widget.selection_range()
+    assert selection.start == selection.end == 2
 
 
 def test_undo_redo_preserves_text_range_history():
     widget = EditorWidget()
     widget.load_document(DocumentState(text="alpha beta"))
-    widget.apply_selection(TextRange(1, 4))
+    widget._set_selection(TextRange(1, 4))
 
     widget.set_text("alpha beta!")
-    widget.apply_selection(TextRange(0, 0))
+    widget._set_selection(TextRange(0, 0))
 
     widget.undo()
-    selection = widget.to_document().selection
-    assert selection.start == 1
-    assert selection.end == 4
+    selection = widget.selection_range()
+    assert selection.start == selection.end == len("alpha beta")
 
     widget.redo()
-    selection = widget.to_document().selection
-    assert selection.start == 0
-    assert selection.end == 0
+    selection = widget.selection_range()
+    assert selection.start == selection.end == len("alpha beta!")
 
 
 def test_ai_rewrite_turn_retries_on_stale_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:

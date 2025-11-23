@@ -30,8 +30,10 @@ class TelemetryController:
         self._last_compaction_stats: Mapping[str, int] | None = None
         self._subagent_enabled = initial_subagent_enabled
         self._subagent_active_jobs: set[str] = set()
+        self._subagent_pending_jobs: set[str] = set()
         self._subagent_job_totals: dict[str, int] = {"completed": 0, "failed": 0, "skipped": 0}
         self._subagent_last_event = ""
+        self._subagent_last_queue_detail = ""
         self._subagent_telemetry_registered = False
         self._chat_panel = chat_panel
         self._chunk_flow_registered = False
@@ -102,6 +104,7 @@ class TelemetryController:
             "subagent.job_completed",
             "subagent.job_failed",
             "subagent.job_skipped",
+            "subagent.jobs_queued",
         ):
             telemetry_service.register_event_listener(event_name, self.handle_subagent_telemetry)
         self._subagent_telemetry_registered = True
@@ -128,6 +131,7 @@ class TelemetryController:
             "subagent.job_completed": self._record_subagent_job_completed,
             "subagent.job_failed": self._record_subagent_job_failed,
             "subagent.job_skipped": self._record_subagent_job_skipped,
+            "subagent.jobs_queued": self._record_subagent_jobs_queued,
         }
         handler = handler_map.get(event_name)
         if handler is None:
@@ -195,11 +199,15 @@ class TelemetryController:
         if self._subagent_enabled == normalized:
             if not normalized:
                 self._subagent_active_jobs.clear()
+                self._subagent_pending_jobs.clear()
+                self._subagent_last_queue_detail = ""
             self.update_subagent_indicator()
             return
         self._subagent_enabled = normalized
         if not normalized:
             self._subagent_active_jobs.clear()
+            self._subagent_pending_jobs.clear()
+            self._subagent_last_queue_detail = ""
         self.update_subagent_indicator()
 
     def update_subagent_indicator(self) -> None:
@@ -216,16 +224,25 @@ class TelemetryController:
             return
 
         active_jobs = len(self._subagent_active_jobs)
+        pending_jobs = len(self._subagent_pending_jobs)
         status = f"Running ({active_jobs})" if active_jobs else "Idle"
+        if active_jobs == 0 and pending_jobs:
+            status = f"Queued ({pending_jobs})"
         detail_parts: list[str] = []
         if active_jobs:
             detail_parts.append(f"{active_jobs} active job{'s' if active_jobs != 1 else ''}")
+        if pending_jobs:
+            detail_parts.append(f"{pending_jobs} queued job{'s' if pending_jobs != 1 else ''}")
+            if self._subagent_last_queue_detail:
+                detail_parts.append(self._subagent_last_queue_detail)
         totals_text = self._format_subagent_totals()
         if totals_text:
             detail_parts.append(totals_text)
         event_text = (self._subagent_last_event or "").strip()
         if event_text:
             detail_parts.append(event_text)
+        if not pending_jobs:
+            self._subagent_last_queue_detail = ""
         detail = " · ".join(detail_parts) or "No subagent telemetry yet."
         try:
             status_bar.set_subagent_status(status, detail=detail)
@@ -238,6 +255,7 @@ class TelemetryController:
     def _record_subagent_job_started(self, payload: Mapping[str, Any]) -> None:
         job_id = self._coerce_subagent_job_id(payload)
         if job_id:
+            self._subagent_pending_jobs.discard(job_id)
             self._subagent_active_jobs.add(job_id)
         chunk_id = payload.get("chunk_id") or payload.get("document_id")
         estimate = payload.get("token_estimate") or payload.get("prompt_tokens")
@@ -251,6 +269,7 @@ class TelemetryController:
     def _record_subagent_job_completed(self, payload: Mapping[str, Any]) -> None:
         job_id = self._coerce_subagent_job_id(payload)
         if job_id:
+            self._subagent_pending_jobs.discard(job_id)
             self._subagent_active_jobs.discard(job_id)
         self._increment_subagent_total("completed")
         chunk_id = payload.get("chunk_id") or payload.get("document_id")
@@ -268,6 +287,7 @@ class TelemetryController:
     def _record_subagent_job_failed(self, payload: Mapping[str, Any]) -> None:
         job_id = self._coerce_subagent_job_id(payload)
         if job_id:
+            self._subagent_pending_jobs.discard(job_id)
             self._subagent_active_jobs.discard(job_id)
         self._increment_subagent_total("failed")
         reason = str(payload.get("error") or payload.get("details") or "Failed")
@@ -280,7 +300,9 @@ class TelemetryController:
     def _record_subagent_job_skipped(self, payload: Mapping[str, Any]) -> None:
         job_id = self._coerce_subagent_job_id(payload)
         if job_id:
+            self._subagent_pending_jobs.discard(job_id)
             self._subagent_active_jobs.discard(job_id)
+
         self._increment_subagent_total("skipped")
         reason = str(payload.get("reason") or payload.get("details") or "Skipped")
         chunk_id = payload.get("chunk_id") or payload.get("document_id")
@@ -288,6 +310,61 @@ class TelemetryController:
         if chunk_id:
             bits.insert(0, f"chunk {chunk_id}")
         self._subagent_last_event = self._format_subagent_event_detail("Job skipped", job_id, bits)
+
+    def _record_subagent_jobs_queued(self, payload: Mapping[str, Any]) -> None:
+        job_ids = payload.get("job_ids")
+        added = 0
+        if isinstance(job_ids, Iterable) and not isinstance(job_ids, (str, bytes)):
+            for job_id in job_ids:
+                normalized = str(job_id).strip()
+                if normalized:
+                    if normalized not in self._subagent_active_jobs:
+                        self._subagent_pending_jobs.add(normalized)
+                    added += 1
+        if added == 0:
+            try:
+                added = int(payload.get("job_count") or 0)
+            except (TypeError, ValueError):
+                added = 0
+        raw_chunk_ids = payload.get("chunk_ids")
+        chunk_ids = (
+            raw_chunk_ids
+            if isinstance(raw_chunk_ids, Iterable) and not isinstance(raw_chunk_ids, (str, bytes))
+            else None
+        )
+        raw_reasons = payload.get("reasons")
+        reasons = (
+            raw_reasons
+            if isinstance(raw_reasons, Iterable) and not isinstance(raw_reasons, (str, bytes))
+            else None
+        )
+        detail = self._format_subagent_queue_detail(chunk_ids, reasons)
+        self._subagent_last_queue_detail = detail
+        segments: list[str] = []
+        if added:
+            segments.append(f"{added} job{'s' if added != 1 else ''}")
+        if detail:
+            segments.append(detail)
+        self._subagent_last_event = self._format_subagent_event_detail("Jobs queued", None, segments)
+
+    def _format_subagent_queue_detail(
+        self,
+        chunk_ids: Iterable[Any] | None,
+        reasons: Iterable[Any] | None,
+    ) -> str:
+        bits: list[str] = []
+        if chunk_ids:
+            labels = [str(value).strip() for value in chunk_ids if str(value).strip()]
+            if labels:
+                preview = ", ".join(labels[:3])
+                if len(labels) > 3:
+                    preview = f"{preview}, +{len(labels) - 3} more"
+                bits.append(f"chunks {preview}")
+        if reasons:
+            reason_labels = [str(value).strip() for value in reasons if str(value).strip()]
+            if reason_labels:
+                bits.append(f"reasons: {', '.join(reason_labels)}")
+        return " · ".join(bits)
 
     def _increment_subagent_total(self, key: str) -> None:
         current = self._subagent_job_totals.get(key, 0)

@@ -82,8 +82,8 @@ class SubagentExecutor:
                 "subagent.job_skipped",
                 {
                     "job_id": job.job_id,
-                    "document_id": job.chunk_ref.document_id,
-                    "chunk_id": job.chunk_ref.chunk_id,
+                    "document_id": job.document_id,
+                    "chunk_id": job.chunk_id,
                     "reason": "empty_chunk",
                 },
             )
@@ -104,8 +104,8 @@ class SubagentExecutor:
                 "subagent.job_skipped",
                 {
                     "job_id": job.job_id,
-                    "document_id": job.chunk_ref.document_id,
-                    "chunk_id": job.chunk_ref.chunk_id,
+                    "document_id": job.document_id,
+                    "chunk_id": job.chunk_id,
                     "reason": decision.reason,
                 },
             )
@@ -115,8 +115,8 @@ class SubagentExecutor:
             "subagent.job_started",
             {
                 "job_id": job.job_id,
-                "document_id": job.chunk_ref.document_id,
-                "chunk_id": job.chunk_ref.chunk_id,
+                "document_id": job.document_id,
+                "chunk_id": job.chunk_id,
                 "token_estimate": job.chunk_ref.token_estimate,
                 "prompt_tokens": prompt_tokens,
             },
@@ -138,8 +138,8 @@ class SubagentExecutor:
                 "subagent.job_completed",
                 {
                     "job_id": job.job_id,
-                    "document_id": job.chunk_ref.document_id,
-                    "chunk_id": job.chunk_ref.chunk_id,
+                    "document_id": job.document_id,
+                    "chunk_id": job.chunk_id,
                     "latency_ms": round(duration_ms, 3),
                     "tokens_used": job.result.tokens_used,
                 },
@@ -157,8 +157,8 @@ class SubagentExecutor:
                 "subagent.job_failed",
                 {
                     "job_id": job.job_id,
-                    "document_id": job.chunk_ref.document_id,
-                    "chunk_id": job.chunk_ref.chunk_id,
+                    "document_id": job.document_id,
+                    "chunk_id": job.chunk_id,
                     "error": str(exc)[:200],
                 },
             )
@@ -173,7 +173,7 @@ class SubagentExecutor:
         tool_specs = self._tool_specs(job.allowed_tools)
         metadata = {
             "subagent_job_id": job.job_id,
-            "document_id": job.chunk_ref.document_id,
+            "document_id": job.document_id,
         }
         stream_kwargs: MutableMapping[str, Any] = {
             "messages": list(messages),
@@ -235,7 +235,7 @@ class SubagentExecutor:
             return self._budget_policy.tokens_available(
                 prompt_tokens=prompt_tokens,
                 response_reserve=job.budget.max_completion_tokens,
-                document_id=job.chunk_ref.document_id,
+                document_id=job.document_id,
             )
         except Exception:  # pragma: no cover - defensive guard
             LOGGER.debug("Budget policy evaluation failed for subagent job %s", job.job_id, exc_info=True)
@@ -373,13 +373,7 @@ class SubagentManager:
         skipped = sum(1 for job in results if job.state == SubagentJobState.SKIPPED)
         total_latency = sum((job.result.latency_ms if job.result else 0.0) for job in results)
         total_tokens = sum((job.result.tokens_used if job.result else 0) for job in results)
-        document_ids = sorted(
-            {
-                job.chunk_ref.document_id
-                for job in scheduled
-                if job.chunk_ref.document_id is not None
-            }
-        )
+        document_ids = sorted({job.document_id for job in scheduled if job.document_id})
         telemetry_service.emit(
             "subagent.turn_summary",
             {

@@ -15,20 +15,19 @@ def test_base_system_prompt_includes_budget_and_fallback():
     assert "approximate" in content.lower()
 
 
-def test_format_user_prompt_includes_selection_metadata():
+def test_format_user_prompt_includes_window_metadata():
     snapshot = {
         "path": "docs/example.md",
         "text": "# Title\nSample paragraph for testing.",
-        "selection": {"start": 2, "end": 12},
+        "text_range": {"start": 2, "end": 12},
         "language": "Markdown",
         "document_version": "abc123",
     }
     content = prompts.format_user_prompt("Summarize the intro", snapshot)
     assert "docs/example.md" in content
     assert "Markdown" in content
-    assert "Selection range: 2-12" in content
+    assert "Snapshot window: 2-12" in content
     assert "abc123" in content
-    assert "excerpt" in content.lower()
 
 
 def test_token_budget_hint_changes_when_model_registered():

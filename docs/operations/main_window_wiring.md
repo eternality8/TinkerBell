@@ -31,7 +31,7 @@ This document captures how `MainWindow` composes widgets, routes signals, and de
 | --- | --- | --- |
 | `TabbedEditorWidget` | `add_snapshot_listener(document_monitor.handle_editor_snapshot)` | Persist editor snapshots for AI context + autosave cache. |
 | `TabbedEditorWidget` | `add_text_listener(document_monitor.handle_editor_text_changed)` | Track dirty state, schedule suggestion refresh, update outline digests. |
-| `TabbedEditorWidget` | `add_selection_listener(document_monitor.handle_editor_selection_changed)` | Keep status bar selection info, drive targeted AI prompts. |
+| `TabbedEditorWidget` | *(selection listener removed)* | Selection data stays private to the editor; controllers request spans through SelectionRangeTool or cached snapshots instead of live listeners. |
 | `TabbedEditorWidget` | `add_tab_created_listener(_bridge.track_tab)` | Let `WorkspaceBridgeRouter` observe new tabs for diff application. |
 | `Workspace` | `add_active_listener(document_monitor.handle_active_tab_changed)` | Update window title, autosave indicator, outline caches when focus changes. |
 | `Workspace` | `add_active_listener(_handle_active_tab_for_review)` | Keep AI review state in sync with the focused document. |

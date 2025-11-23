@@ -40,8 +40,8 @@ class AnalysisInput:
     document_id: str
     document_version: str | None
     document_path: str | None = None
-    selection_start: int = 0
-    selection_end: int = 0
+    span_start: int = 0
+    span_end: int = 0
     document_chars: int | None = None
     chunk_profile_hint: str | None = None
     chunk_index_ready: bool = False
@@ -55,19 +55,19 @@ class AnalysisInput:
     concordance_status: str | None = None
     concordance_age_seconds: float | None = None
     retrieval_enabled: bool = True
-    selection_fingerprint: str | None = None
     extra_metadata: Mapping[str, object] | None = None
     chunk_flow_warnings: Sequence[str] | None = None
     plot_loop_flags: Sequence[str] | None = None
 
-    def selection_length(self) -> int:
-        return max(0, self.selection_end - self.selection_start)
+    def span_length(self) -> int:
+        return max(0, self.span_end - self.span_start)
 
     def cache_key(self) -> tuple[object, ...]:
         return (
             self.document_id,
             self.document_version,
-            self.selection_fingerprint,
+            self.span_start,
+            self.span_end,
             self.outline_digest,
             self.plot_override_version,
             self.chunk_manifest_cache_key,

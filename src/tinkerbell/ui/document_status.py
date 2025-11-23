@@ -49,16 +49,12 @@ def _format_chunk_line(chunks: Mapping[str, Any] | None) -> str:
         chunks_payload = manifest.get("chunks")
         if isinstance(chunks_payload, Sequence):
             chunk_count = len(chunks_payload)
-    selection = window.get("selection") if isinstance(window, Mapping) else None
-    if isinstance(selection, Mapping):
-        selection_range = (selection.get("start"), selection.get("end"))
-    else:
-        selection_range = None
-    if selection_range and all(isinstance(value, int) for value in selection_range):
-        return (
-            f"Chunks: {chunk_count} ({profile}) covering selection "
-            f"{selection_range[0]}–{selection_range[1]}"
-        )
+    start = end = None
+    if isinstance(window, Mapping):
+        start = window.get("start")
+        end = window.get("end")
+    if isinstance(start, int) and isinstance(end, int) and end > start:
+        return f"Chunks: {chunk_count} ({profile}) window {start}–{end}"
     return f"Chunks: {chunk_count} ({profile})"
 
 

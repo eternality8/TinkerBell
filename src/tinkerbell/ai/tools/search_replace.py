@@ -6,7 +6,7 @@ import difflib
 import hashlib
 import re
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Literal, Mapping, Protocol
+from typing import Any, ClassVar, Literal, Mapping, Protocol, Sequence
 
 from .diff_builder import DiffBuilderTool
 from ...documents.ranges import TextRange
@@ -34,7 +34,7 @@ class SearchReplaceResult:
     preview: str
     applied: bool
     dry_run: bool
-    scope: Literal["document", "selection"]
+    scope: Literal["document", "target_range"]
     target_range: tuple[int, int]
     document_version: str | None = None
     max_replacements: int | None = None
@@ -62,7 +62,7 @@ class SearchReplaceTool:
         replacement: str,
         *,
         is_regex: bool = False,
-        scope: Literal["document", "selection"] = "document",
+        target_range: Mapping[str, Any] | Sequence[int] | tuple[int, int] | None = None,
         dry_run: bool = False,
         max_replacements: int | None = None,
         match_case: bool = True,
@@ -72,18 +72,10 @@ class SearchReplaceTool:
         if not pattern:
             raise ValueError("pattern must not be empty")
 
-        normalized_scope = scope.lower()
-        if normalized_scope not in {"document", "selection"}:
-            raise ValueError("scope must be either 'document' or 'selection'")
-
         snapshot = self.bridge.generate_snapshot(delta_only=False)
         text = str(snapshot.get("text") or "")
-        selection = snapshot.get("selection") or (0, 0)
-        selection_range = self._clamp_range(selection, len(text))
-
-        use_selection = normalized_scope == "selection" and selection_range[0] != selection_range[1]
-        segment_start, segment_end = selection_range if use_selection else (0, len(text))
-        active_scope = "selection" if use_selection else "document"
+        segment_start, segment_end = self._resolve_target_range(target_range, len(text))
+        active_scope = "document" if target_range is None else "target_range"
         segment_text = text[segment_start:segment_end]
         range_hint = TextRange(segment_start, segment_end)
 
@@ -97,10 +89,13 @@ class SearchReplaceTool:
         )
 
         updated_document = text if replacements == 0 else text[:segment_start] + updated_segment + text[segment_end:]
-        focus_index = self._compute_focus_index(first_match, segment_start if active_scope == "document" else 0)
+        focus_index = self._compute_focus_index(first_match, segment_start)
 
         preview_source = updated_document if active_scope == "document" else updated_segment
-        preview = self._build_preview(preview_source, focus_index)
+        preview_focus = focus_index
+        if preview_focus is not None and target_range is not None:
+            preview_focus -= segment_start
+        preview = self._build_preview(preview_source, preview_focus)
 
         diff_preview = None
         if replacements:
@@ -271,18 +266,32 @@ class SearchReplaceTool:
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _clamp_range(selection: tuple[int, int] | list[int], length: int) -> tuple[int, int]:
+    def _resolve_target_range(
+        target_range: Mapping[str, Any] | Sequence[int] | tuple[int, int] | None,
+        length: int,
+    ) -> tuple[int, int]:
+        if target_range is None:
+            return (0, length)
+        if isinstance(target_range, Mapping):
+            start = target_range.get("start")
+            end = target_range.get("end")
+        elif hasattr(target_range, "start") and hasattr(target_range, "end"):
+            start = getattr(target_range, "start")
+            end = getattr(target_range, "end")
+        elif isinstance(target_range, Sequence) and len(target_range) == 2 and not isinstance(target_range, (str, bytes)):
+            start, end = target_range
+        else:
+            raise ValueError("target_range must be a mapping or [start, end] sequence")
         try:
-            start = int(selection[0])
-            end = int(selection[1])
-        except (TypeError, ValueError, IndexError):
-            return (0, 0)
-
-        start = max(0, min(start, length))
-        end = max(0, min(end, length))
-        if end < start:
-            start, end = end, start
-        return (start, end)
+            start_i = int(start)
+            end_i = int(end)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("target_range must provide numeric start/end offsets") from exc
+        start_i = max(0, min(start_i, length))
+        end_i = max(0, min(end_i, length))
+        if end_i < start_i:
+            start_i, end_i = end_i, start_i
+        return start_i, end_i
 
     @staticmethod
     def _compute_focus_index(match: re.Match[str] | None, offset: int) -> int | None:

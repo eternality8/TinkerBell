@@ -34,6 +34,17 @@ def _clear_chunk_flow_listeners() -> None:
         telemetry_service._EVENT_LISTENERS.pop(name, None)  # type: ignore[attr-defined]
 
 
+def _clear_subagent_listeners() -> None:
+    for name in (
+        "subagent.job_started",
+        "subagent.job_completed",
+        "subagent.job_failed",
+        "subagent.job_skipped",
+        "subagent.jobs_queued",
+    ):
+        telemetry_service._EVENT_LISTENERS.pop(name, None)  # type: ignore[attr-defined]
+
+
 def test_chunk_flow_events_update_indicators() -> None:
     _clear_chunk_flow_listeners()
     status_bar = StatusBar()
@@ -69,3 +80,51 @@ def test_chunk_flow_events_update_indicators() -> None:
     controller.reset_chunk_flow_state()
     assert status_bar.chunk_flow_state == ("", "")
     assert chat_probe.state == ("", "")
+
+
+def test_subagent_queue_events_drive_indicator() -> None:
+    _clear_subagent_listeners()
+    status_bar = StatusBar()
+    controller = TelemetryController(
+        status_bar=status_bar,
+        context=WindowContext(unsaved_cache=UnsavedCache()),
+        initial_subagent_enabled=True,
+    )
+
+    controller.register_subagent_listeners()
+
+    try:
+        telemetry_service.emit(
+            "subagent.jobs_queued",
+            {
+                "job_ids": ["job-1", "job-2"],
+                "chunk_ids": ["chunk-a", "chunk-b", "chunk-c", "chunk-d"],
+                "reasons": ["dirty_chunks", "long_selection"],
+            },
+        )
+
+        status, detail = status_bar.subagent_state
+        assert status == "Queued (2)"
+        assert "2 queued jobs" in detail
+        assert "chunks chunk-a, chunk-b, chunk-c, +1 more" in detail
+        assert "reasons: dirty_chunks, long_selection" in detail
+
+        telemetry_service.emit("subagent.job_started", {"job_id": "job-1"})
+        status, detail = status_bar.subagent_state
+        assert status == "Running (1)"
+        assert "1 active job" in detail
+        assert "1 queued job" in detail
+
+        telemetry_service.emit("subagent.job_completed", {"job_id": "job-1", "tokens_used": 120})
+        status, detail = status_bar.subagent_state
+        assert status == "Queued (1)"
+        assert "1 queued job" in detail
+
+        telemetry_service.emit("subagent.job_started", {"job_id": "job-2"})
+        telemetry_service.emit("subagent.job_skipped", {"job_id": "job-2", "reason": "cache_hit"})
+
+        status, detail = status_bar.subagent_state
+        assert status == "Idle"
+        assert "queued" not in detail
+    finally:
+        _clear_subagent_listeners()

@@ -66,14 +66,14 @@ def test_guardrail_indicator_tracks_state():
 
 def test_chat_panel_appends_user_and_ai_messages():
     panel = _make_panel()
-    panel.append_user_message("Hello", selection_summary="lines 1-2")
+    panel.append_user_message("Hello", metadata={"cursor": "line 1"})
     assistant = ChatMessage(role="assistant", content="Hi there")
     panel.append_ai_message(assistant)
 
     history = panel.history()
     assert len(history) == 2
     assert history[0].role == "user"
-    assert history[0].metadata["selection_summary"] == "lines 1-2"
+    assert history[0].metadata == {"cursor": "line 1"}
     assert history[1].content == "Hi there"
 
 
@@ -116,12 +116,15 @@ def test_chat_panel_notifies_request_listeners_and_clears_composer():
         captured.append((prompt, metadata))
 
     panel.add_request_listener(listener)
-    panel.set_composer_text("Summarize selection", context=ComposerContext("intro"))
+    panel.set_composer_text(
+        "Summarize selection",
+        context=ComposerContext(extras={"cursor": "intro"}),
+    )
     sent = panel.send_prompt()
 
     assert sent == "Summarize selection"
     assert panel.composer_text == ""
-    assert captured == [("Summarize selection", {"selection_summary": "intro"})]
+    assert captured == [("Summarize selection", {"cursor": "intro"})]
 
 
 def test_chat_panel_show_tool_trace_attaches_to_latest_message():
@@ -405,10 +408,12 @@ def test_chat_panel_shift_enter_inserts_newline():
     assert panel.composer_text == "First line"
 
 
-def test_chat_panel_set_selection_summary_updates_metadata():
+def test_chat_panel_send_prompt_includes_composer_metadata():
     panel = _make_panel()
-    panel.set_selection_summary("Intro", extras={"cursor": "top"})
-    panel.set_composer_text("Summarize this")
+    panel.set_composer_text(
+        "Summarize this",
+        context=ComposerContext(extras={"cursor": "top"}),
+    )
     captured: list[dict[str, Any]] = []
 
     def _collect(prompt: str, metadata: dict[str, Any]) -> None:
@@ -418,8 +423,7 @@ def test_chat_panel_set_selection_summary_updates_metadata():
     panel.add_request_listener(_collect)
     panel.send_prompt()
 
-    assert captured[0]["selection_summary"] == "Intro"
-    assert captured[0]["cursor"] == "top"
+    assert captured[0] == {"cursor": "top"}
 
 
 def test_chat_panel_send_prompt_rejects_empty_text():
@@ -435,7 +439,7 @@ def test_chat_panel_capture_and_restore_state_round_trip():
     panel.show_tool_trace(ToolTrace(name="snapshot", input_summary="all", output_summary="ok"))
     panel.set_suggestions(["Rewrite intro", "Summarize section"])
     panel._toggle_suggestion_panel()
-    composer_context = ComposerContext("Intro", extras={"cursor": "top"})
+    composer_context = ComposerContext(extras={"cursor": "top"})
     panel.set_composer_text("Draft reply", context=composer_context)
     panel.set_ai_running(True)
 
@@ -458,7 +462,6 @@ def test_chat_panel_capture_and_restore_state_round_trip():
     assert panel.suggestions() == ("Rewrite intro", "Summarize section")
     assert panel._suggestion_panel_open is True
     assert panel.composer_text == "Draft reply"
-    assert panel._composer_context.selection_summary == "Intro"
     assert panel._composer_context.extras == {"cursor": "top"}
     assert panel._ai_running is True
     assert panel._pending_turn_snapshot is None
@@ -466,7 +469,7 @@ def test_chat_panel_capture_and_restore_state_round_trip():
 
 def test_chat_panel_consume_turn_snapshot_returns_once():
     panel = _make_panel()
-    panel.set_composer_text("Capture me", context=ComposerContext("Summary"))
+    panel.set_composer_text("Capture me", context=ComposerContext(extras={"cursor": "top"}))
     panel.send_prompt()
 
     snapshot = panel.consume_turn_snapshot()
@@ -494,7 +497,7 @@ def test_chat_panel_start_new_chat_resets_state():
     panel = _make_panel()
     panel.append_user_message("Hi")
     panel.append_ai_message(ChatMessage(role="assistant", content="Hello again"))
-    panel.set_composer_text("Draft reply", context=ComposerContext("intro"))
+    panel.set_composer_text("Draft reply", context=ComposerContext(extras={"cursor": "intro"}))
     panel.start_new_chat()
 
     assert panel.history() == []

@@ -25,6 +25,7 @@ from ..chat.commands import (
 )
 from ..chat.message_model import ChatMessage, EditDirective, ToolTrace
 from ..editor.document_model import DocumentMetadata, DocumentState, SelectionRange
+from ..editor.selection_gateway import SelectionGateway
 from ..editor.workspace import DocumentTab
 from ..documents.ranges import TextRange
 from ..editor.tabbed_editor import TabbedEditorWidget
@@ -121,6 +122,7 @@ class MainWindow(QMainWindow):
         self._editor.set_tab_close_handler(self._handle_tab_close_request)
         self._workspace = self._editor.workspace
         self._chat_panel = ChatPanel(show_tool_activity_panel=show_tool_panel)
+        self._selection_gateway = SelectionGateway(workspace=self._workspace)
         self._bridge = WorkspaceBridgeRouter(self._workspace)
         self._editor.add_tab_created_listener(self._bridge.track_tab)
         self._safe_ai_config: tuple[bool, int, float] = (False, 2, 0.05)
@@ -162,6 +164,7 @@ class MainWindow(QMainWindow):
         self._workspace.add_active_listener(self._document_monitor.handle_active_tab_changed)
         self._workspace.add_active_listener(self._handle_active_tab_for_review)
         self._workspace.add_active_listener(self._handle_active_tab_for_document_status)
+        self._workspace.add_active_listener(self._handle_active_tab_for_cursor)
         initial_subagent_enabled = bool(getattr(initial_settings, "enable_subagents", False))
         self._telemetry_controller = TelemetryController(
             status_bar=self._status_bar,
@@ -249,6 +252,7 @@ class MainWindow(QMainWindow):
         self._tool_provider = ToolProvider(
             controller_resolver=lambda: self._context.ai_controller,
             bridge=self._bridge,
+            selection_gateway=self._selection_gateway,
             document_lookup=self._workspace.find_document_by_id,
             active_document_provider=self._safe_active_document,
             outline_worker_resolver=lambda: self._outline_runtime.worker() if self._outline_runtime else None,
@@ -292,6 +296,7 @@ class MainWindow(QMainWindow):
         self._telemetry_controller.update_subagent_indicator()
         self._telemetry_controller.reset_chunk_flow_state()
         self._register_document_status_listeners()
+        self._handle_active_tab_for_cursor(self._workspace.active_tab)
         if initial_settings is not None:
             self._settings_runtime.apply_theme_setting(initial_settings)
         self._embedding_controller.refresh_runtime(initial_settings)
@@ -448,7 +453,7 @@ class MainWindow(QMainWindow):
         if monitor is not None:
             self._editor.add_snapshot_listener(monitor.handle_editor_snapshot)
             self._editor.add_text_listener(monitor.handle_editor_text_changed)
-            self._editor.add_selection_listener(monitor.handle_editor_selection_changed)
+            self._editor.add_selection_listener(self._handle_editor_selection_changed)
         else:  # pragma: no cover - monitor is always set in production
             def _noop(*args: Any, **kwargs: Any) -> None:  # noqa: ANN002, ANN003 - fallback stub
                 return None
@@ -464,7 +469,18 @@ class MainWindow(QMainWindow):
         self._bridge.add_edit_listener(self._handle_edit_applied)
         self._bridge.add_failure_listener(self._handle_edit_failure)
         if monitor is not None:
-            monitor.handle_editor_selection_changed(self._editor.to_document().selection)
+            monitor.refresh_chat_suggestions()
+
+    def _handle_editor_selection_changed(
+        self,
+        tab_id: str,
+        _selection: SelectionRange,
+        line: int,
+        column: int,
+    ) -> None:
+        if tab_id != self._workspace.active_tab_id:
+            return
+        self._status_bar.update_cursor(line, column)
 
     def _outline_memory(self) -> DocumentSummaryMemory | None:
         runtime = self._outline_runtime
@@ -778,13 +794,6 @@ class MainWindow(QMainWindow):
                 return
             resolved_id = document.document_id
 
-        selection_start = args.get("selection_start")
-        selection_end = args.get("selection_end")
-        if (selection_start is None) ^ (selection_end is None):
-            self._post_assistant_notice("Selection overrides require both --start and --end.")
-            self.update_status("Analysis aborted")
-            return
-
         target_tab_id: str | None = None
         target_document: DocumentState | None = None
         for tab in self._workspace.iter_tabs():
@@ -812,20 +821,13 @@ class MainWindow(QMainWindow):
             self.update_status("Analysis failed")
             return
 
-        if selection_start is not None and selection_end is not None:
-            snapshot = dict(snapshot)
-            snapshot["selection"] = {"start": selection_start, "end": selection_end}
-
         force_refresh = bool(args.get("force_refresh"))
         analyze_reason = (args.get("reason") or "").strip() or None
         telemetry_payload = {
             "document_id": resolved_id,
-            "selection_start": selection_start,
-            "selection_end": selection_end,
             "force_refresh": force_refresh,
             "reason": analyze_reason,
             "source": "manual_command",
-            "has_selection_override": selection_start is not None and selection_end is not None,
         }
         telemetry_service.emit("analysis.ui_override.requested", dict(telemetry_payload))
 
@@ -833,8 +835,6 @@ class MainWindow(QMainWindow):
             advice = controller.request_analysis_advice(
                 document_id=resolved_id,
                 snapshot=snapshot,
-                selection_start=selection_start,
-                selection_end=selection_end,
                 force_refresh=force_refresh,
                 reason=analyze_reason,
             )
@@ -1128,6 +1128,23 @@ class MainWindow(QMainWindow):
             except Exception:  # pragma: no cover - defensive guard
                 document_id = None
         self._refresh_document_status_badge(document_id=document_id)
+
+    def _handle_active_tab_for_cursor(self, tab: DocumentTab | None) -> None:
+        if tab is None:
+            self._status_bar.update_cursor(1, 1)
+            return
+        try:
+            selection = tab.editor.selection_span()
+        except Exception:
+            selection = (0, 0)
+        caret = selection[1]
+        try:
+            document = tab.document()
+            text = document.text or ""
+        except Exception:
+            text = ""
+        line, column = self._line_column_from_offset(text, caret)
+        self._status_bar.update_cursor(line, column)
 
     def _handle_document_status_signal(self, payload: Mapping[str, Any] | None) -> None:
         document_id: str | None = None
@@ -1875,6 +1892,19 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _condense_whitespace(text: str) -> str:
         return " ".join(text.split())
+
+    @staticmethod
+    def _line_column_from_offset(text: str, caret: int) -> tuple[int, int]:
+        if not text:
+            return (1, 1)
+        length = len(text)
+        caret = max(0, min(int(caret), length))
+        line = text.count("\n", 0, caret) + 1
+        last_newline = text.rfind("\n", 0, caret)
+        column = caret + 1 if last_newline == -1 else caret - last_newline
+        if column <= 0:
+            column = 1
+        return (line, column)
 
     def _handle_snapshot_requested(self) -> None:
         """Force a snapshot refresh and log the event."""

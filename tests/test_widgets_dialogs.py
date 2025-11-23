@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -201,6 +202,133 @@ def test_settings_dialog_custom_mode_updates_metadata(qtbot, dialog_settings: Se
     assert api_metadata.get("default_headers", {}).get("X-Test") == "1"
 
 
+def test_settings_dialog_custom_mode_preserves_stored_key(qtbot, dialog_settings: Settings) -> None:
+    stored_settings = replace(
+        dialog_settings,
+        metadata={
+            "embedding_mode": "custom-api",
+            "embedding_api": {
+                "base_url": "https://embeddings.example/v1",
+                "api_key": "stored-secret",
+                "api_key_hint": "st****et",
+            },
+        },
+    )
+
+    dialog = SettingsDialog(settings=stored_settings, show_toasts=False)
+    qtbot.addWidget(dialog)
+
+    mode_combo = dialog.findChild(QComboBox, "embedding_mode_combo")
+    custom_index = mode_combo.findData("custom-api")
+    assert custom_index >= 0
+    mode_combo.setCurrentIndex(custom_index)
+
+    base_input = dialog.findChild(QLineEdit, "embedding_custom_base_url_input")
+    key_input = dialog.findChild(QLineEdit, "embedding_custom_api_key_input")
+    assert base_input is not None
+    assert key_input is not None
+
+    base_input.setText("https://embeddings.example/v2")
+    key_input.clear()
+    assert key_input.text().strip() == ""
+
+    updated = dialog.gather_settings()
+
+    api_metadata = updated.metadata.get("embedding_api", {})
+    assert api_metadata.get("api_key") == "stored-secret"
+    assert api_metadata.get("api_key_hint") == "st****et"
+    assert api_metadata.get("base_url") == "https://embeddings.example/v2"
+
+
+def test_settings_dialog_custom_mode_embedding_test_reuses_stored_key(
+    qtbot, dialog_settings: Settings
+) -> None:
+    stored_settings = replace(
+        dialog_settings,
+        metadata={
+            "embedding_mode": "custom-api",
+            "embedding_api": {
+                "base_url": "https://embeddings.example/v1",
+                "api_key": "stored-secret",
+            },
+        },
+    )
+
+    captured: dict[str, Settings] = {}
+
+    def embedding_tester(settings: Settings) -> ValidationResult:
+        captured["settings"] = settings
+        return ValidationResult(ok=True, message="Embeddings reachable")
+
+    dialog = SettingsDialog(settings=stored_settings, embedding_tester=embedding_tester, show_toasts=False)
+    qtbot.addWidget(dialog)
+
+    key_input = dialog.findChild(QLineEdit, "embedding_custom_api_key_input")
+    assert key_input is not None
+    key_input.clear()
+
+    test_button = dialog.findChild(QPushButton, "embedding_test_button")
+    assert test_button is not None
+
+    qtbot.mouseClick(test_button, Qt.MouseButton.LeftButton)
+
+    api_metadata = captured["settings"].metadata.get("embedding_api", {})
+    assert api_metadata.get("api_key") == "stored-secret"
+
+
+def test_settings_dialog_custom_mode_auto_prefixes_scheme(qtbot, dialog_settings: Settings) -> None:
+    dialog = SettingsDialog(
+        settings=dialog_settings,
+        embedding_tester=lambda s: ValidationResult(True, "ok"),
+        show_toasts=False,
+    )
+    qtbot.addWidget(dialog)
+
+    mode_combo = dialog.findChild(QComboBox, "embedding_mode_combo")
+    key_input = dialog.findChild(QLineEdit, "embedding_custom_api_key_input")
+    base_input = dialog.findChild(QLineEdit, "embedding_custom_base_url_input")
+    assert mode_combo is not None
+    assert key_input is not None
+    assert base_input is not None
+
+    custom_index = mode_combo.findData("custom-api")
+    assert custom_index >= 0
+    mode_combo.setCurrentIndex(custom_index)
+
+    key_input.setText("secret")
+    base_input.setText("neko:8666/v1")
+    QApplication.processEvents()
+
+    assert base_input.text() == "https://neko:8666/v1"
+    test_button = dialog.findChild(QPushButton, "embedding_test_button")
+    assert test_button is not None
+    assert test_button.isEnabled() is True
+
+
+def test_settings_dialog_custom_mode_accepts_http_endpoints(qtbot, dialog_settings: Settings) -> None:
+    dialog = SettingsDialog(settings=dialog_settings, show_toasts=False)
+    qtbot.addWidget(dialog)
+
+    mode_combo = dialog.findChild(QComboBox, "embedding_mode_combo")
+    key_input = dialog.findChild(QLineEdit, "embedding_custom_api_key_input")
+    base_input = dialog.findChild(QLineEdit, "embedding_custom_base_url_input")
+    assert mode_combo is not None
+    assert key_input is not None
+    assert base_input is not None
+
+    custom_index = mode_combo.findData("custom-api")
+    assert custom_index >= 0
+    mode_combo.setCurrentIndex(custom_index)
+
+    key_input.setText("secret")
+    base_input.setText("http://localhost:8666/v1")
+    QApplication.processEvents()
+
+    updated = dialog.gather_settings()
+    api_metadata = updated.metadata.get("embedding_api", {})
+    assert api_metadata.get("base_url") == "http://localhost:8666/v1"
+
+
 def test_settings_dialog_local_mode_requires_model_path(qtbot, dialog_settings: Settings) -> None:
     dialog = SettingsDialog(settings=dialog_settings, show_toasts=False)
     qtbot.addWidget(dialog)
@@ -300,23 +428,23 @@ def test_document_load_dialog_preview_updates(qtbot, tmp_path: Path) -> None:
     assert "Tokens" in token_label.text()
 
 
-def test_document_export_dialog_preview_modes(qtbot) -> None:
+def test_document_export_dialog_displays_document_preview(qtbot) -> None:
     dialog = DocumentExportDialog(
         parent=None,
         document_text="alpha beta gamma",
-        selection_text="alpha beta",
         token_budget=1000,
     )
     qtbot.addWidget(dialog)
 
     stats_label = dialog.findChild(QLabel, "preview_stats_label")
     assert stats_label is not None
-    assert "Selection" in stats_label.text()
+    assert "Document preview" in stats_label.text()
 
-    mode_combo = dialog.findChild(QComboBox, "preview_mode_combo")
-    assert mode_combo is not None
-    mode_combo.setCurrentIndex(1)
-    assert "Document" in stats_label.text()
+    preview_widget = dialog.findChild(QPlainTextEdit, "save_preview")
+    assert preview_widget is not None
+    assert "alpha beta" in preview_widget.toPlainText()
+
+    assert dialog.findChild(QComboBox, "preview_mode_combo") is None
 
 
 def test_discover_sample_documents_returns_entries() -> None:

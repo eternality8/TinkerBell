@@ -51,6 +51,13 @@ def _build_job(job_id: str, chunk_hash: str) -> SubagentJob:
     return job
 
 
+def test_subagent_job_exposes_chunk_metadata() -> None:
+    job = _build_job("job-meta", "chunk-meta")
+    assert job.document_id == "doc-1"
+    assert job.chunk_id == "selection:job-meta"
+    assert job.chunk_hash == "chunk-meta"
+
+
 @pytest.mark.asyncio
 async def test_subagent_manager_runs_jobs_sequentially(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = SubagentManager(

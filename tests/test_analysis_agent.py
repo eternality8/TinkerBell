@@ -10,8 +10,8 @@ def _make_input(**overrides: object) -> AnalysisInput:
     base = dict(
         document_id="doc-123",
         document_version="v1",
-        selection_start=0,
-        selection_end=0,
+        span_start=0,
+        span_end=0,
         document_chars=70_000,
         outline_age_seconds=1200.0,
         plot_state_status="stale",
@@ -39,7 +39,7 @@ def test_outline_staleness_sets_flag_and_warning() -> None:
 
 def test_cache_hit_short_circuits_analysis() -> None:
     agent = AnalysisAgent()
-    analysis_input = _make_input(document_chars=10_000, selection_end=500)
+    analysis_input = _make_input(document_chars=10_000, span_end=500)
     first = agent.analyze(analysis_input)
     second = agent.analyze(analysis_input)
     assert first.cache_state == "miss"
@@ -63,5 +63,5 @@ def test_plot_state_rule_recommends_update_tool() -> None:
 
 def test_small_document_skips_retrieval_rule() -> None:
     agent = AnalysisAgent()
-    advice = agent.analyze(_make_input(document_chars=1_000, selection_end=1000))
+    advice = agent.analyze(_make_input(document_chars=1_000, span_end=1000))
     assert "document_snapshot" not in advice.required_tools

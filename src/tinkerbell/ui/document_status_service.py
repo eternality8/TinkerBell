@@ -132,7 +132,7 @@ class DocumentStatusService:
                 tab_id=tab.id,
                 include_open_documents=False,
                 include_text=False,
-                window="selection",
+                window="document",
             )
         except Exception:  # pragma: no cover - defensive guard
             LOGGER.debug("Document status snapshot generation failed", exc_info=True)
@@ -144,9 +144,7 @@ class DocumentStatusService:
         tab: DocumentTab | None,
         label: str,
     ) -> dict[str, Any]:
-        selection = document.selection.as_tuple()
         path = document.metadata.path
-        selection_payload = {"start": selection[0], "end": selection[1]}
         version = document.version_info()
         info = {
             "document_id": document.document_id,
@@ -154,7 +152,6 @@ class DocumentStatusService:
             "language": document.metadata.language,
             "dirty": document.dirty,
             "length": len(document.text),
-            "selection": selection_payload,
             "version_id": version.version_id,
             "content_hash": version.content_hash,
         }
@@ -171,10 +168,8 @@ class DocumentStatusService:
             return payload
         manifest = snapshot.get("chunk_manifest") if isinstance(snapshot.get("chunk_manifest"), Mapping) else None
         window_payload = snapshot.get("window") if isinstance(snapshot.get("window"), Mapping) else None
-        selection_payload = snapshot.get("selection") if isinstance(snapshot.get("selection"), Mapping) else None
         payload["chunk_manifest"] = manifest
         payload["window"] = window_payload
-        payload["selection"] = selection_payload
         if manifest and manifest.get("chunk_profile"):
             payload["chunk_profile"] = manifest.get("chunk_profile")
         elif snapshot.get("chunk_profile"):

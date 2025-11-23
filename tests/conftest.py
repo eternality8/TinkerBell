@@ -25,4 +25,8 @@ pytest = _load_pytest()
 
 @pytest.fixture
 def sample_snapshot() -> dict:
-    return {"text": "hello", "selection": (0, 5)}
+    return {
+        "text": "hello",
+        "text_range": {"start": 0, "end": 5},
+        "window": {"start": 0, "end": 5},
+    }

@@ -57,7 +57,6 @@ _SAMPLE_TRANSCRIPTS = [
             {
                 "role": "user",
                 "content": "Summarize the welcome document and highlight the agent workflow.",
-                "metadata": {"selection_summary": "Welcome doc"},
             },
             {
                 "role": "assistant",

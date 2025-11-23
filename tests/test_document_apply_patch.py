@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any, Mapping
 
 import pytest
@@ -19,13 +18,14 @@ class _StreamingBridgeStub:
         self._text = text
         self.snapshot = {
             "text": text,
-            "selection": (0, 0),
             "version": version,
             "version_id": 1,
             "document_id": "doc-stream",
             "path": "doc.md",
             "content_hash": "hash-1",
             "length": len(text),
+            "window": {"start": 0, "end": len(text)},
+            "text_range": {"start": 0, "end": len(text)},
             "line_offsets": self._build_line_offsets(text),
         }
         self.calls: list[dict[str, Any]] = []
@@ -115,9 +115,8 @@ def streaming_tool() -> tuple[DocumentApplyPatchTool, _StreamingBridgeStub]:
     return patch_tool, bridge
 
 
-def _patch_tool(text: str, *, selection: tuple[int, int] = (0, 0)) -> tuple[DocumentApplyPatchTool, _StreamingBridgeStub]:
+def _patch_tool(text: str) -> tuple[DocumentApplyPatchTool, _StreamingBridgeStub]:
     bridge = _StreamingBridgeStub(text=text)
-    bridge.snapshot["selection"] = selection
     edit_tool = DocumentEditTool(bridge=bridge)
     return DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool), bridge
 
@@ -148,6 +147,11 @@ def test_document_apply_patch_streams_ranges_and_attaches_metadata(streaming_too
     assert ranges[0]["replacement"] == "Omega"
     assert ranges[0]["match_text"].lower() == "alpha"
     assert "streamed_diff" in payload.get("metadata", {})
+    assert payload["metadata"]["scope_origin"] == "explicit_span"
+    scope = ranges[0].get("scope")
+    assert isinstance(scope, dict)
+    assert scope["origin"] == "explicit_span"
+    assert scope["range"] == {"start": 0, "end": 5}
 
 
 def test_document_apply_patch_streaming_copies_snapshot_version_and_hash(streaming_tool):
@@ -192,7 +196,7 @@ def test_document_apply_patch_streaming_normalizes_ranges_before_queueing():
 
 def test_document_apply_patch_accepts_target_span():
     text = "Alpha\nBeta\nGamma\n"
-    tool, bridge = _patch_tool(text, selection=(0, 0))
+    tool, bridge = _patch_tool(text)
 
     status = _run_with_meta(
         tool,
@@ -206,6 +210,32 @@ def test_document_apply_patch_accepts_target_span():
     assert range_payload["start"] == len("Alpha\n")
     assert range_payload["end"] == len("Alpha\nBeta\n")
     assert "Beta replacement" in payload["diff"]
+    assert payload["metadata"]["scope_origin"] == "explicit_span"
+    assert payload["metadata"]["scope_range"] == {
+        "start": len("Alpha\n"),
+        "end": len("Alpha\nBeta\n"),
+    }
+    assert range_payload["scope"]["origin"] == "explicit_span"
+
+
+def test_document_apply_patch_marks_document_scope_metadata():
+    text = "Alpha Beta"
+    tool, bridge = _patch_tool(text)
+
+    status = _run_with_meta(
+        tool,
+        content="Gamma Delta",
+        scope="document",
+    )
+
+    assert "queued" in status or "applied" in status
+    payload = bridge.calls[-1]
+    metadata = payload["metadata"]
+    assert metadata["scope_origin"] == "document"
+    assert metadata["scope_range"] == {"start": 0, "end": len(text)}
+    range_payload = payload["ranges"][0]
+    assert range_payload["scope"]["origin"] == "document"
+    assert range_payload["scope_length"] == len(text)
 
 
 def test_document_apply_patch_emits_legacy_adapter_event(monkeypatch: pytest.MonkeyPatch):
@@ -250,16 +280,16 @@ def test_document_apply_patch_allows_span_when_required():
 
 
 def test_document_apply_patch_requires_range_or_anchor_when_selection_unknown():
-    tool, bridge = _patch_tool("Hello world", selection=(0, 0))
+    tool, bridge = _patch_tool("Hello world")
 
-    with pytest.raises(ValueError, match="target_span .*target_range.*match_text"):
+    with pytest.raises(ValueError, match="target_span .*target_range"):
         _run_with_meta(tool, content="Hi there")
 
     assert bridge.calls == []
 
 
 def test_document_apply_patch_forces_replace_all_when_content_matches_document():
-    tool, bridge = _patch_tool("abcdefghij", selection=(0, 0))
+    tool, bridge = _patch_tool("abcdefghij")
 
     status = _run_with_meta(tool, content="jihgfedcba", operation="replace")
 
@@ -272,7 +302,7 @@ def test_document_apply_patch_forces_replace_all_when_content_matches_document()
 
 
 def test_document_apply_patch_realigns_stale_range_with_match_text():
-    tool, bridge = _patch_tool("Alpha BETA Gamma", selection=(0, 5))
+    tool, bridge = _patch_tool("Alpha BETA Gamma")
 
     status = _run_with_meta(tool, content="beta", target_range=(0, 5), match_text="BETA")
 
@@ -282,7 +312,7 @@ def test_document_apply_patch_realigns_stale_range_with_match_text():
 
 
 def test_document_apply_patch_widens_ranges_before_building_diff():
-    tool, bridge = _patch_tool("alpha beta", selection=(0, 0))
+    tool, bridge = _patch_tool("alpha beta")
 
     status = _run_with_meta(tool, content="BETA", target_range=(2, 5))
 
@@ -292,45 +322,15 @@ def test_document_apply_patch_widens_ranges_before_building_diff():
     assert "+alBETA" in diff
 
 
-def test_document_apply_patch_ignores_stale_selection_without_anchor():
-    tool, bridge = _patch_tool("Alpha beta", selection=(0, 5))
-    bridge.snapshot["selection_text"] = "stale"
-
-    status = _run_with_meta(tool, content="BETA", target_range=(0, 5))
-
-    assert "queued" in status
-
-
-def test_document_apply_patch_rejects_selection_fingerprint_mismatch():
-    tool, bridge = _patch_tool("Alpha beta", selection=(0, 5))
-    bridge.snapshot["selection_text"] = "Alpha"
-    bridge.snapshot["selection_hash"] = hashlib.sha1(b"Alpha").hexdigest()
-
-    with pytest.raises(ValueError, match="selection_fingerprint"):
-        _run_with_meta(tool, content="ALPHA", target_range=(0, 5), selection_fingerprint="mismatch")
-
-
-def test_document_apply_patch_rejects_stale_selection_when_fingerprint_used():
-    tool, bridge = _patch_tool("Alpha beta", selection=(0, 5))
-    bridge.snapshot["selection_text"] = "Alpha"
-    fingerprint = hashlib.sha1(b"Alpha").hexdigest()
-    bridge.snapshot["selection_hash"] = fingerprint
-    bridge.snapshot["text"] = "beta only"  # Snapshot selection_text no longer matches live content
-    bridge.snapshot["length"] = len("beta only")
-
-    with pytest.raises(ValueError, match="selection_text no longer matches"):
-        _run_with_meta(tool, content="BETA", selection_fingerprint=fingerprint)
-
-
 def test_document_apply_patch_rejects_ambiguous_match_text():
-    tool, _ = _patch_tool("beta one beta two", selection=(0, 4))
+    tool, _ = _patch_tool("beta one beta two")
 
     with pytest.raises(ValueError, match="matched multiple"):
         _run_with_meta(tool, content="BETA", target_range=(4, 7), match_text="beta")
 
 
 def test_document_apply_patch_rejects_large_insert_without_range():
-    tool, bridge = _patch_tool("Short text", selection=(0, 0))
+    tool, bridge = _patch_tool("Short text")
     long_text = "x" * 2000
 
     with pytest.raises(NeedsRangeError, match="needs_range"):
@@ -339,28 +339,8 @@ def test_document_apply_patch_rejects_large_insert_without_range():
     assert bridge.calls == []
 
 
-def test_document_apply_patch_needs_range_emits_event(monkeypatch: pytest.MonkeyPatch):
-    tool, _ = _patch_tool("Short text", selection=(0, 0))
-    long_text = "y" * 1500
-    captured: list[tuple[str, dict | None]] = []
-
-    def _emit(name: str, payload: dict | None = None) -> None:
-        captured.append((name, payload))
-
-    monkeypatch.setattr(document_apply_patch_module, "telemetry_emit", _emit)
-
-    with pytest.raises(NeedsRangeError):
-        _run_with_meta(tool, content=long_text, operation="replace", tab_id="tab-range")
-
-    event = next((payload for name, payload in captured if name == "needs_range"), None)
-    assert event is not None
-    assert event["tab_id"] == "tab-range"
-    assert event["selection_span"] == {"start": 0, "end": 0}
-    assert event["content_length"] == len(long_text)
-
-
 def test_document_apply_patch_rejects_hash_mismatch():
-    tool, bridge = _patch_tool("Alpha beta", selection=(0, 5))
+    tool, bridge = _patch_tool("Alpha beta")
 
     with pytest.raises(DocumentVersionMismatchError) as exc:
         _run_with_meta(
@@ -377,7 +357,7 @@ def test_document_apply_patch_rejects_hash_mismatch():
 def test_document_apply_patch_forces_replace_all_with_length_tolerance():
     text = "A" * 200
     replacement = "B" * 198  # Within ±5% of document length
-    tool, bridge = _patch_tool(text, selection=(0, 0))
+    tool, bridge = _patch_tool(text)
 
     status = _run_with_meta(tool, content=replacement)
 

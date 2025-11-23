@@ -119,7 +119,7 @@ class AnalysisAgent:
         payload: dict[str, object] = {
             "document_id": analysis_input.document_id,
             "document_version": analysis_input.document_version or "",
-            "selection_len": analysis_input.selection_length(),
+            "span_len": analysis_input.span_length(),
             "source": source,
         }
         if advice is not None:

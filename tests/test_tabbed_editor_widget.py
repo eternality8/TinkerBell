@@ -14,7 +14,7 @@ pytestmark = pytest.mark.usefixtures("qtbot")
 
 def _build_state(text: str, path: Path | None = None) -> DocumentState:
     metadata = DocumentMetadata(path=path)
-    return DocumentState(text=text, metadata=metadata, selection=SelectionRange(0, 0))
+    return DocumentState(text=text, metadata=metadata)
 
 
 def test_tabbed_editor_emits_snapshot_metadata(tmp_path: Path) -> None:
@@ -80,16 +80,13 @@ def test_tabbed_editor_close_handler_can_intercept(tmp_path: Path) -> None:
     assert widget.workspace.tab_count() == 1
 
 
-def test_selection_listeners_fire_on_tab_switch() -> None:
+def test_tabbed_editor_snapshot_excludes_selection_metadata() -> None:
     widget = TabbedEditorWidget()
-    second = widget.create_tab(document=_build_state("other"))
 
-    observed: list[SelectionRange] = []
-    widget.add_selection_listener(lambda selection: observed.append(selection))
+    snapshot = widget.request_snapshot()
 
-    widget.focus_tab(second.id)
-    assert observed
-    assert isinstance(observed[-1], SelectionRange)
+    assert "selection" not in snapshot
+    assert "selection_summary" not in snapshot
 
 
 def test_tabbed_editor_diff_overlay_is_routable() -> None:
@@ -105,3 +102,23 @@ def test_tabbed_editor_diff_overlay_is_routable() -> None:
     widget.clear_diff_overlay(tab_id=tab_id)
 
     assert tab.editor.diff_overlay is None
+
+
+def test_tabbed_editor_notifies_selection_listeners() -> None:
+    widget = TabbedEditorWidget()
+    tab_id = widget.active_tab_id()
+    assert tab_id is not None
+
+    editor = widget.active_editor()
+    editor.set_text("alpha\nbeta")
+
+    captured: list[tuple[str, tuple[int, int], int, int]] = []
+
+    def _listener(tab: str, selection: SelectionRange, line: int, column: int) -> None:
+        captured.append((tab, selection.as_tuple(), line, column))
+
+    widget.add_selection_listener(_listener)
+    editor._set_selection(SelectionRange(6, 6))
+
+    assert captured
+    assert captured[-1] == (tab_id, (6, 6), 2, 1)

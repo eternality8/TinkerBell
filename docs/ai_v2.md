@@ -44,36 +44,84 @@ Workstream 1 removes every caret/selection mutation hook from the AI editing st
 
 ### API changes
 
-- `document_apply_patch` and the inline `document_edit` auto-convert path now reject edits that omit `target_span` (or legacy `target_range`), `match_text`, `selection_fingerprint`, or `replace_all=true`. Snapshot `selection_text` no longer counts as an anchor unless a matching fingerprint is provided.
-- The new `selection_range` tool is the sole read-only surface for inspecting the user’s highlight. It returns `{start_line, end_line, content_hash}` tied to the current snapshot so partners can persist their own fingerprints.
+- `document_apply_patch` and the inline `document_edit` auto-convert path now reject edits that omit `target_span` (or legacy `target_range`), `match_text`, or `replace_all=true`. Snapshot `selection_text` alone no longer counts as an anchor; callers must provide spans or match text from the captured window.
+- Snapshot metadata (`text_range`) and chunk manifests now emit authoritative span hints (`snapshot_span`, chunk pointer ranges) for every window. The `selection_range` tool remains the fallback for inspecting the live caret when those hints are missing or the controller explicitly requests it; it still returns `{start_line, end_line, content_hash}` tied to the current snapshot so partners can persist their own fingerprints.
 - DocumentBridge + EditorWidget now preserve the user’s caret/selection after every AI edit or diff application. The bridge always calls into the adapter with `preserve_selection=True`, eliminating the last caret mutation API.
 - Caret-based schema fields (`insert_at_cursor`, `cursor_offset`, `selection_start`, `selection_end`) are rejected at normalization time. Deprecated callers trigger the `caret_call_blocked` telemetry event plus a validation error instructing them to refresh their snapshot.
 
 ### Migration checklist for partners
 
-1. **Capture an authoritative snapshot** – Call `document_snapshot` (or the controller-provided stub) to grab `document_version`, `content_hash`, and the surrounding text window.
-2. **Opt in to selection metadata when needed** – Call `selection_range` immediately after `document_snapshot` to capture `{start_line, end_line, content_hash}` for the user’s highlight. Pair it with the snapshot’s `selection_hash` when you need to round-trip fingerprints.
+1. **Capture an authoritative snapshot** – Call `document_snapshot` (or the controller-provided stub) to grab `document_version`, `content_hash`, the surrounding text window, and the associated `snapshot_span`/chunk manifest ranges.
+2. **Request live selection data only when spans are missing** – Use the spans baked into `text_range`, `snapshot_span`, or chunk manifests whenever they cover the requested window. Call `selection_range` only if the controller issues a fallback hint or the manifest lacks the required range; keep pairing its `{start_line, end_line, content_hash}` payload with the snapshot digest when you need to round-trip fingerprints.
 3. **Build edits with explicit spans** – Convert model output into a diff by supplying either
-  - `target_span` (`{start_line, end_line}`) copied from the `selection_range` tool results,
+  - `target_span` (`{start_line, end_line}`) copied from the snapshot/manifest span hints (preferred) or from the `selection_range` tool when hints are unavailable,
   - legacy `target_range` (`[start, end]` offsets) when spans are unavailable (the compatibility adapter still accepts them),
   - `match_text`/`expected_text` anchors extracted from the snapshot window, or
   - `replace_all=true` for full-document rewrites (requires hashing the entire snapshot).
-4. **Attach fingerprints or anchors** – Include `selection_fingerprint=selection_hash` whenever you plan to rely on the user’s original highlight. Otherwise, send `match_text` so the bridge can re-locate the slice deterministically.
+4. **Attach deterministic anchors** – Provide the `target_span` derived from snapshot/manifest hints (or, as a fallback, returned by `selection_range`) or include `match_text`/`expected_text` snippets from the snapshot window so the bridge can relocate the slice deterministically.
 5. **Handle guardrails** – When the runtime raises `caret_call_blocked` or `Edits must include target_span...`, refresh the snapshot/selection pair and rebuild the edit rather than retrying with caret metadata.
 
 ### Partner changelog
 
 - **Caret preservation** – `DocumentBridge` now applies patches with `preserve_selection=True`, so the UI never jumps to the AI edit location. Any downstream automation that previously looked for caret jumps must switch to telemetry (`patch.anchor`) or diff spans for auditing.
-- **Selection tool adoption** – `selection_range` is the only supported source of `{start_line, end_line, content_hash}` metadata. The payload should be stored alongside `document_snapshot` output so you can replay fingerprints later (see the checklist above).
-- **Telemetry signals** – Monitor `caret_call_blocked` vs. `selection_snapshot_requested` to confirm all partners have migrated. Dashboards should alert if blocked calls remain once the feature flag is forced on.
+- **Span hint adoption** – Snapshot metadata and chunk manifests now provide the preferred `{start_line, end_line}` ranges. Store those spans alongside `document_snapshot` output and fall back to `selection_range` only when spans are missing or the controller explicitly asks for it (see the checklist above for ordering).
+- **Telemetry signals** – Monitor `caret_call_blocked` vs. `span_snapshot_requested` to confirm all partners have migrated. Dashboards should alert if blocked calls remain once the feature flag is forced on.
+
+#### Selection gateway + ownership guardrails
+
+- **`SelectionGateway` facade** – Editor internals now expose a dedicated `editor.selection_gateway.SelectionGateway` that encapsulates the live caret/selection state plus line offsets. `SelectionRangeTool` depends on this facade, so AI callers never touch raw `SelectionRange` objects or document snapshots to determine spans.
+- **Gateway-only consumers** – Any module that needs live selection data must request a `SelectionSnapshotProvider` (the gateway or a stub) and operate on its immutable payloads. Direct imports of `SelectionRange` outside `src/tinkerbell/editor/*` and `ai/tools/selection_range.py` are forbidden; use tuples/TextRange inputs when constructing `DocumentState` instead.
+- **CI enforcement** – `tests/test_selection_guard.py` scans the tree and fails the suite if a new `SelectionRange` import sneaks into disallowed packages. Update or extend the gateway rather than bypassing it.
+- **Testing guidance** – Tests that require spans should stub `SelectionSnapshotProvider` (see `_SelectionGatewayStub` in `tests/test_ai_tools.py`) or call `SelectionRangeTool` itself. Do not fabricate selection tuples from cached snapshots; instead, pass span dictionaries (`{"start": x, "end": y}`) into bridge stubs via helpers such as `_selection_span()` / `_document_span()` so fixtures mirror the span data that `window`/`text_range`/`snapshot_span` now carry.
+
+##### Developer onboarding: requesting spans in tests
+
+1. Prefer the spans already present in `DocumentSnapshot` (`text_range`, `snapshot_span`) and chunk manifest entries when assembling fixtures. Reserve `SelectionRangeTool` (or `SelectionGateway` stubs) for tests that explicitly validate fallback behavior.
+2. When a test has to embed spans inside mock bridges, copy the snapshot/manifest values into helpers such as `_selection_span(start, end)` so `window`/`text_range` defaults (and `snapshot_span` for search/replace) stay faithful to real payloads.
+3. Avoid importing `SelectionRange` outside editor-focused tests; controller/AI suites should rely on span helpers, chunk manifests, or (when unavoidable) gateway snapshots so SelectionRangeTool remains the single read-only fallback rather than the default span provider.
 
 ### Telemetry & monitoring
 
 - `caret_call_blocked` surfaces every legacy caret attempt (name, tab, range metadata, reason) so dashboards can spot lagging clients.
-- `selection_snapshot_requested` fires when the new `selection_range` tool runs; compare it with `caret_call_blocked` to confirm migrations are complete.
+- `span_snapshot_requested` fires when the new `selection_range` tool runs; compare it with `caret_call_blocked` to confirm migrations are complete.
 - `patch.anchor` now reports `anchor_source = match_text | fingerprint | range_only`, making it obvious when clients omit fingerprints and forcing them through explicit anchors.
 
-Rollouts should watch the `caret_call_blocked` → `selection_snapshot_requested` ratio decline before flipping the feature flag to 100%.
+Rollouts should watch the `caret_call_blocked` → `span_snapshot_requested` ratio decline before flipping the feature flag to 100%.
+
+## Workstream 11 – Scope provenance & telemetry enforcement
+
+Workstream 11 closes the loop on “chunk or explicit range” guarantees. Every edit now carries forward the exact span/chunk data the agent captured so the bridge, controller, and telemetry can prove that edits were grounded in deterministic context.
+
+### Runtime requirements
+
+- **Scope metadata is mandatory** – `DocumentApplyPatch` and `DocumentEdit` requests must include a `scope` block for every streamed span: `{origin, range, length, chunk_id?, chunk_version?, snapshot_span?}`. `origin` is one of `chunk`, `explicit_span`, or `document`; `range` is the `{start_line, end_line}` window copied from the snapshot/chunk manifest; `length` is the total lines covered.
+- **Bridge validation** – `DocumentBridge` rejects edits that omit scope metadata or send ranges outside the claimed snapshot. The bridge summarizes scopes per streamed edit (`scope_summary`) and emits it with success/failure telemetry so dashboards can audit provenance.
+- **Controller propagation** – `AIController` extracts `scope_summary` from tool arguments, stamps it onto tool records, and feeds it into retry events (`document_edit.retry`) plus `needs_range` payloads. `span_hint` messages now prefer metadata-provided spans before issuing SelectionRangeTool fallbacks.
+- **SelectionRangeTool remains last resort** – Agents (and downstream partners) may only call SelectionRangeTool when snapshots/chunk manifests cannot supply a span and the controller injects an explicit fallback hint. All other edits must reference the captured chunk/span.
+
+### Agent + partner expectations
+
+- **Capture + replay scope** – Whenever a snapshot or chunk manifest is hydrated, immediately copy the provided `text_range`/`chunk.range` into `target_span` and persist a matching `scope` entry. Send that same metadata with every downstream edit, even after multiple planning steps.
+- **Never guess spans** – If an edit fails with `needs_range`, refresh the snapshot, rehydrate the manifest, and resend the explicit span. Do not fabricate offsets or ask SelectionRangeTool unless the controller tells you to.
+- **Explain provenance in reasoning** – Prompts now instruct agents to mention whether an edit is chunk-backed (`scope_origin=chunk:<chunk_id>`) or explicit span-backed. This mirrors what telemetry captures and gives operators immediate visibility into compliance.
+- **Tooling alignment** – Custom agents must echo the same behavior: persist spans from manifests, attach `scope` blocks to edit calls, and retry only after grabbing deterministic windows.
+
+### Telemetry additions
+
+- `patch.apply`, `patch.range_conflict`, `patch.hash_mismatch`, and `patch.rejected` now export `scope_summary` plus per-span fields (`scope_origin`, `scope_length`, `scope_range`). These show up in `docs/operations/telemetry.md` and downstream dashboards for auditing.
+- `document_edit.retry` payloads include the failing scope metadata so incidents can be correlated with specific spans/chunks.
+- `needs_range` telemetry reports the hinted span (`span_hint`, `span_hint_reason`) along with the previous scope summary, making it obvious when callers skipped chunk manifests.
+
+### Troubleshooting quick reference
+
+| Signal | Meaning | Recovery |
+| --- | --- | --- |
+| `scope_required` validation error | Edit lacked a `scope` block or claimed `scope_origin="chunk"` without a manifest ID. | Rehydrate the snapshot/chunk manifest, attach `{origin, range, length}` (and chunk IDs when relevant), then resend. |
+| `needs_range` with `span_hint_reason=missing_scope` | Controller could not locate deterministic spans in the previous payload. | Grab a fresh snapshot, copy its `text_range` to `target_span`, include matching `scope`, and retry. |
+| Telemetry shows `scope_origin=document` spikes | Agents are defaulting to whole-document spans. | Revisit prompts/configuration so chunk manifests drive most edits; SelectionRangeTool should remain a last resort. |
+| `document_edit.retry` includes `scope_origin=document` then `scope_origin=chunk` | Automatic retry refreshed the scope successfully. | No action required; use this as proof the controller recovered by rehydrating the chunk manifest. |
+
+These rules keep edits auditable and allow telemetry dashboards to trace every applied diff back to the exact window the agent inspected.
 
 ## Workstream 3 – Snapshot + plot-state validation
 
@@ -159,7 +207,7 @@ Phase 5.2 layers a rule-based analyzer (`tinkerbell.ai.analysis`) on top of the
 ### Operator interactions
 
 - The status bar exposes a dedicated **Preflight** badge that summarizes the latest advice, while the chat panel mirrors it with hover text (chunk profile, required tools, warnings).
-- Operators can run `/analyze [--doc ...] [--start N --end M] [--force-refresh] [--reason note]` to rerun the analyzer on demand. The helper leverages `AIController.request_analysis_advice()`, posts a formatted notice, refreshes badges, and records the run via `analysis.ui_override.*` telemetry.
+- Operators can run `/analyze [--doc ...] [--force-refresh] [--reason note]` to rerun the analyzer on demand. The helper leverages `AIController.request_analysis_advice()`, posts a formatted notice, refreshes badges, and records the run via `analysis.ui_override.*` telemetry.
 - LangGraph planners call `ToolUsageAdvisorTool` when they need fresh guidance mid-turn; the tool bridges into `_advisor_tool_entrypoint()` and returns the serialized advice payload.
 
 ### Telemetry & exports
@@ -187,6 +235,7 @@ Phase 5.2 layers a rule-based analyzer (`tinkerbell.ai.analysis`) on top of the
 - **Programmatic access** – `AIController.get_recent_context_events()` exposes the rolling buffer for tests or external dashboards. Additional sinks can be registered via `TelemetrySink` to stream events elsewhere.
 - **Export script** – `uv run python -m tinkerbell.scripts.export_context_usage --format csv --limit 50` dumps the persisted buffer (JSON/CSV) from `~/.tinkerbell/telemetry/context_usage.json` for audits or support bundles.
 - **Outline/Retrieval telemetry** – Outline builder (`ai/services/outline_worker.py`), `DocumentOutlineTool`, `DocumentFindSectionsTool`, and `DocumentEmbeddingIndex` now emit structured events (`outline.build.start/end`, `outline.tool.hit/miss`, `outline.stale`, `retrieval.query`, `retrieval.provider.error`, `embedding.cache.hit/miss`) that include latency, cache hit counts, provider names, and `tokens_saved` deltas. Dashboards can subscribe via `TelemetrySink` or reuse `scripts/export_context_usage.py` to trend outline freshness, retrieval performance, and embedding cost spikes.
+- **Scope provenance metrics** – Context usage events now include per-turn scope aggregates (`scope_origin_counts`, `scope_missing_count`, `scope_total_length`). Use them to confirm chunk-first editing is enforced (chunk/explicit spans should dominate, `scope_missing_count` should remain zero) and to spot suspicious full-document rewrites when `scope_total_length` spikes.
 
 ## 3. Document version IDs & optimistic patching
 
@@ -200,15 +249,15 @@ Phase 5 hardens diff tooling so every edit is anchored to an explicit snapshot s
 
 ### Tool & schema changes
 
-- `DocumentSnapshot` always exposes `selection_text` and `selection_hash` (SHA-1 of the selected text) so agents can round-trip anchors without recomputing hashes.
-- `DocumentApplyPatchTool` and `DocumentEditTool` accept `match_text`, `expected_text`, and `selection_fingerprint` parameters. `selection_fingerprint` is compared against the snapshot `selection_hash`, while `match_text`/`expected_text` are used to relocate the edit if the offsets drift.
-- The tool manifest plus system prompts (`src/tinkerbell/ai/prompts.py`) now instruct agents to copy these fields from `document_snapshot` before calling diff/edit tools.
+- `DocumentSnapshot` no longer exposes `selection_text` or `selection_hash`; callers must rely on the snapshot's `text_range`, `snapshot_span`, and chunk manifests to describe the intended span, falling back to `selection_range` only when those hints are missing.
+- `DocumentApplyPatchTool` and `DocumentEditTool` accept `match_text` and `expected_text` anchors (plus the preferred `target_span`). Anchors are compared against the live document to relocate edits when offsets drift.
+- The tool manifest plus system prompts (`src/tinkerbell/ai/prompts.py`) now instruct agents to copy spans and anchor text from `document_snapshot`/chunk manifests (and only reach for `selection_range` if spans are missing) before calling diff/edit tools.
 
 ### Recommended workflow
 
-1. Call `document_snapshot` with `include_text=true` and capture `selection_text`, `selection_hash`, `document_version`, plus the `{start_line, end_line}` span from the `selection_range` tool (store offsets as a fallback `target_range`).
+1. Call `document_snapshot` with `include_text=true` and capture `document_version`, the snapshot `text_range`/`snapshot_span`, and any chunk manifest ranges that cover the requested window (store offsets as a fallback `target_range`). Run `selection_range` only if those hints are missing and you need the live caret span.
 2. When building a patch, include at least one of `target_span` or `match_text`. Prefer to send both (and optionally the legacy `target_range`) so the bridge can double-check offsets.
-3. Copy `selection_hash` into the `selection_fingerprint` field and copy the literal snippet into `match_text` (and `expected_text` if the schema requires it for your caller).
+3. Copy the literal snippet from the snapshot window into `match_text` (and `expected_text` if the schema requires it for your caller) so the bridge can relocate the edit when offsets drift.
 4. If the snapshot slice no longer matches the document, let the tools raise their guardrail errors and immediately refresh the snapshot instead of guessing offsets.
 5. Reserve caret inserts (`target_range` start == end / `target_span` covering zero lines) for explicit `action="insert"` directives. Replace operations now require anchors or a non-empty span.
 
@@ -216,15 +265,14 @@ Phase 5 hardens diff tooling so every edit is anchored to an explicit snapshot s
 
 | Message fragment | Meaning | Next step |
 | --- | --- | --- |
-| `Edits must include target_span (preferred), target_range, match_text, or replace_all=true` | The edit lacked both a span and an anchor. | Re-run `document_snapshot` and send the captured `target_span` (or fallback `target_range`), `match_text`/`selection_fingerprint`, or set `replace_all=true` for full-document edits. |
-| `selection_fingerprint does not match the latest snapshot` | The hash no longer matches the live document. | Refresh the snapshot and rebuild the patch from the new selection window. |
+| `Edits must include target_span (preferred), target_range, match_text, or replace_all=true` | The edit lacked both a span and an anchor. | Re-run `document_snapshot` and send the captured `target_span` (or fallback `target_range`), include `match_text`, or set `replace_all=true` for full-document edits. |
 | `Snapshot selection_text no longer matches document content` | The auto-anchor pulled from the snapshot was stale. | Provide explicit `match_text` from the user-visible context or fetch a new snapshot. |
-| `match_text matched multiple ranges` | Anchoring text was ambiguous in the current document. | Narrow the selection and resend the edit with a more specific snippet. |
+| `match_text matched multiple ranges` | Anchoring text was ambiguous in the current document. | Narrow the target span (or provide exact offsets) and resend the edit with a more specific snippet. |
 | `match_text did not match any content` | The document drifted beyond the provided snippet. | Refresh the snapshot before retrying the edit. |
 
 ### Telemetry & dashboards
 
-- `patch.anchor` – emitted whenever `DocumentApplyPatchTool` or the inline `DocumentEdit` auto-convert path validates anchors. Payload highlights `status` (`success` or `reject`), `phase` (`requirements`, `alignment`, etc.), `anchor_source` (`match_text`, `selection_text`, `fingerprint`, or `range_only`), plus document/tab identifiers. Use this to trend anchor mismatch rates after rollout.
+- `patch.anchor` – emitted whenever `DocumentApplyPatchTool` or the inline `DocumentEdit` auto-convert path validates anchors. Payload highlights `status` (`success` or `reject`), `phase` (`requirements`, `alignment`, etc.), `anchor_source` (`match_text` or `range_only`), plus document/tab identifiers. Use this to trend anchor mismatch rates after rollout.
 - `patch.apply` – emitted by `DocumentBridge` when a patch succeeds, conflicts, or arrives stale. Includes the duration in milliseconds, `range_count` (for streamed diffs), diff summary, and whether the bridge had to fall back because of a conflict. Dashboards can now plot success/conflict ratios directly from telemetry instead of scraping logs.
 
 These events piggyback on the existing telemetry bus, so the status bar debug widgets and `scripts/export_context_usage.py` will surface them automatically once the sinks are subscribed.
@@ -265,7 +313,7 @@ Phase 5 tightens the read flow so the agent stays on the "selection snapshot →
 ## 7. Desktop UX helpers (Phase 1)
 
 - **Preview-first import/open dialogs** – `DocumentLoadDialog` replaces the native picker so every open/import run shows file size, inferred language, and token counts. The dialog highlights how much of the configured context budget a file would occupy and surfaces the first ~3k characters for sanity checks before loading a tab.
-- **Selection-aware export dialog** – Saving a document now routes through `DocumentExportDialog`, which renders the current selection (or the start of the file), reports both selection + full-document token totals, and keeps the token budget gauge visible so authors know when exports approach window limits.
+- **Document export dialog** – Saving a document now routes through `DocumentExportDialog`, which previews the start of the file, reports document-wide token totals, and keeps the token budget gauge visible so authors know when exports approach window limits.
 - **Curated sample library** – A dropdown in the open dialog pulls Markdown/JSON/YAML fixtures from `test_data/` (and `assets/sample_docs/` when present) so smoke tests on large files are one click away. Selecting a sample immediately previews its contents and token footprint before creating the new tab.
 
 ## 8. Benchmarking + performance checkpoints

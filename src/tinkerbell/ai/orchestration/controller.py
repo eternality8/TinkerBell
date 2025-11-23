@@ -15,12 +15,18 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, ClassVar, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, cast
+from typing import Any, Awaitable, Callable, ClassVar, Dict, Iterable, Mapping, MutableMapping, Sequence, cast
 
 from openai.types.chat import ChatCompletionToolParam
 
+from ...chat.message_model import ToolPointerMessage
+from ...services import telemetry as telemetry_service
+from ...services.bridge import DocumentVersionMismatchError
+from ...services.telemetry import TelemetrySink
 from .. import prompts
-from ..analysis import AnalysisAgent, AnalysisAdvice, AnalysisInput
+from ..analysis.agent import AnalysisAgent
+from ..analysis.models import AnalysisAdvice, AnalysisInput
+from ..agents.graph import build_agent_graph
 from ..ai_types import (
     AgentConfig,
     ChunkReference,
@@ -37,58 +43,64 @@ from ..memory.cache_bus import (
     DocumentClosedEvent,
     get_document_cache_bus,
 )
+from ..memory.character_map import CharacterMapStore
 from ..memory.chunk_index import ChunkIndex
 from ..memory.plot_state import DocumentPlotStateStore
-from ..memory.character_map import CharacterMapStore
-from ..services import ToolPayload, build_pointer, summarize_tool_content, telemetry as telemetry_service
-from ...services.bridge import DocumentVersionMismatchError
+from ..services.context_policy import ContextBudgetPolicy
+from ..services.summarizer import ToolPayload, build_pointer, summarize_tool_content
 from ..services.trace_compactor import TraceCompactor
-from ...chat.message_model import ToolPointerMessage
-from ..services.context_policy import BudgetDecision, ContextBudgetPolicy
-from ..services.telemetry import ContextUsageEvent, TelemetrySink
-from ..agents.graph import build_agent_graph
-from .budget_manager import BudgetManager, ContextBudgetExceeded
+from ..tools.document_apply_patch import NeedsRangeError
+from .budget_manager import BudgetManager
 from .event_log import ChatEventLogger
 from .subagent_runtime import SubagentRuntimeManager
 from .telemetry_manager import TelemetryManager
-from ..tools.document_apply_patch import NeedsRangeError
 
-LOGGER = logging.getLogger(__name__)
-_PROMPT_HEADROOM = 4_096
-_POINTER_SUMMARY_TOKENS = 512
-_SUGGESTION_SYSTEM_PROMPT = (
-    "You are a proactive writing assistant that proposes the next helpful user prompts after reviewing the prior "
-    "conversation. Respond ONLY with a JSON array of concise suggestion strings (each under 120 characters). "
-    "Return at most {max_suggestions} unique ideas tailored to the conversation."
-)
-
+# Normalizes stylized glyphs inside <|tool ...|> markers emitted by some models.
 _TOOL_MARKER_TRANSLATION = str.maketrans(
     {
-        ord("｜"): "|",
-        ord("￨"): "|",
-        ord("∣"): "|",
-        ord("▕"): "|",
         ord("＜"): "<",
         ord("﹤"): "<",
         ord("〈"): "<",
-        ord("⟨"): "<",
         ord("《"): "<",
         ord("＞"): ">",
         ord("﹥"): ">",
         ord("〉"): ">",
-        ord("⟩"): ">",
         ord("》"): ">",
+        ord("｜"): "|",
+        ord("￨"): "|",
+        ord("│"): "|",
+        ord("︱"): "|",
+        ord("︲"): "|",
         ord("▁"): "_",
-        ord("＿"): "_",
-        ord("﹍"): "_",
-        ord("﹎"): "_",
-        ord("﹏"): "_",
-        ord("　"): " ",
+        ord("\u00a0"): " ",
+        ord("\u1680"): " ",
+        ord("\u2000"): " ",
+        ord("\u2001"): " ",
+        ord("\u2002"): " ",
+        ord("\u2003"): " ",
+        ord("\u2004"): " ",
+        ord("\u2005"): " ",
+        ord("\u2006"): " ",
+        ord("\u2007"): " ",
+        ord("\u2008"): " ",
+        ord("\u2009"): " ",
+        ord("\u200a"): " ",
         ord("\u200b"): " ",
         ord("\u200c"): " ",
         ord("\u200d"): " ",
+        ord("\u202f"): " ",
+        ord("\u205f"): " ",
+        ord("\u3000"): " ",
         ord("\ufeff"): " ",
     }
+)
+
+LOGGER = logging.getLogger(__name__)
+_PROMPT_HEADROOM = 6_000
+_POINTER_SUMMARY_TOKENS = 512
+_SUGGESTION_SYSTEM_PROMPT = (
+    "You are a helpful writing copilot asked to propose up to {max_suggestions} focused follow-up suggestions. "
+    "Each suggestion should be a short imperative phrase (no numbering) tailored to the prior conversation transcript."
 )
 _TOOL_CALLS_BLOCK_RE = re.compile(
     r"<\s*\|?\s*tool[\s_]*calls[\s_]*begin\s*\|?\s*>(?P<body>.*?)<\s*\|?\s*tool[\s_]*calls[\s_]*end\s*\|?\s*>",
@@ -171,13 +183,13 @@ class _ChunkFlowTracker:
         includes_full = bool(window.get("includes_full_document"))
         doc_length = self._coerce_int(payload.get("length"))
         window_span = self._window_span(window, payload)
-        selection_span = self._selection_span(window, payload)
+        span_length = self._span_length(window, payload)
         manifest = payload.get("chunk_manifest") if isinstance(payload.get("chunk_manifest"), Mapping) else None
         metadata: dict[str, Any] = {
             "document_id": payload.get("document_id") or self.document_id,
             "document_length": doc_length,
             "window_span": window_span,
-            "selection_span": selection_span,
+            "span_length": span_length,
             "window_kind": str(window.get("kind") or ""),
             "requested_window": str(window.get("requested_kind") or ""),
             "defaulted": bool(window.get("defaulted")),
@@ -229,14 +241,15 @@ class _ChunkFlowTracker:
         return None
 
     @staticmethod
-    def _selection_span(window: Mapping[str, Any], payload: Mapping[str, Any]) -> int | None:
-        selection = window.get("selection")
-        if not isinstance(selection, Mapping):
-            selection = payload.get("selection") if isinstance(payload.get("selection"), Mapping) else None
-        if not isinstance(selection, Mapping):
-            return None
-        start = _ChunkFlowTracker._coerce_int(selection.get("start"))
-        end = _ChunkFlowTracker._coerce_int(selection.get("end"))
+    def _span_length(window: Mapping[str, Any], payload: Mapping[str, Any]) -> int | None:
+        text_range = payload.get("text_range") if isinstance(payload.get("text_range"), Mapping) else None
+        if isinstance(text_range, Mapping):
+            start = _ChunkFlowTracker._coerce_int(text_range.get("start"))
+            end = _ChunkFlowTracker._coerce_int(text_range.get("end"))
+            if start is not None and end is not None:
+                return max(0, end - start)
+        start = _ChunkFlowTracker._coerce_int(window.get("start"))
+        end = _ChunkFlowTracker._coerce_int(window.get("end"))
         if start is None or end is None:
             return None
         return max(0, end - start)
@@ -371,6 +384,16 @@ class _PlotLoopTracker:
 
 
 @dataclass(slots=True)
+class _SubagentDocumentState:
+    """Tracks helper scheduling metadata per document."""
+
+    last_job_hashes: dict[str, str] = field(default_factory=dict)
+    edit_churn: int = 0
+    last_edit_ts: float = 0.0
+    last_job_ts: float = 0.0
+
+
+@dataclass(slots=True)
 class ChunkingRuntimeConfig:
     """Settings governing chunk manifest preferences and tool caps."""
 
@@ -465,6 +488,7 @@ class AIController:
     _chunk_index: ChunkIndex | None = field(default=None, init=False, repr=False)
     _chunk_flow_tracker: _ChunkFlowTracker | None = field(default=None, init=False, repr=False)
     _plot_loop_tracker: _PlotLoopTracker | None = field(default=None, init=False, repr=False)
+    _subagent_doc_states: dict[str, _SubagentDocumentState] = field(default_factory=dict, init=False, repr=False)
     _analysis_agent: AnalysisAgent | None = field(default=None, init=False, repr=False)
     _analysis_advice_cache: dict[str, AnalysisAdvice] = field(default_factory=dict, init=False, repr=False)
     _latest_snapshot_cache: dict[str, Mapping[str, Any]] = field(default_factory=dict, init=False, repr=False)
@@ -793,51 +817,6 @@ class AIController:
                 return text
         return ""
 
-    def _build_manifest_chunk_context(
-        self,
-        snapshot: Mapping[str, Any],
-        selection_span: tuple[int, int],
-        *,
-        hydrate_text: bool,
-    ) -> _ChunkContext | None:
-        manifest = snapshot.get("chunk_manifest")
-        if not isinstance(manifest, Mapping):
-            return None
-        chunks = manifest.get("chunks")
-        if not isinstance(chunks, Sequence) or not chunks:
-            return None
-        self._ingest_chunk_manifest(manifest)
-        chosen = self._select_manifest_chunk(chunks, selection_span)
-        if chosen is None:
-            return None
-        chunk_id = str(chosen.get("id") or "").strip()
-        if not chunk_id:
-            return None
-        document_id = str(manifest.get("document_id") or self._resolve_document_id(snapshot) or "document")
-        start = self._coerce_index(chosen.get("start"), selection_span[0])
-        end = self._coerce_index(chosen.get("end"), max(selection_span[1], start + 1))
-        if end <= start:
-            end = start + max(1, selection_span[1] - selection_span[0])
-        chunk_hash = chosen.get("hash")
-        pointer_id = chosen.get("outline_pointer_id")
-        context = _ChunkContext(
-            chunk_id=chunk_id,
-            document_id=document_id,
-            char_range=(start, end),
-            chunk_hash=str(chunk_hash).strip() if isinstance(chunk_hash, str) and chunk_hash.strip() else None,
-            pointer_id=str(pointer_id).strip() if isinstance(pointer_id, str) and pointer_id.strip() else None,
-        )
-        if hydrate_text:
-            cache_key = manifest.get("cache_key")
-            version = manifest.get("version")
-            text = self._hydrate_chunk_text(
-                chunk_id=chunk_id,
-                document_id=document_id,
-                cache_key=str(cache_key).strip() if isinstance(cache_key, str) and cache_key.strip() else None,
-                version=str(version).strip() if isinstance(version, str) and version.strip() else None,
-            )
-            context.text = text or None
-        return context
 
     def _analysis_hint_message(self, snapshot: Mapping[str, Any]) -> dict[str, str] | None:
         advice = self._run_preflight_analysis(snapshot, source="controller")
@@ -881,7 +860,7 @@ class AIController:
         return agent
 
     def _build_analysis_input(self, snapshot: Mapping[str, Any]) -> AnalysisInput:
-        selection_start, selection_end = self._analysis_selection_bounds(snapshot)
+        span_start, span_end = self._snapshot_span_bounds(snapshot)
         manifest = snapshot.get("chunk_manifest") if isinstance(snapshot.get("chunk_manifest"), Mapping) else None
         chunk_profile = manifest.get("chunk_profile") if isinstance(manifest, Mapping) else None
         chunk_cache_key = manifest.get("cache_key") if isinstance(manifest, Mapping) else None
@@ -889,7 +868,6 @@ class AIController:
         if outline_age is None:
             completed = snapshot.get("outline_completed_at")
             outline_age = self._outline_age_from_timestamp(completed)
-        selection_hash = self._coerce_optional_str(snapshot.get("selection_hash"))
         document_chars = self._coerce_optional_int(snapshot.get("length"))
         if document_chars is None:
             text = snapshot.get("text")
@@ -923,8 +901,8 @@ class AIController:
             document_id=document_id,
             document_version=str(version) if version else None,
             document_path=self._coerce_optional_str(snapshot.get("path")),
-            selection_start=selection_start,
-            selection_end=selection_end,
+            span_start=span_start,
+            span_end=span_end,
             document_chars=document_chars,
             chunk_profile_hint=self._chunk_config.default_profile,
             chunk_index_ready=self._chunk_index is not None,
@@ -938,29 +916,26 @@ class AIController:
             concordance_status=concordance_status,
             concordance_age_seconds=concordance_age,
             retrieval_enabled=True,
-            selection_fingerprint=selection_hash,
             extra_metadata=extras or None,
             chunk_flow_warnings=chunk_flow_flags or None,
             plot_loop_flags=plot_loop_flags or None,
         )
 
-    def _analysis_selection_bounds(self, snapshot: Mapping[str, Any]) -> tuple[int, int]:
-        span = self._selection_span(snapshot)
+    def _snapshot_span_bounds(self, snapshot: Mapping[str, Any]) -> tuple[int, int]:
+        span = self._snapshot_span(snapshot)
         if span is not None:
             return span
-        selection = snapshot.get("selection")
         start = 0
         end = 0
-        if isinstance(selection, Mapping):
-            start = self._coerce_index(selection.get("start"), 0)
-            end = self._coerce_index(selection.get("end"), start)
-        elif isinstance(selection, Sequence) and len(selection) >= 2:
-            try:
-                start = int(selection[0])
-                end = int(selection[1])
-            except (TypeError, ValueError):  # pragma: no cover - defensive
-                start = 0
-                end = 0
+        text_range = snapshot.get("text_range")
+        if isinstance(text_range, Mapping):
+            start = self._coerce_index(text_range.get("start"), 0)
+            end = self._coerce_index(text_range.get("end"), start)
+        if (start, end) == (0, 0):
+            window = snapshot.get("window")
+            if isinstance(window, Mapping):
+                start = self._coerce_index(window.get("start"), 0)
+                end = self._coerce_index(window.get("end"), start)
         document_length = self._coerce_optional_int(snapshot.get("length"))
         if document_length is not None:
             start = max(0, min(start, document_length))
@@ -1020,6 +995,12 @@ class AIController:
         document_id = getattr(event, "document_id", None)
         if not document_id:
             return
+        if isinstance(event, DocumentChangedEvent):
+            state = self._subagent_doc_states.setdefault(document_id, _SubagentDocumentState())
+            state.edit_churn += 1
+            state.last_edit_ts = time.time()
+        elif isinstance(event, DocumentClosedEvent):
+            self._subagent_doc_states.pop(document_id, None)
         self._analysis_advice_cache.pop(document_id, None)
         self._latest_snapshot_cache.pop(document_id, None)
         agent = self._analysis_agent
@@ -1035,8 +1016,8 @@ class AIController:
         *,
         event_name: str,
         document_id: str | None,
-        selection_start: int | None,
-        selection_end: int | None,
+        span_start: int | None,
+        span_end: int | None,
         force_refresh: bool,
         reason: str | None,
         snapshot_origin: str,
@@ -1046,15 +1027,15 @@ class AIController:
             return
         payload: dict[str, object] = {
             "document_id": document_id,
-            "selection_start": selection_start if selection_start is not None else None,
-            "selection_end": selection_end if selection_end is not None else None,
+            "span_start": span_start if span_start is not None else None,
+            "span_end": span_end if span_end is not None else None,
             "force_refresh": bool(force_refresh),
             "snapshot_origin": snapshot_origin,
             "source": "tool",
         }
         if reason:
             payload["reason"] = reason
-        payload["has_selection_override"] = selection_start is not None and selection_end is not None
+        payload["has_span_override"] = span_start is not None and span_end is not None
         emitter(event_name, payload)
 
     def request_analysis_advice(
@@ -1062,8 +1043,8 @@ class AIController:
         *,
         document_id: str | None = None,
         snapshot: Mapping[str, Any] | None = None,
-        selection_start: int | None = None,
-        selection_end: int | None = None,
+        span_start: int | None = None,
+        span_end: int | None = None,
         force_refresh: bool = False,
         reason: str | None = None,
     ) -> AnalysisAdvice | None:
@@ -1072,8 +1053,8 @@ class AIController:
         return self._advisor_tool_entrypoint(
             document_id=document_id,
             snapshot=snapshot,
-            selection_start=selection_start,
-            selection_end=selection_end,
+            span_start=span_start,
+            span_end=span_end,
             force_refresh=force_refresh,
             reason=reason,
             invocation_source="ui",
@@ -1084,8 +1065,8 @@ class AIController:
         *,
         document_id: str | None = None,
         snapshot: Mapping[str, Any] | None = None,
-        selection_start: int | None = None,
-        selection_end: int | None = None,
+        span_start: int | None = None,
+        span_end: int | None = None,
         force_refresh: bool = False,
         reason: str | None = None,
         invocation_source: str | None = None,
@@ -1110,46 +1091,29 @@ class AIController:
         resolved_id = target_id or self._resolve_document_id(snapshot_payload)
         if resolved_id:
             snapshot_payload.setdefault("document_id", resolved_id)
-        if selection_start is not None and selection_end is not None:
-            snapshot_payload["selection"] = {"start": selection_start, "end": selection_end}
+        if span_start is None or span_end is None:
+            fallback_start, fallback_end = self._snapshot_span_bounds(snapshot_payload)
+            if span_start is None:
+                span_start = fallback_start
+            if span_end is None:
+                span_end = fallback_end
         if source == "tool":
             self._emit_analysis_invocation_event(
                 event_name="analysis.advisor_tool.invoked",
                 document_id=resolved_id,
-                selection_start=selection_start,
-                selection_end=selection_end,
+                span_start=span_start,
+                span_end=span_end,
                 force_refresh=force_refresh,
                 reason=reason,
                 snapshot_origin=snapshot_origin,
             )
         return self._run_preflight_analysis(snapshot_payload, source=source, force_refresh=force_refresh)
 
-    @staticmethod
-    def _select_manifest_chunk(
-        chunks: Sequence[Any],
-        selection_span: tuple[int, int],
-    ) -> Mapping[str, Any] | None:
-        start, end = selection_span
-        width = max(1, end - start)
-        center = start + width // 2
-        fallback: Mapping[str, Any] | None = None
-        for chunk in chunks:
-            if not isinstance(chunk, Mapping):
-                continue
-            chunk_start = AIController._coerce_index(chunk.get("start"), start)
-            chunk_end = AIController._coerce_index(chunk.get("end"), chunk_start + 1)
-            if chunk_end <= chunk_start:
-                chunk_end = chunk_start + 1
-            if chunk_start <= center < chunk_end:
-                return chunk
-            if fallback is None and start < chunk_end and end > chunk_start:
-                fallback = chunk
-        return fallback
-
     def configure_budget_policy(self, policy: ContextBudgetPolicy | None) -> None:
         """Update (or initialize) the active budget policy."""
 
         model_name = getattr(getattr(self.client, "settings", None), "model", None)
+        self._budget_manager.telemetry_emitter = getattr(telemetry_service, "emit", None)
         self.budget_policy = self._budget_manager.configure_policy(
             policy,
             model_name=model_name,
@@ -1741,6 +1705,13 @@ class AIController:
         return max(1, min(candidate, 200))
 
     @staticmethod
+    def _normalize_scope_origin(origin: Any) -> str | None:
+        if not isinstance(origin, str):
+            return None
+        text = origin.strip().lower()
+        return text or None
+
+    @staticmethod
     def _normalize_context_tokens(value: int | None) -> int:
         default = 128_000
         try:
@@ -1905,6 +1876,54 @@ class AIController:
                 self._capture_outline_tool_metrics(context, record)
             elif name == "document_find_sections":
                 self._capture_retrieval_tool_metrics(context, record)
+        self._record_scope_metrics(context, records)
+
+    def _record_scope_metrics(self, context: dict[str, Any], records: Sequence[Mapping[str, Any]]) -> None:
+        if not records:
+            return
+        counts: dict[str, int]
+        existing_counts = context.get("scope_origin_counts")
+        if isinstance(existing_counts, dict):
+            counts = existing_counts
+        else:
+            counts = {}
+            context["scope_origin_counts"] = counts
+        missing = context.get("scope_missing_count")
+        if not isinstance(missing, int):
+            missing = 0
+        total_length = context.get("scope_total_length")
+        if not isinstance(total_length, int):
+            total_length = 0
+        for record in records:
+            summary = record.get("scope_summary") if isinstance(record.get("scope_summary"), Mapping) else None
+            origin = record.get("scope_origin")
+            if not isinstance(origin, str) or not origin.strip():
+                if isinstance(summary, Mapping):
+                    summary_origin = summary.get("origin")
+                    if isinstance(summary_origin, str):
+                        origin = summary_origin
+            normalized_origin = self._normalize_scope_origin(origin)
+            length_value = record.get("scope_length")
+            if length_value is None and isinstance(summary, Mapping):
+                length_value = summary.get("length")
+            length = self._coerce_optional_int(length_value)
+            range_payload = record.get("scope_range") if isinstance(record.get("scope_range"), Mapping) else None
+            if range_payload is None and isinstance(summary, Mapping):
+                candidate = summary.get("range")
+                if isinstance(candidate, Mapping):
+                    range_payload = candidate
+            if length is None and range_payload is not None:
+                bounds = self._range_bounds_from_mapping(range_payload)
+                if bounds is not None:
+                    length = max(0, bounds[1] - bounds[0])
+            if normalized_origin is None:
+                missing += 1
+                continue
+            counts[normalized_origin] = counts.get(normalized_origin, 0) + 1
+            if length is not None:
+                total_length += max(0, length)
+        context["scope_missing_count"] = missing
+        context["scope_total_length"] = total_length
 
     def _guardrail_hints_from_records(self, records: Sequence[Mapping[str, Any]]) -> list[str]:
         if not records:
@@ -2384,23 +2403,23 @@ class AIController:
         runtime = self._subagent_runtime
         manager = runtime.manager if runtime else None
         document_id = self._resolve_document_id(snapshot)
-        selection_span = self._selection_span(snapshot)
+        focus_span = self._snapshot_span(snapshot)
         if manager is None or not self.subagent_config.enabled:
             LOGGER.debug(
-                "Subagent pipeline skipped (manager=%s, enabled=%s, document_id=%s, selection=%s)",
+                "Subagent pipeline skipped (manager=%s, enabled=%s, document_id=%s, span=%s)",
                 bool(manager),
                 self.subagent_config.enabled,
                 document_id,
-                selection_span,
+                focus_span,
             )
             return [], []
 
         jobs = self._plan_subagent_jobs(prompt, snapshot, turn_context)
         if not jobs:
             LOGGER.debug(
-                "Subagent pipeline planned zero jobs (document_id=%s, selection=%s)",
+                "Subagent pipeline planned zero jobs (document_id=%s, span=%s)",
                 document_id,
-                selection_span,
+                focus_span,
             )
             return [], []
 
@@ -2423,6 +2442,165 @@ class AIController:
         turn_context["subagent_jobs"] = len(results)
         return results, messages
 
+    def _subagent_state_for(self, document_id: str) -> _SubagentDocumentState:
+        state = self._subagent_doc_states.get(document_id)
+        if state is None:
+            state = _SubagentDocumentState()
+            self._subagent_doc_states[document_id] = state
+        return state
+
+    def _infer_document_kind(self, snapshot: Mapping[str, Any]) -> str:
+        format_hint = str(snapshot.get("document_format") or snapshot.get("format") or "").lower()
+        if format_hint in {"code", "python", "notebook"}:
+            return "code"
+        path_value = snapshot.get("path") or snapshot.get("tab_name")
+        if isinstance(path_value, str) and path_value:
+            suffix = Path(path_value).suffix.lower()
+            if suffix in _CODE_EXTENSIONS:
+                return "code"
+        return "prose"
+
+    def _window_focus_center(self, snapshot: Mapping[str, Any]) -> int | None:
+        candidates = (
+            snapshot.get("text_range"),
+            snapshot.get("window"),
+        )
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            start = self._coerce_index(candidate.get("start"), 0)
+            end = self._coerce_index(candidate.get("end"), start)
+            if end > start:
+                return start + (end - start) // 2
+        return None
+
+    def _span_center(self, snapshot: Mapping[str, Any]) -> int | None:
+        span = self._snapshot_span(snapshot)
+        if span is None:
+            return None
+        start, end = span
+        if end <= start:
+            return None
+        return start + (end - start) // 2
+
+    def _prioritize_chunks(
+        self,
+        snapshot: Mapping[str, Any],
+        chunks: Sequence[Mapping[str, Any]],
+    ) -> list[Mapping[str, Any]]:
+        center = self._span_center(snapshot)
+        if center is None:
+            center = self._window_focus_center(snapshot)
+        if center is None:
+            return [dict(chunk) for chunk in chunks]
+
+        def _chunk_center(entry: Mapping[str, Any]) -> int:
+            start = self._coerce_index(entry.get("start"), 0)
+            end = self._coerce_index(entry.get("end"), start)
+            width = max(1, end - start)
+            return start + width // 2
+
+        return sorted(chunks, key=lambda entry: abs(_chunk_center(entry) - center))
+
+    def _dirty_manifest_chunks(
+        self,
+        chunks: Sequence[Mapping[str, Any]],
+        state: _SubagentDocumentState,
+    ) -> list[Mapping[str, Any]]:
+        dirty: list[Mapping[str, Any]] = []
+        for entry in chunks:
+            if not isinstance(entry, Mapping):
+                continue
+            chunk_id = str(entry.get("id") or "").strip()
+            if not chunk_id:
+                continue
+            chunk_hash = entry.get("hash")
+            normalized_hash = str(chunk_hash).strip() if isinstance(chunk_hash, str) and chunk_hash.strip() else None
+            if not normalized_hash or state.last_job_hashes.get(chunk_id) != normalized_hash:
+                dirty.append(entry)
+        return dirty
+
+    def _build_chunk_context_from_entry(
+        self,
+        snapshot: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+        entry: Mapping[str, Any],
+        *,
+        hydrate_text: bool,
+    ) -> _ChunkContext | None:
+        chunk_id = str(entry.get("id") or "").strip()
+        if not chunk_id:
+            return None
+        start = self._coerce_index(entry.get("start"), 0)
+        end = self._coerce_index(entry.get("end"), start + 1)
+        if end <= start:
+            end = start + 1
+        document_id = str(
+            manifest.get("document_id")
+            or self._resolve_document_id(snapshot)
+            or snapshot.get("document_id")
+            or "document"
+        )
+        chunk_hash = entry.get("hash")
+        pointer_id = entry.get("outline_pointer_id")
+        context = _ChunkContext(
+            chunk_id=chunk_id,
+            document_id=document_id,
+            char_range=(start, end),
+            chunk_hash=str(chunk_hash).strip() if isinstance(chunk_hash, str) and chunk_hash.strip() else None,
+            pointer_id=str(pointer_id).strip() if isinstance(pointer_id, str) and pointer_id.strip() else None,
+        )
+        if hydrate_text:
+            cache_key = manifest.get("cache_key")
+            version = manifest.get("version") or snapshot.get("version") or snapshot.get("document_version")
+            text = self._hydrate_chunk_text(
+                chunk_id=chunk_id,
+                document_id=document_id,
+                cache_key=str(cache_key).strip() if isinstance(cache_key, str) and cache_key.strip() else None,
+                version=str(version).strip() if isinstance(version, str) and version else None,
+            )
+            context.text = text or None
+        return context
+
+    def _subagent_trigger_reasons(
+        self,
+        snapshot: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+        state: _SubagentDocumentState,
+        dirty_chunks: Sequence[Mapping[str, Any]],
+    ) -> list[str]:
+        config = self.subagent_config
+        chunk_entries = manifest.get("chunks")
+        chunk_count = len(chunk_entries) if isinstance(chunk_entries, Sequence) else 0
+        reasons: list[str] = []
+        if dirty_chunks:
+            reasons.append("dirty_chunks")
+        if chunk_count >= max(1, config.chunk_trigger_threshold):
+            reasons.append("chunk_threshold")
+        if self._infer_document_kind(snapshot) == "code" and chunk_count >= max(1, config.code_chunk_trigger):
+            reasons.append("code_format")
+        if state.edit_churn >= max(0, config.edit_churn_threshold):
+            reasons.append("edit_churn")
+        return reasons
+
+    def _emit_subagent_queue_event(
+        self,
+        document_id: str,
+        jobs: Sequence[SubagentJob],
+        reasons: Sequence[str],
+    ) -> None:
+        if not jobs:
+            return
+        payload = {
+            "document_id": document_id,
+            "job_count": len(jobs),
+            "job_ids": [job.job_id for job in jobs if job.job_id],
+            "chunk_ids": [job.chunk_id for job in jobs if job.chunk_id],
+            "chunk_hashes": [job.chunk_hash for job in jobs if job.chunk_hash],
+            "reasons": list(reasons),
+        }
+        telemetry_service.emit("subagent.jobs_queued", payload)
+
     def _plan_subagent_jobs(
         self,
         prompt: str,
@@ -2430,76 +2608,97 @@ class AIController:
         turn_context: Mapping[str, Any],
     ) -> list[SubagentJob]:
         config = self.subagent_config
-        document_id = self._resolve_document_id(snapshot) or "document"
+        base_document_id = self._resolve_document_id(snapshot) or "document"
         if not config.enabled:
-            LOGGER.debug("Subagent planning skipped: config disabled (document_id=%s)", document_id)
+            LOGGER.debug("Subagent planning skipped: config disabled (document_id=%s)", base_document_id)
             return []
-        selection_span = self._selection_span(snapshot)
-        if selection_span is None:
-            LOGGER.debug("Subagent planning skipped: no selection span (document_id=%s)", document_id)
+        manifest = snapshot.get("chunk_manifest")
+        if not isinstance(manifest, Mapping):
+            LOGGER.debug("Subagent planning skipped: missing chunk manifest (document_id=%s)", base_document_id)
             return []
-        start, end = selection_span
-        span_length = end - start
-        if span_length <= 0 or span_length < config.selection_min_chars:
-            LOGGER.debug(
-                "Subagent planning skipped: span length %s below threshold %s (document_id=%s)",
-                span_length,
-                config.selection_min_chars,
-                document_id,
-            )
+        chunks = manifest.get("chunks")
+        if not isinstance(chunks, Sequence) or not chunks:
+            LOGGER.debug("Subagent planning skipped: empty chunk manifest (document_id=%s)", base_document_id)
             return []
-        text, window_start, window_end = self._snapshot_text_segment(snapshot)
-        selection_within_window = bool(text) and start >= window_start and end <= window_end
-        selection_text = ""
-        if selection_within_window and text:
-            local_start = start - window_start
-            local_end = end - window_start
-            selection_text = text[local_start:local_end]
-        chunk_context = self._build_manifest_chunk_context(
-            snapshot,
-            selection_span,
-            hydrate_text=not selection_within_window,
+        document_id = str(
+            manifest.get("document_id")
+            or snapshot.get("document_id")
+            or base_document_id
         )
-        if not selection_text and (chunk_context is None or not chunk_context.text):
+        self._ingest_chunk_manifest(manifest)
+        state = self._subagent_state_for(document_id)
+        now = time.monotonic()
+        cooldown = max(0.0, config.helper_cooldown_seconds)
+        if state.last_job_ts and now - state.last_job_ts < cooldown:
             LOGGER.debug(
-                "Subagent planning skipped: unable to hydrate selection text (document_id=%s, selection_len=%s)",
+                "Subagent planning skipped: helper cooldown active (document_id=%s, remaining=%.2fs)",
                 document_id,
-                span_length,
+                cooldown - (now - state.last_job_ts),
             )
             return []
-        context_text = chunk_context.text if chunk_context else None
-        preview_source = (context_text or selection_text or "").strip()
+        debounce = max(0.0, config.edit_debounce_seconds)
+        if state.last_edit_ts and now - state.last_edit_ts < debounce:
+            LOGGER.debug(
+                "Subagent planning skipped: edit debounce active (document_id=%s, remaining=%.2fs)",
+                document_id,
+                debounce - (now - state.last_edit_ts),
+            )
+            return []
+        dirty_chunks = self._dirty_manifest_chunks(chunks, state)
+        prioritized_source = dirty_chunks if dirty_chunks else chunks
+        prioritized = self._prioritize_chunks(snapshot, prioritized_source)
+        if not prioritized:
+            LOGGER.debug("Subagent planning skipped: unable to prioritize chunks (document_id=%s)", document_id)
+            return []
+        reasons = self._subagent_trigger_reasons(snapshot, manifest, state, dirty_chunks)
+        if not reasons:
+            LOGGER.debug(
+                "Subagent planning skipped: heuristics not satisfied (document_id=%s, chunk_count=%s, churn=%s)",
+                document_id,
+                len(chunks),
+                state.edit_churn,
+            )
+            return []
+        target_entry = prioritized[0]
+        chunk_context = self._build_chunk_context_from_entry(
+            snapshot,
+            manifest,
+            target_entry,
+            hydrate_text=True,
+        )
+        if chunk_context is None:
+            LOGGER.debug(
+                "Subagent planning skipped: manifest entry lacked context (document_id=%s)",
+                document_id,
+            )
+            return []
+        document_id = chunk_context.document_id or document_id
+        preview_source = (chunk_context.text or "").strip()
         if not preview_source:
             LOGGER.debug(
-                "Subagent planning skipped: empty preview source (document_id=%s, selection_len=%s)",
+                "Subagent planning skipped: unable to hydrate chunk text (document_id=%s, chunk_id=%s)",
                 document_id,
-                span_length,
+                chunk_context.chunk_id,
             )
             return []
         preview = preview_source[: config.chunk_preview_chars].strip()
         if not preview:
             LOGGER.debug(
-                "Subagent planning skipped: preview trimmed to empty string (document_id=%s)",
+                "Subagent planning skipped: preview trimmed to empty string (document_id=%s, chunk_id=%s)",
                 document_id,
+                chunk_context.chunk_id,
             )
             return []
-
-        document_id = chunk_context.document_id if chunk_context else document_id
-        version = snapshot.get("version") or snapshot.get("document_version")
-        chunk_id = chunk_context.chunk_id if chunk_context else f"selection:{start}-{end}"
-        char_range = chunk_context.char_range if chunk_context else (start, end)
-        chunk_hash = chunk_context.chunk_hash if chunk_context else None
-        if not chunk_hash:
-            chunk_hash = self._hash_subagent_chunk(document_id, version, preview_source)
-        pointer_id = chunk_context.pointer_id if chunk_context and chunk_context.pointer_id else f"selection:{document_id}:{chunk_id}"
-        token_source = context_text or selection_text or preview_source
-        token_estimate = self._estimate_text_tokens(token_source)
+        version = manifest.get("version") or snapshot.get("version") or snapshot.get("document_version")
+        chunk_hash = chunk_context.chunk_hash or self._hash_subagent_chunk(document_id, version, preview_source)
+        pointer_id = chunk_context.pointer_id or f"chunk:{document_id}:{chunk_context.chunk_id}"
+        token_estimate = self._estimate_text_tokens(preview_source)
         chunk_ref = ChunkReference(
             document_id=document_id,
-            chunk_id=chunk_id,
+            chunk_id=chunk_context.chunk_id,
             version_id=str(version) if version else None,
             pointer_id=pointer_id,
-            char_range=char_range,
+            char_range=chunk_context.char_range,
             token_estimate=token_estimate,
             chunk_hash=chunk_hash,
             preview=preview,
@@ -2516,39 +2715,35 @@ class AIController:
             budget=budget,
             dedup_hash=chunk_hash,
         )
+        state.last_job_ts = now
+        state.edit_churn = 0
+        if chunk_hash:
+            state.last_job_hashes[chunk_context.chunk_id] = chunk_hash
+        if isinstance(turn_context, MutableMapping):
+            turn_context.setdefault("subagent_trigger_reasons", list(reasons))
+            turn_context["subagent_focus_chunk"] = chunk_context.chunk_id
+            turn_context["subagent_focus_document"] = document_id
+        self._emit_subagent_queue_event(document_id, (job,), reasons)
         LOGGER.debug(
-            "Subagent planning created job (document_id=%s, chunk_id=%s, selection_len=%s, token_estimate=%s, tools=%s)",
+            "Subagent planning created job (document_id=%s, chunk_id=%s, tokens=%s, tools=%s, reasons=%s)",
             document_id,
-            chunk_id,
-            span_length,
+            chunk_context.chunk_id,
             token_estimate,
             len(allowed_tools),
+            ",".join(reasons),
         )
         return [job]
 
     @staticmethod
-    def _selection_span(snapshot: Mapping[str, Any]) -> tuple[int, int] | None:
-        selection = snapshot.get("selection")
-        start: int | None = None
-        end: int | None = None
-        if isinstance(selection, Mapping):
-            start = selection.get("start")  # type: ignore[assignment]
-            end = selection.get("end")  # type: ignore[assignment]
-        elif isinstance(selection, Sequence) and len(selection) >= 2:
-            try:
-                start = int(selection[0])  # type: ignore[arg-type]
-                end = int(selection[1])  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                return None
-        if start is None or end is None:
+    def _snapshot_span(snapshot: Mapping[str, Any]) -> tuple[int, int] | None:
+        span = AIController._coerce_span(snapshot.get("snapshot_span"))
+        if span is None:
+            span = AIController._coerce_span(snapshot.get("text_range"))
+        if span is None:
+            span = AIController._coerce_span(snapshot.get("window"))
+        if span is None:
             return None
-        try:
-            start_idx = int(start)
-            end_idx = int(end)
-        except (TypeError, ValueError):
-            return None
-        if end_idx < start_idx:
-            start_idx, end_idx = end_idx, start_idx
+        start_idx, end_idx = span
         doc_length = snapshot.get("length")
         if not isinstance(doc_length, int):
             text = snapshot.get("text")
@@ -2560,19 +2755,24 @@ class AIController:
         return (start_idx, end_idx)
 
     @staticmethod
-    def _snapshot_text_segment(snapshot: Mapping[str, Any]) -> tuple[str, int, int]:
-        text = snapshot.get("text")
-        if not isinstance(text, str) or not text:
-            return "", 0, 0
-        text_range = snapshot.get("text_range")
-        start_offset = 0
-        end_offset = len(text)
-        if isinstance(text_range, Mapping):
-            start_offset = AIController._coerce_index(text_range.get("start"), 0)
-            end_offset = AIController._coerce_index(text_range.get("end"), start_offset + len(text))
-        if end_offset <= start_offset:
-            end_offset = start_offset + len(text)
-        return text, start_offset, end_offset
+    def _coerce_span(value: Any) -> tuple[int, int] | None:
+        if value is None:
+            return None
+        if isinstance(value, Mapping):
+            start = value.get("start")
+            end = value.get("end")
+        elif isinstance(value, Sequence) and len(value) == 2 and not isinstance(value, (str, bytes)):
+            start, end = value
+        else:
+            return None
+        try:
+            start_i = int(start)
+            end_i = int(end)
+        except (TypeError, ValueError):
+            return None
+        if end_i < start_i:
+            start_i, end_i = end_i, start_i
+        return start_i, end_i
 
     @staticmethod
     def _coerce_index(value: Any, default: int) -> int:
@@ -2808,11 +3008,11 @@ class AIController:
         path = snapshot.get("path")
         if path:
             metadata["doc_path"] = str(path)
-        selection = snapshot.get("selection")
-        if isinstance(selection, Mapping):
-            start = selection.get("start")
-            end = selection.get("end")
-            metadata["selection"] = f"{start}:{end}"
+        text_range = snapshot.get("text_range")
+        if isinstance(text_range, Mapping):
+            start = text_range.get("start")
+            end = text_range.get("end")
+            metadata["window_range"] = f"{start}:{end}"
         if runtime_metadata:
             metadata.update(runtime_metadata)
         return metadata or None
@@ -3380,6 +3580,8 @@ class AIController:
         snapshot = await self._refresh_document_snapshot(tab_id)
         document_id = self._snapshot_document_id(snapshot)
         self._inject_snapshot_metadata(resolved_arguments, snapshot)
+        scope_summary = self._scope_summary_from_arguments(resolved_arguments)
+        scope_fields = self._scope_fields_from_summary(scope_summary)
         base_context: dict[str, Any] = {
             "tool": call.name or "unknown",
             "tab_id": tab_id,
@@ -3387,6 +3589,10 @@ class AIController:
             "cause": error.cause or "hash_mismatch",
             "attempts": 2,
         }
+        if scope_summary:
+            base_context["scope_summary"] = scope_summary
+        if scope_fields:
+            base_context.update(scope_fields)
         LOGGER.warning(
             "Retrying %s after DocumentVersionMismatchError (cause=%s)",
             call.name,
@@ -3490,6 +3696,10 @@ class AIController:
             return
         event_payload = dict(payload)
         event_payload.setdefault("event_source", "controller")
+        scope_summary = event_payload.get("scope_summary") if isinstance(event_payload.get("scope_summary"), Mapping) else None
+        scope_fields = self._scope_fields_from_summary(scope_summary)
+        for key, value in scope_fields.items():
+            event_payload.setdefault(key, value)
         telemetry_service.emit("document_edit.retry", event_payload)
 
     @staticmethod
@@ -3522,6 +3732,15 @@ class AIController:
                 " or replace_all=true."
             ),
         }
+        scope_summary = self._scope_summary_from_arguments(resolved_arguments)
+        if scope_summary:
+            payload["scope_summary"] = scope_summary
+            scope_fields = self._scope_fields_from_summary(scope_summary)
+            if scope_fields:
+                payload.update(scope_fields)
+        span_hint = self._resolve_needs_range_span_hint(resolved_arguments, tab_id)
+        if span_hint:
+            payload["span_hint"] = span_hint
         content_length = getattr(error, "content_length", None)
         if content_length is not None:
             payload["content_length"] = content_length
@@ -3535,6 +3754,349 @@ class AIController:
         label = tool_name or "document_apply_patch"
         message = str(payload.get("message") or "needs_range: Provide explicit range information before retrying.")
         return f"Tool '{label}' failed: {message}"
+
+    def _resolve_needs_range_span_hint(
+        self,
+        resolved_arguments: Any,
+        tab_id: str | None,
+    ) -> dict[str, Any] | None:
+        scope_summary = self._scope_summary_from_arguments(resolved_arguments)
+        scope_hint = self._span_hint_from_scope_summary(scope_summary)
+        if scope_hint is not None:
+            return scope_hint
+        chunk_hint = self._span_hint_from_chunk_arguments(resolved_arguments)
+        if chunk_hint is not None:
+            return chunk_hint
+        snapshot_hint = self._span_hint_from_snapshot(resolved_arguments)
+        if snapshot_hint is not None:
+            return snapshot_hint
+        if tab_id:
+            selection_hint = self._span_hint_from_selection_tool(tab_id)
+            if selection_hint is not None:
+                return selection_hint
+        return None
+
+    def _span_hint_from_snapshot(self, arguments: Any) -> dict[str, Any] | None:
+        if not isinstance(arguments, Mapping):
+            return None
+        snapshot = arguments.get("snapshot")
+        if not isinstance(snapshot, Mapping):
+            return None
+        span = self._snapshot_span(snapshot)
+        if span is None:
+            return None
+        start, end = span
+        return {
+            "source": "snapshot_span",
+            "target_range": {"start": start, "end": end},
+        }
+
+    def _span_hint_from_chunk_arguments(self, arguments: Any) -> dict[str, Any] | None:
+        if not isinstance(arguments, Mapping):
+            return None
+        chunk_id = self._extract_chunk_id(arguments)
+        if not chunk_id:
+            return None
+        bounds = self._parse_chunk_bounds(chunk_id)
+        if not bounds:
+            return None
+        start, end = bounds
+        return {
+            "source": "chunk_manifest",
+            "chunk_id": chunk_id,
+            "target_range": {"start": start, "end": end},
+        }
+
+    def _span_hint_from_selection_tool(self, tab_id: str | None) -> dict[str, Any] | None:
+        registration = self.tools.get("selection_range")
+        if registration is None:
+            return None
+        runner = getattr(registration.impl, "run", registration.impl)
+        if not callable(runner):
+            return None
+        try:
+            result = runner(tab_id=tab_id)
+        except TypeError:
+            result = runner()
+        except Exception:  # pragma: no cover - selection snapshots are best-effort for retries
+            LOGGER.debug("SelectionRangeTool failed while building needs_range span hint", exc_info=True)
+            return None
+        if inspect.isawaitable(result):  # pragma: no cover - defensive guard
+            LOGGER.debug("SelectionRangeTool returned awaitable; skipping needs_range hint")
+            return None
+        if not isinstance(result, Mapping):
+            return None
+        start_line = result.get("start_line")
+        end_line = result.get("end_line")
+        if not isinstance(start_line, int) or not isinstance(end_line, int):
+            return None
+        normalized_start = max(0, start_line)
+        normalized_end = max(0, end_line)
+        return {
+            "source": "selection_range_tool",
+            "target_span": {"start_line": normalized_start, "end_line": normalized_end},
+            "content_hash": result.get("content_hash"),
+        }
+
+    def _span_hint_from_scope_summary(self, scope_summary: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(scope_summary, Mapping):
+            return None
+        scope_fields = self._scope_fields_from_summary(scope_summary)
+        if not scope_fields:
+            return None
+        range_payload = scope_fields.get("scope_range")
+        origin = scope_fields.get("scope_origin")
+        hint: dict[str, Any] = {"source": "tool_scope_metadata"}
+        if isinstance(range_payload, Mapping):
+            hint["target_range"] = {"start": range_payload.get("start"), "end": range_payload.get("end")}
+        elif origin == "document":
+            hint["target_range"] = {"scope": "document"}
+        else:
+            return None
+        if origin:
+            hint["scope_origin"] = origin
+        scope_length = scope_fields.get("scope_length")
+        if isinstance(scope_length, int):
+            hint["scope_length"] = scope_length
+        chunk_id = scope_summary.get("chunk_id") if isinstance(scope_summary, Mapping) else None
+        if isinstance(chunk_id, str) and chunk_id.strip():
+            hint["chunk_id"] = chunk_id.strip()
+        return hint
+
+    def _scope_summary_from_arguments(self, arguments: Any) -> dict[str, Any] | None:
+        if not isinstance(arguments, Mapping):
+            return None
+        metadata_summary = self._scope_summary_from_metadata(arguments.get("metadata"))
+        if metadata_summary:
+            return metadata_summary
+        ranges_summary = self._scope_summary_from_ranges(arguments.get("ranges"))
+        if ranges_summary:
+            return ranges_summary
+        target_summary = self._scope_summary_from_target_range(arguments.get("target_range"))
+        if target_summary:
+            return target_summary
+        chunk_summary = self._scope_summary_from_chunk_arguments(arguments)
+        if chunk_summary:
+            return chunk_summary
+        return None
+
+    def _scope_summary_from_metadata(self, metadata: Any) -> dict[str, Any] | None:
+        if not isinstance(metadata, Mapping):
+            return None
+        scope_payload = metadata.get("scope") if isinstance(metadata.get("scope"), Mapping) else None
+        origin = metadata.get("scope_origin")
+        if (not isinstance(origin, str) or not origin.strip()) and isinstance(scope_payload, Mapping):
+            origin = scope_payload.get("origin")
+        normalized_origin = self._normalize_scope_origin(origin)
+        summary: dict[str, Any] = {}
+        if normalized_origin:
+            summary["origin"] = normalized_origin
+        length_value = metadata.get("scope_length")
+        length = self._coerce_optional_int(length_value)
+        if length is None and isinstance(scope_payload, Mapping):
+            length = self._coerce_optional_int(scope_payload.get("length"))
+        if length is not None:
+            summary["length"] = max(0, length)
+        range_payload = metadata.get("scope_range")
+        if not isinstance(range_payload, Mapping) and isinstance(scope_payload, Mapping):
+            candidate = scope_payload.get("range")
+            if isinstance(candidate, Mapping):
+                range_payload = candidate
+        bounds = self._range_bounds_from_mapping(range_payload)
+        if bounds is not None:
+            start, end = bounds
+            summary["range"] = {"start": start, "end": end}
+        return summary or None
+
+    def _scope_summary_from_ranges(self, ranges: Any) -> dict[str, Any] | None:
+        if not isinstance(ranges, Sequence) or isinstance(ranges, (str, bytes)):
+            return None
+        origins: set[str] = set()
+        total_length = 0
+        range_starts: list[int] = []
+        range_ends: list[int] = []
+        found = False
+        for entry in ranges:
+            if not isinstance(entry, Mapping):
+                continue
+            found = True
+            origin = self._normalize_scope_origin(entry.get("scope_origin"))
+            scope_payload = entry.get("scope") if isinstance(entry.get("scope"), Mapping) else None
+            if origin is None and isinstance(scope_payload, Mapping):
+                origin = self._normalize_scope_origin(scope_payload.get("origin"))
+            if origin:
+                origins.add(origin)
+            length = self._coerce_optional_int(entry.get("scope_length"))
+            if length is None and isinstance(scope_payload, Mapping):
+                length = self._coerce_optional_int(scope_payload.get("length"))
+            bounds = self._range_bounds_from_entry(entry)
+            if bounds is not None:
+                start, end = bounds
+                range_starts.append(start)
+                range_ends.append(end)
+                if length is None:
+                    length = max(0, end - start)
+            if length is not None:
+                total_length += max(0, length)
+        if not found:
+            return None
+        origin_summary = "mixed"
+        if len(origins) == 1:
+            origin_summary = origins.pop()
+        elif not origins:
+            origin_summary = "explicit_span"
+        summary: dict[str, Any] = {"origin": origin_summary}
+        if total_length > 0:
+            summary["length"] = total_length
+        if range_starts and range_ends:
+            summary["range"] = {"start": min(range_starts), "end": max(range_ends)}
+        return summary
+
+    def _scope_summary_from_target_range(self, target_range: Any) -> dict[str, Any] | None:
+        if target_range is None:
+            return None
+        if isinstance(target_range, str):
+            token = target_range.strip().lower()
+            if token in {"document"}:
+                return {"origin": "document"}
+            return None
+        start: int | None = None
+        end: int | None = None
+        origin: str | None = None
+        if isinstance(target_range, Mapping):
+            scope_token = str(target_range.get("scope") or target_range.get("origin") or "").strip().lower()
+            if scope_token in {"document"}:
+                origin = "document"
+            start = self._coerce_optional_int(target_range.get("start"))
+            end = self._coerce_optional_int(target_range.get("end"))
+        elif isinstance(target_range, Sequence) and len(target_range) == 2 and not isinstance(target_range, (str, bytes)):
+            start = self._coerce_optional_int(target_range[0])
+            end = self._coerce_optional_int(target_range[1])
+        if start is None or end is None:
+            if origin == "document":
+                return {"origin": "document"}
+            return None
+        if end < start:
+            start, end = end, start
+        summary = {
+            "origin": origin or "explicit_span",
+            "range": {"start": start, "end": end},
+            "length": max(0, end - start),
+        }
+        return summary
+
+    def _scope_summary_from_chunk_arguments(self, arguments: Mapping[str, Any]) -> dict[str, Any] | None:
+        chunk_id = self._extract_chunk_id(arguments)
+        if not chunk_id:
+            return None
+        bounds = self._parse_chunk_bounds(chunk_id)
+        if not bounds:
+            return None
+        start, end = bounds
+        return {
+            "origin": "chunk",
+            "range": {"start": start, "end": end},
+            "length": max(0, end - start),
+            "chunk_id": chunk_id,
+        }
+
+    def _range_bounds_from_entry(self, entry: Mapping[str, Any]) -> tuple[int, int] | None:
+        range_payload = entry.get("scope_range") if isinstance(entry.get("scope_range"), Mapping) else None
+        if range_payload is None:
+            scope_payload = entry.get("scope") if isinstance(entry.get("scope"), Mapping) else None
+            if isinstance(scope_payload, Mapping):
+                candidate = scope_payload.get("range")
+                if isinstance(candidate, Mapping):
+                    range_payload = candidate
+        bounds = self._range_bounds_from_mapping(range_payload)
+        if bounds is not None:
+            return bounds
+        start = self._coerce_optional_int(entry.get("start"))
+        end = self._coerce_optional_int(entry.get("end"))
+        if start is None or end is None:
+            return None
+        if end < start:
+            start, end = end, start
+        return start, end
+
+    def _range_bounds_from_mapping(self, payload: Mapping[str, Any] | None) -> tuple[int, int] | None:
+        if not isinstance(payload, Mapping):
+            return None
+        start = self._coerce_optional_int(payload.get("start"))
+        end = self._coerce_optional_int(payload.get("end"))
+        if start is None or end is None:
+            return None
+        if end < start:
+            start, end = end, start
+        return start, end
+
+    @staticmethod
+    def _scope_fields_from_summary(summary: Mapping[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(summary, Mapping):
+            return {}
+        payload: dict[str, Any] = {}
+        origin = summary.get("origin")
+        if isinstance(origin, str) and origin.strip():
+            payload["scope_origin"] = origin.strip()
+        length = summary.get("length")
+        try:
+            if length is not None:
+                payload["scope_length"] = max(0, int(length))
+        except (TypeError, ValueError):
+            pass
+        range_payload = summary.get("range")
+        if isinstance(range_payload, Mapping):
+            try:
+                start = int(range_payload.get("start"))
+                end = int(range_payload.get("end"))
+            except (TypeError, ValueError):
+                start = end = None
+            if start is not None and end is not None:
+                payload["scope_range"] = {"start": start, "end": end}
+        return payload
+
+    def _extract_chunk_id(self, arguments: Mapping[str, Any]) -> str | None:
+        def _coerce(value: Any) -> str | None:
+            if isinstance(value, str):
+                text = value.strip()
+                return text or None
+            return None
+
+        chunk_id = _coerce(arguments.get("chunk_id"))
+        if chunk_id:
+            return chunk_id
+        metadata = arguments.get("metadata")
+        if isinstance(metadata, Mapping):
+            chunk_id = _coerce(metadata.get("chunk_id"))
+            if chunk_id:
+                return chunk_id
+        for key in ("patches", "ranges"):
+            entries = arguments.get(key)
+            if not isinstance(entries, Sequence):
+                continue
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                chunk_id = _coerce(entry.get("chunk_id"))
+                if chunk_id:
+                    return chunk_id
+        return None
+
+    @staticmethod
+    def _parse_chunk_bounds(chunk_id: str | None) -> tuple[int, int] | None:
+        if not chunk_id:
+            return None
+        parts = chunk_id.split(":")
+        if len(parts) < 4:
+            return None
+        try:
+            start = int(parts[-2])
+            end = int(parts[-1])
+        except ValueError:
+            return None
+        if end < start:
+            start, end = end, start
+        return start, end
 
     def _build_tool_record(
         self,
@@ -3550,7 +4112,9 @@ class AIController:
     ) -> dict[str, Any]:
         diff_summary = self._summarize_tool_result(call.name, resolved_arguments, raw_result, serialized_result)
         status = self._derive_tool_status(call.name, serialized_result)
-        return {
+        scope_summary = self._scope_summary_from_arguments(resolved_arguments)
+        scope_fields = self._scope_fields_from_summary(scope_summary)
+        record = {
             "id": call.call_id,
             "name": call.name,
             "index": call.index,
@@ -3566,6 +4130,11 @@ class AIController:
             "diff_summary": diff_summary,
             "summarizable": summarizable,
         }
+        if scope_summary:
+            record["scope_summary"] = scope_summary
+        if scope_fields:
+            record.update(scope_fields)
+        return record
 
     def _derive_tool_status(self, tool_name: str | None, serialized_result: str) -> str:
         probe = {"name": tool_name, "result": serialized_result}

@@ -1,7 +1,7 @@
 # AI Diff Tooling Fixes Plan
 
 ## 1. Snapshot-Anchored Range Resolution
-- Add optional `match_text`/`expected_text` (and `selection_fingerprint`) arguments to `DocumentApplyPatchTool` and propagate them to `DocumentEditTool`.
+- Add optional `match_text`/`expected_text` anchors (alongside `target_span`) to `DocumentApplyPatchTool` and propagate them to `DocumentEditTool`.
 - When present, locate the text inside the current snapshot and realign `start/end` or raise a version mismatch error if no unambiguous hit exists.
 - If both a range and anchor are provided, validate that `base_text[start:end]` matches; reject the edit when it does not.
 - Surface clear error messages instructing agents to refresh `document_snapshot` when anchors fail, preventing silent mid-word overwrites.

@@ -159,6 +159,20 @@ class SubagentJob:
     created_at: datetime = field(default_factory=_utcnow)
     result: SubagentJobResult | None = None
     dedup_hash: str | None = None
+    document_id: str = field(init=False)
+    chunk_id: str = field(init=False)
+    chunk_hash: str | None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        document_id = (self.chunk_ref.document_id or "").strip()
+        chunk_id = (self.chunk_ref.chunk_id or "").strip()
+        if not document_id:
+            raise ValueError("SubagentJob requires chunk_ref.document_id")
+        if not chunk_id:
+            raise ValueError("SubagentJob requires chunk_ref.chunk_id")
+        self.document_id = document_id
+        self.chunk_id = chunk_id
+        self.chunk_hash = (self.chunk_ref.chunk_hash or None)
 
     def as_payload(self) -> dict[str, Any]:
         payload = {
@@ -169,6 +183,9 @@ class SubagentJob:
             "allowed_tools": list(self.allowed_tools),
             "instructions": self.instructions,
             "chunk": self.chunk_ref.as_payload(),
+            "document_id": self.document_id,
+            "chunk_id": self.chunk_id,
+            "chunk_hash": self.chunk_hash,
             "budget": asdict(self.budget),
             "result": self.result.as_payload() if self.result else None,
             "dedup_hash": self.dedup_hash,
@@ -182,7 +199,6 @@ class SubagentRuntimeConfig:
 
     enabled: bool = False
     max_jobs_per_turn: int = 2
-    selection_min_chars: int = 400
     chunk_preview_chars: int = 1_200
     plot_outline_min_chars: int = 400
     allowed_tools: tuple[str, ...] = (
@@ -195,12 +211,27 @@ class SubagentRuntimeConfig:
         "list any risks or continuity issues, and return concrete follow-up suggestions for the main controller."
     )
     plot_scaffolding_enabled: bool = False
+    chunk_trigger_threshold: int = 12
+    code_chunk_trigger: int = 8
+    edit_churn_threshold: int = 2
+    edit_debounce_seconds: float = 6.0
+    helper_cooldown_seconds: float = 30.0
 
     def clamp(self) -> SubagentRuntimeConfig:
         self.max_jobs_per_turn = max(0, int(self.max_jobs_per_turn or 0))
-        self.selection_min_chars = max(0, int(self.selection_min_chars or 0))
         self.chunk_preview_chars = max(200, int(self.chunk_preview_chars or 200))
         self.plot_outline_min_chars = max(0, int(self.plot_outline_min_chars or 0))
+        self.chunk_trigger_threshold = max(1, int(self.chunk_trigger_threshold or 1))
+        self.code_chunk_trigger = max(1, int(self.code_chunk_trigger or 1))
+        self.edit_churn_threshold = max(0, int(self.edit_churn_threshold or 0))
+        try:
+            self.edit_debounce_seconds = max(0.0, float(self.edit_debounce_seconds))
+        except (TypeError, ValueError):
+            self.edit_debounce_seconds = 0.0
+        try:
+            self.helper_cooldown_seconds = max(0.0, float(self.helper_cooldown_seconds))
+        except (TypeError, ValueError):
+            self.helper_cooldown_seconds = 0.0
         allowed = tuple(tool.strip() for tool in self.allowed_tools if tool)
         self.allowed_tools = allowed or (
             "document_snapshot",

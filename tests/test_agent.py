@@ -144,7 +144,7 @@ def _build_chunk_manifest(
                 "end": end,
                 "length": end - start,
                 "hash": f"hash-{idx}",
-                "selection_overlap": True,
+                "span_overlap": True,
                 "outline_pointer_id": f"outline:{document_id}:{idx}",
             }
         )
@@ -160,10 +160,6 @@ def _build_chunk_manifest(
             "start": window_start,
             "end": window_end,
             "length": window_end - window_start,
-            "selection": {
-                "start": window_start,
-                "end": min(window_end, window_start + 1),
-            },
         },
         "chunks": chunk_entries,
         "cache_key": cache_key,
@@ -201,7 +197,9 @@ def test_ai_controller_collects_streamed_response(sample_snapshot):
         "response_builder",
     ]
     assert graph["tools"] == []
-    assert stub_client.calls[0]["metadata"] == {"tab": "notes"}
+    metadata = stub_client.calls[0]["metadata"]
+    assert metadata["tab"] == "notes"
+    assert metadata.get("window_range") == "0:5"
 
 
 def test_preflight_analysis_hint_injected_when_document_known(sample_snapshot):
@@ -541,7 +539,7 @@ def test_ai_controller_ingests_chunk_manifest_on_run():
     snapshot = {
         "document_id": "doc-ingest",
         "text": "Hello world",
-        "selection": {"start": 0, "end": 5},
+        "text_range": {"start": 0, "end": 5},
         "length": 32,
         "chunk_manifest": manifest,
     }
@@ -560,7 +558,7 @@ def test_ai_controller_ingests_chunk_manifest_on_run():
 
 def test_subagent_jobs_use_chunk_manifest_outside_window():
     stub_client = _StubClient([AIStreamEvent(type="content.done", content="ok")])
-    runtime_config = SubagentRuntimeConfig(enabled=True, selection_min_chars=10, chunk_preview_chars=32)
+    runtime_config = SubagentRuntimeConfig(enabled=True, chunk_preview_chars=32)
     controller = AIController(client=cast(AIClient, stub_client), subagent_config=runtime_config)
     controller.configure_subagents(runtime_config)
 
@@ -585,7 +583,8 @@ def test_subagent_jobs_use_chunk_manifest_outside_window():
         "document_id": "doc-chunk",
         "text": doc_text[:16],
         "text_range": {"start": 0, "end": 16},
-        "selection": {"start": 30, "end": 50},
+        "window": {"start": 30, "end": 50},
+        "snapshot_span": {"start": 30, "end": 50},
         "length": len(doc_text),
         "chunk_manifest": manifest,
     }

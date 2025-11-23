@@ -198,6 +198,30 @@ def test_chat_panel_visibility_controlled_by_settings():
     assert window.chat_panel.tool_activity_visible is True
 
 
+def test_main_window_updates_status_bar_cursor_on_selection():
+    window = _make_window()
+    active_tab_id = window._workspace.active_tab_id
+    assert active_tab_id is not None
+
+    window._status_bar.update_cursor(5, 5)
+    window._handle_editor_selection_changed(active_tab_id, SelectionRange(0, 0), 3, 7)
+
+    assert window._status_bar.cursor_position == (3, 7)
+
+
+def test_active_tab_cursor_refresh_updates_status_bar():
+    window = _make_window()
+    tab = window._workspace.active_tab
+    assert tab is not None
+
+    tab.editor.load_document(DocumentState(text="alpha\nbeta\ngamma"))
+    caret = len("alpha\nbeta\n") + 2
+    tab.editor._set_selection(SelectionRange(caret, caret))
+
+    window._handle_active_tab_for_cursor(tab)
+
+    assert window._status_bar.cursor_position == (3, 3)
+
 def test_safe_ai_settings_apply_to_existing_bridges():
     settings = Settings(
         safe_ai_edits=True,
@@ -319,7 +343,7 @@ def test_safe_edit_failure_surfaces_guardrail_notice():
     directive = EditDirective(
         action="patch",
         content="",
-        target_range=SelectionRange(0, 0),
+        target_range=(0, 0),
     )
     metadata = {
         "reason": "Paragraph repeated 3 times after edit",
@@ -347,7 +371,7 @@ def test_hash_mismatch_failure_surfaces_guardrail_notice():
     directive = EditDirective(
         action="patch",
         content="",
-        target_range=SelectionRange(0, 0),
+        target_range=(0, 0),
     )
     metadata = {
         "reason": "Provided content_hash does not match the latest snapshot.",
@@ -365,14 +389,13 @@ def test_hash_mismatch_failure_surfaces_guardrail_notice():
     history = window.chat_panel.history()
     assert "Refresh document_snapshot" in history[-1].content
 
-def test_selection_updates_chat_suggestions_and_metadata():
+def test_chat_suggestions_ignore_selection_state():
     window = _make_window()
     window.editor_widget.set_text("Alpha beta gamma")
-    window.editor_widget.apply_selection(SelectionRange(0, 5))
 
     suggestions = window.chat_panel.suggestions()
-    assert "Summarize the selected text." in suggestions
-    assert "Rewrite the selected text for clarity." in suggestions
+    assert "Summarize the current document." in suggestions
+    assert "Summarize the selected text." not in suggestions
 
     captured: list[dict[str, Any]] = []
 
@@ -385,7 +408,7 @@ def test_selection_updates_chat_suggestions_and_metadata():
     window.chat_panel.send_prompt()
 
     assert captured
-    assert captured[0]["selection_summary"] == "Alpha"
+    assert "selection_summary" not in captured[0]
 
 
 def test_suggestion_panel_without_history_keeps_default_suggestions():
@@ -844,14 +867,19 @@ def test_missing_last_session_file_is_cleared(tmp_path: Path):
 
 
 def test_unsaved_snapshot_restores_when_available():
-    cache = UnsavedCache(unsaved_snapshot={"text": "Draft", "language": "markdown", "selection": (1, 3)})
+    cache = UnsavedCache(unsaved_snapshot={"text": "Draft", "language": "markdown"})
     window = _make_window(settings=Settings(), unsaved_cache=cache)
 
     document = window.editor_widget.to_document()
     assert document.text == "Draft"
     assert document.metadata.path is None
-    assert tuple(document.selection.as_tuple()) == (1, 3)
     assert window.last_status_message == "Restored unsaved draft"
+
+
+def test_unsaved_snapshot_with_selection_field_raises():
+    cache = UnsavedCache(unsaved_snapshot={"text": "Draft", "language": "markdown", "selection": (1, 3)})
+    with pytest.raises(ValueError, match="selection"):
+        _make_window(settings=Settings(), unsaved_cache=cache)
 
 
 def test_workspace_tabs_restore_from_settings(tmp_path: Path) -> None:
@@ -880,8 +908,8 @@ def test_workspace_tabs_restore_from_settings(tmp_path: Path) -> None:
         next_untitled_index=5,
     )
     cache = UnsavedCache(
-        untitled_snapshots={"draft-1": {"text": "Draft", "language": "markdown", "selection": [0, 5]}},
-        unsaved_snapshots={normalized: {"text": "Edited", "language": "markdown", "selection": [0, 6]}},
+        untitled_snapshots={"draft-1": {"text": "Draft", "language": "markdown"}},
+        unsaved_snapshots={normalized: {"text": "Edited", "language": "markdown"}},
     )
 
     window = _make_window(settings=settings, unsaved_cache=cache)

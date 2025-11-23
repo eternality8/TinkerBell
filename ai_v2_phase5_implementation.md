@@ -74,7 +74,7 @@ Phase 5 ships the remaining large-document capabilities on top of the Phase 0–
 Even after streaming diffs ship, we must harden the existing patch/edit path so legacy agents and UI actions stop corrupting text. The following tasks come directly from `ai_fixes.md` and should be executed alongside Workstream 3; treat them as a co-equal workstream rather than a follow-up.
 
 #### 3b.1 Snapshot-anchored range resolution — ✅ landed 19 Nov
-- `DocumentApplyPatchTool` and `DocumentEditTool` now accept `match_text`/`expected_text` plus `selection_fingerprint`, enforce anchor uniqueness, and refuse stale ranges with refresh guidance (see `tests/test_document_apply_patch.py`).
+- `DocumentApplyPatchTool` and `DocumentEditTool` now require explicit spans and `match_text`/`expected_text` anchors, enforce anchor uniqueness, and refuse stale ranges with refresh guidance (see `tests/test_document_apply_patch.py`).
 - Follow-up: monitor telemetry for anchor failure rates once counters from 3b.5 go live.
 
 #### 3b.2 Inline edit auto-conversion safety — ✅ landed 19 Nov

@@ -7,10 +7,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from ..chat.message_model import ToolTrace
-from ..editor.document_model import DocumentState, SelectionRange
+from ..editor.document_model import DocumentState
 from ..editor.workspace import DocumentTab
 from ..services.unsaved_cache import UnsavedCache
 from ..utils import file_io
@@ -84,9 +84,6 @@ class DocumentStateMonitor:
         self.maybe_clear_diff_overlay(state)
         self._publish_document_change(state)
 
-    def handle_editor_selection_changed(self, selection: SelectionRange) -> None:
-        self._refresh_chat_suggestions(selection=selection)
-
     def handle_active_tab_changed(self, tab: DocumentTab | None) -> None:
         if tab is None:
             self.current_path_setter(None)
@@ -126,9 +123,8 @@ class DocumentStateMonitor:
         self,
         *,
         state: DocumentState | None = None,
-        selection: SelectionRange | None = None,
     ) -> None:
-        self._refresh_chat_suggestions(state=state, selection=selection)
+        self._refresh_chat_suggestions(state=state)
 
     def clear_unsaved_snapshot(
         self,
@@ -203,27 +199,14 @@ class DocumentStateMonitor:
         self,
         *,
         state: DocumentState | None = None,
-        selection: SelectionRange | None = None,
     ) -> None:
         document = state or self.editor.to_document()
-        active_selection = selection or document.selection
-        start, end = active_selection.as_tuple()
-        text = document.text[start:end]
-        summary = self._summarize_selection_text(text)
-        self.chat_panel.set_selection_summary(summary)
-        suggestions = self._build_chat_suggestions(document, text)
+        suggestions = self._build_chat_suggestions(document)
         self.chat_panel.set_suggestions(suggestions)
 
-    def _build_chat_suggestions(self, document: DocumentState, selection_text: str) -> list[str]:
-        has_selection = bool(selection_text.strip())
+    def _build_chat_suggestions(self, document: DocumentState) -> list[str]:
         has_document_text = bool(document.text.strip())
-        if has_selection:
-            suggestions = [
-                "Summarize the selected text.",
-                "Rewrite the selected text for clarity.",
-                "Extract action items from the selection.",
-            ]
-        elif has_document_text:
+        if has_document_text:
             suggestions = [
                 "Summarize the current document.",
                 "Suggest improvements to the document structure.",
@@ -238,14 +221,6 @@ class DocumentStateMonitor:
             ]
         suggestions.append("Help me plan the next edits.")
         return suggestions
-
-    def _summarize_selection_text(self, selection_text: str) -> Optional[str]:
-        condensed = self._condense_whitespace(selection_text)
-        if not condensed:
-            return None
-        if len(condensed) > 80:
-            condensed = f"{condensed[:77].rstrip()}…"
-        return condensed
 
     def _emit_outline_timeline_event(self, document_id: str, outline_digest: str) -> None:
         try:
@@ -323,7 +298,6 @@ class DocumentStateMonitor:
         snapshot = {
             "text": document.text,
             "language": document.metadata.language,
-            "selection": list(document.selection.as_tuple()),
         }
         digest = file_io.compute_text_digest(snapshot["text"])
         if self._unsaved_snapshot_digests.get(key) == digest:
@@ -386,10 +360,6 @@ class DocumentStateMonitor:
             return f"{hours}h ago"
         days = hours // 24
         return f"{days}d ago"
-
-    @staticmethod
-    def _condense_whitespace(text: str) -> str:
-        return " ".join(text.split())
 
 
 __all__ = ["DocumentStateMonitor"]

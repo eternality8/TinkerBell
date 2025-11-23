@@ -86,7 +86,6 @@ class DocumentState:
 
     text: str = ""
     metadata: DocumentMetadata = field(default_factory=DocumentMetadata)
-    selection: SelectionRange = field(default_factory=SelectionRange)
     dirty: bool = False
     document_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     version_id: int = 1
@@ -110,7 +109,6 @@ class DocumentState:
 
         payload: Dict[str, Any] = {
             "text": self.text if not delta_only else "",
-            "selection": self.selection.as_tuple(),
             "language": self.metadata.language,
             "dirty": self.dirty,
         }

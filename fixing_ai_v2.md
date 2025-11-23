@@ -22,7 +22,7 @@ Incidents on 2025-11-21 show the assistant still pastes full-story rewrites afte
 - Deprecate API parameters such as `insert_at_cursor`, `cursor_offset`, or implicit "current selection" writes; return `unsupported_operation` if older clients attempt to use them.
 - Introduce a single read-only `get_selection_range` tool so the agent can inspect what the human highlighted without mutating it; the returned `{start_line, end_line}` must be pinned to the snapshot hash included in the edit request.
 - Update the agent runtime to always compute edits as diff patches (range-based or replace-all) derived from the fetched snapshot, never from editor UI state.
-- Add telemetry counters `caret_call_blocked` and `selection_snapshot_requested` so we can track lingering clients and real selection usage until they migrate.
+- Add telemetry counters `caret_call_blocked` and `span_snapshot_requested` so we can track lingering clients and real span usage until they migrate.
 
 ### 2. Replace-All Semantics (P0)
 - Add an explicit `operation: "replace"` flag (or `replace_all: true`) to `document_apply_patch`.

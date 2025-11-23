@@ -97,8 +97,6 @@ _ANALYZE_FLAG_ALIASES = {
     "--doc": "document_id",
     "--document": "document_id",
     "--tab": "document_id",
-    "--start": "selection_start",
-    "--end": "selection_end",
     "--reason": "reason",
 }
 _ANALYZE_BOOLEAN_FLAGS = {
@@ -149,6 +147,7 @@ _DEPRECATED_CARET_FIELDS = (
     "cursor_offset",
     "selection_start",
     "selection_end",
+    "selection",
 )
 
 
@@ -314,12 +313,9 @@ def _parse_analyze_command(tokens: deque[str]) -> dict[str, Any]:
             cleaned = value.strip()
             if not cleaned:
                 raise ValueError(f"Flag '{token}' requires a value")
-            if normalized in {"selection_start", "selection_end"}:
-                args[normalized] = _coerce_int_flag(cleaned, token, minimum=0)
-            else:
-                if inline_value is None and normalized == "document_id":
-                    cleaned = _collect_reference_value(cleaned, tokens)
-                args[normalized] = cleaned
+            if inline_value is None and normalized == "document_id":
+                cleaned = _collect_reference_value(cleaned, tokens)
+            args[normalized] = cleaned
             continue
         positional.append(token)
     if positional and "document_id" not in args:
@@ -482,7 +478,6 @@ DIRECTIVE_SCHEMA: Dict[str, Any] = {
         "metadata": {"type": "object"},
         "tab_id": {"type": "string", "minLength": 1},
         "replace_all": {"type": "boolean"},
-        "selection_fingerprint": {"type": "string", "minLength": 1},
         "match_text": {"type": "string"},
         "expected_text": {"type": "string"},
         "ranges": {
@@ -496,6 +491,10 @@ DIRECTIVE_SCHEMA: Dict[str, Any] = {
                     "match_text": {"type": "string"},
                     "chunk_id": {"type": "string"},
                     "chunk_hash": {"type": "string"},
+                    "scope": {"type": "object"},
+                    "scope_origin": {"type": "string"},
+                    "scope_length": {"type": "integer", "minimum": 0},
+                    "scope_range": _TEXT_RANGE_OBJECT_SCHEMA,
                 },
                 "required": ["start", "end", "replacement", "match_text"],
                 "additionalProperties": False,
@@ -560,8 +559,9 @@ def validate_directive(payload: Mapping[str, Any]) -> ValidationResult:
         return ValidationResult(
             ok=False,
             message=(
-                f"Deprecated caret parameters ({field_list}) are no longer supported. "
-                "Call document_snapshot/selection_range and send target_range or replace_all=true."
+                f"Deprecated range parameters ({field_list}) are no longer supported. "
+                "Capture a span via DocumentSnapshot windows, chunk manifests, or SelectionRangeTool "
+                "(when authorized) and send target_range or replace_all=true."
             ),
         )
 
@@ -623,7 +623,7 @@ def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["action"] = action.strip().lower()
 
     if "target_range" not in normalized:
-        for alias in ("target", "range", "selection"):
+        for alias in ("target", "range"):
             if alias in normalized:
                 normalized["target_range"] = normalized.pop(alias)
                 break

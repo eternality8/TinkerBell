@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import pytest
 
+from tinkerbell.editor.selection_gateway import SelectionSnapshot
 from tinkerbell.ui.tools import provider as provider_module
 from tinkerbell.ui.tools.provider import ToolProvider
 
@@ -16,11 +17,24 @@ class _WorkerStub:
     def is_rebuild_pending(self, document_id: str) -> bool:  # pragma: no cover - trivial
         return self._pending and bool(document_id)
 
+class _GatewayStub:
+    def capture(self, *, tab_id: str | None = None) -> SelectionSnapshot:  # pragma: no cover - simple stub
+        return SelectionSnapshot(
+            tab_id=tab_id,
+            document_id="doc",
+            content_hash="hash",
+            selection_start=0,
+            selection_end=0,
+            length=0,
+            line_offsets=(0,),
+        )
+
 
 def _make_provider(*, phase3: bool = True, plot: bool = True) -> ToolProvider:
     return ToolProvider(
         controller_resolver=lambda: object(),
         bridge=object(),
+        selection_gateway=_GatewayStub(),
         document_lookup=lambda doc_id: {"id": doc_id},
         active_document_provider=lambda: {"id": "active"},
         outline_worker_resolver=lambda: cast(Any, _WorkerStub()),

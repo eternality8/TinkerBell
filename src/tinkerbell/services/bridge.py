@@ -70,6 +70,7 @@ class _QueuedEdit:
     payload: Optional[Mapping[str, Any]] = None
     diff: Optional[str] = None
     ranges: tuple["PatchRangePayload", ...] = ()
+    scope_summary: Mapping[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -82,6 +83,10 @@ class PatchRangePayload:
     match_text: str
     chunk_id: str | None = None
     chunk_hash: str | None = None
+    scope_origin: str | None = None
+    scope_length: int | None = None
+    scope_range: tuple[int, int] | None = None
+    scope: Mapping[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -208,18 +213,14 @@ class DocumentBridge:
 
         document = self.editor.to_document()
         snapshot = document.snapshot(delta_only=delta_only)
-        start, end = self._clamp_range(*document.selection.as_tuple(), len(document.text))
-        snapshot["selection_text"] = document.text[start:end]
         snapshot["length"] = len(document.text)
         snapshot["line_offsets"] = self._compute_line_offsets(document.text)
-        if snapshot["selection_text"]:
-            snapshot["selection_hash"] = self._hash_text(snapshot["selection_text"])
         window_range = self._resolve_window(
             window,
-            selection=(start, end),
             length=len(document.text),
             max_tokens=max_tokens,
         )
+        focus_span = TextRange(window_range["start"], window_range["end"])
         chunk_profile_name = self._normalize_chunk_profile(chunk_profile)
         snapshot["window"] = dict(window_range)
         snapshot["text_range"] = {"start": window_range["start"], "end": window_range["end"]}
@@ -227,7 +228,12 @@ class DocumentBridge:
             snapshot["text"] = ""
         elif not delta_only and not window_range["includes_full_document"]:
             snapshot["text"] = document.text[window_range["start"] : window_range["end"]]
-        chunk_manifest = self._resolve_chunk_manifest(document, window_range, chunk_profile_name)
+        chunk_manifest = self._resolve_chunk_manifest(
+            document,
+            window_range,
+            chunk_profile_name,
+            focus_span=focus_span,
+        )
         if chunk_manifest is not None:
             snapshot["chunk_manifest"] = chunk_manifest
         version = document.version_info()
@@ -438,9 +444,11 @@ class DocumentBridge:
         streamed: bool | None,
         record_conflict: bool,
         diagnostics: Mapping[str, Any] | None = None,
+        scope_summary: Mapping[str, Any] | None = None,
     ) -> None:
         summary = reason or "edit rejected"
         self._last_diff = f"failed: {summary}"
+        scope_summary = scope_summary or queued.scope_summary
         failure_metadata = self._build_failure_metadata(
             version=version,
             status=status,
@@ -449,6 +457,7 @@ class DocumentBridge:
             range_count=range_count,
             streamed=streamed,
             diagnostics=diagnostics,
+            scope_summary=scope_summary,
         )
         self._record_failure(queued.directive, self._last_diff, failure_metadata)
         if record_conflict:
@@ -461,6 +470,7 @@ class DocumentBridge:
             range_count=range_count,
             streamed=streamed,
             cause=cause,
+            scope_summary=scope_summary,
         )
         self._emit_edit_rejected_event(
             version=version,
@@ -470,6 +480,7 @@ class DocumentBridge:
             range_count=range_count,
             streamed=streamed,
             diagnostics=diagnostics,
+            scope_summary=scope_summary,
         )
         if cause in {self.CAUSE_HASH_MISMATCH, self.CAUSE_CHUNK_HASH_MISMATCH}:
             self._emit_hash_mismatch_event(
@@ -480,6 +491,7 @@ class DocumentBridge:
                 range_count=range_count,
                 streamed=streamed,
                 diagnostics=diagnostics,
+                scope_summary=scope_summary,
             )
 
     def _validate_patch_context(self, document: DocumentState, queued: _QueuedEdit) -> None:
@@ -518,6 +530,7 @@ class DocumentBridge:
         pre_version = document_before.version_info()
         range_count = len(queued.ranges) if use_ranges else None
         range_hint: tuple[int, int] | None = None
+        scope_summary = queued.scope_summary
         try:
             if use_ranges:
                 expanded_ranges = self._expand_patch_ranges(document_before, queued.ranges)
@@ -526,6 +539,8 @@ class DocumentBridge:
                 if range_hint is not None:
                     queued.directive.target_range = TextRange.from_value(range_hint)
                 self._validate_range_chunk_hashes(document_before, expanded_ranges)
+                scope_summary = self._summarize_patch_scopes(expanded_ranges)
+                queued.scope_summary = scope_summary
                 patch_result = self._apply_range_payloads(expanded_ranges, document_before)
             else:
                 patch_result = apply_unified_diff(document_before.text, diff_text)
@@ -558,8 +573,13 @@ class DocumentBridge:
                 raise DocumentVersionMismatchError("Streamed patch validation failed", cause=cause) from exc
             raise RuntimeError(f"Patch application failed: {exc}") from exc
 
+        selection_hint = range_hint
         updated_state = self._execute_on_main_thread(
-            lambda: self.editor.apply_patch_result(patch_result, preserve_selection=True)
+            lambda: self.editor.apply_patch_result(
+                patch_result,
+                selection_hint=selection_hint,
+                preserve_selection=True,
+            )
         )
         diff_summary = patch_result.summary
         inspection = self._run_post_edit_inspection(
@@ -606,6 +626,7 @@ class DocumentBridge:
             range_count=len(patch_result.spans),
             streamed=use_ranges,
             cause=None,
+            scope_summary=scope_summary,
         )
 
         _LOGGER.debug("Applied patch directive diff=%s spans=%s", patch_result.summary, patch_result.spans)
@@ -628,6 +649,7 @@ class DocumentBridge:
         streamed: bool | None = None,
         reason: str | None = None,
         cause: str | None = None,
+        scope_summary: Mapping[str, Any] | None = None,
     ) -> None:
         event_name = self.PATCH_EVENT_NAME
         if not event_name:
@@ -652,6 +674,7 @@ class DocumentBridge:
             payload["reason"] = reason
         if cause:
             payload["cause"] = cause
+        self._attach_scope_metadata(payload, scope_summary)
         telemetry_emit(event_name, payload)
 
     def _format_auto_revert_message(self, details: Mapping[str, Any] | None) -> str:
@@ -676,6 +699,7 @@ class DocumentBridge:
         reason: str,
         detail: str,
         diagnostics: Mapping[str, Any] | None,
+        scope_summary: Mapping[str, Any] | None = None,
     ) -> None:
         event_name = self.AUTO_REVERT_EVENT_NAME
         if not event_name:
@@ -693,6 +717,7 @@ class DocumentBridge:
             payload["tab_id"] = self._tab_id
         if diagnostics:
             payload["diagnostics"] = dict(diagnostics)
+        self._attach_scope_metadata(payload, scope_summary)
         telemetry_emit(event_name, payload)
 
     def _emit_duplicate_detected_event(
@@ -774,6 +799,7 @@ class DocumentBridge:
             reason=reason_code,
             detail=detail,
             diagnostics=diagnostics,
+            scope_summary=queued.scope_summary,
         )
         if diagnostics.get("duplicate"):
             self._emit_duplicate_detected_event(
@@ -791,6 +817,7 @@ class DocumentBridge:
             streamed=streamed,
             record_conflict=False,
             diagnostics=diagnostics,
+            scope_summary=queued.scope_summary,
         )
         return {
             "code": "auto_revert",
@@ -826,6 +853,7 @@ class DocumentBridge:
         range_count: int | None = None,
         streamed: bool | None = None,
         diagnostics: Mapping[str, Any] | None = None,
+        scope_summary: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
         if version is not None:
@@ -844,6 +872,7 @@ class DocumentBridge:
             metadata["streamed"] = bool(streamed)
         if diagnostics:
             metadata["diagnostics"] = dict(diagnostics)
+        self._attach_scope_metadata(metadata, scope_summary)
         return metadata
 
     @staticmethod
@@ -874,6 +903,7 @@ class DocumentBridge:
         range_count: int | None,
         streamed: bool | None,
         diagnostics: Mapping[str, Any] | None = None,
+        scope_summary: Mapping[str, Any] | None = None,
     ) -> None:
         event_name = self.EDIT_REJECTED_EVENT_NAME
         if not event_name:
@@ -895,6 +925,7 @@ class DocumentBridge:
             payload["streamed"] = bool(streamed)
         if diagnostics:
             payload["diagnostics"] = dict(diagnostics)
+        self._attach_scope_metadata(payload, scope_summary)
         telemetry_emit(event_name, payload)
 
     def _emit_hash_mismatch_event(
@@ -907,6 +938,7 @@ class DocumentBridge:
         range_count: int | None,
         streamed: bool | None,
         diagnostics: Mapping[str, Any] | None = None,
+        scope_summary: Mapping[str, Any] | None = None,
     ) -> None:
         event_name = self.HASH_MISMATCH_EVENT_NAME
         if not event_name or not cause:
@@ -930,6 +962,7 @@ class DocumentBridge:
             payload["streamed"] = bool(streamed)
         if diagnostics:
             payload["diagnostics"] = dict(diagnostics)
+        self._attach_scope_metadata(payload, scope_summary)
         telemetry_emit(event_name, payload)
 
     def _apply_range_payloads(
@@ -1062,6 +1095,10 @@ class DocumentBridge:
         normalized = normalize_text_range(text, entry.start, entry.end, replacement=entry.replacement)
         if normalized.start == entry.start and normalized.end == entry.end:
             return entry
+        scope_mapping = self._refresh_scope_span(entry.scope, normalized.start, normalized.end)
+        scope_origin = scope_mapping.get("origin") if isinstance(scope_mapping, Mapping) else entry.scope_origin
+        scope_length = scope_mapping.get("length") if isinstance(scope_mapping, Mapping) else entry.scope_length
+        scope_range = (normalized.start, normalized.end) if scope_mapping is not None else entry.scope_range
         return PatchRangePayload(
             start=normalized.start,
             end=normalized.end,
@@ -1069,6 +1106,10 @@ class DocumentBridge:
             match_text=normalized.slice_text,
             chunk_id=entry.chunk_id,
             chunk_hash=entry.chunk_hash,
+            scope_origin=self._normalize_scope_origin(scope_origin) if scope_origin else entry.scope_origin,
+            scope_length=self._coerce_scope_length(scope_length) if scope_length is not None else entry.scope_length,
+            scope_range=scope_range,
+            scope=scope_mapping if scope_mapping is not None else entry.scope,
         )
 
     def _range_hint_from_payload(
@@ -1137,6 +1178,7 @@ class DocumentBridge:
             content_hash = self._extract_content_hash(payload)
             if not content_hash:
                 raise ValueError("Patch directives must include the originating content_hash")
+            scope_summary = self._summarize_patch_scopes(ranges)
             range_hint = self._range_hint_from_payload(ranges, payload)
             directive = EditDirective(
                 action=action,
@@ -1154,20 +1196,19 @@ class DocumentBridge:
                 payload=payload,
                 diff=diff_text if diff_text.strip() else None,
                 ranges=ranges,
+                scope_summary=scope_summary,
             )
         raise ValueError(
             "DocumentBridge only accepts patch directives; convert inline edits into patches before queueing."
         )
 
     def _normalize_target_range(self, target_range: Any, document: DocumentState) -> tuple[int, int]:
-        selection = document.selection.as_tuple()
-        resolved: Sequence[Any]
         if target_range is None:
-            resolved = selection
+            resolved: Sequence[Any] = (0, 0)
         elif isinstance(target_range, Mapping):
             resolved = (
-                target_range.get("start", selection[0]),
-                target_range.get("end", selection[1]),
+                target_range.get("start", 0),
+                target_range.get("end", 0),
             )
         elif isinstance(target_range, Sequence) and len(target_range) == 2:
             resolved = target_range
@@ -1203,17 +1244,190 @@ class DocumentBridge:
             end = int(entry.get("end", 0))
             if end < start:
                 start, end = end, start
+            scope_payload = entry.get("scope")
+            scope_mapping = dict(scope_payload) if isinstance(scope_payload, Mapping) else None
+            scope_origin = entry.get("scope_origin")
+            if not isinstance(scope_origin, str) and scope_mapping is not None:
+                scope_origin = scope_mapping.get("origin")
+            normalized_scope_origin = self._normalize_scope_origin(scope_origin)
+            scope_length = entry.get("scope_length")
+            if scope_length is None and scope_mapping is not None:
+                scope_length = scope_mapping.get("length")
+            scope_range_payload = entry.get("scope_range")
+            if scope_range_payload is None and scope_mapping is not None:
+                scope_range_payload = scope_mapping.get("range")
+            normalized_scope_range = self._coerce_scope_range(scope_range_payload)
+            normalized_scope_length = self._coerce_scope_length(scope_length)
+            if normalized_scope_length is None and normalized_scope_range is not None:
+                normalized_scope_length = max(0, normalized_scope_range[1] - normalized_scope_range[0])
+            chunk_id = str(entry.get("chunk_id")) if isinstance(entry.get("chunk_id"), str) else None
+            chunk_hash = str(entry.get("chunk_hash")) if isinstance(entry.get("chunk_hash"), str) else None
+            scope_mapping = self._normalize_scope_mapping(
+                scope_mapping,
+                origin=normalized_scope_origin,
+                scope_range=normalized_scope_range,
+                scope_length=normalized_scope_length,
+            )
+            self._validate_scope_requirements(
+                origin=normalized_scope_origin,
+                scope_range=normalized_scope_range,
+                scope_length=normalized_scope_length,
+                chunk_id=chunk_id,
+                chunk_hash=chunk_hash,
+            )
             normalized.append(
                 PatchRangePayload(
                     start=start,
                     end=end,
                     replacement=str(replacement),
                     match_text=str(match_text),
-                    chunk_id=str(entry.get("chunk_id")) if isinstance(entry.get("chunk_id"), str) else None,
-                    chunk_hash=str(entry.get("chunk_hash")) if isinstance(entry.get("chunk_hash"), str) else None,
+                    chunk_id=chunk_id,
+                    chunk_hash=chunk_hash,
+                    scope_origin=normalized_scope_origin,
+                    scope_length=normalized_scope_length,
+                    scope_range=normalized_scope_range,
+                    scope=scope_mapping,
                 )
             )
         return tuple(normalized)
+
+    @staticmethod
+    def _normalize_scope_origin(origin: Any) -> str | None:
+        if not isinstance(origin, str):
+            return None
+        token = origin.strip().lower()
+        return token or None
+
+    @staticmethod
+    def _coerce_scope_length(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            length = int(value)
+        except (TypeError, ValueError):
+            return None
+        return max(0, length)
+
+    @staticmethod
+    def _refresh_scope_span(
+        scope: Mapping[str, Any] | None,
+        start: int,
+        end: int,
+    ) -> Mapping[str, Any] | None:
+        if not isinstance(scope, Mapping):
+            return None
+        updated = dict(scope)
+        updated["range"] = {"start": start, "end": end}
+        updated["length"] = max(0, end - start)
+        return updated
+
+    @staticmethod
+    def _coerce_scope_range(value: Any) -> tuple[int, int] | None:
+        if value is None:
+            return None
+        try:
+            text_range = TextRange.from_value(value)
+        except (TypeError, ValueError):
+            return None
+        start, end = text_range.to_tuple()
+        if end < start:
+            start, end = end, start
+        return (start, end)
+
+    @staticmethod
+    def _normalize_scope_mapping(
+        scope: Mapping[str, Any] | None,
+        *,
+        origin: str | None,
+        scope_range: tuple[int, int] | None,
+        scope_length: int | None,
+    ) -> Mapping[str, Any] | None:
+        has_data = any(value is not None for value in (origin, scope_range, scope_length))
+        if not isinstance(scope, Mapping) and not has_data:
+            return None
+        mapping = dict(scope) if isinstance(scope, Mapping) else {}
+        if origin:
+            mapping.setdefault("origin", origin)
+        if scope_range is not None:
+            mapping.setdefault("range", {"start": scope_range[0], "end": scope_range[1]})
+        if scope_length is not None:
+            mapping.setdefault("length", scope_length)
+        return mapping or None
+
+    def _validate_scope_requirements(
+        self,
+        *,
+        origin: str | None,
+        scope_range: tuple[int, int] | None,
+        scope_length: int | None,
+        chunk_id: str | None,
+        chunk_hash: str | None,
+    ) -> None:
+        if origin is None:
+            raise ValueError("Patch ranges must include scope metadata (scope.origin)")
+        if origin != "document" and scope_range is None:
+            raise ValueError("Patch ranges must include scope_range metadata for non-document scopes")
+        if origin == "chunk" and not chunk_id and not chunk_hash:
+            raise ValueError("Chunk-scoped ranges must include chunk_id or chunk_hash metadata")
+        if scope_range is not None and scope_length is not None:
+            expected = max(0, scope_range[1] - scope_range[0])
+            if expected != scope_length:
+                raise ValueError("scope_length must match the provided scope_range span")
+
+    def _summarize_patch_scopes(self, ranges: Sequence[PatchRangePayload]) -> Mapping[str, Any] | None:
+        if not ranges:
+            return None
+        origins: set[str] = set()
+        lengths: list[int] = []
+        for entry in ranges:
+            origin = entry.scope_origin
+            if not origin and isinstance(entry.scope, Mapping):
+                origin = self._normalize_scope_origin(entry.scope.get("origin"))
+            if origin:
+                origins.add(origin)
+            length = entry.scope_length
+            if length is None and entry.scope_range is not None:
+                length = max(0, entry.scope_range[1] - entry.scope_range[0])
+            if length is None:
+                length = max(0, entry.end - entry.start)
+            lengths.append(length)
+        if not origins:
+            origins.add("unknown")
+        origin_summary = origins.pop() if len(origins) == 1 else "mixed"
+        summary: dict[str, Any] = {"origin": origin_summary}
+        if lengths:
+            summary["length"] = sum(lengths)
+        range_starts = [entry.scope_range[0] if entry.scope_range else entry.start for entry in ranges]
+        range_ends = [entry.scope_range[1] if entry.scope_range else entry.end for entry in ranges]
+        if range_starts and range_ends:
+            summary["range"] = {
+                "start": min(range_starts),
+                "end": max(range_ends),
+            }
+        return summary
+
+    @staticmethod
+    def _attach_scope_metadata(target: dict[str, Any], scope_summary: Mapping[str, Any] | None) -> None:
+        if not isinstance(scope_summary, Mapping):
+            return
+        origin = scope_summary.get("origin")
+        if isinstance(origin, str) and origin.strip():
+            target["scope_origin"] = origin.strip()
+        length = scope_summary.get("length")
+        try:
+            if length is not None:
+                target["scope_length"] = max(0, int(length))
+        except (TypeError, ValueError):
+            pass
+        range_payload = scope_summary.get("range")
+        if isinstance(range_payload, Mapping):
+            start = range_payload.get("start")
+            end = range_payload.get("end")
+            try:
+                if start is not None and end is not None:
+                    target["scope_range"] = {"start": int(start), "end": int(end)}
+            except (TypeError, ValueError):
+                pass
 
     def _extract_context_version(self, payload: Mapping[str, Any]) -> Optional[str]:
         for key in ("document_version", "snapshot_version", "version", "document_digest"):
@@ -1310,6 +1524,8 @@ class DocumentBridge:
         document: DocumentState,
         window: Mapping[str, Any],
         chunk_profile: str,
+        *,
+        focus_span: TextRange | None,
     ) -> dict[str, Any] | None:
         cache_key = self._manifest_cache_key(window, chunk_profile, document.content_hash)
         cached = self._chunk_manifest_cache.get(cache_key)
@@ -1318,7 +1534,8 @@ class DocumentBridge:
             manifest["cache_hit"] = True
             return manifest
 
-        manifest = self._build_chunk_manifest(document, window, chunk_profile)
+        bounded_focus = (focus_span or TextRange.zero()).clamp(lower=0, upper=len(document.text))
+        manifest = self._build_chunk_manifest(document, window, chunk_profile, focus_span=bounded_focus)
         if manifest is None:
             return None
         self._store_manifest_cache_entry(cache_key, manifest)
@@ -1338,6 +1555,8 @@ class DocumentBridge:
         document: DocumentState,
         window: Mapping[str, Any],
         chunk_profile: str,
+        *,
+        focus_span: TextRange,
     ) -> dict[str, Any] | None:
         start = int(window.get("start", 0))
         end = int(window.get("end", start))
@@ -1350,9 +1569,9 @@ class DocumentBridge:
         text = document.text
         cursor = start
         chunks: list[dict[str, Any]] = []
-        selection = window.get("selection") or {}
-        selection_start = int(selection.get("start", start))
-        selection_end = int(selection.get("end", selection_start))
+        focus_start = focus_span.start
+        focus_end = focus_span.end
+        focus_length = focus_span.length
         version = document.version_info()
         while cursor < end:
             chunk_end = min(end, cursor + chunk_chars)
@@ -1361,7 +1580,7 @@ class DocumentBridge:
             segment = text[cursor:chunk_end]
             if not segment:
                 break
-            overlap_flag = not (chunk_end <= selection_start or cursor >= selection_end)
+            overlap_flag = focus_length > 0 and not (chunk_end <= focus_start or cursor >= focus_end)
             chunks.append(
                 {
                     "id": f"chunk:{document.document_id}:{cursor}:{chunk_end}",
@@ -1369,7 +1588,7 @@ class DocumentBridge:
                     "start": cursor,
                     "end": chunk_end,
                     "length": chunk_end - cursor,
-                    "selection_overlap": overlap_flag,
+                    "span_overlap": overlap_flag,
                     "outline_pointer_id": None,
                 }
             )
@@ -1389,10 +1608,6 @@ class DocumentBridge:
                 "start": start,
                 "end": end,
                 "length": length,
-                "selection": {
-                    "start": selection_start,
-                    "end": selection_end,
-                },
             },
             "chunks": chunks,
             "content_hash": document.content_hash,
@@ -1428,16 +1643,16 @@ class DocumentBridge:
         self,
         window: Mapping[str, Any] | str | None,
         *,
-        selection: tuple[int, int],
         length: int,
         max_tokens: int | None,
     ) -> dict[str, Any]:
-        default_kind = "selection"
+        default_kind = "document"
         kind = default_kind
         padding = 2048
         max_chars = 8192
         start_override: int | None = None
         end_override: int | None = None
+        focus_override: TextRange | None = None
         if isinstance(window, str):
             kind = window.strip().lower() or kind
         elif isinstance(window, Mapping):
@@ -1455,37 +1670,43 @@ class DocumentBridge:
             token_override = window.get("max_tokens")
             if token_override is not None:
                 max_tokens = int(self._safe_int(token_override, fallback=max_tokens or 0)) or max_tokens
+            focus_payload = window.get("target_span") or window.get("focus_span") or window.get("span")
+            if focus_payload is not None:
+                try:
+                    focus_override = TextRange.from_value(focus_payload).clamp(lower=0, upper=length)
+                except Exception:
+                    focus_override = None
 
         token_cap = self._estimate_chars_from_tokens(max_tokens)
         span_cap = max_chars if max_chars else None
         if token_cap is not None:
             span_cap = min(span_cap, token_cap) if span_cap is not None else token_cap
 
-        selection_start, selection_end = selection
-        selection_start, selection_end = self._clamp_range(selection_start, selection_end, length)
+        focus_hint = focus_override or self._focus_span_hint(length)
         requested_kind = kind
         if kind in {"document", "full", "entire"}:
             start = 0
             end = length
-            kind = "document"
+            if span_cap is not None and span_cap < (end - start):
+                end = min(length, start + span_cap)
         elif start_override is not None or end_override is not None:
             start, end = self._clamp_range(start_override or 0, end_override or length, length)
             kind = "range"
         else:
-            center = selection_end if selection_end > selection_start else selection_start
-            span = selection_end - selection_start
+            span = focus_hint.length if focus_hint.length > 0 else padding * 2 or 1024
+            if span_cap is not None:
+                span = min(span, span_cap)
             if span <= 0:
-                span = padding * 2 or 1024
-            start = max(0, selection_start - padding)
-            end = min(length, selection_end + padding if selection_end > selection_start else center + padding)
-            if end <= start:
-                end = min(length, start + span)
-            if span_cap is not None and (end - start) > span_cap:
-                half = span_cap // 2 or 1
-                start = max(0, center - half)
-                end = min(length, start + span_cap)
-                if end - start < span_cap and start > 0:
-                    start = max(0, end - span_cap)
+                span = span_cap or length or 0
+            if span <= 0:
+                span = length
+            half = max(1, span // 2)
+            center = focus_hint.end if focus_hint.length > 0 else focus_hint.start
+            start = max(0, min(center - half, length))
+            end = min(length, start + span)
+            if end - start < span and start > 0:
+                start = max(0, end - span)
+            kind = "focus"
 
         includes_full = start == 0 and end == length
         return {
@@ -1498,10 +1719,18 @@ class DocumentBridge:
             "padding": padding,
             "max_chars": span_cap,
             "max_tokens": max_tokens,
-            "selection": {"start": selection_start, "end": selection_end},
             "source_length": length,
             "includes_full_document": includes_full,
         }
+
+    def _focus_span_hint(self, length: int) -> TextRange:
+        context = self._last_edit_context
+        if context is None:
+            return TextRange.zero()
+        try:
+            return context.target_range.clamp(lower=0, upper=length)
+        except Exception:
+            return TextRange.zero()
 
     @staticmethod
     def _estimate_chars_from_tokens(max_tokens: int | None) -> int | None:

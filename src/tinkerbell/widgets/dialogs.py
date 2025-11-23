@@ -8,7 +8,7 @@ import tempfile
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
 import httpx
@@ -46,6 +46,9 @@ from ..services.settings import (
 )
 from ..services.telemetry import count_text_tokens
 from ..theme import theme_manager
+
+if TYPE_CHECKING:  # pragma: no cover - type-checking only
+    from ..ui.embedding_controller import EmbeddingValidationResult
 
 __all__ = [
     "DEFAULT_FILE_FILTER",
@@ -383,7 +386,7 @@ class DocumentLoadDialog(QDialog):
 
 
 class DocumentExportDialog(QDialog):
-    """Save dialog showing selection preview and token stats."""
+    """Save dialog showing document preview and token stats."""
 
     def __init__(
         self,
@@ -394,7 +397,6 @@ class DocumentExportDialog(QDialog):
         file_filter: str | None = None,
         default_suffix: str = "md",
         document_text: str | None = None,
-        selection_text: str | None = None,
         token_budget: int | None = None,
         preview_char_limit: int = _PREVIEW_CHAR_LIMIT,
     ) -> None:
@@ -408,8 +410,6 @@ class DocumentExportDialog(QDialog):
         self._token_budget = token_budget
         self._preview_char_limit = max(512, preview_char_limit)
         self._document_text = document_text or ""
-        self._selection_text = selection_text or ""
-        self._has_selection = bool(self._selection_text)
 
         layout = QVBoxLayout(self)
 
@@ -429,10 +429,6 @@ class DocumentExportDialog(QDialog):
 
         stats_row = QHBoxLayout()
         self._document_tokens = count_text_tokens(self._document_text) if self._document_text else 0
-        self._selection_tokens = (
-            count_text_tokens(self._selection_text) if self._has_selection else self._document_tokens
-        )
-        self._preview_mode_combo: QComboBox | None = None
         doc_label = QLabel(f"Document: {self._document_tokens:,} tokens")
         doc_label.setObjectName("document_stats_label")
         self._preview_stats_label = QLabel(self._preview_label_text())
@@ -447,13 +443,6 @@ class DocumentExportDialog(QDialog):
         self._budget_bar.setVisible(token_budget is not None)
         layout.addWidget(self._budget_bar)
         self._update_budget_bar()
-
-        if self._document_text and self._selection_text:
-            self._preview_mode_combo = QComboBox()
-            self._preview_mode_combo.setObjectName("preview_mode_combo")
-            self._preview_mode_combo.addItems(["Selection", "Entire Document"])
-            self._preview_mode_combo.currentIndexChanged.connect(self._swap_preview_source)
-            layout.addWidget(self._preview_mode_combo)
 
         self._preview = QPlainTextEdit()
         self._preview.setObjectName("save_preview")
@@ -481,20 +470,12 @@ class DocumentExportDialog(QDialog):
         return path
 
     def _preview_label_text(self) -> str:
-        if self._has_selection and self._current_preview_tokens() == self._selection_tokens:
-            return f"Selection preview: {self._selection_tokens:,} tokens"
         return f"Document preview: {self._current_preview_tokens():,} tokens"
 
     def _active_preview_text(self) -> str:
-        if self._preview_mode_combo and self._preview_mode_combo.currentIndex() == 1:
-            return self._document_text
-        return self._selection_text or self._document_text
+        return self._document_text
 
     def _current_preview_tokens(self) -> int:
-        if self._preview_mode_combo and self._preview_mode_combo.currentIndex() == 1:
-            return self._document_tokens
-        if self._has_selection:
-            return self._selection_tokens
         return self._document_tokens
 
     def _apply_preview_text(self, text: str) -> None:
@@ -502,10 +483,6 @@ class DocumentExportDialog(QDialog):
         if not preview and self._document_text:
             preview = self._document_text[: self._preview_char_limit]
         self._preview.setPlainText(preview)
-
-    def _swap_preview_source(self, _: int) -> None:
-        self._apply_preview_text(self._active_preview_text())
-        self._refresh_preview_stats()
 
     def _browse_for_path(self) -> None:
         start_dir = str(self._start_dir) if self._start_dir else ""
@@ -607,11 +584,10 @@ def save_file_dialog(
     file_filter: str | None = None,
     default_suffix: str = "md",
     document_text: str | None = None,
-    selection_text: str | None = None,
     token_budget: int | None = None,
     preview_char_limit: int = _PREVIEW_CHAR_LIMIT,
 ) -> Path | None:
-    """Display the enhanced save/export dialog with selection preview."""
+    """Display the enhanced save/export dialog with document previews."""
 
     dialog = DocumentExportDialog(
         parent=parent,
@@ -620,7 +596,6 @@ def save_file_dialog(
         file_filter=file_filter,
         default_suffix=default_suffix,
         document_text=document_text,
-        selection_text=selection_text,
         token_budget=token_budget,
         preview_char_limit=preview_char_limit,
     )
@@ -1490,8 +1465,9 @@ class SettingsDialog(QDialog):
     def _collect_custom_api_metadata(self) -> dict[str, Any]:
         payload = dict(self._embedding_api_metadata)
         base_url = self._custom_api_base_url_input.text().strip()
-        if base_url:
-            payload["base_url"] = base_url
+        normalized_url, _ = self._normalize_custom_api_base_url(base_url) if base_url else (None, None)
+        if normalized_url:
+            payload["base_url"] = normalized_url
         else:
             payload.pop("base_url", None)
 
@@ -1502,11 +1478,29 @@ class SettingsDialog(QDialog):
             payload.pop("organization", None)
 
         api_key = self._custom_api_key_input.text().strip()
-        payload["api_key"] = api_key
+        existing_plaintext = str(self._embedding_api_metadata.get("api_key") or "").strip()
+        existing_ciphertext = self._embedding_api_metadata.get("api_key_ciphertext")
+        existing_hint = self._embedding_api_metadata.get("api_key_hint")
+
         if api_key:
+            payload["api_key"] = api_key
             payload.pop("api_key_ciphertext", None)
             payload.pop("api_key_hint", None)
+        elif existing_plaintext or existing_ciphertext:
+            if existing_plaintext:
+                payload["api_key"] = existing_plaintext
+            else:
+                payload.pop("api_key", None)
+            if existing_ciphertext:
+                payload["api_key_ciphertext"] = existing_ciphertext
+            else:
+                payload.pop("api_key_ciphertext", None)
+            if existing_hint is not None:
+                payload["api_key_hint"] = existing_hint
+            else:
+                payload.pop("api_key_hint", None)
         else:
+            payload["api_key"] = ""
             payload.pop("api_key_ciphertext", None)
             payload.pop("api_key_hint", None)
 
@@ -1840,14 +1834,15 @@ class SettingsDialog(QDialog):
             return
         base_url = self._custom_api_base_url_input.text().strip()
         api_key = self._custom_api_key_input.text().strip() or self._embedding_api_metadata.get("api_key", "")
-        if not base_url:
-            self._set_field_error("embedding_custom_base_url", "Base URL is required for custom embeddings.")
+        normalized_url, url_error = self._normalize_custom_api_base_url(base_url) if base_url else (None, None)
+        if url_error:
+            self._set_field_error("embedding_custom_base_url", url_error)
         else:
-            parsed = urlparse(base_url)
-            if (parsed.scheme or "").lower() != "https" or not parsed.netloc:
-                self._set_field_error("embedding_custom_base_url", "Provide a valid https:// endpoint for embeddings.")
-            else:
-                self._set_field_error("embedding_custom_base_url", None)
+            if normalized_url and normalized_url != base_url:
+                self._custom_api_base_url_input.blockSignals(True)
+                self._custom_api_base_url_input.setText(normalized_url)
+                self._custom_api_base_url_input.blockSignals(False)
+            self._set_field_error("embedding_custom_base_url", None)
         if not api_key:
             self._set_field_error("embedding_custom_api_key", "API key is required for custom embeddings.")
         else:
@@ -1875,6 +1870,20 @@ class SettingsDialog(QDialog):
             self._set_field_error("embedding_local_model_path", "Local embeddings require a model path or identifier.")
         else:
             self._set_field_error("embedding_local_model_path", None)
+
+    def _normalize_custom_api_base_url(self, raw_value: str) -> tuple[str | None, str | None]:
+        trimmed = raw_value.strip()
+        if not trimmed:
+            return None, "Base URL is required for custom embeddings."
+        candidate = trimmed
+        if "://" not in candidate:
+            candidate = f"https://{candidate.lstrip('/')}"
+        parsed = urlparse(candidate)
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in {"http", "https"} or not parsed.netloc:
+            return None, "Provide a valid http(s) endpoint for embeddings."
+        sanitized = parsed._replace(fragment="", query="")
+        return sanitized.geturl(), None
 
     def _populate_theme_combo(self, active_theme: str | None) -> None:
         available = theme_manager.available()

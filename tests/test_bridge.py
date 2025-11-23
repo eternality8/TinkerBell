@@ -26,6 +26,7 @@ class RecordingEditor:
     def __init__(self) -> None:
         self.state = DocumentState(text="hello world")
         self.applied: list[EditDirective] = []
+        self._selection = SelectionRange()
 
     def load_document(self, document: DocumentState) -> None:
         self.state = document
@@ -54,6 +55,15 @@ class RecordingEditor:
         self.state.update_text(result.text)
         return self.state
 
+    def selection_span(self) -> tuple[int, int]:
+        return (self._selection.start, self._selection.end)
+
+    def selection_range(self) -> SelectionRange:
+        return SelectionRange(self._selection.start, self._selection.end)
+
+    def set_selection(self, start: int, end: int) -> None:
+        self._selection = SelectionRange(start, end)
+
 
 def _make_diff(before: str, after: str, filename: str = "doc.txt") -> str:
     diff = difflib.unified_diff(
@@ -68,9 +78,31 @@ def _make_diff(before: str, after: str, filename: str = "doc.txt") -> str:
     return diff_text
 
 
+def _range_payload(
+    start: int,
+    end: int,
+    *,
+    replacement: str,
+    match_text: str,
+    origin: str = "explicit_span",
+) -> dict[str, Any]:
+    length = max(0, end - start)
+    return {
+        "start": start,
+        "end": end,
+        "replacement": replacement,
+        "match_text": match_text,
+        "scope": {
+            "origin": origin,
+            "range": {"start": start, "end": end},
+            "length": length,
+        },
+    }
+
+
 def test_generate_snapshot():
     editor = RecordingEditor()
-    editor.state.selection = SelectionRange(0, 5)
+    editor.set_selection(0, 5)
     bridge = DocumentBridge(editor=editor)
     snapshot = bridge.generate_snapshot()
     assert snapshot["language"] == "markdown"
@@ -78,7 +110,24 @@ def test_generate_snapshot():
     assert snapshot["version_id"] >= 1
     assert snapshot["document_id"]
     assert snapshot["length"] == len(editor.state.text)
-    assert snapshot["selection_text"] == editor.state.text[:5]
+    assert "selection_span" not in snapshot
+    assert "selection_text" not in snapshot
+    assert "selection_hash" not in snapshot
+
+
+def test_generate_snapshot_caps_default_window():
+    editor = RecordingEditor()
+    editor.state.update_text("".join(str(i % 10) for i in range(12000)))
+    bridge = DocumentBridge(editor=editor)
+
+    snapshot = bridge.generate_snapshot()
+
+    window = snapshot["window"]
+    assert window["kind"] == "document"
+    assert window["start"] == 0
+    assert 0 < window["length"] <= 8192
+    assert window["end"] == window["start"] + window["length"]
+
 
 
 def test_queue_edit_rejects_invalid_payload():
@@ -107,7 +156,7 @@ def test_range_patch_expands_to_word_boundaries():
         "document_version": snapshot["version"],
         "content_hash": snapshot["content_hash"],
         "ranges": [
-            {"start": 1, "end": 4, "replacement": "ALPHA", "match_text": "lph"},
+            _range_payload(1, 4, replacement="ALPHA", match_text="lph"),
         ],
     }
 
@@ -133,12 +182,12 @@ def test_range_patch_expands_to_paragraph_boundaries():
         "document_version": snapshot["version"],
         "content_hash": snapshot["content_hash"],
         "ranges": [
-            {
-                "start": start,
-                "end": end,
-                "replacement": "Updated first paragraph.\n",
-                "match_text": text[start:end],
-            }
+            _range_payload(
+                start,
+                end,
+                replacement="Updated first paragraph.\n",
+                match_text=text[start:end],
+            )
         ],
     }
 
@@ -162,12 +211,12 @@ def test_patch_failure_metadata_includes_target_range():
         "document_version": snapshot["version"],
         "content_hash": snapshot["content_hash"],
         "ranges": [
-            {
-                "start": 0,
-                "end": 5,
-                "replacement": "HELLO",
-                "match_text": "hello",
-            }
+            _range_payload(
+                0,
+                5,
+                replacement="HELLO",
+                match_text="hello",
+            )
         ],
     }
 
@@ -179,6 +228,9 @@ def test_patch_failure_metadata_includes_target_range():
     metadata = bridge.last_failure_metadata
     assert metadata is not None
     assert metadata["target_range"] == {"start": 0, "end": 5}
+    assert metadata["scope_origin"] == "explicit_span"
+    assert metadata["scope_length"] == 5
+    assert metadata["scope_range"] == {"start": 0, "end": 5}
 
 
 def test_queue_edit_rejects_stale_snapshot_version():
@@ -505,12 +557,7 @@ def test_queue_edit_applies_streamed_ranges():
         {
             "action": "patch",
             "ranges": [
-                {
-                    "start": 0,
-                    "end": 5,
-                    "replacement": "HELLO",
-                    "match_text": "hello",
-                },
+                _range_payload(0, 5, replacement="HELLO", match_text="hello"),
             ],
             "document_version": snapshot["version"],
             "content_hash": snapshot["content_hash"],
@@ -521,23 +568,24 @@ def test_queue_edit_applies_streamed_ranges():
     assert bridge.patch_metrics.total == 1
 
 
-def test_queue_edit_range_patch_detects_mismatch():
+def test_queue_edit_range_patch_detects_mismatch(monkeypatch: pytest.MonkeyPatch):
     editor = RecordingEditor()
     bridge = DocumentBridge(editor=editor)
     snapshot = bridge.generate_snapshot()
     editor.state.update_text("HOLA world")
+    captured: list[tuple[str, dict | None]] = []
+
+    def _emit(name: str, payload: dict | None = None) -> None:
+        captured.append((name, payload))
+
+    monkeypatch.setattr(bridge_module, "telemetry_emit", _emit)
 
     with pytest.raises(RuntimeError):
         bridge.queue_edit(
             {
                 "action": "patch",
                 "ranges": [
-                    {
-                        "start": 0,
-                        "end": 5,
-                        "replacement": "HELLO",
-                        "match_text": "hello",
-                    }
+                    _range_payload(0, 5, replacement="HELLO", match_text="hello"),
                 ],
                 "document_version": snapshot["version"],
                 "content_hash": snapshot["content_hash"],
@@ -546,6 +594,16 @@ def test_queue_edit_range_patch_detects_mismatch():
 
     assert editor.state.text.startswith("HOLA")
     assert bridge.patch_metrics.conflicts == 1
+    event = next((payload for name, payload in captured if name == "patch.apply"), None)
+    assert event is not None
+    assert event["scope_origin"] == "explicit_span"
+    assert event["scope_length"] == 5
+    assert event["scope_range"] == {"start": 0, "end": 5}
+    hash_event = next((payload for name, payload in captured if name == "hash_mismatch"), None)
+    assert hash_event is not None
+    assert hash_event["scope_origin"] == "explicit_span"
+    assert hash_event["scope_length"] == 5
+    assert hash_event["scope_range"] == {"start": 0, "end": 5}
 
 
 def test_range_patch_chunk_hash_mismatch_rejected():
@@ -559,21 +617,15 @@ def test_range_patch_chunk_hash_mismatch_rejected():
     chunk_id = first_chunk.get("id")
     assert chunk_id, "expected chunk id in manifest"
     tampered_hash = "deadbeef"
+    range_entry = _range_payload(0, 5, replacement="HELLO", match_text="hello")
+    range_entry["chunk_id"] = chunk_id
+    range_entry["chunk_hash"] = tampered_hash
 
     with pytest.raises(DocumentVersionMismatchError) as exc:
         bridge.queue_edit(
             {
                 "action": "patch",
-                "ranges": [
-                    {
-                        "start": 0,
-                        "end": 5,
-                        "replacement": "HELLO",
-                        "match_text": "hello",
-                        "chunk_id": chunk_id,
-                        "chunk_hash": tampered_hash,
-                    }
-                ],
+                "ranges": [range_entry],
                 "document_version": snapshot["version"],
                 "content_hash": snapshot["content_hash"],
             }
@@ -772,14 +824,16 @@ def test_bridge_publishes_document_changed_events() -> None:
     assert changed.edited_ranges[0][1] >= 5
 
 
-def test_bridge_applies_patches_without_moving_selection() -> None:
+def test_bridge_applies_patches_while_preserving_selection() -> None:
     class _SelectionTrackingEditor(RecordingEditor):
         def __init__(self) -> None:
             super().__init__()
             self.preserve_calls: list[bool] = []
+            self.selection_hints: list[tuple[int, int] | None] = []
 
         def apply_patch_result(self, result: PatchResult, selection_hint=None, *, preserve_selection: bool = False) -> DocumentState:  # type: ignore[override]
             self.preserve_calls.append(preserve_selection)
+            self.selection_hints.append(selection_hint)
             return super().apply_patch_result(result, selection_hint, preserve_selection=preserve_selection)
 
     editor = _SelectionTrackingEditor()
@@ -798,6 +852,7 @@ def test_bridge_applies_patches_without_moving_selection() -> None:
 
     assert editor.preserve_calls
     assert editor.preserve_calls[-1] is True
+    assert editor.selection_hints[-1] is None
 
 
 def test_bridge_notifies_document_closed() -> None:

@@ -166,7 +166,7 @@ class DocumentChunkTool:
             "start": entry.start,
             "end": entry.end,
             "length": entry.length,
-            "selection_overlap": entry.selection_overlap,
+            "span_overlap": entry.span_overlap,
             "chunk_hash": entry.chunk_hash,
             "outline_pointer_id": entry.outline_pointer_id,
             "version": entry.version,

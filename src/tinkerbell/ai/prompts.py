@@ -10,7 +10,6 @@ PLANNER_TOKEN_BUDGET = 2_048
 TOOL_LOOP_TOKEN_BUDGET = 8_192
 FOLLOWUP_TOKEN_BUDGET = 512
 LARGE_DOC_CHAR_THRESHOLD = 20_000
-SELECTION_SNIPPET_CHARS = 240
 
 
 def base_system_prompt(*, model_name: str | None = None) -> str:
@@ -38,7 +37,8 @@ def base_system_prompt(*, model_name: str | None = None) -> str:
         "- Stay chunk-first: operate on windowed snapshots + chunk manifests before escalating to full-document reads, and explain any required fallback.\n"
         "- Always diff-first: gather a DocumentSnapshot, draft with DiffBuilder or DocumentApplyPatch, then validate via DocumentEdit.\n"
         "- Never apply multiple patches against the same snapshot. Refresh snapshots after every successful edit.\n"
-        "- Enforce document_version, selection hashes, and guardrails before responding.\n"
+        "- Every edit must declare its provenance: carry forward the span or chunk you captured (`scope_origin`, `scope_range`, `scope_length`) so DocumentApplyPatch/DocumentEdit can prove the change was chunk- or range-backed.\n"
+        "- Enforce document_version, chunk manifest guardrails, and telemetry hints before responding.\n"
         f"- Tokenizer fallback: {fallback_hint}\n"
         "- Keep responses grounded in the tools you actually invoked."
     )
@@ -48,18 +48,19 @@ def planner_instructions() -> str:
     """Guidance for the planner node."""
 
     return (
-        "1. Inspect the latest DocumentSnapshot (path, language, selection hash, window range, chunk_manifest cache hints).\n"
+        "1. Inspect the latest DocumentSnapshot (path, language, window range, chunk_manifest cache hints, and span telemetry).\n"
         "2. Summarize the user's intent and map it to concrete tool steps (windowed snapshot → chunk manifest → outline/retrieval → diff → edit).\n"
-        "3. Stay chunk-first: if the manifest covers the requested span, hydrate it with DocumentChunkTool before asking for the outline or retrieval tools, and explain any chunk-flow guardrail hints the controller inserts.\n"
+        "3. Stay chunk-first: if the manifest covers the requested span, hydrate it with DocumentChunkTool before asking for outline or retrieval tools, and explain any chunk-flow guardrail hints the controller inserts.\n"
         "4. Ask for DocumentOutlineTool when the request references headings/sections or when the document exceeds the large-doc threshold; compare the returned outline_digest with prior values to avoid redundant calls.\n"
         "5. Call DocumentFindSectionsTool when you need specific passages or when the outline points at pointer IDs that must be hydrated before editing.\n"
-        "6. Respect selection metadata: if a range is provided, focus edits there first and confirm with the user before touching other sections.\n"
+        "6. Respect span hints: when the controller or chunk manifest surfaces `target_span`/`span_hint`, copy that window, label it (`scope_origin = chunk | explicit_span | document`), and confirm with the user before expanding scope.\n"
         "7. Budget thoughts to stay within the planner token window and hand off clear instructions to the tool loop.\n"
         "8. When outline/retrieval responses include guardrails, pending status, or retry hints, echo the warning back to the user and adapt the plan instead of ignoring it.\n"
-        "9. Default to selection-scoped snapshots; escalate to full-document reads only if the controller budget hints say so or every chunk attempt fails, and narrate why you had to fall back.\n"
-        "10. Pair every DocumentSnapshot with the `selection_range` tool: copy `{start_line, end_line}` into `target_span` and keep `selection_text` + `selection_hash` handy so you can pass them back via match_text/expected_text and selection_fingerprint when editing.\n"
+        "9. Default to span-scoped snapshots sized to the hinted window; escalate to full-document reads only if the controller budget hints say so or every chunk attempt fails, and narrate why you had to fall back.\n"
+        "10. Pair every DocumentSnapshot with the best available span source: copy `{start_line, end_line}` from `text_range` or chunk manifest ranges into `target_span`; only reach for SelectionRangeTool when snapshots/manifests cannot supply bounds and the controller authorizes it.\n"
         "11. When plot scaffolding is enabled, call PlotOutlineTool before touching a chunk and run PlotStateUpdateTool immediately after applying edits so continuity stays in sync.\n"
-        "12. If DocumentApplyPatch/DocumentEdit complain about stale anchors or fingerprints, refresh DocumentSnapshot immediately instead of guessing offsets."
+        "12. If DocumentApplyPatch/DocumentEdit complain about stale anchors or fingerprints, refresh DocumentSnapshot immediately instead of guessing offsets.\n"
+        "13. If the controller raises `needs_range` or scope errors, capture a new snapshot/chunk manifest, resend explicit spans with the correct `scope_origin`, and only fall back to SelectionRangeTool when the controller explicitly tells you to."
     )
 
 
@@ -85,12 +86,13 @@ def tool_use_instructions() -> str:
     """Guidance for the tool execution loop."""
 
     return (
-        "- DocumentSnapshot: request selection-scoped windows (specify `window`, `chunk_profile`, or `max_tokens`) to receive slim text plus a chunk_manifest describing reusable ranges; only ask for the full document when the controller explicitly authorizes it. Immediately follow up with `selection_range` to capture `{start_line, end_line, content_hash}` for span-aware edits.\n"
-        "- Anchored edits: copy `selection_text` and `selection_hash` from each snapshot and include them as `match_text`/`expected_text` plus `selection_fingerprint` (hash) whenever you call DocumentApplyPatch or inline DocumentEdit. Refresh the snapshot when the bridge reports anchor mismatches.\n"
+        "- DocumentSnapshot: request span-scoped windows (specify `window`, `chunk_profile`, or `max_tokens`) to receive slim text plus a chunk_manifest describing reusable ranges; only ask for the full document when the controller explicitly authorizes it. Immediately capture `target_span` using the snapshot's `text_range` or chunk manifest ranges, record the provenance (`scope_origin`, `scope_range`, `scope_length`), and call SelectionRangeTool only when those sources are missing or the controller issues a fallback hint.\n"
+        "- Anchored edits: reuse diff-friendly context by capturing `match_text`/`expected_text` from the latest snapshot or chunk hydration before calling DocumentApplyPatch or inline DocumentEdit. Refresh the snapshot when the bridge reports anchor mismatches.\n"
         "- DiffBuilder: convert \"before\"/\"after\" snippets into unified diffs; include context lines.\n"
         "- DocumentChunkTool: hydrate chunk_manifest entries when you need additional text instead of requesting a full snapshot. If the chunk payload returns a pointer, follow the instructions before editing.\n"
-        "- DocumentApplyPatch: send `target_span` (preferred) from `selection_range` plus replacement text and the anchor metadata (`match_text`, `expected_text`, `selection_fingerprint`) from the current snapshot; fall back to `target_range` only when spans are unavailable. The tool composes the diff + DocumentEdit for you and rejects stale anchors.\n"
-        "- DocumentEdit: prefer `action=\"patch\"` referencing the latest snapshot version; if you must call it inline, include the same anchor metadata and reserve caret inserts for explicit `action=\"insert\"`.\n"
+        "- DocumentApplyPatch: send `target_span` (preferred) derived from the latest snapshot or chunk manifest span data plus replacement text and explicit anchor metadata (`match_text`, `expected_text`) from the current snapshot; include the `scope` metadata for each range (`origin`, `range`, `length`, chunk ids when applicable). Fall back to SelectionRangeTool or `target_range` only when other span sources are unavailable. The tool composes the diff + DocumentEdit for you and rejects stale anchors.\n"
+        "- DocumentEdit: prefer `action=\"patch\"` referencing the latest snapshot version; if you must call it inline, include the same anchor metadata and scope fields, and use explicit `action=\"insert\"` directives for standalone insert operations.\n"
+        "- NeedsRange errors: when a tool responds with `needs_range`, rehydrate the chunk manifest or snapshot span, capture a fresh `target_span`/chunk id, and resubmit with complete scope metadata instead of guessing offsets.\n"
         "- SearchReplace & Validation: use them to stage scoped regex replacements and lint JSON/YAML/Markdown before committing patches.\n"
         "- PlotOutlineTool: when the controller hints that plot scaffolding refreshed (or when continuity risks arise), call it before drafting edits to read cached character/entity + arc summaries plus overrides/dependencies.\n"
         "- PlotStateUpdateTool: immediately after you apply chunk edits, call this tool to record the new beats/overrides so the plot memory stays current; the controller will block further work if you skip it.\n"
@@ -144,9 +146,6 @@ def format_user_prompt(
     doc_chars = doc_length if isinstance(doc_length, int) and doc_length >= 0 else len(text)
     approx_tokens = _estimate_doc_tokens(text, model_name=model_name)
     doc_scale = "large" if doc_chars >= LARGE_DOC_CHAR_THRESHOLD else "standard"
-    selection_data = snapshot.get("selection")
-    selection_range = _selection_range(selection_data)
-    selection_excerpt = _selection_excerpt(text, selection_range, text_offset=window_start)
     metadata_lines = [
         f"Document: {path}",
         f"Language: {language or 'unknown'}",
@@ -154,12 +153,6 @@ def format_user_prompt(
     ]
     if version:
         metadata_lines.append(f"Document version: {version}")
-    if selection_range:
-        start, end = selection_range
-        span = max(0, end - start)
-        metadata_lines.append(f"Selection range: {start}-{end} ({span} chars)")
-    if selection_excerpt:
-        metadata_lines.append("Selection excerpt:\n" + selection_excerpt)
     if text and (window_start > 0 or window_end < doc_chars):
         window_span = max(0, window_end - window_start)
         metadata_lines.append(
@@ -186,41 +179,6 @@ def format_user_prompt(
         f"{metadata_block}\n\n"
         "Remember to cite the tools you invoke and summarize the resulting diffs before presenting the final response."
     )
-
-
-def _selection_range(selection: Any) -> tuple[int, int] | None:
-    if isinstance(selection, Mapping):
-        start = selection.get("start")
-        end = selection.get("end")
-    elif isinstance(selection, Sequence) and not isinstance(selection, (str, bytes)) and len(selection) == 2:
-        start, end = selection
-    else:
-        return None
-
-    start_i = _coerce_int(start)
-    end_i = _coerce_int(end)
-    if start_i is None or end_i is None:
-        return None
-    if end_i < start_i:
-        start_i, end_i = end_i, start_i
-    return start_i, end_i
-
-
-def _selection_excerpt(text: str, selection_range: tuple[int, int] | None, *, text_offset: int = 0) -> str | None:
-    if not selection_range or not text:
-        return None
-    start, end = selection_range
-    local_start = max(0, start - text_offset)
-    local_end = max(local_start, min(len(text), end - text_offset))
-    if local_start >= len(text):
-        return None
-    snippet = text[local_start:local_end]
-    if not snippet:
-        return None
-    snippet = snippet.strip()
-    if len(snippet) > SELECTION_SNIPPET_CHARS:
-        snippet = snippet[: SELECTION_SNIPPET_CHARS - 1].rstrip() + "…"
-    return snippet
 
 
 def _normalize_language(snapshot: Mapping[str, Any]) -> str | None:

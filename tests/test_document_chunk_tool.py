@@ -50,7 +50,7 @@ def _manifest(document_id: str, chunks: list[tuple[int, int]], *, cache_key: str
                 "end": end,
                 "length": end - start,
                 "hash": f"hash-{idx}",
-                "selection_overlap": True,
+                "span_overlap": True,
                 "outline_pointer_id": None,
             }
         )

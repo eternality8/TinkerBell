@@ -26,8 +26,9 @@ from .chat.commands import (
     resolve_tab_reference,
 )
 from .chat.message_model import ChatMessage, EditDirective, ToolTrace
-from .editor.document_model import DocumentMetadata, DocumentState, SelectionRange
+from .editor.document_model import DocumentMetadata, DocumentState
 from .editor.editor_widget import DiffOverlayState
+from .editor.selection_gateway import SelectionGateway
 from .editor.workspace import DocumentTab
 from .documents.ranges import TextRange
 from .editor.tabbed_editor import TabbedEditorWidget
@@ -381,14 +382,17 @@ class MainWindow(QMainWindow):
         self._workspace = self._editor.workspace
         self._file_importer = FileImporter()
         self._chat_panel = ChatPanel(show_tool_activity_panel=show_tool_panel)
+        self._selection_gateway = SelectionGateway(workspace=self._workspace)
         self._bridge = WorkspaceBridgeRouter(self._workspace)
         self._editor.add_tab_created_listener(self._bridge.track_tab)
         self._workspace.add_active_listener(self._handle_active_tab_changed)
         self._status_bar = StatusBar()
         self._subagent_enabled = bool(getattr(initial_settings, "enable_subagents", False))
         self._subagent_active_jobs: set[str] = set()
+        self._subagent_pending_jobs: set[str] = set()
         self._subagent_job_totals: dict[str, int] = {"completed": 0, "failed": 0, "skipped": 0}
         self._subagent_last_event: str = ""
+        self._subagent_last_queue_detail: str = ""
         self._subagent_telemetry_registered = False
         self._splitter: Any = None
         self._actions: Dict[str, WindowAction] = {}
@@ -863,14 +867,13 @@ class MainWindow(QMainWindow):
 
         self._editor.add_snapshot_listener(self._handle_editor_snapshot)
         self._editor.add_text_listener(self._handle_editor_text_changed)
-        self._editor.add__listener(self._handle_editor_selection_changed)
         self._chat_panel.add_request_listener(self._handle_chat_request)
         self._chat_panel.add_session_reset_listener(self._handle_chat_session_reset)
         self._chat_panel.add_suggestion_panel_listener(self._handle_suggestion_panel_toggled)
         self._chat_panel.set_stop_ai_callback(self._cancel_active_ai_turn)
         self._bridge.add_edit_listener(self._handle_edit_applied)
         self._bridge.add_failure_listener(self._handle_edit_failure)
-        self._handle_editor_selection_changed(self._editor.to_document().selection)
+        self._refresh_chat_suggestions()
 
     def _register_default_ai_tools(self) -> None:
         """Register the default document-aware tools with the AI controller."""
@@ -1026,7 +1029,7 @@ class MainWindow(QMainWindow):
                 "search_replace",
                 search_tool,
                 description=(
-                    "Search the current document or selection and optionally apply replacements with regex/literal matching."
+                    "Search the current document or an explicit byte range and optionally apply replacements with regex/literal matching."
                 ),
                 parameters={
                     "type": "object",
@@ -1043,10 +1046,20 @@ class MainWindow(QMainWindow):
                             "type": "boolean",
                             "description": "Interpret the pattern as a regular expression.",
                         },
-                        "scope": {
-                            "type": "string",
-                            "enum": ["document", "selection"],
-                            "description": "Limit replacements to the entire document or just the current selection.",
+                        "target_range": {
+                            "type": "object",
+                            "properties": {
+                                "start": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                },
+                                "end": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                },
+                            },
+                            "required": ["start", "end"],
+                            "description": "Optional document offsets to confine matches; omit to operate on the full document.",
                         },
                         "dry_run": {
                             "type": "boolean",
@@ -2101,6 +2114,7 @@ class MainWindow(QMainWindow):
             "subagent.job_completed",
             "subagent.job_failed",
             "subagent.job_skipped",
+            "subagent.jobs_queued",
         ):
             telemetry_service.register_event_listener(event_name, self._handle_subagent_telemetry)
         self._subagent_telemetry_registered = True
@@ -2116,6 +2130,7 @@ class MainWindow(QMainWindow):
             "subagent.job_completed": self._record_subagent_job_completed,
             "subagent.job_failed": self._record_subagent_job_failed,
             "subagent.job_skipped": self._record_subagent_job_skipped,
+            "subagent.jobs_queued": self._record_subagent_jobs_queued,
         }
         handler = handler_map.get(event_name)
         if handler is None:
@@ -2126,6 +2141,7 @@ class MainWindow(QMainWindow):
     def _record_subagent_job_started(self, payload: Mapping[str, Any]) -> None:
         job_id = self._coerce_subagent_job_id(payload)
         if job_id:
+            self._subagent_pending_jobs.discard(job_id)
             self._subagent_active_jobs.add(job_id)
         chunk_id = payload.get("chunk_id") or payload.get("document_id")
         estimate = payload.get("token_estimate") or payload.get("prompt_tokens")
@@ -2139,6 +2155,7 @@ class MainWindow(QMainWindow):
     def _record_subagent_job_completed(self, payload: Mapping[str, Any]) -> None:
         job_id = self._coerce_subagent_job_id(payload)
         if job_id:
+            self._subagent_pending_jobs.discard(job_id)
             self._subagent_active_jobs.discard(job_id)
         self._increment_subagent_total("completed")
         chunk_id = payload.get("chunk_id") or payload.get("document_id")
@@ -2156,6 +2173,7 @@ class MainWindow(QMainWindow):
     def _record_subagent_job_failed(self, payload: Mapping[str, Any]) -> None:
         job_id = self._coerce_subagent_job_id(payload)
         if job_id:
+            self._subagent_pending_jobs.discard(job_id)
             self._subagent_active_jobs.discard(job_id)
         self._increment_subagent_total("failed")
         reason = str(payload.get("error") or payload.get("details") or "Failed")
@@ -2168,7 +2186,9 @@ class MainWindow(QMainWindow):
     def _record_subagent_job_skipped(self, payload: Mapping[str, Any]) -> None:
         job_id = self._coerce_subagent_job_id(payload)
         if job_id:
+            self._subagent_pending_jobs.discard(job_id)
             self._subagent_active_jobs.discard(job_id)
+
         self._increment_subagent_total("skipped")
         reason = str(payload.get("reason") or payload.get("details") or "Skipped")
         chunk_id = payload.get("chunk_id") or payload.get("document_id")
@@ -2176,6 +2196,61 @@ class MainWindow(QMainWindow):
         if chunk_id:
             bits.insert(0, f"chunk {chunk_id}")
         self._subagent_last_event = self._format_subagent_event_detail("Job skipped", job_id, bits)
+
+    def _record_subagent_jobs_queued(self, payload: Mapping[str, Any]) -> None:
+        job_ids = payload.get("job_ids")
+        added = 0
+        if isinstance(job_ids, Iterable) and not isinstance(job_ids, (str, bytes)):
+            for job_id in job_ids:
+                normalized = str(job_id).strip()
+                if normalized:
+                    if normalized not in self._subagent_active_jobs:
+                        self._subagent_pending_jobs.add(normalized)
+                    added += 1
+        if added == 0:
+            try:
+                added = int(payload.get("job_count") or 0)
+            except (TypeError, ValueError):
+                added = 0
+        raw_chunk_ids = payload.get("chunk_ids")
+        chunk_ids = (
+            raw_chunk_ids
+            if isinstance(raw_chunk_ids, Iterable) and not isinstance(raw_chunk_ids, (str, bytes))
+            else None
+        )
+        raw_reasons = payload.get("reasons")
+        reasons = (
+            raw_reasons
+            if isinstance(raw_reasons, Iterable) and not isinstance(raw_reasons, (str, bytes))
+            else None
+        )
+        detail = self._format_subagent_queue_detail(chunk_ids, reasons)
+        self._subagent_last_queue_detail = detail
+        segments: list[str] = []
+        if added:
+            segments.append(f"{added} job{'s' if added != 1 else ''}")
+        if detail:
+            segments.append(detail)
+        self._subagent_last_event = self._format_subagent_event_detail("Jobs queued", None, segments)
+
+    def _format_subagent_queue_detail(
+        self,
+        chunk_ids: Iterable[Any] | None,
+        reasons: Iterable[Any] | None,
+    ) -> str:
+        bits: list[str] = []
+        if chunk_ids:
+            labels = [str(value).strip() for value in chunk_ids if str(value).strip()]
+            if labels:
+                preview = ", ".join(labels[:3])
+                if len(labels) > 3:
+                    preview = f"{preview}, +{len(labels) - 3} more"
+                bits.append(f"chunks {preview}")
+        if reasons:
+            reason_labels = [str(value).strip() for value in reasons if str(value).strip()]
+            if reason_labels:
+                bits.append(f"reasons: {', '.join(reason_labels)}")
+        return " · ".join(bits)
 
     def _increment_subagent_total(self, key: str) -> None:
         current = self._subagent_job_totals.get(key, 0)
@@ -2232,16 +2307,25 @@ class MainWindow(QMainWindow):
             return
 
         active_jobs = len(self._subagent_active_jobs)
+        pending_jobs = len(self._subagent_pending_jobs)
         status = f"Running ({active_jobs})" if active_jobs else "Idle"
+        if active_jobs == 0 and pending_jobs:
+            status = f"Queued ({pending_jobs})"
         detail_parts: list[str] = []
         if active_jobs:
             detail_parts.append(f"{active_jobs} active job{'s' if active_jobs != 1 else ''}")
+        if pending_jobs:
+            detail_parts.append(f"{pending_jobs} queued job{'s' if pending_jobs != 1 else ''}")
+            if self._subagent_last_queue_detail:
+                detail_parts.append(self._subagent_last_queue_detail)
         totals_text = self._format_subagent_totals()
         if totals_text:
             detail_parts.append(totals_text)
         event_text = (self._subagent_last_event or "").strip()
         if event_text:
             detail_parts.append(event_text)
+        if not pending_jobs:
+            self._subagent_last_queue_detail = ""
         detail = " · ".join(detail_parts) or "No subagent telemetry yet."
         try:
             status_bar.set_subagent_status(status, detail=detail)
@@ -2904,11 +2988,6 @@ class MainWindow(QMainWindow):
         self._update_autosave_indicator(document=state)
         self._maybe_clear_diff_overlay(state)
 
-    def _handle_editor_selection_changed(self, selection: SelectionRange) -> None:
-        """Refresh suggestions and composer context when the selection moves."""
-
-        self._refresh_chat_suggestions(selection=selection)
-
     def _handle_active_tab_changed(self, tab: DocumentTab | None) -> None:
         if tab is None:
             self._current_document_path = None
@@ -2927,27 +3006,14 @@ class MainWindow(QMainWindow):
         self,
         *,
         state: DocumentState | None = None,
-        selection: SelectionRange | None = None,
     ) -> None:
         document = state or self._editor.to_document()
-        active_selection = selection or document.selection
-        start, end = active_selection.as_tuple()
-        text = document.text[start:end]
-        summary = self._summarize_selection_text(text)
-        self._chat_panel.set_selection_summary(summary)
-        suggestions = self._build_chat_suggestions(document, text)
+        suggestions = self._build_chat_suggestions(document)
         self._chat_panel.set_suggestions(suggestions)
 
-    def _build_chat_suggestions(self, document: DocumentState, selection_text: str) -> list[str]:
-        has_selection = bool(selection_text.strip())
+    def _build_chat_suggestions(self, document: DocumentState) -> list[str]:
         has_document_text = bool(document.text.strip())
-        if has_selection:
-            suggestions = [
-                "Summarize the selected text.",
-                "Rewrite the selected text for clarity.",
-                "Extract action items from the selection.",
-            ]
-        elif has_document_text:
+        if has_document_text:
             suggestions = [
                 "Summarize the current document.",
                 "Suggest improvements to the document structure.",
@@ -2969,14 +3035,6 @@ class MainWindow(QMainWindow):
             name = path.name
             return name if name else WINDOW_APP_NAME
         return UNTITLED_DOCUMENT_NAME
-
-    def _summarize_selection_text(self, selection_text: str) -> Optional[str]:
-        condensed = self._condense_whitespace(selection_text)
-        if not condensed:
-            return None
-        if len(condensed) > 80:
-            condensed = f"{condensed[:77].rstrip()}…"
-        return condensed
 
     def _emit_outline_timeline_event(self, document_id: str, outline_digest: str) -> None:
         try:
@@ -3484,20 +3542,12 @@ class MainWindow(QMainWindow):
                 token_budget = raw_budget
 
         document_text: str | None = None
-        selection_text: str | None = None
         if document is not None:
             document_text = document.text
-            selection = document.selection
-            if selection.end > selection.start:
-                text = document.text
-                start = max(0, min(len(text), selection.start))
-                end = max(start, min(len(text), selection.end))
-                selection_text = text[start:end]
         return save_file_dialog(
             parent=parent,
             start_dir=start_dir,
             document_text=document_text,
-            selection_text=selection_text,
             token_budget=token_budget,
         )
 
@@ -3731,16 +3781,12 @@ class MainWindow(QMainWindow):
             snapshot.get("language")
             or (self._infer_language(path) if path is not None else "markdown")
         )
-        selection_raw = snapshot.get("selection")
-        if isinstance(selection_raw, (tuple, list)) and len(selection_raw) == 2:
-            selection = SelectionRange(int(selection_raw[0]), int(selection_raw[1]))
-        else:
-            selection = SelectionRange()
+        if "selection" in snapshot:
+            raise ValueError("Snapshots may no longer include 'selection'; delete stale cache entries.")
 
         document = DocumentState(
             text=text,
             metadata=DocumentMetadata(path=path, language=language),
-            selection=selection,
             dirty=True,
         )
         with self._suspend_snapshot_persistence():
@@ -3786,7 +3832,6 @@ class MainWindow(QMainWindow):
         snapshot = {
             "text": document.text,
             "language": document.metadata.language,
-            "selection": list(document.selection.as_tuple()),
         }
         digest = file_io.compute_text_digest(snapshot["text"])
         if self._unsaved_snapshot_digests.get(key) == digest:
@@ -4466,6 +4511,8 @@ class MainWindow(QMainWindow):
         self._subagent_enabled = new_subagent_flag
         if not new_subagent_flag:
             self._subagent_active_jobs.clear()
+            self._subagent_pending_jobs.clear()
+            self._subagent_last_queue_detail = ""
         self._update_subagent_indicator()
         if not self._ai_settings_ready(settings):
             self._disable_ai_controller()

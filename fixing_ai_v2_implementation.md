@@ -7,7 +7,7 @@ This document breaks down the `fixing_ai_v2.md` strategy into concrete workstrea
 - [x] Deprecate client parameters `insert_at_cursor`, `cursor_offset`, `selection_start`, `selection_end` (schema now rejects legacy caret fields and emits `caret_call_blocked`).
 - [x] Implement read-only `get_selection_range` tool returning `{start_line, end_line, content_hash}` (SelectionRangeTool registered + covered by pytest).
 - [x] Update agent runtime to require `{range|replace_all}` on every edit request (DocumentEditTool/ApplyPatch enforce range, match_text, or `replace_all=true`).
-- [x] Emit telemetry counters `caret_call_blocked`, `selection_snapshot_requested` (events wired + asserted in `tests/test_ai_tools.py`).
+- [x] Emit telemetry counters `caret_call_blocked`, `span_snapshot_requested` (events wired + asserted in `tests/test_ai_tools.py`).
 - [x] Migration guide + changelog entry for partners.
 
 _Status_: Code/tests for caret-free enforcement and selection snapshots merged on branch `AI_v2`; caret-free guidance now lives in `docs/ai_v2.md` and the release notes. Bridge-layer caret mutation APIs now preserve the original user selection, and the partner migration guide/changelog updates are published.
@@ -46,7 +46,7 @@ _Status_: Metadata enforcement, plot-state drift checks, controller retry plumbi
 - [x] Add load test covering concurrent edit attempts + auto-retry flow.
 
 ## Workstream 7 – Observability & UX (P1)
-- [x] Emit structured events: `edit_rejected`, `auto_revert`, `duplicate_detected`, `hash_mismatch`, `needs_range`, `caret_call_blocked`, `selection_snapshot_requested`.
+- [x] Emit structured events: `edit_rejected`, `auto_revert`, `duplicate_detected`, `hash_mismatch`, `needs_range`, `caret_call_blocked`, `span_snapshot_requested`.
 - [x] Editor UI: toast + inline banner describing failure reason and suggested action.
 
 _Status_: Hash mismatch telemetry now fires from both DocumentApplyPatch preflight validators and the DocumentBridge rejection path, and the chat/status UI surfaces guardrail toasts for snapshot/streamed chunk failures.

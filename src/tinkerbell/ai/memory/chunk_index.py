@@ -29,7 +29,7 @@ class ChunkIndexEntry:
     end: int
     length: int
     chunk_hash: str | None
-    selection_overlap: bool
+    span_overlap: bool
     outline_pointer_id: str | None
     chunk_profile: str
     cache_key: str
@@ -118,7 +118,7 @@ class ChunkIndex:
                     end=end,
                     length=length,
                     chunk_hash=_string_or_none(chunk.get("hash")),
-                    selection_overlap=bool(chunk.get("selection_overlap")),
+                    span_overlap=bool(chunk.get("span_overlap")),
                     outline_pointer_id=_string_or_none(chunk.get("outline_pointer_id")),
                     chunk_profile=chunk_profile,
                     cache_key=cache_key,
@@ -313,12 +313,6 @@ def _window_dict(candidate: Any) -> dict[str, Any]:
             "end": int(candidate.get("end", 0)),
             "length": int(candidate.get("length", max(0, int(candidate.get("end", 0)) - int(candidate.get("start", 0))))),
         }
-        selection = candidate.get("selection")
-        if isinstance(selection, Mapping):
-            window["selection"] = {
-                "start": int(selection.get("start", window["start"])),
-                "end": int(selection.get("end", window["start"])),
-            }
         return window
     return {"start": 0, "end": 0, "length": 0}
 

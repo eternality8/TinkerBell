@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from tinkerbell.editor.document_model import DocumentMetadata, DocumentState, SelectionRange
+from tinkerbell.editor.document_model import DocumentMetadata, DocumentState
 from tinkerbell.services.settings import Settings
 from tinkerbell.services.unsaved_cache import UnsavedCache
 from tinkerbell.ui.document_session_service import DocumentSessionService
@@ -218,8 +218,8 @@ def test_restore_last_session_document_cleans_orphan_snapshots(tmp_path: Path) -
     service, tracker = _make_service(settings=settings)
     cache = tracker.context.unsaved_cache
     cache.unsaved_snapshots = {
-        normalized: {"text": "Lost", "language": "markdown", "selection": [0, 4]},
-        str(tmp_path / "stale.md"): {"text": "Stale", "language": "markdown", "selection": [0, 5]},
+        normalized: {"text": "Lost", "language": "markdown"},
+        str(tmp_path / "stale.md"): {"text": "Stale", "language": "markdown"},
     }
     cache.untitled_snapshots = {"tab-stale": {"text": "scratch", "language": "markdown"}}
 
@@ -238,7 +238,6 @@ def test_apply_pending_snapshot_for_path_restores_document(tmp_path: Path) -> No
     cache.unsaved_snapshots[key] = {
         "text": "Recovered text",
         "language": "markdown",
-        "selection": (0, 8),
     }
 
     restored = service.apply_pending_snapshot_for_path(path)
@@ -247,6 +246,21 @@ def test_apply_pending_snapshot_for_path_restores_document(tmp_path: Path) -> No
     assert tracker.editor.to_document().text == "Recovered text"
     assert tracker.monitor.digests[-1][0] == path
     assert tracker.status_messages[-1].startswith("Restored unsaved changes")
+
+
+def test_apply_pending_snapshot_for_path_rejects_selection_payload(tmp_path: Path) -> None:
+    service, tracker = _make_service(settings=Settings())
+    path = tmp_path / "draft.md"
+    key = str(path.expanduser())
+    cache = tracker.context.unsaved_cache
+    cache.unsaved_snapshots[key] = {
+        "text": "Recovered text",
+        "language": "markdown",
+        "selection": (0, 8),
+    }
+
+    with pytest.raises(ValueError, match="selection"):
+        service.apply_pending_snapshot_for_path(path)
 
 
 def test_apply_untitled_snapshot_loads_tab_specific_snapshot() -> None:
@@ -263,10 +277,9 @@ def test_apply_untitled_snapshot_loads_tab_specific_snapshot() -> None:
     assert tracker.editor.to_document().text == "Untitled text"
 
 
-def test_prompt_for_save_path_includes_selection_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_prompt_for_save_path_omits_selection_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     service, tracker = _make_service(settings=Settings())
     document = DocumentState(text="Hello world", metadata=DocumentMetadata())
-    document.selection = SelectionRange(0, 5)
     captured: dict[str, Any] = {}
 
     def _fake_save_dialog(**kwargs: Any) -> Path:
@@ -281,6 +294,6 @@ def test_prompt_for_save_path_includes_selection_text(monkeypatch: pytest.Monkey
 
     assert path == tmp_path / "output.md"
     assert captured["document_text"] == "Hello world"
-    assert captured["selection_text"] == "Hello"
+    assert "selection_text" not in captured
     assert captured["token_budget"] == tracker.context.settings.max_context_tokens
     assert captured["parent"] is not None

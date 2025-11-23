@@ -24,6 +24,7 @@ from .search_replace import SearchReplaceTool
 from .selection_range import SelectionRangeTool
 from .tool_usage_advisor import ToolUsageAdvisorTool
 from .validation import validate_snippet
+from ...editor.selection_gateway import SelectionSnapshotProvider
 from ..memory.plot_state import DocumentPlotStateStore
 
 LOGGER = logging.getLogger(__name__)
@@ -51,6 +52,7 @@ class ToolRegistryContext:
 
     controller: Any
     bridge: Any
+    selection_gateway: SelectionSnapshotProvider | None
     outline_digest_resolver: Callable[..., Any]
     directive_schema_provider: Callable[[], Mapping[str, Any]]
     phase3_outline_enabled: bool = False
@@ -128,7 +130,7 @@ def register_default_tools(
                     "properties": {
                         "delta_only": {
                             "type": "boolean",
-                            "description": "When true, include only the selection and surrounding context instead of the full document.",
+                            "description": "When true, include only the requested span (plus nearby context) instead of the full document.",
                         },
                         "include_diff": {
                             "type": "boolean",
@@ -149,7 +151,7 @@ def register_default_tools(
                         },
                         "window": {
                             "description": (
-                                "Controls which portion of the document is returned. Defaults to a selection-centered window; set to 'document' to request the full text."
+                                "Controls which portion of the document is returned. Defaults to a span-directed window; set to 'document' to request the full text."
                             ),
                             "anyOf": [
                                 {"type": "string"},
@@ -187,7 +189,9 @@ def register_default_tools(
             )
 
         try:
-            selection_tool = SelectionRangeTool(provider=context.bridge)
+            if context.selection_gateway is None:
+                raise ValueError("selection_gateway is required for SelectionRangeTool")
+            selection_tool = SelectionRangeTool(gateway=context.selection_gateway)
         except Exception as exc:  # pragma: no cover - defensive guard
             _record_failure("selection_range", exc)
         else:
@@ -216,21 +220,21 @@ def register_default_tools(
                     chunk_index=chunk_index_instance,
                     chunk_config_resolver=chunk_settings_resolver,
                 )
-            except Exception as exc:  # pragma: no cover - defensive guard
+            except Exception as exc:
                 _record_failure("document_chunk", exc)
             else:
                 _safe_register(
                     "document_chunk",
                     chunk_tool,
                     description=(
-                        "Return a specific chunk (or iterator) referenced by document_snapshot manifests, enforcing inline token caps."
+                        "Return cached chunk manifests or incremental chunk windows to guide chunk-first planning."
                     ),
                     parameters={
                         "type": "object",
                         "properties": {
                             "chunk_id": {
                                 "type": "string",
-                                "description": "Chunk identifier returned by document_snapshot.chunk_manifest[].id.",
+                                "description": "Chunk identifier obtained from a chunk manifest or iterator response.",
                             },
                             "document_id": {
                                 "type": "string",
@@ -377,6 +381,11 @@ def register_default_tools(
                                     ],
                                     "description": "Preferred way to describe the edit span using inclusive line bounds.",
                                 },
+                                "scope": {
+                                    "type": "string",
+                                    "enum": ["document"],
+                                    "description": "Declare the intended scope; use 'document' only when overwriting the full file.",
+                                },
                                 "document_version": {
                                     "type": "string",
                                     "description": "Document snapshot version captured before drafting the edit.",
@@ -396,10 +405,6 @@ def register_default_tools(
                                 "expected_text": {
                                     "type": "string",
                                     "description": "Alternate anchor text (must match match_text when provided).",
-                                },
-                                "selection_fingerprint": {
-                                    "type": "string",
-                                    "description": "Hash of the selection returned by document_snapshot to validate intent.",
                                 },
                                 "rationale": {
                                     "type": "string",
@@ -433,9 +438,28 @@ def register_default_tools(
                                 },
                             },
                             "required": ["document_version", "version_id", "content_hash"],
-                            "anyOf": [
-                                {"required": ["content"]},
-                                {"required": ["patches"]},
+                            "allOf": [
+                                {
+                                    "anyOf": [
+                                        {"required": ["content"]},
+                                        {"required": ["patches"]},
+                                    ]
+                                },
+                                {
+                                    "anyOf": [
+                                        {"required": ["target_range"]},
+                                        {"required": ["target_span"]},
+                                        {"required": ["patches"]},
+                                        {
+                                            "properties": {"replace_all": {"const": True}},
+                                            "required": ["replace_all"],
+                                        },
+                                        {
+                                            "properties": {"scope": {"const": "document"}},
+                                            "required": ["scope"]
+                                        },
+                                    ]
+                                },
                             ],
                             "additionalProperties": False,
                         },
@@ -503,7 +527,7 @@ def register_default_tools(
                 "search_replace",
                 search_tool,
                 description=(
-                    "Search the current document or selection and optionally apply replacements with regex/literal matching."
+                    "Search the current document or an explicit byte range and optionally apply replacements with regex/literal matching."
                 ),
                 parameters={
                     "type": "object",
@@ -520,10 +544,20 @@ def register_default_tools(
                             "type": "boolean",
                             "description": "Interpret the pattern as a regular expression.",
                         },
-                        "scope": {
-                            "type": "string",
-                            "enum": ["document", "selection"],
-                            "description": "Limit replacements to the entire document or just the current selection.",
+                        "target_range": {
+                            "type": "object",
+                            "properties": {
+                                "start": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                },
+                                "end": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                },
+                            },
+                            "required": ["start", "end"],
+                            "description": "Optional document offsets to confine matches; omit to operate on the full document.",
                         },
                         "dry_run": {
                             "type": "boolean",
@@ -568,15 +602,20 @@ def register_default_tools(
                                 "type": "string",
                                 "description": "Optional explicit target document identifier; defaults to the active tab.",
                             },
-                            "selection_start": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "description": "Override the selection start used when building analysis inputs.",
-                            },
-                            "selection_end": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "description": "Override the selection end used when building analysis inputs.",
+                            "target_range": {
+                                "type": "object",
+                                "properties": {
+                                    "start": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                    },
+                                    "end": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                    },
+                                },
+                                "required": ["start", "end"],
+                                "description": "Optional byte offsets describing the document span to analyze; omit to use the latest snapshot window span.",
                             },
                             "force_refresh": {
                                 "type": "boolean",

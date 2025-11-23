@@ -13,9 +13,9 @@ class _EditorStub:
     def __init__(self, text: str, selection: tuple[int, int]) -> None:
         self.state = DocumentState(
             text=text,
-            selection=SelectionRange(*selection),
             metadata=DocumentMetadata(language="markdown"),
         )
+        self._selection = SelectionRange(*selection)
 
     def to_document(self) -> DocumentState:  # pragma: no cover - trivial getter
         return deepcopy(self.state)
@@ -29,13 +29,21 @@ class _EditorStub:
     def apply_patch_result(self, result, selection_hint=None, *, preserve_selection: bool = False):  # pragma: no cover - unused in tests
         return self.state
 
+    def selection_span(self) -> tuple[int, int]:
+        return (self._selection.start, self._selection.end)
+
+    def selection_range(self) -> SelectionRange:
+        return SelectionRange(self._selection.start, self._selection.end)
+
+
 
 class _SnapshotProviderStub:
     def __init__(self) -> None:
         self.calls: list[dict] = []
         self.snapshot = {
             "text": "Hello world",
-            "selection": (0, 5),
+            "text_range": {"start": 0, "end": 5},
+            "window": {"start": 0, "end": 5},
             "document_id": "doc-stub",
             "version": "base",
             "length": 11,
@@ -56,19 +64,20 @@ def test_bridge_windowed_snapshot_returns_manifest_cache_hits():
     editor = _EditorStub(text="alpha beta gamma delta epsilon zeta", selection=(12, 17))
     bridge = DocumentBridge(editor=editor)
 
-    first = bridge.generate_snapshot(window={"kind": "selection", "padding": 4}, chunk_profile="prose")
-    second = bridge.generate_snapshot(window={"kind": "selection", "padding": 4}, chunk_profile="prose")
+    window = {"kind": "range", "start": 12, "end": 22, "max_chars": 16}
+    first = bridge.generate_snapshot(window=window, chunk_profile="prose")
+    second = bridge.generate_snapshot(window=window, chunk_profile="prose")
 
     span = first["text_range"]["end"] - first["text_range"]["start"]
-    selection = editor.state.selection.as_tuple()
-    expected_cap = (selection[1] - selection[0]) + 8  # selection span + 2*padding
-    assert span <= expected_cap
+    assert span == 10
     manifest = first.get("chunk_manifest")
     assert manifest and manifest["cache_hit"] is False
+    assert manifest["window"]["start"] == window["start"]
+    assert manifest["window"]["end"] == window["end"]
     assert second["chunk_manifest"]["cache_hit"] is True
 
 
-def test_document_snapshot_tool_defaults_to_selection_window():
+def test_document_snapshot_tool_defaults_to_document_window():
     provider = _SnapshotProviderStub()
     tool = DocumentSnapshotTool(provider=provider)
 
@@ -78,7 +87,7 @@ def test_document_snapshot_tool_defaults_to_selection_window():
     assert provider.calls, "provider should receive a windowed call"
     window_arg = provider.calls[-1].get("window")
     assert isinstance(window_arg, dict)
-    assert window_arg.get("kind") == "selection"
+    assert window_arg.get("kind") == "document"
 
 
 def test_document_snapshot_tool_respects_explicit_window_and_include_text_flag():

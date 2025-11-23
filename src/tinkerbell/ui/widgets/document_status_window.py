@@ -536,12 +536,6 @@ class DocumentStatusWindow:
         length = document_payload.get("length")
         if isinstance(length, int):
             details.append(f"Length: {length:,} chars")
-        selection = document_payload.get("selection")
-        if isinstance(selection, Mapping):
-            start = selection.get("start")
-            end = selection.get("end")
-            if isinstance(start, int) and isinstance(end, int):
-                details.append(f"Selection: {start}–{end}")
         version_id = document_payload.get("version_id")
         content_hash = document_payload.get("content_hash")
         version_bits = []
@@ -555,16 +549,6 @@ class DocumentStatusWindow:
 
     @staticmethod
     def _build_document_meta_fields(document_payload: Mapping[str, Any]) -> dict[str, str]:
-        selection = document_payload.get("selection")
-        if isinstance(selection, Mapping):
-            start = selection.get("start")
-            end = selection.get("end")
-            if isinstance(start, int) and isinstance(end, int):
-                selection_text = f"{start}–{end}"
-            else:
-                selection_text = "—"
-        else:
-            selection_text = "—"
         length = document_payload.get("length")
         length_text = f"{length:,} chars" if isinstance(length, int) else "—"
         version_id = document_payload.get("version_id")
@@ -586,7 +570,6 @@ class DocumentStatusWindow:
             "document": str(label),
             "path": str(path) if path else "—",
             "length": length_text,
-            "selection": selection_text,
             "version": version_text,
             "language": language_text,
         }
@@ -611,13 +594,13 @@ class DocumentStatusWindow:
             return []
         chunk_profile = str(chunk_payload.get("chunk_profile") or "auto").strip()
         chunk_count = DocumentStatusWindow._coerce_chunk_count(chunk_payload)
-        selection_line = DocumentStatusWindow._format_selection_line(chunk_payload)
+        window_line = DocumentStatusWindow._format_window_line(chunk_payload)
         generated_line = DocumentStatusWindow._format_generated_line(chunk_payload)
         version_line = DocumentStatusWindow._format_version_line(chunk_payload.get("document_version"))
         has_summary = any(
             [
                 chunk_count is not None,
-                bool(selection_line),
+                bool(window_line),
                 bool(generated_line),
                 bool(version_line),
             ]
@@ -631,8 +614,8 @@ class DocumentStatusWindow:
             header = f"Chunks: profile {chunk_profile}"
 
         lines = [header]
-        if selection_line:
-            lines.append(selection_line)
+        if window_line:
+            lines.append(window_line)
         if generated_line:
             lines.append(generated_line)
         if version_line:
@@ -655,18 +638,14 @@ class DocumentStatusWindow:
         return None
 
     @staticmethod
-    def _format_selection_line(chunk_payload: Mapping[str, Any]) -> str:
+    def _format_window_line(chunk_payload: Mapping[str, Any]) -> str:
         window = chunk_payload.get("window")
-        if isinstance(window, Mapping):
-            selection = window.get("selection")
-        else:
-            selection = chunk_payload.get("selection")
-        if not isinstance(selection, Mapping):
+        if not isinstance(window, Mapping):
             return ""
-        start = selection.get("start")
-        end = selection.get("end")
+        start = window.get("start")
+        end = window.get("end")
         if isinstance(start, int) and isinstance(end, int):
-            return f"Selection: {start}–{end}"
+            return f"Window: {start}–{end}"
         return ""
 
     @staticmethod
@@ -1042,7 +1021,6 @@ class DocumentStatusWindow:
             ("Document", "document"),
             ("Path", "path"),
             ("Length", "length"),
-            ("Selection", "selection"),
             ("Version", "version"),
             ("Language", "language"),
         )

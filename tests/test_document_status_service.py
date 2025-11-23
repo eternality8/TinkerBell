@@ -14,22 +14,12 @@ from tinkerbell.ui.document_status_service import DocumentStatusService
 from tinkerbell.ui.telemetry_controller import TelemetryController
 
 
-class _StubSelection:
-    def __init__(self, start: int = 0, end: int = 0) -> None:
-        self._start = start
-        self._end = end
-
-    def as_tuple(self) -> tuple[int, int]:
-        return (self._start, self._end)
-
-
 class _StubDocument:
     def __init__(self, document_id: str) -> None:
         self.document_id = document_id
         self.metadata = SimpleNamespace(path="C:/repo/doc.txt", language="en")
         self.dirty = False
         self.text = "alpha beta gamma"
-        self.selection = _StubSelection(0, 5)
 
     def version_info(self) -> SimpleNamespace:
         return SimpleNamespace(version_id="v1", content_hash="hash")
@@ -186,8 +176,8 @@ def _build_service(*, chunk_flow: dict[str, Any] | None, planner_pending: int) -
             "generated_at": "2025-11-19T12:00:00Z",
             "chunks": [{"id": "a"}, {"id": "b"}],
         },
-        "window": {"selection": {"start": 0, "end": 256}},
-        "selection": {"start": 0, "end": 256},
+        "window": {"start": 0, "end": 256},
+        "text_range": {"start": 0, "end": 256},
         "version": "v1",
         "version_id": "v1",
         "content_hash": "hash",

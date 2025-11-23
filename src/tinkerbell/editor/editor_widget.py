@@ -85,9 +85,9 @@ class TextChangeListener(Protocol):
 
 
 class SelectionListener(Protocol):
-    """Callback signature invoked when the selection changes."""
+    """Callback invoked when the active selection or caret moves."""
 
-    def __call__(self, selection: SelectionRange) -> None:
+    def __call__(self, selection: SelectionRange, line: int, column: int) -> None:
         ...
 
 
@@ -96,7 +96,6 @@ class _UndoEntry:
     """Represents a text snapshot for undo/redo bookkeeping."""
 
     text: str
-    selection: TextRange
 
 
 @dataclass(slots=True)
@@ -118,6 +117,7 @@ class EditorWidget(QWidgetBase):
     def __init__(self, parent: Optional[Any] = None) -> None:
         super().__init__(parent)
         self._state = DocumentState()
+        self._selection = SelectionRange()
         self._text_buffer: str = ""
         self._theme: Theme = load_theme()
         self._qt_editor: Any = None
@@ -184,6 +184,7 @@ class EditorWidget(QWidgetBase):
         """Load a new document state into the widget."""
 
         self._state = document
+        self._selection = SelectionRange()
         self._text_buffer = document.text
         self._undo_stack.clear()
         self._redo_stack.clear()
@@ -194,8 +195,8 @@ class EditorWidget(QWidgetBase):
             self._qt_editor.blockSignals(False)
         self._refresh_preview(if_enabled=False)
         self._emit_text_changed()
-        self._emit_selection_changed()
         self._mark_change_source("programmatic")
+        self._emit_selection_changed()
 
     def restore_document(self, document: DocumentState) -> DocumentState:
         """Restore a document snapshot without preserving undo history."""
@@ -209,19 +210,20 @@ class EditorWidget(QWidgetBase):
         self._state.text = self._text_buffer
         return self._state
 
-    def apply_selection(
+    def _set_selection(
         self,
         selection: SelectionRange | TextRange | Mapping[str, Any] | Sequence[int],
     ) -> None:
-        """Apply an external selection update to the widget."""
+        """Internal helper that updates the active selection state."""
 
         normalized = self._coerce_selection(selection)
-        clamped = self._clamp_range(normalized.start, normalized.end)
-        self._state.selection = SelectionRange(*clamped)
+        start, end = self._clamp_range(normalized.start, normalized.end)
+        resolved = SelectionRange(start, end)
+        self._selection = resolved
         if self._qt_editor is not None and QTextCursor is not None:
             cursor = self._qt_editor.textCursor()
-            cursor.setPosition(clamped[0])
-            cursor.setPosition(clamped[1], QTextCursor.KeepAnchor)  # type: ignore[attr-defined]
+            cursor.setPosition(resolved.start)
+            cursor.setPosition(resolved.end, QTextCursor.KeepAnchor)  # type: ignore[attr-defined]
             self._qt_editor.setTextCursor(cursor)
         self._emit_selection_changed()
 
@@ -251,12 +253,12 @@ class EditorWidget(QWidgetBase):
     def insert_text(self, text: str, position: Optional[int] = None) -> None:
         """Insert ``text`` at ``position`` or current selection start."""
 
-        start = position if position is not None else self._state.selection.start
+        start = position if position is not None else self._selection.start
         start = max(0, min(start, len(self._text_buffer)))
         new_text = self._text_buffer[:start] + text + self._text_buffer[start:]
         selection = SelectionRange(start, start + len(text))
         self.set_text(new_text)
-        self.apply_selection(selection)
+        self._set_selection(selection)
 
     def replace_range(self, start: int, end: int, replacement: str) -> None:
         """Replace the slice ``[start:end]`` with ``replacement``."""
@@ -264,12 +266,12 @@ class EditorWidget(QWidgetBase):
         begin, finish = self._clamp_range(start, end)
         new_text = self._text_buffer[:begin] + replacement + self._text_buffer[finish:]
         self.set_text(new_text)
-        self.apply_selection(SelectionRange(begin, begin + len(replacement)))
+        self._set_selection(SelectionRange(begin, begin + len(replacement)))
 
     def apply_ai_edit(self, directive: EditDirective, *, preserve_selection: bool = False) -> DocumentState:
         """Apply an agent-issued edit directive (insert/replace/annotate)."""
 
-        saved_selection = SelectionRange(self._state.selection.start, self._state.selection.end)
+        saved_selection = SelectionRange(self._selection.start, self._selection.end)
         action = directive.action.lower()
         start, end = self._clamp_range(*directive.target_range)
         caret_position: int | None = None
@@ -289,9 +291,9 @@ class EditorWidget(QWidgetBase):
         else:
             raise ValueError(f"Unsupported directive action: {directive.action}")
         if preserve_selection:
-            self.apply_selection(saved_selection)
+            self._set_selection(saved_selection)
         elif caret_position is not None:
-            self.apply_selection(SelectionRange(caret_position, caret_position))
+            self._set_selection(SelectionRange(caret_position, caret_position))
         self._mark_change_source("programmatic")
         return self.to_document()
 
@@ -304,7 +306,7 @@ class EditorWidget(QWidgetBase):
     ) -> DocumentState:
         """Apply a diff-based patch result while emitting a single undo snapshot."""
 
-        saved_selection = SelectionRange(self._state.selection.start, self._state.selection.end)
+        saved_selection = SelectionRange(self._selection.start, self._selection.end)
         previous = self._text_buffer
         if previous == result.text:
             return self.to_document()
@@ -328,9 +330,9 @@ class EditorWidget(QWidgetBase):
             end = len(result.text)
 
         if preserve_selection:
-            self.apply_selection(saved_selection)
+            self._set_selection(saved_selection)
         else:
-            self.apply_selection(SelectionRange(end, end))
+            self._set_selection(SelectionRange(end, end))
         self._mark_change_source("programmatic")
         return self.to_document()
 
@@ -360,7 +362,7 @@ class EditorWidget(QWidgetBase):
         self._text_listeners.append(listener)
 
     def add_selection_listener(self, listener: SelectionListener) -> None:
-        """Register a callback fired whenever the selection range changes."""
+        """Register a callback fired when the selection/caret changes."""
 
         self._selection_listeners.append(listener)
 
@@ -405,12 +407,10 @@ class EditorWidget(QWidgetBase):
         if not self._undo_stack:
             return
         entry = self._undo_stack.pop()
-        self._redo_stack.append(
-            _UndoEntry(text=self._text_buffer, selection=self._state.selection.to_text_range())
-        )
+        self._redo_stack.append(_UndoEntry(text=self._text_buffer))
         self._text_buffer = entry.text
         self._state.text = entry.text
-        self.apply_selection(entry.selection)
+        self._collapse_selection_to()
         if self._qt_editor is not None:
             self._qt_editor.blockSignals(True)
             self._qt_editor.setPlainText(entry.text)
@@ -423,12 +423,10 @@ class EditorWidget(QWidgetBase):
         if not self._redo_stack:
             return
         entry = self._redo_stack.pop()
-        self._undo_stack.append(
-            _UndoEntry(text=self._text_buffer, selection=self._state.selection.to_text_range())
-        )
+        self._undo_stack.append(_UndoEntry(text=self._text_buffer))
         self._text_buffer = entry.text
         self._state.text = entry.text
-        self.apply_selection(entry.selection)
+        self._collapse_selection_to()
         if self._qt_editor is not None:
             self._qt_editor.blockSignals(True)
             self._qt_editor.setPlainText(entry.text)
@@ -453,6 +451,21 @@ class EditorWidget(QWidgetBase):
         return self._preview_enabled
 
     # ------------------------------------------------------------------
+    # Selection accessors
+    # ------------------------------------------------------------------
+    def selection_range(self) -> SelectionRange:
+        """Return a copy of the current selection for internal consumers."""
+
+        selection = self._selection
+        return SelectionRange(selection.start, selection.end)
+
+    def selection_span(self) -> tuple[int, int]:
+        """Return the current selection bounds as a tuple."""
+
+        selection = self._selection
+        return (selection.start, selection.end)
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
     def _clamp_range(self, start: int, end: int) -> tuple[int, int]:
@@ -463,8 +476,13 @@ class EditorWidget(QWidgetBase):
             start, end = end, start
         return start, end
 
+    def _collapse_selection_to(self, position: int | None = None) -> None:
+        caret = len(self._text_buffer) if position is None else position
+        caret = max(0, min(int(caret), len(self._text_buffer)))
+        self._set_selection(SelectionRange(caret, caret))
+
     def _push_undo_snapshot(self, previous_text: str) -> None:
-        entry = _UndoEntry(text=previous_text, selection=self._state.selection.to_text_range())
+        entry = _UndoEntry(text=previous_text)
         self._undo_stack.append(entry)
         if len(self._undo_stack) > self.MAX_HISTORY:
             self._undo_stack.pop(0)
@@ -497,8 +515,25 @@ class EditorWidget(QWidgetBase):
             listener(self._text_buffer, self._state)
 
     def _emit_selection_changed(self) -> None:
+        if not self._selection_listeners:
+            return
+        selection = self.selection_range()
+        line, column = self._cursor_line_column(selection.end)
         for listener in list(self._selection_listeners):
-            listener(self._state.selection)
+            listener(selection, line, column)
+
+    def _cursor_line_column(self, caret: int) -> tuple[int, int]:
+        text = self._text_buffer
+        if not text:
+            return (1, 1)
+        length = len(text)
+        caret = max(0, min(int(caret), length))
+        line = text.count("\n", 0, caret) + 1
+        last_newline = text.rfind("\n", 0, caret)
+        column = caret + 1 if last_newline == -1 else caret - last_newline
+        if column <= 0:
+            column = 1
+        return (line, column)
 
     def _coerce_selection(
         self,
@@ -524,7 +559,7 @@ class EditorWidget(QWidgetBase):
             return
         cursor = self._qt_editor.textCursor()
         selection = SelectionRange(start=cursor.selectionStart(), end=cursor.selectionEnd())
-        self._state.selection = selection
+        self._selection = selection
         self._emit_selection_changed()
 
     # ------------------------------------------------------------------

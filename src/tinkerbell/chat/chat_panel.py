@@ -118,16 +118,10 @@ class SuggestionPanelListener(Protocol):
 class ComposerContext:
     """Metadata passed alongside prompt submissions."""
 
-    selection_summary: Optional[str] = None
     extras: dict[str, Any] | None = None
 
     def to_metadata(self) -> dict[str, Any]:
-        metadata: dict[str, Any] = {}
-        if self.selection_summary:
-            metadata["selection_summary"] = self.selection_summary
-        if self.extras:
-            metadata.update(self.extras)
-        return metadata
+        return dict(self.extras) if self.extras else {}
 
 
 @dataclass(slots=True)
@@ -362,29 +356,18 @@ class ChatPanel(QWidgetBase):
         self._pending_turn_snapshot = None
         self._emit_session_reset()
 
-    def set_selection_summary(
-        self,
-        summary: Optional[str],
-        *,
-        extras: Optional[dict[str, Any]] = None,
-    ) -> None:
-        """Update the composer metadata describing the current editor selection."""
-
-        normalized = summary.strip() if summary else None
-        self._composer_context.selection_summary = normalized or None
-        if extras is not None:
-            self._composer_context.extras = extras if extras else None
-
     # ------------------------------------------------------------------
     # Message append helpers
     # ------------------------------------------------------------------
-    def append_user_message(self, content: str, selection_summary: Optional[str] = None) -> ChatMessage:
+    def append_user_message(
+        self,
+        content: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> ChatMessage:
         """Add a user-authored message to the panel."""
 
-        metadata: dict[str, Any] = {}
-        if selection_summary:
-            metadata["selection_summary"] = selection_summary.strip()
-        message = ChatMessage(role="user", content=content, metadata=metadata)
+        payload = dict(metadata) if metadata else {}
+        message = ChatMessage(role="user", content=content, metadata=payload)
         self._messages.append(message)
         self._trim_history()
         should_autoscroll = self._should_auto_scroll()
@@ -618,9 +601,10 @@ class ChatPanel(QWidgetBase):
         if not text:
             raise ValueError("Prompt cannot be empty")
         self._pending_turn_snapshot = self.capture_state()
+        metadata_payload = self._composer_context.to_metadata()
         if record_history:
-            self.append_user_message(text, self._composer_context.selection_summary)
-        combined_metadata = self._composer_context.to_metadata()
+            self.append_user_message(text, metadata_payload)
+        combined_metadata = dict(metadata_payload)
         if metadata:
             combined_metadata.update(metadata)
         self._emit_request(text, combined_metadata)

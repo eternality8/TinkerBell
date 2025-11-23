@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from ..editor.document_model import DocumentMetadata, DocumentState, SelectionRange
+from ..editor.document_model import DocumentMetadata, DocumentState
 from ..editor.workspace import DocumentTab, DocumentWorkspace
 from ..services.settings import Settings
 from ..services.unsaved_cache import UnsavedCache
@@ -110,20 +110,12 @@ class DocumentSessionService:
         parent = self._qt_parent_provider()
         token_budget = self._resolve_token_budget()
         document_text: str | None = None
-        selection_text: str | None = None
         if document is not None:
             document_text = document.text
-            selection = document.selection
-            if selection.end > selection.start:
-                text = document.text
-                start = max(0, min(len(text), selection.start))
-                end = max(start, min(len(text), selection.end))
-                selection_text = text[start:end]
         return save_file_dialog(
             parent=parent,
             start_dir=start_dir,
             document_text=document_text,
-            selection_text=selection_text,
             token_budget=token_budget,
         )
 
@@ -392,16 +384,12 @@ class DocumentSessionService:
     def _load_snapshot_document(self, snapshot: dict[str, Any], *, path: Path | None, tab_id: str | None) -> None:
         text = str(snapshot.get("text", ""))
         language = str(snapshot.get("language") or (self._infer_language(path) if path is not None else "markdown"))
-        selection_raw = snapshot.get("selection")
-        if isinstance(selection_raw, Sequence) and len(selection_raw) == 2:
-            selection = SelectionRange(int(selection_raw[0]), int(selection_raw[1]))
-        else:
-            selection = SelectionRange()
+        if "selection" in snapshot:
+            raise ValueError("Snapshots may no longer include 'selection'; delete stale cache entries.")
 
         document = DocumentState(
             text=text,
             metadata=DocumentMetadata(path=path, language=language),
-            selection=selection,
             dirty=True,
         )
         monitor = self._require_document_monitor()

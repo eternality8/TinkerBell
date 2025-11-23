@@ -23,7 +23,7 @@
 - `ui/document_session_service.py` persists `selection_text` for save prompts and session restore.
 
 ### Telemetry + tests
-- Telemetry events (`selection_snapshot_requested`, `selection_overlap`, etc.) are emitted from non-tool code paths (bridge, status window, monitor).
+- Telemetry events (`span_snapshot_requested`, `span_overlap`, etc.) are emitted from non-tool code paths (bridge, status window, monitor).
 - Every editor/bridge/unit test encodes assumptions about `SelectionRange` living on `DocumentState`.
 
 These usages must be deleted or rewritten so that the only surviving selection touchpoint is the SelectionRangeTool querying the live editor state.
@@ -69,7 +69,7 @@ These usages must be deleted or rewritten so that the only surviving selection t
 3. Update docs (`docs/ai_v2.md`, partner guides) to state unequivocally that SelectionRangeTool is the sole selection API and that spans/replace-all semantics are mandatory elsewhere.
 
 ### Telemetry & Observability
-1. Ensure only SelectionRangeTool emits `selection_snapshot_requested`; remove `selection_*` fields from other events (bridge chunk metrics, status windows, etc.).
+1. Ensure only SelectionRangeTool emits `span_snapshot_requested`; remove `selection_*` fields from other events (bridge chunk metrics, status windows, etc.).
 2. Introduce replacement metrics (e.g., `span_snapshot_requested`) if observability around span fetches is still required.
 3. Purge dashboards/alerts tied to the deleted telemetry fields.
 

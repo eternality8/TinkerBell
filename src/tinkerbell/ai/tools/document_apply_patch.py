@@ -101,9 +101,9 @@ class DocumentApplyPatchTool:
         patches: Sequence[Mapping[str, Any]] | None = None,
         match_text: str | None = None,
         expected_text: str | None = None,
-        selection_fingerprint: str | None = None,
         replace_all: bool | None = None,
         operation: str | None = None,
+        scope: str | None = None,
     ) -> str:
         streaming_mode = patches is not None and self.use_streamed_diffs
         snapshot = dict(self._generate_snapshot(tab_id=tab_id, include_text=not streaming_mode))
@@ -117,7 +117,7 @@ class DocumentApplyPatchTool:
         normalization_text = document_text
 
         line_span = self._coerce_line_span(target_span)
-        span_from_request = line_span is not None
+        span_requested = line_span is not None
         resolved_target_range: tuple[int, int] | None = None
         if not streaming_mode:
             line_span, resolved_target_range = self._resolve_target_inputs(
@@ -127,12 +127,17 @@ class DocumentApplyPatchTool:
                 document_text=document_text,
                 tab_id=tab_id,
             )
-        range_provided = resolved_target_range is not None
+        range_requested = span_requested or target_range is not None
+        explicit_range = resolved_target_range if range_requested else None
         event_range_payload: Mapping[str, Any] | Sequence[int] | tuple[int, int] | LineRange | None = target_range
         if event_range_payload is None:
             event_range_payload = target_span
         if event_range_payload is None and line_span is not None:
             event_range_payload = line_span.to_dict()
+
+        scope_token = (scope or "").strip().lower() or None
+        if scope_token not in (None, "document"):
+            raise ValueError("scope must be 'document' when provided")
 
         version_token = self._resolve_version(snapshot, document_version, tab_id=tab_id)
         self._verify_version_id(snapshot, version_id, tab_id=tab_id)
@@ -144,18 +149,15 @@ class DocumentApplyPatchTool:
         )
 
         document_length = int(snapshot.get("length") or len(document_text))
-        selection_tuple = snapshot.get("selection") or (0, 0)
-        selection_span = self._selection_span(selection_tuple)
-        selection_text = self._resolve_snapshot_selection_text(snapshot)
-        replace_all_flag = bool(replace_all)
+        replace_all_flag = bool(replace_all) or scope_token == "document"
         operation_token = (operation or "").strip().lower()
         if operation_token and operation_token not in {ActionType.REPLACE.value}:
             raise ValueError("document_apply_patch only supports operation='replace' or replace_all=true")
 
-        anchor_text, anchor_from_user = self._normalize_anchor_text(match_text, expected_text)
+        anchor_text = self._normalize_anchor_text(match_text, expected_text)
         if self._should_force_replace_all(
             content=content,
-            target_range=resolved_target_range,
+            target_range=explicit_range,
             replace_all=replace_all_flag,
             document_length=document_length,
             streaming_mode=streaming_mode,
@@ -163,21 +165,22 @@ class DocumentApplyPatchTool:
             replace_all_flag = True
         if self._should_require_explicit_range(
             content=content,
-            target_range=resolved_target_range,
-            anchor_text=anchor_text,
-            selection_span=selection_span,
+            target_range=explicit_range,
             replace_all=replace_all_flag,
             streaming_mode=streaming_mode,
         ):
             reason = (
-                "needs_range: Large inserts (>1 KB) require target_span (preferred), target_range, match_text, or replace_all=true; capture a snapshot and retry with explicit bounds."
+                "needs_range: Provide target_span (preferred), target_range, or scope='document'/replace_all=true before editing."
             )
-            self._emit_needs_range_event(
+            self._emit_caret_guard_event(
                 snapshot=snapshot,
                 tab_id=tab_id,
-                selection_span=selection_span,
-                content_length=len(content or ""),
+                action="patch",
+                context_range=self._snapshot_window_range(snapshot, document_length),
+                range_provided=range_requested or replace_all_flag,
+                replace_all=replace_all_flag,
                 reason=reason,
+                anchor_present=bool(anchor_text),
             )
             raise NeedsRangeError(
                 reason,
@@ -205,25 +208,22 @@ class DocumentApplyPatchTool:
 
         if content is None:
             raise ValueError("content is required when patches are not provided")
-        anchor_source = self._anchor_source(anchor_text, selection_text, selection_fingerprint)
-        selection_authoritative = bool(selection_fingerprint)
+        anchor_source = self._anchor_source(anchor_text)
         try:
             self._enforce_range_requirements(
-                resolved_target_range,
-                selection_tuple,
-                anchor_text,
-                selection_authoritative,
+                explicit_range,
                 replace_all_flag,
             )
         except ValueError as exc:
             self._emit_caret_guard_event(
                 snapshot=snapshot,
                 tab_id=tab_id,
-                selection_span=selection_span,
-                range_provided=range_provided,
-                range_payload=event_range_payload,
+                action="patch",
+                context_range=self._snapshot_window_range(snapshot, document_length),
+                range_provided=range_requested or replace_all_flag,
                 replace_all=replace_all_flag,
                 reason=str(exc),
+                anchor_present=bool(anchor_text),
             )
             self._emit_anchor_event(
                 snapshot=snapshot,
@@ -232,8 +232,7 @@ class DocumentApplyPatchTool:
                 phase="requirements",
                 reason=str(exc),
                 anchor_source=anchor_source,
-                range_provided=range_provided or replace_all_flag,
-                selection_span=selection_span,
+                range_provided=range_requested or replace_all_flag,
             )
             raise
         try:
@@ -241,11 +240,7 @@ class DocumentApplyPatchTool:
                 base_text,
                 snapshot,
                 resolved_target_range,
-                selection_tuple,
                 anchor_text,
-                anchor_from_user,
-                selection_fingerprint,
-                selection_text,
                 replace_all_flag,
             )
         except ValueError as exc:
@@ -256,8 +251,7 @@ class DocumentApplyPatchTool:
                 phase="alignment",
                 reason=str(exc),
                 anchor_source=anchor_source,
-                range_provided=range_provided or replace_all_flag,
-                selection_span=selection_span,
+                range_provided=range_requested or replace_all_flag,
             )
             raise
         self._emit_anchor_event(
@@ -266,12 +260,11 @@ class DocumentApplyPatchTool:
             status="success",
             phase="alignment",
             anchor_source=anchor_source,
-            range_provided=range_provided or replace_all_flag,
-            selection_span=selection_span,
+            range_provided=range_requested or replace_all_flag,
             resolved_range=(start, end),
         )
         new_text = str(content)
-        if span_from_request and resolved_target_range is not None:
+        if span_requested and resolved_target_range is not None:
             normalized = NormalizedTextRange(
                 start=resolved_target_range[0],
                 end=resolved_target_range[1],
@@ -287,7 +280,7 @@ class DocumentApplyPatchTool:
             original_end=end,
         )
         if normalized.slice_text == normalized_replacement:
-            return "skipped: content already matches selection"
+            return "skipped: content already matches target"
 
         match_text_payload = normalized.slice_text
         updated_text = (
@@ -302,22 +295,30 @@ class DocumentApplyPatchTool:
             filename=filename,
             context=context_lines if context_lines is not None else self.default_context_lines,
         )
+        range_entry: dict[str, Any] = {
+            "start": normalized.start,
+            "end": normalized.end,
+            "replacement": normalized_replacement,
+            "match_text": match_text_payload,
+        }
+        scope_details = self._build_scope_details(
+            origin="document" if replace_all_flag else "explicit_span",
+            span=(normalized.start, normalized.end),
+            line_span=line_span,
+        )
+        range_entry["scope"] = dict(scope_details)
+        range_entry.update(self._range_scope_fields(scope_details))
+
         payload: dict[str, Any] = {
             "action": "patch",
             "diff": diff,
             "document_version": version_token,
             "content_hash": snapshot_hash,
-            "ranges": [
-                {
-                    "start": normalized.start,
-                    "end": normalized.end,
-                    "replacement": normalized_replacement,
-                    "match_text": match_text_payload,
-                }
-            ],
+            "ranges": [range_entry],
         }
         if rationale is not None:
             payload["rationale"] = rationale
+        payload["metadata"] = self._merge_scope_metadata(payload.get("metadata"), scope_details)
         status = self.edit_tool.run(tab_id=tab_id, **payload)
         warnings = self._detect_plot_state_warnings(snapshot, document_text, updated_text)
         return self._finalize_status_with_plot_warning(status, warnings, snapshot, tab_id=tab_id)
@@ -326,15 +327,15 @@ class DocumentApplyPatchTool:
         self,
         match_text: str | None,
         expected_text: str | None,
-    ) -> tuple[str | None, bool]:
+    ) -> str | None:
         values = [value for value in (match_text, expected_text) if value is not None]
         if not values:
-            return None, False
+            return None
         first = str(values[0])
         for candidate in values[1:]:
             if str(candidate) != first:
                 raise ValueError("match_text and expected_text must match when both are provided")
-        return first, True
+        return first
 
     def _coerce_line_span(
         self,
@@ -388,19 +389,26 @@ class DocumentApplyPatchTool:
                 offsets = self._resolve_line_offsets(snapshot, document_text)
             if resolved_range is None:
                 resolved_range = self._line_span_to_offsets(resolved_span, offsets)
+        if resolved_range is None:
+            context_range = self._snapshot_window_range(snapshot, len(document_text or ""))
+            resolved_range = context_range
+            if resolved_span is None:
+                if offsets is None:
+                    offsets = self._resolve_line_offsets(snapshot, document_text)
+                if offsets:
+                    resolved_span = self._line_span_from_offsets(context_range, offsets)
         return resolved_span, resolved_range
 
     def _resolve_range(
         self,
         target_range: Mapping[str, Any] | Sequence[int] | tuple[int, int] | None,
-        selection: Sequence[int],
         length: int,
         replace_all: bool = False,
     ) -> tuple[int, int]:
         if replace_all:
             return (0, max(0, int(length)))
         if target_range is None:
-            start, end = selection if len(selection) == 2 else (0, 0)
+            start, end = (0, 0)
         elif isinstance(target_range, Mapping):
             start = int(target_range.get("start", 0))
             end = int(target_range.get("end", 0))
@@ -485,27 +493,14 @@ class DocumentApplyPatchTool:
     def _enforce_range_requirements(
         self,
         target_range: Mapping[str, Any] | Sequence[int] | tuple[int, int] | None,
-        selection: Sequence[int],
-        anchor_text: str | None,
-        selection_authoritative: bool,
         replace_all: bool,
     ) -> None:
         if replace_all:
             return
         if target_range is not None:
             return
-        if selection_authoritative and len(selection) == 2:
-            try:
-                sel_start = int(selection[0])
-                sel_end = int(selection[1])
-            except (TypeError, ValueError):
-                sel_start = sel_end = 0
-            if (sel_start, sel_end) != (0, 0):
-                return
-        if anchor_text:
-            return
         raise ValueError(
-            "Edits must include target_span (preferred), target_range, match_text, or replace_all=true; call document_snapshot to capture the intended selection before editing."
+            "document_apply_patch requires target_span (preferred), target_range, or scope='document'/replace_all=true; call document_snapshot to capture explicit bounds before editing."
         )
 
     def _resolve_anchored_range(
@@ -513,33 +508,11 @@ class DocumentApplyPatchTool:
         base_text: str,
         snapshot: Mapping[str, Any],
         target_range: Mapping[str, Any] | Sequence[int] | tuple[int, int] | None,
-        selection: Sequence[int],
         anchor_text: str | None,
-        anchor_from_user: bool,
-        selection_fingerprint: str | None,
-        selection_text: str | None,
         replace_all: bool,
     ) -> tuple[int, int]:
-        start, end = self._resolve_range(target_range, selection, len(base_text), replace_all)
-        selection_hash = self._resolve_selection_hash(snapshot, selection_text)
-
-        if selection_fingerprint is not None:
-            fingerprint = selection_fingerprint.strip()
-            if not fingerprint:
-                raise ValueError("selection_fingerprint cannot be empty")
-            if not selection_hash:
-                raise ValueError("Snapshot did not expose selection_text required to validate selection_fingerprint")
-            if fingerprint != selection_hash:
-                raise ValueError(
-                    "selection_fingerprint does not match the latest snapshot; refresh document_snapshot before applying this edit."
-                )
-
+        start, end = self._resolve_range(target_range, len(base_text), replace_all)
         anchor_candidate = anchor_text
-        from_snapshot = False
-        use_snapshot_anchor = selection_fingerprint is not None and selection_text is not None
-        if anchor_candidate is None and use_snapshot_anchor:
-            anchor_candidate = selection_text
-            from_snapshot = True
 
         if anchor_candidate is None or anchor_candidate == "":
             return start, end
@@ -547,11 +520,6 @@ class DocumentApplyPatchTool:
         selection_slice = base_text[start:end]
         if selection_slice == anchor_candidate:
             return start, end
-
-        if from_snapshot and not anchor_from_user:
-            raise ValueError(
-                "Snapshot selection_text no longer matches document content; provide match_text or selection_fingerprint to re-anchor the edit."
-            )
 
         relocated = self._locate_unique_anchor(base_text, anchor_candidate)
         if relocated is None:
@@ -565,27 +533,9 @@ class DocumentApplyPatchTool:
             return None
         duplicate = base_text.find(anchor, position + 1)
         if duplicate >= 0:
-            raise ValueError("match_text matched multiple ranges; narrow the selection to proceed")
+            raise ValueError("match_text matched multiple ranges; narrow the target span to proceed")
         return position, position + len(anchor)
 
-    @staticmethod
-    def _resolve_snapshot_selection_text(snapshot: Mapping[str, Any]) -> str | None:
-        snapshot_value = snapshot.get("selection_text")
-        if isinstance(snapshot_value, str):
-            return snapshot_value
-        return None
-
-    def _resolve_selection_hash(self, snapshot: Mapping[str, Any], selection_text: str | None) -> str | None:
-        token = snapshot.get("selection_hash")
-        if isinstance(token, str) and token.strip():
-            return token.strip()
-        if selection_text:
-            return self._hash_text(selection_text)
-        return None
-
-    @staticmethod
-    def _hash_text(text: str) -> str:
-        return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
     def _coerce_streaming_requests(
         self,
@@ -652,6 +602,7 @@ class DocumentApplyPatchTool:
         tab_id: str | None,
     ) -> dict[str, Any]:
         ranges_payload: list[dict[str, Any]] = []
+        scope_summaries: list[Mapping[str, Any]] = []
         for entry in result.ranges:
             payload: dict[str, Any] = {
                 "start": entry.start,
@@ -663,6 +614,15 @@ class DocumentApplyPatchTool:
                 payload["chunk_id"] = entry.chunk_id
             if entry.chunk_hash:
                 payload["chunk_hash"] = entry.chunk_hash
+            scope_details = self._build_scope_details(
+                origin="chunk" if entry.chunk_id or entry.chunk_hash else "explicit_span",
+                span=(entry.start, entry.end),
+                chunk_id=entry.chunk_id,
+                chunk_hash=entry.chunk_hash,
+            )
+            payload["scope"] = dict(scope_details)
+            payload.update(self._range_scope_fields(scope_details))
+            scope_summaries.append(scope_details)
             ranges_payload.append(payload)
 
         metadata: dict[str, Any] = {
@@ -671,12 +631,15 @@ class DocumentApplyPatchTool:
             "inserted_chars": result.stats.inserted_chars,
         }
 
+        scope_summary = self._summarize_scope_entries(scope_summaries)
+        merged_metadata = self._merge_scope_metadata({"streamed_diff": metadata}, scope_summary)
+
         payload: dict[str, Any] = {
             "action": ActionType.PATCH.value,
             "ranges": ranges_payload,
             "document_version": document_version,
             "content_hash": content_hash,
-            "metadata": {"streamed_diff": metadata},
+            "metadata": merged_metadata,
         }
         if rationale is not None:
             payload["rationale"] = rationale
@@ -796,7 +759,6 @@ class DocumentApplyPatchTool:
         phase: str,
         anchor_source: str,
         range_provided: bool,
-        selection_span: tuple[int, int] | None,
         resolved_range: tuple[int, int] | None = None,
         reason: str | None = None,
     ) -> None:
@@ -811,8 +773,6 @@ class DocumentApplyPatchTool:
             "anchor_source": anchor_source,
             "range_provided": range_provided,
         }
-        if selection_span is not None:
-            payload["selection_span"] = {"start": selection_span[0], "end": selection_span[1]}
         if resolved_range is not None:
             payload["resolved_range"] = {"start": resolved_range[0], "end": resolved_range[1]}
         if reason:
@@ -843,57 +803,6 @@ class DocumentApplyPatchTool:
             },
         )
 
-    def _emit_caret_guard_event(
-        self,
-        *,
-        snapshot: Mapping[str, Any],
-        tab_id: str | None,
-        selection_span: tuple[int, int] | None,
-        range_provided: bool,
-        range_payload: Mapping[str, Any] | Sequence[int] | tuple[int, int] | LineRange | None,
-        replace_all: bool,
-        reason: str,
-    ) -> None:
-        payload: dict[str, Any] = {
-            "document_id": snapshot.get("document_id"),
-            "tab_id": tab_id,
-            "source": "document_apply_patch",
-            "range_provided": range_provided or replace_all,
-            "replace_all": replace_all,
-            "selection_span": self._span_payload(selection_span),
-            "reason": reason,
-        }
-        if range_payload is not None:
-            payload["range_payload"] = self._coerce_range_payload(range_payload)
-        telemetry_emit(
-            "caret_call_blocked",
-            payload,
-        )
-
-    def _emit_needs_range_event(
-        self,
-        *,
-        snapshot: Mapping[str, Any],
-        tab_id: str | None,
-        selection_span: tuple[int, int] | None,
-        content_length: int,
-        reason: str,
-    ) -> None:
-        if not self.needs_range_event:
-            return
-        telemetry_emit(
-            self.needs_range_event,
-            {
-                "document_id": snapshot.get("document_id"),
-                "tab_id": tab_id,
-                "source": "document_apply_patch",
-                "selection_span": self._span_payload(selection_span),
-                "content_length": content_length,
-                "threshold": self.insert_needs_range_threshold,
-                "reason": reason,
-            },
-        )
-
     def _emit_hash_mismatch_event(
         self,
         *,
@@ -919,52 +828,35 @@ class DocumentApplyPatchTool:
             payload["details"] = dict(details)
         telemetry_emit(self.hash_mismatch_event, payload)
 
-    @staticmethod
-    def _selection_span(selection: Sequence[int]) -> tuple[int, int] | None:
-        if len(selection) != 2:
-            return None
-        try:
-            start = int(selection[0])
-            end = int(selection[1])
-        except (TypeError, ValueError):
-            return None
-        if end < start:
-            start, end = end, start
-        return (start, end)
+    def _emit_caret_guard_event(
+        self,
+        *,
+        snapshot: Mapping[str, Any],
+        tab_id: str | None,
+        action: str,
+        context_range: tuple[int, int] | None,
+        range_provided: bool,
+        replace_all: bool,
+        reason: str,
+        anchor_present: bool,
+    ) -> None:
+        telemetry_emit(
+            "caret_call_blocked",
+            {
+                "document_id": snapshot.get("document_id"),
+                "tab_id": tab_id,
+                "source": "document_apply_patch",
+                "action": action,
+                "range_provided": range_provided,
+                "replace_all": replace_all,
+                "anchor_present": anchor_present,
+                "context_range": self._span_payload(context_range),
+                "reason": reason,
+            },
+        )
 
     @staticmethod
-    def _span_payload(span: tuple[int, int] | None) -> dict[str, int] | None:
-        if span is None:
-            return None
-        return {"start": span[0], "end": span[1]}
-
-    @staticmethod
-    def _coerce_range_payload(
-        value: Mapping[str, Any] | Sequence[int] | tuple[int, int] | LineRange | None,
-    ) -> Mapping[str, Any] | Sequence[int] | tuple[int, int]:
-        if value is None:
-            return {}
-        if isinstance(value, Mapping):
-            return dict(value)
-        if isinstance(value, LineRange):
-            return value.to_dict()
-        if isinstance(value, Sequence) and len(value) == 2:
-            try:
-                start = int(value[0])
-                end = int(value[1])
-            except (TypeError, ValueError):
-                return list(value)
-            return {"start": start, "end": end}
-        return value
-
-    @staticmethod
-    def _anchor_source(
-        anchor_text: str | None,
-        selection_text: str | None,
-        selection_fingerprint: str | None,
-    ) -> str:
-        if selection_fingerprint:
-            return "fingerprint"
+    def _anchor_source(anchor_text: str | None) -> str:
         if anchor_text:
             return "match_text"
         return "range_only"
@@ -978,6 +870,43 @@ class DocumentApplyPatchTool:
         if end_int < start_int:
             start_int, end_int = end_int, start_int
         return start_int, end_int
+
+    @staticmethod
+    def _span_payload(span: tuple[int, int] | None) -> dict[str, int] | None:
+        if span is None:
+            return None
+        return {"start": span[0], "end": span[1]}
+
+    @staticmethod
+    def _snapshot_window_range(snapshot: Mapping[str, Any], length: int) -> tuple[int, int]:
+        def _coerce(candidate: Any) -> tuple[int, int] | None:
+            if isinstance(candidate, Mapping):
+                start = candidate.get("start")
+                end = candidate.get("end")
+            elif isinstance(candidate, Sequence) and len(candidate) == 2 and not isinstance(candidate, (str, bytes)):
+                start, end = candidate
+            else:
+                return None
+            try:
+                start_i = int(start)
+                end_i = int(end)
+            except (TypeError, ValueError):
+                return None
+            if end_i < start_i:
+                start_i, end_i = end_i, start_i
+            return start_i, end_i
+
+        for key in ("text_range", "window"):
+            span = _coerce(snapshot.get(key))
+            if span is not None:
+                break
+        else:
+            span = (0, length)
+
+        start, end = span
+        start = max(0, min(start, length))
+        end = max(start, min(end, length))
+        return (start, end)
 
     def _resolve_version(self, snapshot: Mapping[str, Any], explicit: str | None, *, tab_id: str | None) -> str:
         if explicit is None:
@@ -1116,8 +1045,6 @@ class DocumentApplyPatchTool:
         *,
         content: str | None,
         target_range: Mapping[str, Any] | Sequence[int] | tuple[int, int] | None,
-        anchor_text: str | None,
-        selection_span: tuple[int, int] | None,
         replace_all: bool,
         streaming_mode: bool,
     ) -> bool:
@@ -1127,11 +1054,7 @@ class DocumentApplyPatchTool:
             return False
         if content is None or len(content) < self.insert_needs_range_threshold:
             return False
-        if target_range is not None or anchor_text:
-            return False
-        if selection_span is not None and selection_span[0] != selection_span[1]:
-            return False
-        return True
+        return target_range is None
 
     @staticmethod
     def _apply_streamed_ranges(text: str, ranges: Sequence[StreamedPatchRange]) -> str:
@@ -1187,6 +1110,15 @@ class DocumentApplyPatchTool:
             warning["beats"] = removed_beats
         return warning
 
+    def _resolve_plot_state_store(self) -> DocumentPlotStateStore | None:
+        resolver = self.plot_state_store_resolver
+        if resolver is None:
+            return None
+        try:
+            return resolver()
+        except Exception:  # pragma: no cover - defensive
+            return None
+
     def _finalize_status_with_plot_warning(
         self,
         status: str,
@@ -1226,21 +1158,9 @@ class DocumentApplyPatchTool:
             "document_id": snapshot.get("document_id"),
             "tab_id": tab_id,
             "source": "document_apply_patch",
+            "warning": dict(warning),
         }
-        for key in ("entities", "beats"):
-            value = warning.get(key)
-            if isinstance(value, Sequence) and value:
-                payload[key] = list(value)
         telemetry_emit(self.plot_warning_event, payload)
-
-    def _resolve_plot_state_store(self) -> DocumentPlotStateStore | None:
-        resolver = self.plot_state_store_resolver
-        if not callable(resolver):
-            return None
-        try:
-            return resolver()
-        except Exception:
-            return None
 
     @staticmethod
     def _extract_tracked_entities(snapshot: Mapping[str, Any]) -> list[str]:
@@ -1276,6 +1196,125 @@ class DocumentApplyPatchTool:
                     if token not in summaries:
                         summaries.append(token)
         return summaries
+
+    def _build_scope_details(
+        self,
+        *,
+        origin: str,
+        span: tuple[int, int] | None,
+        line_span: LineRange | None = None,
+        chunk_id: str | None = None,
+        chunk_hash: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"origin": origin}
+        if span is not None:
+            start, end = span
+            start = max(0, int(start))
+            end = max(start, int(end))
+            payload["range"] = {"start": start, "end": end}
+            payload["length"] = max(0, end - start)
+        if line_span is not None:
+            payload["line_span"] = line_span.to_dict()
+        if chunk_id:
+            payload.setdefault("chunk_id", chunk_id)
+        if chunk_hash:
+            payload.setdefault("chunk_hash", chunk_hash)
+        return payload
+
+    @staticmethod
+    def _range_scope_fields(scope: Mapping[str, Any]) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        origin = scope.get("origin")
+        if isinstance(origin, str) and origin.strip():
+            payload["scope_origin"] = origin.strip()
+        length = scope.get("length")
+        try:
+            if length is not None:
+                payload["scope_length"] = max(0, int(length))
+        except (TypeError, ValueError):
+            pass
+        range_payload = scope.get("range") if isinstance(scope, Mapping) else None
+        if isinstance(range_payload, Mapping):
+            start = range_payload.get("start")
+            end = range_payload.get("end")
+            try:
+                if start is not None and end is not None:
+                    payload["scope_range"] = {"start": int(start), "end": int(end)}
+            except (TypeError, ValueError):
+                pass
+        return payload
+
+    @staticmethod
+    def _merge_scope_metadata(
+        metadata: Mapping[str, Any] | None,
+        scope: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(metadata) if isinstance(metadata, Mapping) else {}
+        merged["scope"] = dict(scope)
+        origin = scope.get("origin")
+        if isinstance(origin, str) and origin.strip():
+            merged["scope_origin"] = origin.strip()
+        length = scope.get("length")
+        try:
+            if length is not None:
+                merged["scope_length"] = max(0, int(length))
+        except (TypeError, ValueError):
+            pass
+        range_payload = scope.get("range")
+        if isinstance(range_payload, Mapping):
+            start = range_payload.get("start")
+            end = range_payload.get("end")
+            try:
+                if start is not None and end is not None:
+                    merged["scope_range"] = {"start": int(start), "end": int(end)}
+            except (TypeError, ValueError):
+                pass
+        line_span = scope.get("line_span")
+        if isinstance(line_span, Mapping):
+            merged["scope_line_span"] = dict(line_span)
+        return merged
+
+    def _summarize_scope_entries(self, scopes: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+        valid_scopes = [dict(scope) for scope in scopes if isinstance(scope, Mapping)]
+        if not valid_scopes:
+            return {"origin": "unknown"}
+        normalized_origins = {
+            self._normalize_scope_origin(scope.get("origin")) or "unknown" for scope in valid_scopes
+        }
+        origin = normalized_origins.pop() if len(normalized_origins) == 1 else "mixed"
+        summary: dict[str, Any] = {"origin": origin}
+        lengths: list[int] = []
+        for scope in valid_scopes:
+            length = scope.get("length")
+            try:
+                if length is not None:
+                    lengths.append(max(0, int(length)))
+            except (TypeError, ValueError):
+                continue
+        if lengths:
+            summary["length"] = sum(lengths)
+        if len(valid_scopes) == 1:
+            only = valid_scopes[0]
+            range_payload = only.get("range")
+            if isinstance(range_payload, Mapping):
+                start = range_payload.get("start")
+                end = range_payload.get("end")
+                try:
+                    if start is not None and end is not None:
+                        summary["range"] = {"start": int(start), "end": int(end)}
+                except (TypeError, ValueError):
+                    pass
+            line_span = only.get("line_span")
+            if isinstance(line_span, Mapping):
+                summary["line_span"] = dict(line_span)
+        return summary
+
+    @staticmethod
+    def _normalize_scope_origin(origin: Any) -> str | None:
+        if not isinstance(origin, str):
+            return None
+        token = origin.strip().lower()
+        return token or None
 
 
 __all__ = ["DocumentApplyPatchTool", "NeedsRangeError"]

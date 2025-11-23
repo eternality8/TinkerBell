@@ -80,8 +80,8 @@ class SubagentResultCache:
         signature = self._build_signature(job)
         if signature is None or job.result is None:
             return
-        chunk_hash = job.chunk_ref.chunk_hash or job.dedup_hash
-        document_id = job.chunk_ref.document_id
+        chunk_hash = job.chunk_hash or job.dedup_hash
+        document_id = job.document_id
         if not chunk_hash or not document_id:
             return
         entry = _CacheEntry(
@@ -146,8 +146,8 @@ class SubagentResultCache:
         self._emit("subagent.cache_evicted", None, extra={"document_id": entry.document_id})
 
     def _build_signature(self, job: SubagentJob) -> str | None:
-        document_id = job.chunk_ref.document_id
-        chunk_hash = job.chunk_ref.chunk_hash or job.dedup_hash
+        document_id = job.document_id
+        chunk_hash = job.chunk_hash or job.dedup_hash
         if not document_id or not chunk_hash:
             return None
         allowed_tools = job.allowed_tools or ()
@@ -194,12 +194,11 @@ class SubagentResultCache:
             return
         payload: dict[str, object] = dict(extra or {})
         if job is not None:
-            chunk = job.chunk_ref
-            payload.setdefault("document_id", chunk.document_id)
-            if chunk.chunk_hash:
-                payload.setdefault("chunk_hash", chunk.chunk_hash)
-            if chunk.version_id:
-                payload.setdefault("version_id", chunk.version_id)
+            payload.setdefault("document_id", job.document_id)
+            if job.chunk_hash:
+                payload.setdefault("chunk_hash", job.chunk_hash)
+            if job.chunk_ref.version_id:
+                payload.setdefault("version_id", job.chunk_ref.version_id)
         if reason:
             payload["reason"] = reason
         try:

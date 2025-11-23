@@ -134,6 +134,28 @@ def test_load_persistent_events_respects_limit(tmp_path: Path) -> None:
     assert [event.run_id for event in events] == ["run-2", "run-3"]
 
 
+def test_scope_metrics_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "telemetry_scope" / "context_usage.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sink = telemetry_service.PersistentTelemetrySink(path=path, capacity=2)
+    scope_counts = (("chunk", 2), ("explicit_span", 1))
+    sink.record(
+        _make_event(
+            run_id="run-scope",
+            scope_origin_counts=scope_counts,
+            scope_missing_count=3,
+            scope_total_length=45,
+        )
+    )
+
+    events = telemetry_service.load_persistent_events(path)
+    assert events
+    event = events[-1]
+    assert event.scope_origin_counts == scope_counts
+    assert event.scope_missing_count == 3
+    assert event.scope_total_length == 45
+
+
 def test_register_event_listener_receives_payload() -> None:
     received: list[dict[str, object]] = []
     event_name = "test-budget-event"

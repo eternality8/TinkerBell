@@ -48,6 +48,15 @@ def test_parse_mapping_normalizes_action_case() -> None:
     assert result["action"] == ActionType.INSERT.value
 
 
+def test_parse_does_not_alias_selection_field() -> None:
+    payload = {"action": "insert", "content": "hi", "selection": {"start": 0, "end": 4}}
+
+    result = parse_agent_payload(payload)
+
+    assert "target_range" not in result
+    assert result["selection"] == {"start": 0, "end": 4}
+
+
 def test_parse_invalid_payload_raises() -> None:
     with pytest.raises(ValueError):
         parse_agent_payload("no structured json here")
@@ -87,6 +96,15 @@ def test_validate_rejects_bad_target_range_type() -> None:
 
     assert not result.ok
     assert "target_range" in result.message
+
+
+def test_validate_rejects_selection_field() -> None:
+    payload = {"action": "insert", "content": "hi", "selection": {"start": 0, "end": 4}}
+
+    result = validate_directive(payload)
+
+    assert not result.ok
+    assert "Deprecated range parameters" in result.message
 
 
 def test_validate_accepts_patch_with_diff_and_version() -> None:

@@ -114,7 +114,7 @@ class RetrievalRule:
 
     def evaluate(self, analysis_input: AnalysisInput, context: RuleContext) -> AnalysisFinding | None:
         char_count = analysis_input.document_chars or 0
-        selection_len = analysis_input.selection_length()
+        selection_len = analysis_input.span_length()
         if char_count < 5_000 and selection_len < 2_000:
             return None
         required = ("document_snapshot",)

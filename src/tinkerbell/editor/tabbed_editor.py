@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Sequence
 
 from .document_model import DocumentState, SelectionRange
-from .editor_widget import EditorWidget, SelectionListener, SnapshotListener, TextChangeListener, QWidgetBase
+from .editor_widget import EditorWidget, SnapshotListener, TextChangeListener, QWidgetBase
 from .syntax.themes import Theme, load_theme
 from .workspace import DocumentTab, DocumentWorkspace
 from ..services.bridge import DocumentBridge, Executor
@@ -33,6 +33,7 @@ class TabSummary:
 
 
 TabCreatedListener = Callable[[DocumentTab], None]
+SelectionChangeListener = Callable[[str, SelectionRange, int, int], None]
 
 
 class TabbedEditorWidget(QWidgetBase):
@@ -42,13 +43,13 @@ class TabbedEditorWidget(QWidgetBase):
         super().__init__()
         self._snapshot_listeners: list[SnapshotListener] = []
         self._text_listeners: list[TextChangeListener] = []
-        self._selection_listeners: list[SelectionListener] = []
         self._tab_widget: Any | None = None
         self._block_qt_signal = False
         self._initializing = True
         self._editor_lookup: Dict[int, str] = {}
         self._main_thread_executor: Executor | None = None
         self._tab_created_listeners: list[TabCreatedListener] = []
+        self._selection_listeners: list[SelectionChangeListener] = []
         self._tab_close_handler: Callable[[str], bool | None] | None = None
 
         editor_factory = lambda: EditorWidget(parent=self)  # noqa: E731 - intentional lambda factory
@@ -76,7 +77,7 @@ class TabbedEditorWidget(QWidgetBase):
     def add_text_listener(self, listener: TextChangeListener) -> None:
         self._text_listeners.append(listener)
 
-    def add_selection_listener(self, listener: SelectionListener) -> None:
+    def add_selection_listener(self, listener: SelectionChangeListener) -> None:
         self._selection_listeners.append(listener)
 
     def request_snapshot(self, *, tab_id: str | None = None, delta_only: bool = False) -> dict:
@@ -92,10 +93,6 @@ class TabbedEditorWidget(QWidgetBase):
         tab.editor.load_document(document)
         tab.update_title()
         self._update_tab_label(tab)
-
-    def apply_selection(self, selection: SelectionRange, *, tab_id: str | None = None) -> None:
-        tab = self._resolve_tab(tab_id)
-        tab.editor.apply_selection(selection)
 
     def set_text(self, text: str, *, mark_dirty: bool = True) -> None:
         self._workspace.active_editor().set_text(text, mark_dirty=mark_dirty)
@@ -286,7 +283,9 @@ class TabbedEditorWidget(QWidgetBase):
     def _bind_editor_listeners(self, tab: DocumentTab) -> None:
         tab.editor.add_snapshot_listener(lambda snapshot, tab_id=tab.id: self._emit_snapshot(tab_id, snapshot))
         tab.editor.add_text_listener(lambda text, state, tab_id=tab.id: self._emit_text(tab_id, text, state))
-        tab.editor.add_selection_listener(lambda selection, tab_id=tab.id: self._emit_selection(tab_id, selection))
+        tab.editor.add_selection_listener(
+            lambda selection, line, column, tab_id=tab.id: self._emit_selection(tab_id, selection, line, column)
+        )
 
     def _insert_tab_widget(self, tab: DocumentTab) -> None:
         if self._tab_widget is None:
@@ -317,8 +316,7 @@ class TabbedEditorWidget(QWidgetBase):
                     self._tab_widget.setCurrentIndex(index)
                 finally:
                     self._block_qt_signal = False
-        if tab is not None:
-            self._emit_selection(tab.id, tab.document().selection)
+        # Selection changes are no longer broadcast outside the editor widget.
 
     # ------------------------------------------------------------------
     # Event emitters
@@ -336,9 +334,10 @@ class TabbedEditorWidget(QWidgetBase):
         for listener in list(self._text_listeners):
             listener(text, state)
 
-    def _emit_selection(self, tab_id: str, selection: SelectionRange) -> None:
+    def _emit_selection(self, tab_id: str, selection: SelectionRange, line: int, column: int) -> None:
+        payload = SelectionRange(selection.start, selection.end)
         for listener in list(self._selection_listeners):
-            listener(selection)
+            listener(tab_id, payload, line, column)
 
     # ------------------------------------------------------------------
     # Utilities

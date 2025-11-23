@@ -16,7 +16,7 @@ def _sample_manifest(document_id: str, cache_key: str, ranges: list[tuple[int, i
                 "end": end,
                 "length": end - start,
                 "hash": f"hash-{idx}",
-                "selection_overlap": False,
+                "span_overlap": False,
                 "outline_pointer_id": None,
             }
         )

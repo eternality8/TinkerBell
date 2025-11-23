@@ -15,6 +15,7 @@ from ...ai.tools.document_outline import DocumentOutlineTool
 from ...ai.tools.document_plot_state import PlotOutlineTool, DocumentPlotStateTool
 from ...ai.tools.plot_state_update import PlotStateUpdateTool
 from ...ai.tools.registry import ToolRegistryContext
+from ...editor.selection_gateway import SelectionSnapshotProvider
 
 LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ class ToolProvider:
     directive_schema_provider: Callable[[], Mapping[str, Any]]
     plot_state_store_resolver: PlotStateStoreResolver
     character_map_store_resolver: CharacterMapStoreResolver
+    selection_gateway: SelectionSnapshotProvider
     phase3_outline_enabled: bool = False
     plot_scaffolding_enabled: bool = False
 
@@ -79,6 +81,7 @@ class ToolProvider:
         return ToolRegistryContext(
             controller=self.controller_resolver(),
             bridge=self.bridge,
+            selection_gateway=self.selection_gateway,
             outline_digest_resolver=self.outline_digest_resolver,
             directive_schema_provider=self.directive_schema_provider,
             phase3_outline_enabled=self.phase3_outline_enabled,
