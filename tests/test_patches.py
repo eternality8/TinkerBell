@@ -57,6 +57,26 @@ def test_apply_unified_diff_raises_on_context_mismatch():
         apply_unified_diff(original, diff)
 
 
+def test_apply_unified_diff_reports_ambiguous_context():
+    original = "foo\nbar\nfoo\nbar\nTAIL\n"
+    diff = """--- a/doc
++++ b/doc
+@@ -5 +5 @@
+-TAIL
++tail
+@@ -1,2 +1,2 @@
+-foo
+-bar
++FOO
++BAR
+"""
+
+    with pytest.raises(PatchApplyError) as excinfo:
+        apply_unified_diff(original, diff)
+
+    assert excinfo.value.reason == "context_ambiguous"
+
+
 def test_apply_unified_diff_reanchors_when_line_numbers_are_snippet_based():
     original = "intro\nalpha\nbeta\ngamma\n"
     diff = """--- a/snippet

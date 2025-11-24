@@ -161,6 +161,7 @@ class DocumentBridge:
     CAUSE_INSPECTOR_FAILURE = "inspector_failure"
     _HASH_FAILURE_REASONS = {
         "context_mismatch",
+        "context_ambiguous",
         "context_overflow",
         "range_mismatch",
         "range_overlap",
@@ -417,6 +418,15 @@ class DocumentBridge:
         payload.setdefault("target_range", range_payload)
         if self._tab_id:
             payload.setdefault("tab_id", self._tab_id)
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            tab_hint = payload.get("tab_id") if payload else None
+            _LOGGER.debug(
+                "DocumentBridge failure (action=%s, tab_id=%s): %s | metadata=%s",
+                directive.action,
+                tab_hint,
+                message,
+                payload,
+            )
         dispatch_payload = dict(payload) if payload is not None else None
         self._last_failure_metadata = dict(dispatch_payload) if dispatch_payload is not None else None
         for listener in list(self._failure_listeners):

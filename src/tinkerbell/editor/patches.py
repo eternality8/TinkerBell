@@ -257,6 +257,13 @@ def _locate_hunk(lines: Sequence[str], hunk: _Hunk, start_index: int) -> int:
 
     if match_index is None:
         preview = old_lines[0] if old_lines else None
+        if _sequence_occurs_multiple_times(lines, old_lines):
+            raise PatchApplyError(
+                "Context matched multiple locations; provide explicit range/anchors before retrying",
+                reason="context_ambiguous",
+                expected=preview,
+                hunk_header=hunk.header,
+            )
         raise PatchApplyError(
             "Context mismatch while applying patch",
             reason="context_mismatch",
@@ -300,6 +307,24 @@ def _find_sequence(lines: Sequence[str], needle: Sequence[str], start: int) -> i
         if lines[index : index + len(segment)] == segment:
             return index
     return None
+
+
+def _sequence_occurs_multiple_times(lines: Sequence[str], needle: Sequence[str]) -> bool:
+    if not needle:
+        return False
+    segment = list(needle)
+    if not segment:
+        return False
+    limit = len(lines) - len(segment) + 1
+    if limit <= 0:
+        return False
+    matches = 0
+    for index in range(0, limit + 1):
+        if lines[index : index + len(segment)] == segment:
+            matches += 1
+            if matches >= 2:
+                return True
+    return False
 
 
 def _parse_unified_diff(diff: str) -> tuple[tuple[_Hunk, ...], str | None, bool | None]:
