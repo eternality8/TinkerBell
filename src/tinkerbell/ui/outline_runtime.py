@@ -28,16 +28,21 @@ class OutlineRuntime:
     def ensure_started(self) -> OutlineBuilderWorker | None:
         loop = self.loop_resolver()
         if loop is None:
+            LOGGER.warning("Outline worker not started; no asyncio event loop was resolved.")
             return None
+        loop_is_closed = getattr(loop, "is_closed", None)
+        try:
+            if callable(loop_is_closed) and loop_is_closed():
+                LOGGER.warning("Outline worker not started; resolved event loop is closed.")
+                return None
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Outline worker could not verify loop state", exc_info=True)
         if self._worker is not None:
             return self._worker
-        if loop.is_running():
-            return self._start_worker(loop)
-        try:
-            loop.call_soon(self._start_worker, loop)
-        except RuntimeError:  # pragma: no cover - loop may be closed in tests
-            return None
-        return None
+        worker = self._start_worker(loop)
+        if worker is None:
+            LOGGER.warning("Outline worker startup failed; see debug logs for details.")
+        return worker
 
     def _start_worker(self, loop: asyncio.AbstractEventLoop) -> OutlineBuilderWorker | None:
         if self._worker is not None:
@@ -48,8 +53,9 @@ class OutlineRuntime:
                 storage_dir=self.storage_root,
                 loop=loop,
             )
-        except Exception:  # pragma: no cover - optional feature
-            LOGGER.debug("Outline worker unavailable; continuing without outlines.", exc_info=True)
+        except Exception as exc:  # pragma: no cover - optional feature
+            LOGGER.warning("Outline worker unavailable; continuing without outlines: %s", exc)
+            LOGGER.debug("Outline worker startup traceback", exc_info=True)
             return None
         self._worker = worker
         if self.index_propagator is not None:

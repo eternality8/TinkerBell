@@ -54,17 +54,18 @@ def test_outline_runtime_starts_worker_when_loop_running(tmp_path: Path, stub_wo
     assert runtime.outline_memory() == {"outline": "available"}
 
 
-def test_outline_runtime_schedules_start_when_loop_idle(tmp_path: Path, stub_worker_cls: type) -> None:
-    scheduled: dict[str, Any] = {}
+def test_outline_runtime_starts_even_when_loop_idle(tmp_path: Path, stub_worker_cls: type) -> None:
     propagations: list[str] = []
 
     class _IdleLoop:
         def is_running(self) -> bool:
             return False
 
+        def is_closed(self) -> bool:
+            return False
+
         def call_soon(self, callback: Any, *args: Any) -> None:
-            scheduled["callback"] = callback
-            scheduled["args"] = args
+            raise AssertionError("call_soon should not be used when loop is idle")
 
     loop = _IdleLoop()
     runtime = OutlineRuntime(
@@ -74,14 +75,10 @@ def test_outline_runtime_schedules_start_when_loop_idle(tmp_path: Path, stub_wor
         index_propagator=lambda: propagations.append("called"),
     )
 
-    result = runtime.ensure_started()
+    worker = runtime.ensure_started()
 
-    assert result is None
-    assert "callback" in scheduled
-
-    scheduled["callback"](*scheduled["args"])
-
-    assert isinstance(runtime.worker(), stub_worker_cls)
+    assert isinstance(worker, stub_worker_cls)
+    assert runtime.worker() is worker
     assert runtime.outline_memory() == {"outline": "available"}
     assert propagations == ["called"]
 

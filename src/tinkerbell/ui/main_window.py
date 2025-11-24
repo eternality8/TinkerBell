@@ -24,7 +24,7 @@ from ..chat.commands import (
     resolve_tab_reference,
 )
 from ..chat.message_model import ChatMessage, EditDirective, ToolTrace
-from ..editor.document_model import DocumentMetadata, DocumentState, SelectionRange
+from ..editor.document_model import DocumentMetadata, DocumentState
 from ..editor.selection_gateway import SelectionGateway
 from ..editor.workspace import DocumentTab
 from ..documents.ranges import TextRange
@@ -113,6 +113,7 @@ class MainWindow(QMainWindow):
     def __init__(self, context: WindowContext):  # noqa: D401 - doc inherited
         super().__init__()
         self._context = context
+        self._async_loop: asyncio.AbstractEventLoop | None = None
         initial_settings = context.settings
         self._phase3_outline_enabled = bool(getattr(initial_settings, "phase3_outline_tools", False))
         self._outline_generation_enabled = bool(getattr(initial_settings, "enable_outline_generation", False))
@@ -474,7 +475,7 @@ class MainWindow(QMainWindow):
     def _handle_editor_selection_changed(
         self,
         tab_id: str,
-        _selection: SelectionRange,
+        _selection: object,
         line: int,
         column: int,
     ) -> None:
@@ -511,10 +512,27 @@ class MainWindow(QMainWindow):
         return record.outline_hash if record else None
 
     def _resolve_async_loop(self) -> asyncio.AbstractEventLoop | None:
+        loop: asyncio.AbstractEventLoop | None = None
         try:
-            return asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
+            loop = None
+        if loop is None:
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = None
+        cached = self._async_loop
+        if loop is None and cached is not None and not cached.is_closed():
+            loop = cached
+        if loop is None:
+            _LOGGER.warning("No asyncio event loop is currently available; outline worker startup is deferred.")
             return None
+        if loop.is_closed():
+            _LOGGER.warning("Resolved asyncio event loop is closed; outline worker cannot start.")
+            return None
+        self._async_loop = loop
+        return loop
 
     def _run_background_task(self, task_factory: Callable[[], Coroutine[Any, Any, Any]]) -> None:
         def _build_coroutine() -> Coroutine[Any, Any, Any]:
