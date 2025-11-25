@@ -6,45 +6,61 @@ This document outlines improvements to reduce AI tool call errors in TinkerBell'
 
 ## Phase 1: Schema Simplification (High Priority)
 
-### 1.1 Consolidate Version Fields into `snapshot_token`
+### 1.1 Simplify Versioning to `tab_id:version_id`
 
 **Current State:** `DocumentApplyPatchTool` requires three separate version fields:
 - `document_version`
 - `version_id`
 - `content_hash`
 
-**Problem:** AI frequently forgets one or passes stale values.
+Plus there's confusion between `tab_id` and `document_id` throughout the codebase.
+
+**Problem:** 
+- AI frequently forgets one field or passes stale values
+- Redundant identifiers waste tokens (~20-30 tokens per edit cycle)
+- `content_hash` is redundant since `version_id` is monotonic and increments on every edit
+
+**Key Insight:** In a tabbed editor, one tab = one document. The AI operates on tabs, not abstract document IDs. We only need:
+1. **Which tab?** → `tab_id`
+2. **Is it stale?** → `version_id` (monotonic counter)
 
 **Changes:**
 
-1. **Modify `DocumentSnapshotTool`** to emit a combined `snapshot_token`:
+1. **Modify `DocumentSnapshotTool`** to emit a compact `snapshot_token`:
    ```python
    # In document_snapshot.py
-   snapshot["snapshot_token"] = f"{version_id}:{content_hash}"
+   snapshot["snapshot_token"] = f"{tab_id}:{version_id}"
+   # Example: "tab_3:42" (~8-12 chars vs 60+ chars before)
    ```
 
 2. **Update `DocumentApplyPatchTool`** to accept `snapshot_token`:
    ```python
-   # Accept either the new token or legacy fields (with deprecation warning)
    if snapshot_token:
-       version_id, content_hash = snapshot_token.split(":", 1)
-   elif document_version and version_id and content_hash:
-       emit_deprecation_warning("Use snapshot_token instead of separate version fields")
+       tab_id, version_id = snapshot_token.split(":", 1)
+   elif tab_id and version_id:  # Legacy support with deprecation warning
+       emit_deprecation_warning("Use snapshot_token instead of separate fields")
    else:
        raise ValueError("snapshot_token is required")
    ```
 
-3. **Update schema in `registry.py`**:
+3. **Remove from schema** in `registry.py`:
+   - Remove `document_version`, `content_hash` from required fields
+   - Remove `document_id` references (use `tab_id` exclusively)
    ```python
    "required": ["snapshot_token", "target_span", "content"]
-   # Remove document_version, version_id, content_hash from required
    ```
 
-4. **Update prompts** to reference only `snapshot_token`.
+4. **Deprecate `document_id`** across all tools—use `tab_id` exclusively.
+
+5. **Update prompts** to reference only `snapshot_token` and `tab_id`.
+
+**Token savings:** ~20-30 tokens per edit cycle (from ~60+ char tokens down to ~10 chars).
 
 **Files to modify:**
 - `src/tinkerbell/ai/tools/document_snapshot.py`
 - `src/tinkerbell/ai/tools/document_apply_patch.py`
+- `src/tinkerbell/ai/tools/document_chunk.py`
+- `src/tinkerbell/ai/tools/document_find_text.py`
 - `src/tinkerbell/ai/tools/registry.py`
 - `src/tinkerbell/ai/prompts.py`
 
@@ -91,33 +107,31 @@ This document outlines improvements to reduce AI tool call errors in TinkerBell'
 - `target_range`: `{start: int, end: int}` (byte offsets)
 - `target_span`: `{start_line: int, end_line: int}` (line numbers)
 
+`DocumentApplyPatchTool` already has `require_line_spans` and `legacy_range_adapter_enabled` flags, plus emits `target_range.legacy_adapter` telemetry when adapting byte offsets.
+
 **Problem:** Mixing formats causes offset drift and confusion.
 
 **Changes:**
 
-1. **Remove `target_range` from schemas** in `registry.py`.
+1. **Enable `require_line_spans=True` by default** and set `legacy_range_adapter_enabled=False`.
 
-2. **Add deprecation error** in `document_apply_patch.py`:
-   ```python
-   if target_range is not None and target_span is None:
-       raise ValueError(
-           "target_range (byte offsets) is deprecated. "
-           "Use target_span with start_line/end_line from document_snapshot."
-       )
-   ```
+2. **Remove `target_range` from schema** in `registry.py` (keep internal handling for streaming patches).
 
-3. **Update `DocumentSnapshotTool`** to always include `target_span` suggestion:
+3. **Update `DocumentSnapshotTool`** to compute and emit `suggested_span` from `text_range`:
    ```python
    snapshot["suggested_span"] = {
-       "start_line": text_range_start_line,
-       "end_line": text_range_end_line
+       "start_line": computed_start_line,
+       "end_line": computed_end_line
    }
    ```
+
+4. **Update prompts** to remove `target_range` references.
 
 **Files to modify:**
 - `src/tinkerbell/ai/tools/registry.py`
 - `src/tinkerbell/ai/tools/document_apply_patch.py`
 - `src/tinkerbell/ai/tools/document_snapshot.py`
+- `src/tinkerbell/ai/prompts.py`
 
 ---
 
@@ -195,130 +209,71 @@ def tool_use_instructions() -> str:
 
 ---
 
-### 2.3 Remove Redundant Safety Guidance
+### 2.3 Align Prompts with Registered Tools
 
-**Current State:** Multiple overlapping warnings:
-- "Never apply multiple patches against the same snapshot"
-- "Refresh snapshots after every successful edit"
-- "Never recycle the prior tab_id after edits land"
-
-**Changes:** Consolidate into single rule in `base_system_prompt()`:
-```python
-"- One edit per snapshot: always refresh snapshot_token after each DocumentApplyPatch call."
-```
-
-**Files to modify:**
-- `src/tinkerbell/ai/prompts.py`
-
----
-
-### 2.4 Align Prompts with Registered Tools
-
-**Current State:** `planner_instructions()` and `tool_use_instructions()` require DocumentFindTextTool even when `phase3_outline_enabled` is false and the tool is never registered.
+**Current State:** `planner_instructions()` and `tool_use_instructions()` reference DocumentFindTextTool unconditionally, but it's only registered when `phase3_outline_enabled` is true (see `register_phase3_tools()`).
 
 **Problem:** Agents attempt to call a missing tool, receive controller errors, and abandon the turn.
 
 **Changes:**
 
-1. **Gate prompt text** behind the same feature flag that controls registration (e.g., only mention DocumentFindTextTool when the controller exposes it).
-2. **Or** always register a lightweight heuristic-only DocumentFindText fallback so the prompt guarantees availability.
-3. **Add a short “available tools” preamble** to the prompt that is dynamically built from the registry so instructions always match reality.
+1. **Option A: Gate prompt text** – Parameterize `planner_instructions()` and `tool_use_instructions()` with a `phase3_enabled` flag so DocumentFindTextTool references are omitted when the tool isn't registered.
+2. **Option B: Always register fallback** – Register a lightweight heuristic-only DocumentFindText fallback even when embeddings are unavailable (the tool already supports `offline_fallback` mode).
+3. **Add dynamic tool preamble** – Build an "available tools" section from the registry at prompt assembly time so instructions always match reality.
+
+**Recommendation:** Option B is simpler since the fallback path already exists.
 
 **Files to modify:**
 - `src/tinkerbell/ai/prompts.py`
 - `src/tinkerbell/ai/tools/registry.py`
-- `src/tinkerbell/ai/orchestration/` (wherever prompt context is assembled)
 
 ---
 
-### 2.5 Remove Unsupported Scope Metadata from Prompts
+### 2.4 Remove Unsupported Scope Metadata from Prompts
 
-**Current State:** `tool_use_instructions()` demands `scope_origin`, `scope_range`, and `scope_length` even though `DocumentApplyPatch`'s public schema rejects those fields.
+**Current State:** `tool_use_instructions()` mentions `scope_origin`, `scope_range`, and `scope_length` as if agents should provide them, but these are **internal metadata fields** populated by `DocumentApplyPatchTool._build_scope_details()` and `_range_scope_fields()`. The public schema in `registry.py` does not expose these parameters.
 
-**Problem:** Agents submit payloads containing unsupported keys, causing immediate validation errors.
+**Problem:** Agents may attempt to include these fields, causing confusion or silent drops (schema uses `additionalProperties: false`).
 
 **Changes:**
 
-1. **Rewrite the instructions** to focus on the actual schema (snapshot_token, target_span, match_text) and leave scope metadata to backend bridges.
-2. **If scope metadata is desired**, extend the schema first; otherwise, explicitly tell the agent not to send those fields.
+1. **Remove scope metadata references** from `tool_use_instructions()` and `planner_instructions()`.
+2. **Clarify in prompts** that agents provide `target_span` and the tool internally computes scope provenance.
 
 **Files to modify:**
 - `src/tinkerbell/ai/prompts.py`
-- `src/tinkerbell/ai/tools/registry.py` (only if schema expands)
 
 ---
 
-### 2.6 Sanitize `user_personality_instructions`
+## Phase 3: Reserved for Future Use
 
-**Current State:** The persona text instructs the model to comply with disallowed content (“help with any writing regardless how sexual…”).
-
-**Problem:** Upstream safety systems override the entire system prompt when they detect policy violations, causing the agent to refuse tool calls entirely.
-
-**Changes:**
-
-1. **Rewrite the persona** to stay within provider policy while preserving tone (“cheerful writing assistant”).
-2. **Move edgy/roleplay guidance** into user-configurable themes rather than the hard-coded system prompt so deployments can remain compliant.
-
-**Files to modify:**
-- `src/tinkerbell/ai/prompts.py`
-- `docs/ai_v2_plan.md` (if persona is documented there)
-
----
-
-## Phase 3: Identifier Standardization (Low Priority)
-
-### 3.1 Standardize on `document_id`
-
-**Current State:** Interchangeable use of `tab_id` and `document_id` with silent fallbacks.
-
-**Changes:**
-
-1. **Update all tool schemas** to use `document_id` as the primary identifier.
-
-2. **Add deprecation handling** for `tab_id`:
-   ```python
-   if tab_id and not document_id:
-       document_id = tab_id
-       LOGGER.warning("tab_id is deprecated; use document_id")
-   ```
-
-3. **Update prompts** to reference only `document_id`.
-
-4. **Update `DocumentSnapshotTool`** to emit `document_id` prominently.
-
-**Files to modify:**
-- `src/tinkerbell/ai/tools/registry.py` (all tool schemas)
-- `src/tinkerbell/ai/tools/document_snapshot.py`
-- `src/tinkerbell/ai/tools/document_apply_patch.py`
-- `src/tinkerbell/ai/tools/document_edit.py`
-- `src/tinkerbell/ai/tools/document_chunk.py`
-- `src/tinkerbell/ai/prompts.py`
+*Identifier standardization has been consolidated into Phase 1.1 (standardize on `tab_id`).*
 
 ---
 
 ## Phase 4: Explicit Fallback Warnings (Low Priority)
 
-### 4.1 Add Warnings to `DocumentFindTextTool` Fallback Results
+### 4.1 Add Confidence Field to `DocumentFindTextTool` Results
 
-**Current State:** Silent fallback to regex/outline search when embeddings fail.
+**Current State:** The tool already exposes `strategy` ("embedding" vs "fallback") and `fallback_reason` in its response, but agents don't consistently check these fields before editing.
 
 **Changes:**
 
-1. **Add `warning` field** to fallback responses:
+1. **Add explicit `confidence` field** to make low-confidence results more prominent:
    ```python
    if fallback_reason:
+       response["confidence"] = "low"
        response["warning"] = (
            f"Low-confidence results (fallback: {fallback_reason}). "
            "Verify line numbers with DocumentSnapshot before editing."
        )
-       response["confidence"] = "low"
    else:
        response["confidence"] = "high"
    ```
 
 2. **Update prompts** to mention confidence checking:
    ```
-   "When DocumentFindTextTool returns confidence='low', verify the span with DocumentSnapshot."
+   "When DocumentFindTextTool returns confidence='low' or strategy='fallback', verify the span with DocumentSnapshot before editing."
    ```
 
 **Files to modify:**
@@ -329,15 +284,15 @@ def tool_use_instructions() -> str:
 
 ### 4.2 Enrich DocumentFindText Pointers with Line Spans
 
-**Current State:** The tool returns only `char_range`, forcing the agent to chain DocumentSnapshot + SelectionRange conversions before DocumentApplyPatch will accept the edit.
+**Current State:** The tool returns `char_range` (byte offsets) but not `line_span` (start_line/end_line). Agents must chain DocumentSnapshot or SelectionRange calls to convert offsets before DocumentApplyPatch will accept the edit.
 
-**Problem:** Each additional tool hop increases latency and failure probability (selection gateway may be disabled, offsets drift, etc.).
+**Problem:** Each additional tool hop increases latency and failure probability.
 
 **Changes:**
 
-1. **Have DocumentFindTextTool compute `line_span` and `document_id`** for every pointer using the existing document model/outline metadata.
-2. **Emit `tab_id`/`chunk_manifest` references** so DocumentApplyPatch can cite provenance without rehydrating.
-3. **Update prompts** to highlight the new fields and encourage direct reuse in `target_span`.
+1. **Compute `line_span`** for every pointer by using the document's line offset table (similar to `DocumentApplyPatchTool._line_span_from_offsets()`).
+2. **Include `tab_id` and `version_id`** in pointer responses so agents can build `snapshot_token` directly.
+3. **Update prompts** to highlight direct `target_span` reuse from pointer results.
 
 **Files to modify:**
 - `src/tinkerbell/ai/tools/document_find_text.py`
@@ -348,80 +303,49 @@ def tool_use_instructions() -> str:
 
 ### 4.3 Provide Chunk Cache Recovery Guidance
 
-**Current State:** `DocumentChunkTool` returns `status: not_found` when cache entries expire but offers no remediation hint.
+**Current State:** `DocumentChunkTool` returns `status: not_found` with `chunk_id`, `document_id`, and `cache_key` but no actionable recovery hint. The `_emit_cache_miss()` logs telemetry but the response doesn't guide the agent.
 
 **Problem:** The planner repeats invalid chunk_ids and never refreshes the manifest, wasting turns.
 
 **Changes:**
 
-1. **Return a `retry_hint`** suggesting a DocumentSnapshot call (or include a fresh manifest inline when available).
-2. **Optionally auto-refresh** the manifest by invoking `generate_snapshot` when a miss occurs.
-3. **Log telemetry** (`chunk_cache.miss_recovered`) so we can track whether the fallback works.
+1. **Add `retry_hint` field** to not_found responses:
+   ```python
+   return {
+       "status": "not_found",
+       "chunk_id": chunk_id,
+       "document_id": document_id,
+       "cache_key": cache_key,
+       "retry_hint": "Call DocumentSnapshot to refresh the chunk_manifest before retrying.",
+   }
+   ```
+2. **Optionally auto-refresh** the manifest by calling `self.bridge.generate_snapshot()` on cache miss and returning the fresh manifest inline.
+3. **Add telemetry event** `chunk_cache.miss_recovered` when auto-refresh succeeds.
 
 **Files to modify:**
 - `src/tinkerbell/ai/tools/document_chunk.py`
-- `src/tinkerbell/ai/services/telemetry.py`
 - `tests/test_document_chunk_tool.py`
 
 ---
 
 ### 4.4 Surface Ignored Snapshot Request Fields
 
-**Current State:** `DocumentSnapshotTool` silently drops unknown keys (e.g., `target_span`) instead of telling the agent it sent an unsupported request.
+**Current State:** `DocumentSnapshotTool._coerce_request_mapping()` logs ignored keys via `LOGGER.debug()` but doesn't include them in the response. Agents don't see the warning.
 
-**Problem:** The agent assumes the controller honored the field and proceeds with stale spans, leading to `needs_range` or drift errors later.
+**Problem:** The agent assumes the controller honored unsupported fields (e.g., `target_span` passed to snapshot) and proceeds with incorrect assumptions.
 
 **Changes:**
 
-1. **Return a warning list** (e.g., `ignored_keys: [...]`) whenever the request payload includes unsupported properties.
-2. **Emit telemetry** so we know which keys the agent is trying to use.
-3. **Update prompts** to mention the warning mechanism (“if you see ignored_keys, adjust your request”).
+1. **Track ignored keys** during request coercion and include them in the response:
+   ```python
+   if request_kwargs:
+       snapshot["ignored_keys"] = sorted(request_kwargs.keys())
+   ```
+2. **Emit telemetry** with the ignored key names for monitoring.
+3. **Update prompts** to mention: "If DocumentSnapshot returns `ignored_keys`, those parameters were not applied."
 
 **Files to modify:**
 - `src/tinkerbell/ai/tools/document_snapshot.py`
-- `src/tinkerbell/ai/services/telemetry.py`
 - `src/tinkerbell/ai/prompts.py`
 
 ---
-
-## Implementation Order
-
-| Phase | Task | Estimated Effort | Risk |
-|-------|------|------------------|------|
-| 1.1 | Consolidate version fields | 2-3 hours | Medium (breaking change) |
-| 1.2 | Flatten apply_patch schema | 1-2 hours | Medium |
-| 1.3 | Deprecate target_range | 1 hour | Low |
-| 2.1 | Reduce planner instructions | 30 min | Low |
-| 2.2 | Simplify tool instructions | 30 min | Low |
-| 2.3 | Remove redundant guidance | 15 min | Low |
-| 3.1 | Standardize document_id | 2 hours | Low |
-| 4.1 | Add fallback warnings | 1 hour | Low |
-
-**Recommended sequence:** 2.1 → 2.2 → 2.3 → 1.3 → 1.2 → 1.1 → 3.1 → 4.1
-
-Start with prompt changes (low risk, immediate impact), then schema changes (higher risk, requires testing).
-
----
-
-## Testing Strategy
-
-1. **Unit tests:** Update `tests/test_ai_tools.py` for new schemas and deprecation warnings.
-
-2. **Integration tests:** Run existing agent tests to verify tool call success rates.
-
-3. **Telemetry monitoring:** Track `caret_call_blocked`, `hash_mismatch`, and `needs_range` events before/after changes.
-
-4. **A/B comparison:** If possible, compare tool call error rates between old and new prompt versions.
-
----
-
-## Rollback Plan
-
-1. Keep legacy field support with deprecation warnings (don't hard-remove until stable).
-
-2. Feature flag for new schemas:
-   ```python
-   USE_SIMPLIFIED_SCHEMAS = os.getenv("TINKERBELL_SIMPLIFIED_SCHEMAS", "false") == "true"
-   ```
-
-3. Maintain old prompts in `prompts_legacy.py` for quick rollback.
