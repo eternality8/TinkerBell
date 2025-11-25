@@ -127,3 +127,86 @@ def test_document_chunk_tool_iterator_fetches_multiple_chunks():
     assert chunk_texts[0] == text[:9]
     assert chunk_texts[1] == text[9:19]
     assert iterator["next_chunk_id"].startswith("chunk:doc-3:")
+
+
+# ---------------------------------------------------------------------------
+# WS3 4.3.x: Chunk cache recovery tests
+# ---------------------------------------------------------------------------
+
+def test_document_chunk_tool_retry_hint_on_not_found():
+    """WS3 4.3.1: Cache miss returns retry_hint."""
+    text = "Lorem ipsum"
+    bridge = _BridgeStub(text)
+    index = ChunkIndex()
+    tool = DocumentChunkTool(bridge=bridge, chunk_index=index)
+
+    result = tool.run(chunk_id="missing-chunk", document_id="doc-unknown")
+
+    assert result["status"] == "not_found"
+    assert "retry_hint" in result
+    assert "snapshot" in result["retry_hint"].lower()
+
+
+def test_document_chunk_tool_auto_refresh_recovers_on_miss():
+    """WS3 4.3.2: Auto-refresh can recover from cache miss."""
+
+    class _RefreshingBridgeStub(_BridgeStub):
+        def __init__(self, text: str, index: ChunkIndex) -> None:
+            super().__init__(text)
+            self._index = index
+            self._manifest_created = False
+
+        def generate_snapshot(
+            self,
+            *,
+            delta_only: bool = False,
+            tab_id: str | None = None,
+            include_open_documents: bool = False,
+            window: Mapping[str, Any] | str | None = None,
+            chunk_profile: str | None = None,
+            max_tokens: int | None = None,
+            include_text: bool = True,
+        ) -> Mapping[str, Any]:
+            # On first call, create the manifest so chunk can be found
+            if not self._manifest_created:
+                manifest = _manifest("doc-refresh", [(0, len(self.text))], cache_key="refreshed-cache")
+                self._index.ingest_manifest(manifest)
+                self._manifest_created = True
+                return {
+                    "text": self.text,
+                    "chunk_manifest": {"cache_key": "refreshed-cache"},
+                }
+            return super().generate_snapshot(
+                delta_only=delta_only,
+                tab_id=tab_id,
+                include_open_documents=include_open_documents,
+                window=window,
+                chunk_profile=chunk_profile,
+                max_tokens=max_tokens,
+                include_text=include_text,
+            )
+
+    text = "Recovery test content"
+    index = ChunkIndex()
+    bridge = _RefreshingBridgeStub(text, index)
+    tool = DocumentChunkTool(bridge=bridge, chunk_index=index, auto_refresh_on_miss=True)
+
+    # Request a chunk that doesn't exist yet - should trigger auto-refresh
+    result = tool.run(chunk_id="chunk:doc-refresh:0:21", document_id="doc-refresh")
+
+    assert result.get("recovered") is True
+    assert result["status"] == "recovered"
+    assert result["chunk"]["text"] == text
+
+
+def test_document_chunk_tool_no_auto_refresh_when_disabled():
+    """WS3 4.3.2: Auto-refresh is disabled by default."""
+    text = "Lorem ipsum"
+    bridge = _BridgeStub(text)
+    index = ChunkIndex()
+    tool = DocumentChunkTool(bridge=bridge, chunk_index=index, auto_refresh_on_miss=False)
+
+    result = tool.run(chunk_id="missing-chunk", document_id="doc-missing")
+
+    assert result["status"] == "not_found"
+    assert result.get("recovered") is None

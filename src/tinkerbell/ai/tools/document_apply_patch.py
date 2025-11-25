@@ -46,6 +46,19 @@ class NeedsRangeError(ValueError):
             self.details["threshold"] = threshold
 
 
+class InvalidSnapshotTokenError(ValueError):
+    """Raised when a snapshot_token is malformed or cannot be parsed."""
+
+    code = "invalid_snapshot_token"
+
+    def __init__(self, message: str, *, token: str | None = None) -> None:
+        super().__init__(message)
+        self.token = token
+        self.details: dict[str, Any] = {"code": self.code}
+        if token is not None:
+            self.details["token"] = token
+
+
 @dataclass(slots=True)
 class DocumentApplyPatchTool:
     """Build a diff from the live snapshot and route it through DocumentEdit."""
@@ -66,8 +79,8 @@ class DocumentApplyPatchTool:
     replace_all_length_tolerance: float = 0.05
     plot_state_store_resolver: Callable[[], DocumentPlotStateStore | None] | None = None
     plot_warning_event: str | None = "plot_state.warning"
-    require_line_spans: bool = False
-    legacy_range_adapter_enabled: bool = True
+    require_line_spans: bool = True  # WS1.3.1: Enabled by default
+    legacy_range_adapter_enabled: bool = False  # WS1.3.1: Disabled by default
     legacy_range_event: str | None = "target_range.legacy_adapter"
     summarizable: ClassVar[bool] = False
 
@@ -95,6 +108,7 @@ class DocumentApplyPatchTool:
         document_version: str | None = None,
         version_id: str | int | None = None,
         content_hash: str | None = None,
+        snapshot_token: str | None = None,
         rationale: str | None = None,
         context_lines: int | None = None,
         tab_id: str | None = None,
@@ -104,7 +118,20 @@ class DocumentApplyPatchTool:
         replace_all: bool | None = None,
         operation: str | None = None,
         scope: str | None = None,
+        suggested_span: Mapping[str, Any] | Sequence[int] | tuple[int, int] | LineRange | None = None,
     ) -> str:
+        # Parse snapshot_token if provided (WS1.1.2)
+        parsed_tab_id, parsed_version_id = self._parse_snapshot_token(snapshot_token)
+        if parsed_tab_id is not None and tab_id is None:
+            tab_id = parsed_tab_id
+        if parsed_version_id is not None and version_id is None:
+            version_id = parsed_version_id
+
+        # Auto-fill target_span from suggested_span if not provided (WS1.4.3)
+        if target_span is None and target_range is None and suggested_span is not None:
+            target_span = suggested_span
+            self._emit_auto_fill_event(tab_id=tab_id, suggested_span=suggested_span)
+
         streaming_mode = patches is not None and self.use_streamed_diffs
         snapshot = dict(self._generate_snapshot(tab_id=tab_id, include_text=not streaming_mode))
         base_text = snapshot.get("text", "")
@@ -1345,5 +1372,64 @@ class DocumentApplyPatchTool:
         token = origin.strip().lower()
         return token or None
 
+    def _parse_snapshot_token(self, token: str | None) -> tuple[str | None, str | None]:
+        """Parse snapshot_token into (tab_id, version_id) components.
+        
+        The token format is: `{tab_id}:{version_id}`
+        Returns (None, None) if token is None or empty.
+        Raises InvalidSnapshotTokenError if the token is malformed.
+        """
+        if token is None:
+            return (None, None)
+        token_str = str(token).strip()
+        if not token_str:
+            return (None, None)
+        if ":" not in token_str:
+            raise InvalidSnapshotTokenError(
+                "snapshot_token must be in format 'tab_id:version_id'",
+                token=token_str,
+            )
+        parts = token_str.split(":", 1)
+        if len(parts) != 2:
+            raise InvalidSnapshotTokenError(
+                "snapshot_token must be in format 'tab_id:version_id'",
+                token=token_str,
+            )
+        tab_id, version_id = parts
+        if not tab_id.strip():
+            raise InvalidSnapshotTokenError(
+                "snapshot_token tab_id component cannot be empty",
+                token=token_str,
+            )
+        if not version_id.strip():
+            raise InvalidSnapshotTokenError(
+                "snapshot_token version_id component cannot be empty",
+                token=token_str,
+            )
+        return (tab_id.strip(), version_id.strip())
 
-__all__ = ["DocumentApplyPatchTool", "NeedsRangeError"]
+    def _emit_auto_fill_event(
+        self,
+        *,
+        tab_id: str | None,
+        suggested_span: Mapping[str, Any] | Sequence[int] | tuple[int, int] | LineRange | None,
+    ) -> None:
+        """Emit telemetry when auto-filling target_span from suggested_span."""
+        span_payload: dict[str, Any] | None = None
+        if isinstance(suggested_span, LineRange):
+            span_payload = suggested_span.to_dict()
+        elif isinstance(suggested_span, Mapping):
+            span_payload = dict(suggested_span)
+        elif isinstance(suggested_span, (list, tuple)) and len(suggested_span) >= 2:
+            span_payload = {"start_line": suggested_span[0], "end_line": suggested_span[1]}
+        telemetry_emit(
+            "target_span.auto_fill",
+            {
+                "tab_id": tab_id,
+                "source": "suggested_span",
+                "suggested_span": span_payload,
+            },
+        )
+
+
+__all__ = ["DocumentApplyPatchTool", "NeedsRangeError", "InvalidSnapshotTokenError"]

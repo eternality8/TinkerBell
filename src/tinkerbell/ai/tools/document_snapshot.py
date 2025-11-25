@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, ClassVar, Iterable, Mapping, Protocol, cast
 
 from ..memory.chunk_index import ChunkIndex
+from ...services.telemetry import emit
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ class DocumentSnapshotTool:
         include_text: bool = True,
     ) -> dict:
         request_kwargs = self._coerce_request_mapping(request)
+        ignored_keys: list[str] = []  # WS3 4.4.1: Track ignored keys
         if request_kwargs:
             delta_only = request_kwargs.pop("delta_only", delta_only)
             include_diff = request_kwargs.pop("include_diff", include_diff)
@@ -77,10 +79,13 @@ class DocumentSnapshotTool:
             if (tab_id is None or not str(tab_id).strip()) and alias:
                 tab_id = alias
             if request_kwargs:
+                ignored_keys = sorted(request_kwargs.keys())  # WS3 4.4.1
                 LOGGER.debug(
                     "DocumentSnapshotTool ignoring unsupported request keys: %s",
-                    ", ".join(sorted(request_kwargs.keys())),
+                    ", ".join(ignored_keys),
                 )
+                # WS3 4.4.2: Telemetry for ignored fields
+                self._emit_ignored_keys(ignored_keys, tab_id=tab_id)
         resolved_window = self._resolve_window(window)
         snapshot = self._build_snapshot(
             delta_only=delta_only,
@@ -108,6 +113,11 @@ class DocumentSnapshotTool:
         )
         if extras:
             snapshot["source_tab_snapshots"] = extras
+
+        # WS3 4.4.1: Add ignored_keys to response with warning
+        if ignored_keys:
+            snapshot["ignored_keys"] = ignored_keys
+            snapshot["warning"] = f"The following request parameters were not recognized and ignored: {', '.join(ignored_keys)}"
 
         return snapshot
 
@@ -151,7 +161,43 @@ class DocumentSnapshotTool:
 
         self._ingest_chunk_manifest(snapshot)
 
+        # Add snapshot_token for simplified versioning (WS1.1.1)
+        self._add_snapshot_token(snapshot, tab_id)
+
+        # Add suggested_span for auto-fill (WS1.4.2)
+        self._add_suggested_span(snapshot)
+
         return snapshot
+
+    def _add_snapshot_token(self, snapshot: dict, tab_id: str | None) -> None:
+        """Add compact snapshot_token combining tab_id and version_id."""
+        resolved_tab_id = tab_id or snapshot.get("tab_id") or snapshot.get("document_id") or ""
+        version_id = snapshot.get("version_id")
+        if resolved_tab_id and version_id is not None:
+            snapshot["snapshot_token"] = f"{resolved_tab_id}:{version_id}"
+
+    def _add_suggested_span(self, snapshot: dict) -> None:
+        """Derive suggested_span from text_range for downstream tools."""
+        text_range = snapshot.get("text_range")
+        if not isinstance(text_range, Mapping):
+            return
+        line_offsets = snapshot.get("line_start_offsets") or snapshot.get("line_offsets")
+        if not isinstance(line_offsets, (list, tuple)) or not line_offsets:
+            return
+        start_offset = text_range.get("start", 0)
+        end_offset = text_range.get("end", 0)
+        start_line = self._line_for_offset(start_offset, line_offsets)
+        # For end_line, use the last character position (end - 1) to get the inclusive line
+        end_line = self._line_for_offset(max(start_offset, end_offset - 1), line_offsets) if end_offset > start_offset else start_line
+        snapshot["suggested_span"] = {"start_line": start_line, "end_line": end_line}
+
+    @staticmethod
+    def _line_for_offset(offset: int, offsets: list | tuple) -> int:
+        """Return the 0-based line index containing the given offset."""
+        from bisect import bisect_right
+        cursor = max(0, offset)
+        index = bisect_right(offsets, cursor) - 1
+        return max(0, index)
 
     def _build_additional_snapshots(
         self,
@@ -297,3 +343,14 @@ class DocumentSnapshotTool:
         except (ValueError, SyntaxError):
             return None
 
+    @staticmethod
+    def _emit_ignored_keys(keys: list[str], *, tab_id: str | None) -> None:
+        """WS3 4.4.2: Telemetry for ignored request fields."""
+        emit(
+            "snapshot_tool.ignored_keys",
+            {
+                "tab_id": tab_id,
+                "ignored_keys": keys,
+                "count": len(keys),
+            },
+        )

@@ -723,7 +723,7 @@ def test_document_apply_patch_tool_builds_and_applies_diff():
     edit_tool = DocumentEditTool(bridge=bridge)
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
-    status = _run_document_apply_patch(tool, content="BETA", target_range=(6, 10))
+    status = _run_document_apply_patch(tool, content="BETA", target_span=(0, 0))
 
     assert bridge.calls and bridge.calls[-1]["action"] == "patch"
     assert "digest-7" in status
@@ -739,7 +739,7 @@ def test_document_apply_patch_tool_targets_specific_tab():
     edit_tool = DocumentEditTool(bridge=bridge)
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
-    _run_document_apply_patch(tool, content="ALPHA", target_range=(0, 5), tab_id="tab-b")
+    _run_document_apply_patch(tool, content="ALPHA", target_span=(0, 0), tab_id="tab-b")
 
     assert bridge.queue_tab_ids[-1] == "tab-b"
     assert bridge.snapshot_requests[-1]["tab_id"] == "tab-b"
@@ -751,7 +751,7 @@ def test_document_apply_patch_tool_validates_snapshot_version():
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
     with pytest.raises(DocumentVersionMismatchError):
-        _run_document_apply_patch(tool, content="Hola", target_range=(0, 5), document_version="digest-old")
+        _run_document_apply_patch(tool, content="Hola", target_span=(0, 0), document_version="digest-old")
 
 
 def test_document_apply_patch_tool_skips_noop_edits():
@@ -759,7 +759,7 @@ def test_document_apply_patch_tool_skips_noop_edits():
     edit_tool = DocumentEditTool(bridge=bridge)
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
-    outcome = _run_document_apply_patch(tool, content="Hello", target_range=(0, 5))
+    outcome = _run_document_apply_patch(tool, content="Hello world", target_span=(0, 0))
 
     assert outcome.startswith("skipped")
     assert bridge.calls == []
@@ -781,7 +781,7 @@ def test_document_apply_patch_tool_emits_anchor_success_event(monkeypatch: pytes
 
     monkeypatch.setattr(document_apply_patch_module, "telemetry_emit", _emit)
 
-    _run_document_apply_patch(tool, content="ALPHA", target_range=(0, 5), match_text="Alpha")
+    _run_document_apply_patch(tool, content="ALPHA", target_span=(0, 0), match_text="Alpha")
 
     event = next((payload for name, payload in captured if name == "patch.anchor"), None)
     assert event is not None
@@ -795,7 +795,7 @@ def test_document_apply_patch_tool_reports_span_wording_for_duplicate_match_text
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
     with pytest.raises(ValueError, match="target span"):
-        _run_document_apply_patch(tool, content="GAMMA", target_range=(0, 4), match_text="Alpha")
+        _run_document_apply_patch(tool, content="GAMMA", target_span=(0, 0), match_text="Alpha")
 
 
 def test_document_apply_patch_full_document_rewrite_replaces_buffer():
@@ -862,7 +862,7 @@ def test_document_apply_patch_emits_hash_mismatch_event(monkeypatch: pytest.Monk
     with pytest.raises(DocumentVersionMismatchError):
         tool.run(
             content="BETA",
-            target_range=(0, 4),
+            target_span=(0, 0),
             document_version=bridge.snapshot["version"],
             version_id=bridge.snapshot["version_id"],
             content_hash="hash-mismatch",
@@ -881,7 +881,7 @@ def test_document_apply_patch_tool_handles_missing_rationale():
     edit_tool = DocumentEditTool(bridge=bridge)
     tool = DocumentApplyPatchTool(bridge=bridge, edit_tool=edit_tool)
 
-    status = _run_document_apply_patch(tool, content="Hello world", target_range=(0, 0))
+    status = _run_document_apply_patch(tool, content="Hello world", target_span=(0, 0))
 
     assert bridge.calls and bridge.calls[-1]["action"] == "patch"
     assert "digest-9" in status

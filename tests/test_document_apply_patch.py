@@ -7,7 +7,7 @@ from typing import Any, Mapping
 import pytest
 
 from tinkerbell.ai.tools import document_apply_patch as document_apply_patch_module
-from tinkerbell.ai.tools.document_apply_patch import DocumentApplyPatchTool, NeedsRangeError
+from tinkerbell.ai.tools.document_apply_patch import DocumentApplyPatchTool, NeedsRangeError, InvalidSnapshotTokenError
 from tinkerbell.ai.tools.document_edit import DocumentEditTool
 from tinkerbell.chat.message_model import EditDirective
 from tinkerbell.services.bridge import DocumentVersionMismatchError
@@ -253,6 +253,8 @@ def test_document_apply_patch_marks_document_scope_metadata():
 
 def test_document_apply_patch_emits_legacy_adapter_event(monkeypatch: pytest.MonkeyPatch):
     tool, bridge = _patch_tool("Hello world")
+    # Enable legacy adapter for this test
+    tool.configure_line_span_policy(require_line_spans=True, adapt_legacy_ranges=True)
     captured: list[tuple[str, dict | None]] = []
 
     def _emit(event: str, payload: dict | None = None) -> None:
@@ -316,6 +318,8 @@ def test_document_apply_patch_forces_replace_all_when_content_matches_document()
 
 def test_document_apply_patch_realigns_stale_range_with_match_text():
     tool, bridge = _patch_tool("Alpha BETA Gamma")
+    # Enable legacy adapter for this test
+    tool.configure_line_span_policy(require_line_spans=True, adapt_legacy_ranges=True)
 
     status = _run_with_meta(tool, content="beta", target_range=(0, 5), match_text="BETA")
 
@@ -326,6 +330,8 @@ def test_document_apply_patch_realigns_stale_range_with_match_text():
 
 def test_document_apply_patch_widens_ranges_before_building_diff():
     tool, bridge = _patch_tool("alpha beta")
+    # Enable legacy adapter for this test
+    tool.configure_line_span_policy(require_line_spans=True, adapt_legacy_ranges=True)
 
     status = _run_with_meta(tool, content="BETA", target_range=(2, 5))
 
@@ -337,6 +343,8 @@ def test_document_apply_patch_widens_ranges_before_building_diff():
 
 def test_document_apply_patch_rejects_ambiguous_match_text():
     tool, _ = _patch_tool("beta one beta two")
+    # Enable legacy adapter for this test
+    tool.configure_line_span_policy(require_line_spans=True, adapt_legacy_ranges=True)
 
     with pytest.raises(ValueError, match="matched multiple"):
         _run_with_meta(tool, content="BETA", target_range=(4, 7), match_text="beta")
@@ -354,6 +362,8 @@ def test_document_apply_patch_rejects_large_insert_without_range():
 
 def test_document_apply_patch_rejects_hash_mismatch():
     tool, bridge = _patch_tool("Alpha beta")
+    # Enable legacy adapter for this test so we can test hash mismatch specifically
+    tool.configure_line_span_policy(require_line_spans=True, adapt_legacy_ranges=True)
 
     with pytest.raises(DocumentVersionMismatchError) as exc:
         _run_with_meta(
@@ -380,3 +390,121 @@ def test_document_apply_patch_forces_replace_all_with_length_tolerance():
     assert range_payload["start"] == 0
     assert range_payload["end"] == len(text)
     assert range_payload["match_text"] == text
+
+
+# -----------------------------------------------------------------------
+# WS1.1.7: snapshot_token parsing tests
+# -----------------------------------------------------------------------
+
+
+def test_document_apply_patch_parses_valid_snapshot_token():
+    """Test that a valid snapshot_token is parsed into tab_id and version_id."""
+    tool, bridge = _patch_tool("Alpha\nBeta\n")
+    bridge.snapshot["version_id"] = 42
+    
+    # Use snapshot_token instead of separate fields
+    status = tool.run(
+        snapshot_token="doc-stream:42",
+        content="New Beta\n",
+        target_span={"start_line": 1, "end_line": 1},
+        document_version="digest-1",
+        version_id=42,
+        content_hash="hash-1",
+    )
+    
+    assert "queued" in status or "applied" in status
+
+
+def test_document_apply_patch_extracts_tab_id_from_snapshot_token():
+    """Test that tab_id is extracted from snapshot_token when not explicitly provided."""
+    tool, bridge = _patch_tool("Alpha Beta")
+    
+    status = tool.run(
+        snapshot_token="my-tab:1",
+        content="Gamma",
+        target_span={"start_line": 0, "end_line": 0},
+        document_version="digest-1",
+        version_id=1,
+        content_hash="hash-1",
+    )
+    
+    assert "queued" in status or "applied" in status
+
+
+def test_document_apply_patch_rejects_malformed_snapshot_token_no_colon():
+    """Test that malformed tokens without colons are rejected."""
+    tool, _ = _patch_tool("Alpha Beta")
+    
+    with pytest.raises(InvalidSnapshotTokenError, match="tab_id:version_id"):
+        tool.run(
+            snapshot_token="no-colon-here",
+            content="Gamma",
+            target_span={"start_line": 0, "end_line": 0},
+            document_version="digest-1",
+            version_id=1,
+            content_hash="hash-1",
+        )
+
+
+def test_document_apply_patch_rejects_snapshot_token_empty_tab_id():
+    """Test that tokens with empty tab_id are rejected."""
+    tool, _ = _patch_tool("Alpha Beta")
+    
+    with pytest.raises(InvalidSnapshotTokenError, match="tab_id"):
+        tool.run(
+            snapshot_token=":1",
+            content="Gamma",
+            target_span={"start_line": 0, "end_line": 0},
+            document_version="digest-1",
+            version_id=1,
+            content_hash="hash-1",
+        )
+
+
+def test_document_apply_patch_rejects_snapshot_token_empty_version_id():
+    """Test that tokens with empty version_id are rejected."""
+    tool, _ = _patch_tool("Alpha Beta")
+    
+    with pytest.raises(InvalidSnapshotTokenError, match="version_id"):
+        tool.run(
+            snapshot_token="my-tab:",
+            content="Gamma",
+            target_span={"start_line": 0, "end_line": 0},
+            document_version="digest-1",
+            version_id=1,
+            content_hash="hash-1",
+        )
+
+
+def test_document_apply_patch_accepts_none_snapshot_token():
+    """Test that None snapshot_token is handled gracefully."""
+    tool, bridge = _patch_tool("Alpha Beta")
+    
+    # Should work without snapshot_token using traditional fields
+    status = _run_with_meta(
+        tool,
+        content="Gamma",
+        target_span={"start_line": 0, "end_line": 0},
+    )
+    
+    assert "queued" in status or "applied" in status
+
+
+def test_document_apply_patch_auto_fills_target_span_from_suggested_span():
+    """Test that target_span is auto-filled from suggested_span when not provided."""
+    tool, bridge = _patch_tool("Alpha\nBeta\nGamma\n")
+    
+    status = tool.run(
+        suggested_span={"start_line": 1, "end_line": 1},
+        content="New Beta\n",
+        document_version="digest-1",
+        version_id=1,
+        content_hash="hash-1",
+    )
+    
+    assert "queued" in status or "applied" in status
+    payload = bridge.calls[-1]
+    range_payload = payload["ranges"][0]
+    # Should have used the suggested_span to derive the range
+    assert range_payload["start"] == len("Alpha\n")
+    assert range_payload["end"] == len("Alpha\nBeta\n")

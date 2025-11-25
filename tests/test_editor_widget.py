@@ -256,7 +256,7 @@ def test_ai_rewrite_turn_retries_on_stale_snapshot(monkeypatch: pytest.MonkeyPat
         arguments=json.dumps(
             {
                 "content": "hello brave world",
-                "target_range": {"start": 0, "end": len("hello world")},
+                "target_span": {"start_line": 0, "end_line": 0},
                 "tab_id": "tab-ai",
                 "document_version": initial_snapshot["version"],
                 "version_id": initial_snapshot["version_id"],

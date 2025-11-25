@@ -17,6 +17,7 @@ from .document_edit import DocumentEditTool
 from .document_find_text import DocumentFindTextTool
 from .document_outline import DocumentOutlineTool
 from .document_plot_state import DocumentPlotStateTool, PlotOutlineTool
+from .document_replace_all import DocumentReplaceAllTool
 from .document_snapshot import DocumentSnapshotTool
 from .list_tabs import ListTabsTool
 from .plot_state_update import PlotStateUpdateTool
@@ -236,9 +237,17 @@ def register_default_tools(
                                 "type": "string",
                                 "description": "Chunk identifier obtained from a chunk manifest or iterator response.",
                             },
+                            "snapshot_token": {
+                                "type": "string",
+                                "description": "Compact version identifier in format 'tab_id:version_id' from document_snapshot response.",
+                            },
+                            "tab_id": {
+                                "type": "string",
+                                "description": "Tab identifier; can be extracted from snapshot_token or provided directly.",
+                            },
                             "document_id": {
                                 "type": "string",
-                                "description": "Document identifier associated with the manifest entry.",
+                                "description": "Document identifier associated with the manifest entry (legacy; prefer snapshot_token).",
                             },
                             "cache_key": {
                                 "type": "string",
@@ -347,9 +356,13 @@ def register_default_tools(
                         parameters={
                             "type": "object",
                             "properties": {
+                                "snapshot_token": {
+                                    "type": "string",
+                                    "description": "Compact version identifier in format 'tab_id:version_id' from document_snapshot response.",
+                                },
                                 "content": {
                                     "type": "string",
-                                    "description": "Replacement text that should occupy the specified target_range.",
+                                    "description": "Replacement text that should occupy the specified target_span.",
                                 },
                                 "operation": {
                                     "type": "string",
@@ -360,7 +373,6 @@ def register_default_tools(
                                     "type": "boolean",
                                     "description": "When true, overwrite the entire document instead of a bounded range.",
                                 },
-                                "target_range": DIRECTIVE_SCHEMA["properties"]["target_range"],
                                 "target_span": {
                                     "anyOf": [
                                         {
@@ -379,7 +391,27 @@ def register_default_tools(
                                             "maxItems": 2,
                                         },
                                     ],
-                                    "description": "Preferred way to describe the edit span using inclusive line bounds.",
+                                    "description": "Line-based span using inclusive line bounds (start_line, end_line). Preferred over target_range.",
+                                },
+                                "suggested_span": {
+                                    "anyOf": [
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "start_line": {"type": "integer", "minimum": 0},
+                                                "end_line": {"type": "integer", "minimum": 0},
+                                            },
+                                            "required": ["start_line", "end_line"],
+                                            "additionalProperties": False,
+                                        },
+                                        {
+                                            "type": "array",
+                                            "items": {"type": "integer"},
+                                            "minItems": 2,
+                                            "maxItems": 2,
+                                        },
+                                    ],
+                                    "description": "Fallback span from document_snapshot; auto-fills target_span when not explicitly provided.",
                                 },
                                 "scope": {
                                     "type": "string",
@@ -419,51 +451,49 @@ def register_default_tools(
                                     "type": "string",
                                     "description": "Optional tab identifier; defaults to the active tab when omitted.",
                                 },
-                                "patches": {
-                                    "type": "array",
-                                    "description": "Streamed diff payload consisting of start/end and replacement values.",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "start": {"type": "integer", "minimum": 0},
-                                            "end": {"type": "integer", "minimum": 0},
-                                            "replacement": {"type": "string"},
-                                            "match_text": {"type": "string"},
-                                            "chunk_id": {"type": "string"},
-                                            "chunk_hash": {"type": "string"},
-                                        },
-                                        "required": ["start", "end", "replacement"],
-                                        "additionalProperties": False,
-                                    },
-                                },
                             },
-                            "required": ["document_version", "version_id", "content_hash"],
-                            "allOf": [
-                                {
-                                    "anyOf": [
-                                        {"required": ["content"]},
-                                        {"required": ["patches"]},
-                                    ]
-                                },
-                                {
-                                    "anyOf": [
-                                        {"required": ["target_range"]},
-                                        {"required": ["target_span"]},
-                                        {"required": ["patches"]},
-                                        {
-                                            "properties": {"replace_all": {"const": True}},
-                                            "required": ["replace_all"],
-                                        },
-                                        {
-                                            "properties": {"scope": {"const": "document"}},
-                                            "required": ["scope"]
-                                        },
-                                    ]
-                                },
-                            ],
+                            "required": ["snapshot_token", "content", "target_span"],
                             "additionalProperties": False,
                         },
                     )
+
+                    # Register DocumentReplaceAllTool for full-document replacements
+                    try:
+                        replace_all_tool = DocumentReplaceAllTool(patch_tool=apply_patch_tool)
+                    except Exception as exc:
+                        _record_failure("document_replace_all", exc)
+                    else:
+                        _safe_register(
+                            "document_replace_all",
+                            replace_all_tool,
+                            description=(
+                                "Replace the entire document content with new text. Use this instead of document_apply_patch "
+                                "when you need to overwrite the full document."
+                            ),
+                            parameters={
+                                "type": "object",
+                                "properties": {
+                                    "snapshot_token": {
+                                        "type": "string",
+                                        "description": "Compact version identifier in format 'tab_id:version_id' from document_snapshot response.",
+                                    },
+                                    "content": {
+                                        "type": "string",
+                                        "description": "The new document content to replace the entire document.",
+                                    },
+                                    "rationale": {
+                                        "type": "string",
+                                        "description": "Optional explanation stored alongside the edit directive.",
+                                    },
+                                    "tab_id": {
+                                        "type": "string",
+                                        "description": "Optional tab identifier; defaults to value extracted from snapshot_token.",
+                                    },
+                                },
+                                "required": ["snapshot_token", "content"],
+                                "additionalProperties": False,
+                            },
+                        )
 
         try:
             tab_listing_tool = ListTabsTool(provider=context.bridge)
@@ -732,6 +762,8 @@ def register_phase3_tools(
             else:
                 registered.append("document_outline")
 
+    # Always register DocumentFindTextTool - use factory if available, otherwise create fallback (WS2.3.1)
+    find_text_tool: DocumentFindTextTool | None = None
     find_text_factory = context.ensure_find_text_tool
     if find_text_factory is not None:
         try:
@@ -739,59 +771,85 @@ def register_phase3_tools(
         except Exception as exc:
             if failures is not None:
                 failures.append(ToolRegistrationFailure(name="document_find_text", error=exc))
-            LOGGER.warning("Failed to build document_find_text tool: %s", exc, exc_info=True)
+            LOGGER.warning("Failed to build document_find_text tool from factory: %s", exc, exc_info=True)
             find_text_tool = None
-        if find_text_tool is not None:
-            try:
-                register(
-                    "document_find_text",
-                    find_text_tool,
-                    description=(
-                        "Return the best-matching document chunks for a natural language query using embeddings or fallback heuristics."
-                    ),
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "document_id": {
-                                "type": "string",
-                                "description": "Optional target document identifier; defaults to the active document.",
-                            },
-                            "query": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Natural-language description of the section(s) to find.",
-                            },
-                            "top_k": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 12,
-                                "description": "Maximum number of pointers to return.",
-                            },
-                            "min_confidence": {
-                                "type": "number",
-                                "minimum": 0.0,
-                                "maximum": 1.0,
-                                "description": "Minimum embedding match score before falling back to heuristics.",
-                            },
-                            "filters": {
-                                "type": "object",
-                                "description": "Optional additional filtering hints understood by custom index providers.",
-                            },
-                            "include_outline_context": {
-                                "type": "boolean",
-                                "description": "When true, include nearby outline headings for each pointer.",
-                            },
+
+    # Create fallback tool if factory failed or wasn't provided
+    if find_text_tool is None:
+        try:
+            # Create minimal offline-only tool with document resolver from bridge
+            document_lookup = getattr(context.bridge, "lookup_document", None)
+            active_provider = getattr(context.bridge, "get_active_document", None)
+            find_text_tool = DocumentFindTextTool(
+                embedding_index=None,  # Will run in offline_fallback mode
+                document_lookup=document_lookup,
+                active_document_provider=active_provider,
+            )
+        except Exception as exc:
+            if failures is not None:
+                failures.append(ToolRegistrationFailure(name="document_find_text", error=exc))
+            LOGGER.warning("Failed to create fallback document_find_text tool: %s", exc, exc_info=True)
+            find_text_tool = None
+
+    if find_text_tool is not None:
+        try:
+            register(
+                "document_find_text",
+                find_text_tool,
+                description=(
+                    "Return the best-matching document chunks for a natural language query using embeddings or fallback heuristics."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "snapshot_token": {
+                            "type": "string",
+                            "description": "Compact version identifier in format 'tab_id:version_id' from document_snapshot response.",
                         },
-                        "required": ["query"],
-                        "additionalProperties": False,
+                        "tab_id": {
+                            "type": "string",
+                            "description": "Tab identifier; can be extracted from snapshot_token or provided directly.",
+                        },
+                        "document_id": {
+                            "type": "string",
+                            "description": "Optional target document identifier; defaults to the active document (legacy; prefer snapshot_token).",
+                        },
+                        "query": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Natural-language description of the section(s) to find.",
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 12,
+                            "description": "Maximum number of pointers to return.",
+                        },
+                        "min_confidence": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "description": "Minimum embedding match score before falling back to heuristics.",
+                        },
+                        "filters": {
+                            "type": "object",
+                            "description": "Optional additional filtering hints understood by custom index providers.",
+                        },
+                        "include_outline_context": {
+                            "type": "boolean",
+                            "description": "When true, include nearby outline headings for each pointer.",
+                        },
                     },
-                )
-            except Exception as exc:
-                if failures is not None:
-                    failures.append(ToolRegistrationFailure(name="document_find_text", error=exc))
-                LOGGER.warning("Failed to register document_find_text: %s", exc, exc_info=True)
-            else:
-                registered.append("document_find_text")
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            )
+        except Exception as exc:
+            if failures is not None:
+                failures.append(ToolRegistrationFailure(name="document_find_text", error=exc))
+            LOGGER.warning("Failed to register document_find_text: %s", exc, exc_info=True)
+        else:
+            registered.append("document_find_text")
 
     return registered
 

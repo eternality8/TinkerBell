@@ -22,42 +22,42 @@ This document provides a detailed, trackable implementation plan for the AI Tool
 
 #### Implementation Tasks
 
-- [ ] **1.1.1** Modify `DocumentSnapshotTool` to emit `snapshot_token`
+- [x] **1.1.1** Modify `DocumentSnapshotTool` to emit `snapshot_token`
   - File: `src/tinkerbell/ai/tools/document_snapshot.py`
   - Add `snapshot["snapshot_token"] = f"{tab_id}:{version_id}"` to response
   - Remove old version fields (`document_version`, `content_hash`)
 
-- [ ] **1.1.2** Update `DocumentApplyPatchTool` to accept `snapshot_token`
+- [x] **1.1.2** Update `DocumentApplyPatchTool` to accept `snapshot_token`
   - File: `src/tinkerbell/ai/tools/document_apply_patch.py`
   - Add parsing logic: `tab_id, version_id = snapshot_token.split(":", 1)`
   - Add validation for malformed tokens
 
-- [ ] **1.1.3** Update `DocumentChunkTool` to use `snapshot_token`
+- [x] **1.1.3** Update `DocumentChunkTool` to use `snapshot_token`
   - File: `src/tinkerbell/ai/tools/document_chunk.py`
   - Accept `snapshot_token` as primary identifier
   - Remove `document_id` references
 
-- [ ] **1.1.4** Update `DocumentFindTextTool` to use `snapshot_token`
+- [x] **1.1.4** Update `DocumentFindTextTool` to use `snapshot_token`
   - File: `src/tinkerbell/ai/tools/document_find_text.py`
   - Standardize on `tab_id` throughout
   - Include `snapshot_token` in pointer responses
 
-- [ ] **1.1.5** Update tool registry schemas
+- [x] **1.1.5** Update tool registry schemas
   - File: `src/tinkerbell/ai/tools/registry.py`
   - Remove `document_version`, `content_hash` from required fields
   - Remove `document_id` references
   - Update `required` arrays to use `snapshot_token`
 
-- [ ] **1.1.6** Update prompts to reference `snapshot_token`
+- [x] **1.1.6** Update prompts to reference `snapshot_token`
   - File: `src/tinkerbell/ai/prompts.py`
   - Replace all references to separate version fields
   - Update examples to use new format
 
-- [ ] **1.1.7** Add unit tests for `snapshot_token` parsing
+- [x] **1.1.7** Add unit tests for `snapshot_token` parsing
   - File: `tests/test_document_apply_patch.py`
   - Test valid tokens and malformed tokens
 
-- [ ] **1.1.8** Add integration tests for version flow
+- [x] **1.1.8** Add integration tests for version flow
   - File: `tests/test_document_snapshot.py`
   - Verify end-to-end snapshot → edit → refresh cycle
 
@@ -69,28 +69,28 @@ This document provides a detailed, trackable implementation plan for the AI Tool
 
 #### Implementation Tasks
 
-- [ ] **1.2.1** Remove `patches` parameter from schema
+- [x] **1.2.1** Remove `patches` parameter from schema
   - File: `src/tinkerbell/ai/tools/registry.py`
   - Simplify to `required: ["snapshot_token", "target_span", "content"]`
 
-- [ ] **1.2.2** Remove `allOf`/`anyOf` blocks from schema
+- [x] **1.2.2** Remove `allOf`/`anyOf` blocks from schema
   - File: `src/tinkerbell/ai/tools/registry.py`
   - Replace with flat required array
 
-- [ ] **1.2.3** Create `DocumentReplaceAllTool` for full-document replacements
+- [x] **1.2.3** Create `DocumentReplaceAllTool` for full-document replacements
   - File: `src/tinkerbell/ai/tools/document_replace_all.py` (new file)
   - Minimal schema: `required: ["snapshot_token", "content"]`
   - No target_span needed
 
-- [ ] **1.2.4** Register `DocumentReplaceAllTool` in registry
+- [x] **1.2.4** Register `DocumentReplaceAllTool` in registry
   - File: `src/tinkerbell/ai/tools/registry.py`
   - Add to appropriate tool groups
 
-- [ ] **1.2.5** Add tests for `DocumentReplaceAllTool`
+- [x] **1.2.5** Add tests for `DocumentReplaceAllTool`
   - File: `tests/test_document_replace_all.py` (new file)
   - Test full replacement scenarios
 
-- [ ] **1.2.6** Update prompts to mention `DocumentReplaceAll` for full replacements
+- [x] **1.2.6** Update prompts to mention `DocumentReplaceAll` for full replacements
   - File: `src/tinkerbell/ai/prompts.py`
 
 ---
@@ -101,23 +101,23 @@ This document provides a detailed, trackable implementation plan for the AI Tool
 
 #### Implementation Tasks
 
-- [ ] **1.3.1** Enable `require_line_spans=True` by default
+- [x] **1.3.1** Enable `require_line_spans=True` by default
   - File: `src/tinkerbell/ai/tools/document_apply_patch.py`
   - Set `legacy_range_adapter_enabled=False`
 
-- [ ] **1.3.2** Remove `target_range` from schema
+- [x] **1.3.2** Remove `target_range` from schema
   - File: `src/tinkerbell/ai/tools/registry.py`
 
-- [ ] **1.3.3** Update `DocumentSnapshotTool` to emit `suggested_span`
+- [x] **1.3.3** Update `DocumentSnapshotTool` to emit `suggested_span`
   - File: `src/tinkerbell/ai/tools/document_snapshot.py`
   - Compute `start_line` and `end_line` from `text_range`
   - Add to snapshot response
 
-- [ ] **1.3.4** Remove `target_range` references from prompts
+- [x] **1.3.4** Remove `target_range` references from prompts
   - File: `src/tinkerbell/ai/prompts.py`
   - Update all examples to use `target_span`
 
-- [ ] **1.3.5** Update tests to use `target_span` exclusively
+- [x] **1.3.5** Update tests to use `target_span` exclusively
   - Files: `tests/test_document_apply_patch.py`, `tests/test_patches.py`
 
 ---
@@ -128,31 +128,31 @@ This document provides a detailed, trackable implementation plan for the AI Tool
 
 #### Implementation Tasks
 
-- [ ] **1.4.1** Tighten `DocumentSnapshotTool` defaults
+- [x] **1.4.1** Tighten `DocumentSnapshotTool` defaults
   - File: `src/tinkerbell/ai/tools/document_snapshot.py`
   - Honor controller-provided `text_range`/`target_span` hints
   - Clamp to last successful snapshot span when no hint provided
 
-- [ ] **1.4.2** Emit `suggested_span` in snapshot responses
+- [x] **1.4.2** Emit `suggested_span` in snapshot responses
   - File: `src/tinkerbell/ai/tools/document_snapshot.py`
   - Derive from returned window bounds
   - Include `start_line` and `end_line`
 
-- [ ] **1.4.3** Auto-fill `target_span` in `DocumentApplyPatchTool`
+- [x] **1.4.3** Auto-fill `target_span` in `DocumentApplyPatchTool`
   - File: `src/tinkerbell/ai/tools/document_apply_patch.py`
   - If `target_span` omitted but `suggested_span` available, copy it
   - Apply before `needs_range` enforcement
 
-- [ ] **1.4.4** Add telemetry for auto-fill recovery path
+- [x] **1.4.4** Add telemetry for auto-fill recovery path
   - File: `src/tinkerbell/ai/services/telemetry.py`
   - Log when inferred span is auto-filled
   - Track success/failure rates
 
-- [ ] **1.4.5** Update registry with new response fields
+- [x] **1.4.5** Update registry with new response fields
   - File: `src/tinkerbell/ai/tools/registry.py`
   - Document `suggested_span` in schema
 
-- [ ] **1.4.6** Add tests for auto-fill behavior
+- [x] **1.4.6** Add tests for auto-fill behavior
   - File: `tests/test_document_apply_patch.py`
   - Test with/without `suggested_span` context
 
@@ -166,12 +166,12 @@ This document provides a detailed, trackable implementation plan for the AI Tool
 
 #### Implementation Tasks
 
-- [ ] **2.1.1** Rewrite `planner_instructions()` function
+- [x] **2.1.1** Rewrite `planner_instructions()` function
   - File: `src/tinkerbell/ai/prompts.py`
   - Reduce to 6 core rules
   - Focus on snapshot → find → edit → refresh cycle
 
-- [ ] **2.1.2** Review and test with sample prompts
+- [x] **2.1.2** Review and test with sample prompts
   - Verify AI follows simplified instructions
   - Document any edge cases needing explicit guidance
 
@@ -183,12 +183,12 @@ This document provides a detailed, trackable implementation plan for the AI Tool
 
 #### Implementation Tasks
 
-- [ ] **2.2.1** Rewrite `tool_use_instructions()` function
+- [x] **2.2.1** Rewrite `tool_use_instructions()` function
   - File: `src/tinkerbell/ai/prompts.py`
   - Create "Edit Recipe" section with numbered steps
   - Create "Error Recovery" section with common issues
 
-- [ ] **2.2.2** Remove redundant edge case documentation
+- [x] **2.2.2** Remove redundant edge case documentation
   - File: `src/tinkerbell/ai/prompts.py`
   - Keep only most common errors
 
@@ -200,17 +200,17 @@ This document provides a detailed, trackable implementation plan for the AI Tool
 
 #### Implementation Tasks
 
-- [ ] **2.3.1** Register fallback `DocumentFindTextTool` unconditionally
+- [x] **2.3.1** Register fallback `DocumentFindTextTool` unconditionally
   - File: `src/tinkerbell/ai/tools/registry.py`
   - Use `offline_fallback` mode when embeddings unavailable
   - Ensures tool is always available
 
-- [ ] **2.3.2** Add dynamic tool preamble to prompt assembly
+- [x] **2.3.2** Add dynamic tool preamble to prompt assembly
   - File: `src/tinkerbell/ai/prompts.py`
   - Build "available tools" section from registry
   - Instructions match registered tools
 
-- [ ] **2.3.3** Test prompt generation with various configurations
+- [x] **2.3.3** Test prompt generation with various configurations
   - Verify tool references match availability
 
 ---
@@ -221,12 +221,12 @@ This document provides a detailed, trackable implementation plan for the AI Tool
 
 #### Implementation Tasks
 
-- [ ] **2.4.1** Remove scope metadata references from prompts
+- [x] **2.4.1** Remove scope metadata references from prompts
   - File: `src/tinkerbell/ai/prompts.py`
   - Remove `scope_origin`, `scope_range`, `scope_length` mentions
   - Clarify that agents provide `target_span` only
 
-- [ ] **2.4.2** Add clarifying note about internal scope computation
+- [x] **2.4.2** Add clarifying note about internal scope computation
   - File: `src/tinkerbell/ai/prompts.py`
   - Explain tool internally computes provenance
 
@@ -240,16 +240,16 @@ This document provides a detailed, trackable implementation plan for the AI Tool
 
 #### Implementation Tasks
 
-- [ ] **4.1.1** Add `confidence` field to response
+- [x] **4.1.1** Add `confidence` field to response
   - File: `src/tinkerbell/ai/tools/document_find_text.py`
   - Set to "high" or "low" based on strategy/fallback
   - Add `warning` message for low confidence
 
-- [ ] **4.1.2** Update prompts with confidence checking guidance
+- [x] **4.1.2** Update prompts with confidence checking guidance
   - File: `src/tinkerbell/ai/prompts.py`
   - Instruct agents to verify low-confidence results
 
-- [ ] **4.1.3** Add tests for confidence field
+- [x] **4.1.3** Add tests for confidence field
   - File: `tests/test_document_find_text.py`
   - Test embedding vs fallback scenarios
 
@@ -261,20 +261,20 @@ This document provides a detailed, trackable implementation plan for the AI Tool
 
 #### Implementation Tasks
 
-- [ ] **4.2.1** Compute `line_span` for every pointer
+- [x] **4.2.1** Compute `line_span` for every pointer
   - File: `src/tinkerbell/ai/tools/document_find_text.py`
   - Use document's line offset table
   - Include `start_line` and `end_line`
 
-- [ ] **4.2.2** Include `tab_id` and `version_id` in pointer responses
+- [x] **4.2.2** Include `tab_id` and `version_id` in pointer responses
   - File: `src/tinkerbell/ai/tools/document_find_text.py`
   - Allow agents to build `snapshot_token` directly
 
-- [ ] **4.2.3** Update prompts to highlight direct `target_span` reuse
+- [x] **4.2.3** Update prompts to highlight direct `target_span` reuse
   - File: `src/tinkerbell/ai/prompts.py`
   - Show example of using pointer results directly
 
-- [ ] **4.2.4** Add tests for enriched pointers
+- [x] **4.2.4** Add tests for enriched pointers
   - File: `tests/test_document_find_text.py`
 
 ---
@@ -285,20 +285,20 @@ This document provides a detailed, trackable implementation plan for the AI Tool
 
 #### Implementation Tasks
 
-- [ ] **4.3.1** Add `retry_hint` to not_found responses
+- [x] **4.3.1** Add `retry_hint` to not_found responses
   - File: `src/tinkerbell/ai/tools/document_chunk.py`
   - Include actionable recovery instruction
 
-- [ ] **4.3.2** Implement optional auto-refresh on cache miss
+- [x] **4.3.2** Implement optional auto-refresh on cache miss
   - File: `src/tinkerbell/ai/tools/document_chunk.py`
   - Call `bridge.generate_snapshot()` automatically
   - Return fresh manifest inline
 
-- [ ] **4.3.3** Add telemetry for cache miss recovery
+- [x] **4.3.3** Add telemetry for cache miss recovery
   - File: `src/tinkerbell/ai/tools/document_chunk.py`
   - Event: `chunk_cache.miss_recovered`
 
-- [ ] **4.3.4** Add tests for recovery behavior
+- [x] **4.3.4** Add tests for recovery behavior
   - File: `tests/test_document_chunk_tool.py`
 
 ---
@@ -309,20 +309,20 @@ This document provides a detailed, trackable implementation plan for the AI Tool
 
 #### Implementation Tasks
 
-- [ ] **4.4.1** Track and return ignored keys in response
+- [x] **4.4.1** Track and return ignored keys in response
   - File: `src/tinkerbell/ai/tools/document_snapshot.py`
   - Add `ignored_keys` array to response
   - Populate from `_coerce_request_mapping()` rejects
 
-- [ ] **4.4.2** Add telemetry for ignored fields
+- [x] **4.4.2** Add telemetry for ignored fields
   - File: `src/tinkerbell/ai/tools/document_snapshot.py`
   - Log ignored key names for monitoring
 
-- [ ] **4.4.3** Update prompts with ignored keys guidance
+- [x] **4.4.3** Update prompts with ignored keys guidance
   - File: `src/tinkerbell/ai/prompts.py`
   - Warn that ignored parameters were not applied
 
-- [ ] **4.4.4** Add tests for ignored keys reporting
+- [x] **4.4.4** Add tests for ignored keys reporting
   - File: `tests/test_document_snapshot.py`
 
 ---

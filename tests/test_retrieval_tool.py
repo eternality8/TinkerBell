@@ -239,6 +239,108 @@ def test_retrieval_tool_detects_unsupported_documents() -> None:
 
 
 # ---------------------------------------------------------------------------
+# WS3 4.1.x: Confidence field tests
+# ---------------------------------------------------------------------------
+
+def test_retrieval_tool_confidence_high_with_embedding_match() -> None:
+    """WS3 4.1.3: High confidence when embedding strategy returns matches."""
+    document = _build_document("doc-conf-high", "Alpha beta gamma delta epsilon")
+    record = _build_chunk_record(document.document_id, chunk_id="c1", start=0, end=20)
+    matches = [EmbeddingMatch(record=record, score=0.9)]
+    index = cast(DocumentEmbeddingIndex, _StubEmbeddingIndex(matches))
+    tool = DocumentFindTextTool(
+        embedding_index=index,
+        document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
+    )
+
+    response = tool.run(document_id=document.document_id, query="alpha", min_confidence=0.3)
+
+    assert response["confidence"] == "high"
+    assert response["warning"] is None
+
+
+def test_retrieval_tool_confidence_low_with_fallback() -> None:
+    """WS3 4.1.3: Low confidence when using fallback strategy."""
+    document = _build_document("doc-conf-low", "Alpha beta gamma")
+    # No embedding matches above threshold -> fallback
+    record = _build_chunk_record(document.document_id, chunk_id="c1", start=0, end=10)
+    matches = [EmbeddingMatch(record=record, score=0.1)]  # Below default threshold
+    index = cast(DocumentEmbeddingIndex, _StubEmbeddingIndex(matches))
+    tool = DocumentFindTextTool(
+        embedding_index=index,
+        document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
+    )
+
+    response = tool.run(document_id=document.document_id, query="alpha", min_confidence=0.5)
+
+    assert response["confidence"] == "low"
+    assert response["warning"] is not None
+    assert "fallback" in response["warning"].lower() or "semantic" in response["warning"].lower()
+
+
+def test_retrieval_tool_confidence_low_offline_mode() -> None:
+    """WS3 4.1.3: Low confidence in offline mode (no embedding index)."""
+    document = _build_document("doc-offline", "Alpha beta gamma")
+    tool = DocumentFindTextTool(
+        embedding_index=None,
+        document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
+    )
+
+    response = tool.run(document_id=document.document_id, query="alpha")
+
+    assert response["confidence"] == "low"
+    assert response["offline_mode"] is True
+    assert response["warning"] is not None
+    assert "unavailable" in response["warning"].lower()
+
+
+# ---------------------------------------------------------------------------
+# WS3 4.2.x: Line span tests
+# ---------------------------------------------------------------------------
+
+def test_retrieval_tool_pointers_include_line_span() -> None:
+    """WS3 4.2.3: Embedding pointers have line_span with start_line/end_line."""
+    document = _build_document("doc-lines", "Line 0\nLine 1\nLine 2\nLine 3\n")
+    # Chunk covers "Line 1\nLine 2" (offsets 7-21)
+    record = _build_chunk_record(document.document_id, chunk_id="c1", start=7, end=21)
+    matches = [EmbeddingMatch(record=record, score=0.9)]
+    index = cast(DocumentEmbeddingIndex, _StubEmbeddingIndex(matches))
+    tool = DocumentFindTextTool(
+        embedding_index=index,
+        document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
+    )
+
+    response = tool.run(document_id=document.document_id, query="line", min_confidence=0.3)
+
+    assert response["pointers"]
+    pointer = response["pointers"][0]
+    assert "line_span" in pointer
+    assert pointer["line_span"]["start_line"] == 1
+    assert pointer["line_span"]["end_line"] == 2
+
+
+def test_retrieval_tool_fallback_pointers_include_line_span() -> None:
+    """WS3 4.2.3: Fallback pointers also have line_span."""
+    document = _build_document("doc-lines-fb", "First line\nSecond line\nThird line\n")
+    tool = DocumentFindTextTool(
+        embedding_index=None,
+        document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
+    )
+
+    response = tool.run(document_id=document.document_id, query="Second")
+
+    assert response["pointers"]
+    pointer = response["pointers"][0]
+    assert "line_span" in pointer
+    # Fallback extends preview window, so line_span starts at 0 (whole text fits in preview)
+    assert "start_line" in pointer["line_span"]
+    assert "end_line" in pointer["line_span"]
+    # line_span values should be consistent with char_range
+    assert pointer["line_span"]["start_line"] >= 0
+    assert pointer["line_span"]["end_line"] >= pointer["line_span"]["start_line"]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

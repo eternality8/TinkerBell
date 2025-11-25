@@ -37,12 +37,22 @@ class DocumentFindTextTool:
         self,
         *,
         document_id: str | None = None,
+        tab_id: str | None = None,
+        snapshot_token: str | None = None,
         query: str | None = None,
         top_k: int | None = None,
         min_confidence: float | None = None,
         filters: Mapping[str, Any] | None = None,
         include_outline_context: bool = True,
     ) -> dict[str, Any]:
+        # Parse snapshot_token if provided (WS1.1.4)
+        parsed_tab_id, parsed_version_id = self._parse_snapshot_token(snapshot_token)
+        if parsed_tab_id is not None:
+            if tab_id is None:
+                tab_id = parsed_tab_id
+            if document_id is None:
+                document_id = parsed_tab_id
+
         query_text = (query or "").strip()
         if not query_text:
             return {
@@ -50,12 +60,13 @@ class DocumentFindTextTool:
                 "reason": "query_required",
             }
 
-        document = self._resolve_document(document_id)
+        document = self._resolve_document(document_id or tab_id)
         if document is None:
             return {
                 "status": "no_document",
                 "reason": "document_unavailable",
                 "document_id": document_id,
+                "tab_id": tab_id,
             }
         unsupported_reason = unsupported_format_reason(document)
         if unsupported_reason:
@@ -63,6 +74,7 @@ class DocumentFindTextTool:
                 "status": "unsupported_format",
                 "reason": unsupported_reason,
                 "document_id": document.document_id,
+                "tab_id": tab_id,
             }
 
         limit = self._sanitize_top_k(top_k)
@@ -131,13 +143,22 @@ class DocumentFindTextTool:
         document_tokens = count_text_tokens(document.text or "", estimate_only=True)
         pointer_tokens = self._total_pointer_tokens(pointers)
         tokens_saved = max(0, document_tokens - pointer_tokens)
+
+        # WS3 4.1.x: Add confidence level based on strategy and mode
+        result_confidence = self._determine_confidence(strategy, offline_mode, pointers)
+        warning = self._build_confidence_warning(result_confidence, fallback_reason, offline_mode)
+
         response = {
             "status": status,
             "document_id": document.document_id,
+            "tab_id": tab_id or document.document_id,
             "version_id": document.version_id,
+            "snapshot_token": f"{document.document_id}:{document.version_id}" if document.version_id else None,
             "query": query_text,
             "strategy": strategy,
             "fallback_reason": fallback_reason,
+            "confidence": result_confidence,
+            "warning": warning,
             "latency_ms": round(latency_ms, 3),
             "top_k": limit,
             "min_confidence": confidence,
@@ -157,6 +178,7 @@ class DocumentFindTextTool:
                 "pointer_count": len(pointers),
                 "top_k": limit,
                 "min_confidence": confidence,
+                "result_confidence": result_confidence,
                 "status": status,
                 "latency_ms": round(latency_ms, 3),
                 "fallback_reason": fallback_reason,
@@ -213,6 +235,21 @@ class DocumentFindTextTool:
             return self.embedding_index_resolver()
         return None
 
+    def _parse_snapshot_token(self, token: str | None) -> tuple[str | None, str | None]:
+        """Parse snapshot_token into (tab_id, version_id) components."""
+        if token is None:
+            return (None, None)
+        token_str = str(token).strip()
+        if not token_str:
+            return (None, None)
+        if ":" not in token_str:
+            return (None, None)
+        parts = token_str.split(":", 1)
+        if len(parts) != 2:
+            return (None, None)
+        tab_id, version_id = parts
+        return (tab_id.strip() or None, version_id.strip() or None)
+
     # ------------------------------------------------------------------
     # Core helpers
     # ------------------------------------------------------------------
@@ -224,6 +261,36 @@ class DocumentFindTextTool:
         if value is None:
             return 0.3
         return max(0.0, min(float(value), 1.0))
+
+    def _determine_confidence(
+        self,
+        strategy: str,
+        offline_mode: bool,
+        pointers: list[dict[str, Any]],
+    ) -> str:
+        """WS3 4.1.1: Return 'high' or 'low' based on retrieval quality."""
+        # High confidence only when using semantic embeddings with results
+        if strategy == "embedding" and not offline_mode and pointers:
+            return "high"
+        # Low confidence for fallback, offline mode, or no results
+        return "low"
+
+    def _build_confidence_warning(
+        self,
+        confidence: str,
+        fallback_reason: str | None,
+        offline_mode: bool,
+    ) -> str | None:
+        """WS3 4.1.1: Build warning message for low-confidence results."""
+        if confidence == "high":
+            return None
+        if offline_mode:
+            return "Embeddings unavailable; using heuristic search. Results may be less accurate."
+        if fallback_reason == "no_embedding_matches":
+            return "No semantic matches found; using regex/outline fallback. Consider refining query."
+        if fallback_reason == "embedding_unavailable":
+            return "Embedding index not ready; using heuristic search."
+        return "Low confidence results. Verify retrieved spans match intent."
 
     def _similarity_search(
         self,
@@ -257,19 +324,25 @@ class DocumentFindTextTool:
         document: DocumentState,
         include_outline_context: bool,
         outline_index: Mapping[str, OutlineNode] | None,
+        line_offsets: list[int] | None = None,
     ) -> list[dict[str, Any]]:
         text = document.text or ""
+        # WS3 4.2.2: Compute line offsets if not provided
+        if line_offsets is None:
+            line_offsets = self._compute_line_offsets(text)
         pointers: list[dict[str, Any]] = []
         for match in matches:
             record = match.record
             preview = self._extract_preview(text, record.start_offset, record.end_offset)
+            char_range = [record.start_offset, record.end_offset]
             pointer: dict[str, Any] = {
                 "chunk_id": record.chunk_id,
                 "pointer_id": self._pointer_id(document.document_id, record.chunk_id),
                 "score": round(match.score, 4),
                 "preview": preview,
                 "token_estimate": max(1, int(record.token_count or 0)),
-                "char_range": [record.start_offset, record.end_offset],
+                "char_range": char_range,
+                "line_span": self._line_span_for_char_range(char_range, line_offsets),
                 "outline_node_id": record.outline_node_id,
             }
             if include_outline_context and outline_index and record.outline_node_id:
@@ -291,17 +364,21 @@ class DocumentFindTextTool:
         limit: int,
         include_outline_context: bool,
         outline_index: Mapping[str, OutlineNode] | None,
+        line_offsets: list[int] | None = None,
     ) -> list[dict[str, Any]]:
         text = document.text or ""
         if not text:
             return []
+        # WS3 4.2.2: Compute line offsets if not provided
+        if line_offsets is None:
+            line_offsets = self._compute_line_offsets(text)
         pattern = self._fallback_pattern(query)
         matches: list[dict[str, Any]] = []
         if pattern is not None:
             for match in pattern.finditer(text):
                 start = max(0, match.start() - self.max_preview_chars // 2)
                 end = min(len(text), match.end() + self.max_preview_chars // 2)
-                matches.append(self._fallback_pointer(document, start, end, "regex"))
+                matches.append(self._fallback_pointer(document, start, end, "regex", line_offsets=line_offsets))
                 if len(matches) >= limit:
                     break
         if not matches and outline_index:
@@ -315,12 +392,13 @@ class DocumentFindTextTool:
                             node.char_range[1],
                             "outline",
                             outline_node=node,
+                            line_offsets=line_offsets,
                         )
                     )
                     if len(matches) >= limit:
                         break
         if not matches:
-            matches.append(self._fallback_pointer(document, 0, self.max_preview_chars, "document"))
+            matches.append(self._fallback_pointer(document, 0, self.max_preview_chars, "document", line_offsets=line_offsets))
         if include_outline_context and outline_index:
             for pointer in matches:
                 if "outline_context" in pointer:
@@ -349,19 +427,25 @@ class DocumentFindTextTool:
         match_type: str,
         *,
         outline_node: OutlineNode | None = None,
+        line_offsets: list[int] | None = None,
     ) -> dict[str, Any]:
         text = document.text or ""
         start = max(0, min(len(text), start))
         end = max(start + 1, min(len(text), end))
         preview = self._extract_preview(text, start, end)
         pointer_id = self._pointer_id(document.document_id, f"fallback-{start}-{end}")
+        char_range = [start, end]
+        # WS3 4.2.2: Compute line offsets if not provided
+        if line_offsets is None:
+            line_offsets = self._compute_line_offsets(text)
         pointer: dict[str, Any] = {
             "chunk_id": f"fallback-{start}-{end}",
             "pointer_id": pointer_id,
             "score": 0.2,
             "preview": preview,
             "token_estimate": self._estimate_tokens(preview),
-            "char_range": [start, end],
+            "char_range": char_range,
+            "line_span": self._line_span_for_char_range(char_range, line_offsets),
             "match_type": match_type,
         }
         if outline_node is not None:
@@ -386,6 +470,41 @@ class DocumentFindTextTool:
     def _estimate_tokens(self, text: str) -> int:
         words = text.split()
         return max(1, len(words))
+
+    # ------------------------------------------------------------------
+    # WS3 4.2.x: Line span helpers
+    # ------------------------------------------------------------------
+    def _compute_line_offsets(self, text: str) -> list[int]:
+        """Build list of line start offsets for offset-to-line conversion."""
+        offsets = [0]
+        for i, ch in enumerate(text):
+            if ch == "\n":
+                offsets.append(i + 1)
+        return offsets
+
+    def _line_for_offset(self, offset: int, line_offsets: list[int]) -> int:
+        """Return the 0-based line index containing the given offset."""
+        from bisect import bisect_right
+        cursor = max(0, offset)
+        index = bisect_right(line_offsets, cursor) - 1
+        return max(0, index)
+
+    def _line_span_for_char_range(
+        self,
+        char_range: Sequence[int],
+        line_offsets: list[int],
+    ) -> dict[str, int]:
+        """WS3 4.2.1: Convert char_range to line_span."""
+        start_offset = int(char_range[0]) if char_range else 0
+        end_offset = int(char_range[1]) if len(char_range) > 1 else start_offset
+        start_line = self._line_for_offset(start_offset, line_offsets)
+        # Use end_offset - 1 for inclusive line calculation (same as document_snapshot)
+        end_line = (
+            self._line_for_offset(max(start_offset, end_offset - 1), line_offsets)
+            if end_offset > start_offset
+            else start_line
+        )
+        return {"start_line": start_line, "end_line": end_line}
 
     def _pointer_id(self, document_id: str, chunk_id: str) -> str:
         safe_chunk = chunk_id.replace(" ", "_")
