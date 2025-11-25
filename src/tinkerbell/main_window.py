@@ -46,7 +46,7 @@ from .ai.tools.diff_builder import DiffBuilderTool
 from .ai.tools.document_snapshot import DocumentSnapshotTool
 from .ai.tools.document_edit import DocumentEditTool
 from .ai.tools.document_apply_patch import DocumentApplyPatchTool
-from .ai.tools.document_find_sections import DocumentFindSectionsTool
+from .ai.tools.document_find_text import DocumentFindTextTool
 from .ai.tools.document_outline import DocumentOutlineTool
 from .ai.tools.document_plot_state import DocumentPlotStateTool
 from .ai.tools.list_tabs import ListTabsTool
@@ -431,7 +431,7 @@ class MainWindow(QMainWindow):
         self._suppress_cancel_abort = False
         self._outline_worker: OutlineBuilderWorker | None = None
         self._outline_tool: DocumentOutlineTool | None = None
-        self._find_sections_tool: DocumentFindSectionsTool | None = None
+        self._find_text_tool: DocumentFindTextTool | None = None
         self._plot_state_tool: DocumentPlotStateTool | None = None
         self._embedding_index: DocumentEmbeddingIndex | None = None
         self._embedding_state = EmbeddingRuntimeState()
@@ -1117,7 +1117,7 @@ class MainWindow(QMainWindow):
             ]
             if self._phase3_outline_enabled:
                 registered.insert(1, "document_outline")
-                registered.insert(2, "document_find_sections")
+                registered.insert(2, "document_find_text")
             if self._plot_scaffolding_enabled:
                 registered.append("document_plot_state")
             _LOGGER.debug("Default AI tools registered: %s", ", ".join(registered))
@@ -1172,11 +1172,11 @@ class MainWindow(QMainWindow):
                 },
             )
 
-        find_sections_tool = self._ensure_find_sections_tool()
-        if find_sections_tool is not None:
+            find_text_tool = self._ensure_find_text_tool()
+            if find_text_tool is not None:
             register(
-                "document_find_sections",
-                find_sections_tool,
+                "document_find_text",
+                find_text_tool,
                 description=(
                     "Return the best-matching document chunks for a natural language query using embeddings or fallback heuristics."
                 ),
@@ -1225,7 +1225,7 @@ class MainWindow(QMainWindow):
         unregister = getattr(controller, "unregister_tool", None)
         if not callable(unregister):
             return
-        for name in ("document_outline", "document_find_sections"):
+        for name in ("document_outline", "document_find_text"):
             try:
                 unregister(name)
             except Exception:  # pragma: no cover - defensive
@@ -1345,22 +1345,22 @@ class MainWindow(QMainWindow):
         self._outline_tool = tool
         return tool
 
-    def _ensure_find_sections_tool(self) -> DocumentFindSectionsTool | None:
+    def _ensure_find_text_tool(self) -> DocumentFindTextTool | None:
         if not self._phase3_outline_enabled:
             return None
-        if self._find_sections_tool is not None:
-            return self._find_sections_tool
+        if self._find_text_tool is not None:
+            return self._find_text_tool
         try:
-            tool = DocumentFindSectionsTool(
+            tool = DocumentFindTextTool(
                 embedding_index_resolver=self._resolve_embedding_index,
                 document_lookup=self._workspace.find_document_by_id,
                 active_document_provider=self._safe_active_document,
                 outline_memory=self._outline_memory,
             )
         except Exception:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to initialize DocumentFindSectionsTool", exc_info=True)
+            _LOGGER.debug("Unable to initialize DocumentFindTextTool", exc_info=True)
             return None
-        self._find_sections_tool = tool
+        self._find_text_tool = tool
         return tool
 
     @staticmethod
@@ -1616,7 +1616,7 @@ class MainWindow(QMainWindow):
             self._handle_manual_outline_command(request)
             return
         if request.command is ManualCommandType.FIND_SECTIONS:
-            self._handle_manual_find_sections_command(request)
+            self._handle_manual_find_text_command(request)
             return
         self._post_assistant_notice(f"Unsupported manual command '{request.command.value}'.")
         self.update_status("Manual command unsupported")
@@ -1665,15 +1665,15 @@ class MainWindow(QMainWindow):
         )
         self.update_status("Outline ready")
 
-    def _handle_manual_find_sections_command(self, request: ManualCommandRequest) -> None:
+    def _handle_manual_find_text_command(self, request: ManualCommandRequest) -> None:
         if not self._phase3_outline_enabled:
             self._post_assistant_notice("Retrieval tooling is disabled. Enable it in Settings > AI to use /find.")
             self.update_status("Retrieval disabled")
             return
 
-        tool = self._ensure_find_sections_tool()
+        tool = self._ensure_find_text_tool()
         if tool is None:
-            self._post_assistant_notice("Find sections tool is unavailable.")
+            self._post_assistant_notice("Find text tool is unavailable.")
             self.update_status("Retrieval unavailable")
             return
 
@@ -1692,22 +1692,22 @@ class MainWindow(QMainWindow):
         try:
             response = tool.run(**args)
         except Exception as exc:  # pragma: no cover - defensive path
-            _LOGGER.debug("Manual find sections command failed", exc_info=True)
-            self._post_assistant_notice(f"Find sections command failed: {exc}")
-            self.update_status("Find sections failed")
+            _LOGGER.debug("Manual find text command failed", exc_info=True)
+            self._post_assistant_notice(f"Find text command failed: {exc}")
+            self.update_status("Find text failed")
             return
 
         message = self._render_manual_retrieval_response(response, args.get("query"), doc_reference)
         self._post_assistant_notice(message)
         status_text = str(response.get("status") or "ok") if isinstance(response, Mapping) else "ok"
         self._record_manual_tool_trace(
-            name="manual:document_find_sections",
-            input_summary=self._summarize_manual_input("document_find_sections", args),
+            name="manual:document_find_text",
+            input_summary=self._summarize_manual_input("document_find_text", args),
             output_summary=status_text,
             args=args,
             response=response,
         )
-        self.update_status("Find sections ready")
+        self.update_status("Find text ready")
 
     def _resolve_manual_document_id(self, reference: str | None) -> str | None:
         text = (reference or "").strip()
@@ -1850,9 +1850,9 @@ class MainWindow(QMainWindow):
         doc_label = self._document_label_from_id(response.get("document_id"), fallback=requested_document_label)
         query_text = response.get("query") or (requested_query or "")
         if query_text:
-            header = f"Find sections ({status}) for {doc_label} — \"{query_text}\""
+            header = f"Find text ({status}) for {doc_label} — \"{query_text}\""
         else:
-            header = f"Find sections ({status}) for {doc_label}."
+            header = f"Find text ({status}) for {doc_label}."
         parts = [header]
 
         details: list[str] = []
@@ -1876,7 +1876,7 @@ class MainWindow(QMainWindow):
             if extra:
                 parts.append(f"… {extra} additional match(es).")
         else:
-            parts.append("No matching sections were found.")
+            parts.append("No matching spans were found.")
 
         return "\n".join(parts)
 
@@ -4358,7 +4358,7 @@ class MainWindow(QMainWindow):
         self._shutdown_outline_worker()
         self._outline_worker = None
         self._outline_tool = None
-        self._find_sections_tool = None
+        self._find_text_tool = None
         self._outline_digest_cache.clear()
         if self._status_bar is not None:
             self._status_bar.set_outline_status("")

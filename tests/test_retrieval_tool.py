@@ -1,4 +1,4 @@
-"""Tests for the DocumentFindSectionsTool."""
+"""Tests for the DocumentFindTextTool."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from tinkerbell.ai.memory.embeddings import (
     EmbeddingMatch,
     LocalEmbeddingProvider,
 )
-from tinkerbell.ai.tools.document_find_sections import DocumentFindSectionsTool
+from tinkerbell.ai.tools.document_find_text import DocumentFindTextTool
 from tinkerbell.editor.document_model import DocumentMetadata, DocumentState
 from tinkerbell.services import telemetry as telemetry_service
 
@@ -55,7 +55,7 @@ def test_retrieval_tool_returns_embedding_matches() -> None:
     stub = _StubEmbeddingIndex(matches)
     index = cast(DocumentEmbeddingIndex, stub)
 
-    tool = DocumentFindSectionsTool(
+    tool = DocumentFindTextTool(
         embedding_index=index,
         document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
         outline_memory=memory,
@@ -74,7 +74,7 @@ def test_retrieval_tool_returns_embedding_matches() -> None:
 
 def test_retrieval_tool_falls_back_without_embeddings() -> None:
     document = _build_document("doc-fallback", "Heading\nAlpha beta body text.")
-    tool = DocumentFindSectionsTool(
+    tool = DocumentFindTextTool(
         embedding_index=None,
         document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
     )
@@ -94,7 +94,7 @@ def test_retrieval_tool_fallback_when_no_match() -> None:
     matches = [EmbeddingMatch(record=record, score=0.2)]
     stub = _StubEmbeddingIndex(matches)
     index = cast(DocumentEmbeddingIndex, stub)
-    tool = DocumentFindSectionsTool(
+    tool = DocumentFindTextTool(
         embedding_index=index,
         document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
     )
@@ -108,7 +108,7 @@ def test_retrieval_tool_fallback_when_no_match() -> None:
 
 def test_retrieval_tool_handles_missing_query() -> None:
     document = _build_document("doc-missing", "Alpha")
-    tool = DocumentFindSectionsTool(document_lookup=lambda doc_id: document)
+    tool = DocumentFindTextTool(document_lookup=lambda doc_id: document)
 
     response = tool.run(document_id=document.document_id, query="   ")
 
@@ -116,7 +116,7 @@ def test_retrieval_tool_handles_missing_query() -> None:
 
 
 def test_retrieval_tool_handles_missing_document() -> None:
-    tool = DocumentFindSectionsTool(document_lookup=lambda _: None)
+    tool = DocumentFindTextTool(document_lookup=lambda _: None)
 
     response = tool.run(document_id="missing", query="alpha")
 
@@ -131,7 +131,7 @@ def test_retrieval_tool_emits_retrieval_event() -> None:
     events: list[dict[str, object]] = []
     telemetry_service.register_event_listener("retrieval.query", lambda payload: events.append(payload))
 
-    tool = DocumentFindSectionsTool(
+    tool = DocumentFindTextTool(
         embedding_index=index,
         document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
     )
@@ -153,7 +153,7 @@ def test_retrieval_tool_reports_provider_error_and_falls_back() -> None:
     events: list[dict[str, object]] = []
     telemetry_service.register_event_listener("retrieval.provider.error", lambda payload: events.append(payload))
     index = cast(DocumentEmbeddingIndex, _ErrorEmbeddingIndex())
-    tool = DocumentFindSectionsTool(
+    tool = DocumentFindTextTool(
         embedding_index=index,
         document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
     )
@@ -203,7 +203,7 @@ async def test_retrieval_tool_ingests_with_local_embedding_provider(tmp_path: Pa
     ingest = await index.ingest_outline(document=document, nodes=nodes, outline_hash="outline-local")
     assert ingest.embedded == len(nodes)
 
-    tool = DocumentFindSectionsTool(
+    tool = DocumentFindTextTool(
         embedding_index=index,
         document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
         outline_memory=memory,
@@ -227,7 +227,7 @@ def test_retrieval_tool_detects_unsupported_documents() -> None:
     metadata = DocumentMetadata()
     metadata.path = Path("manual.pdf")
     document = DocumentState(text="", metadata=metadata, document_id="doc-unsupported")
-    tool = DocumentFindSectionsTool(
+    tool = DocumentFindTextTool(
         embedding_index=None,
         document_lookup=lambda doc_id: document if doc_id == document.document_id else None,
     )

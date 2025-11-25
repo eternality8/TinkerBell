@@ -682,7 +682,7 @@ class MainWindow(QMainWindow):
             self._handle_manual_outline_command(request)
             return
         if request.command is ManualCommandType.FIND_SECTIONS:
-            self._handle_manual_find_sections_command(request)
+            self._handle_manual_find_text_command(request)
             return
         if request.command is ManualCommandType.ANALYZE:
             self._handle_manual_analyze_command(request)
@@ -738,16 +738,16 @@ class MainWindow(QMainWindow):
         )
         self.update_status("Outline ready")
 
-    def _handle_manual_find_sections_command(self, request: ManualCommandRequest) -> None:
+    def _handle_manual_find_text_command(self, request: ManualCommandRequest) -> None:
         if not self._phase3_outline_enabled:
             self._post_assistant_notice("Retrieval tooling is disabled. Enable it in Settings > AI to use /find.")
             self.update_status("Retrieval disabled")
             return
 
         provider = self._tool_provider
-        tool = provider.ensure_find_sections_tool() if provider is not None else None
+        tool = provider.ensure_find_text_tool() if provider is not None else None
         if tool is None:
-            self._post_assistant_notice("Find sections tool is unavailable.")
+            self._post_assistant_notice("Find text tool is unavailable.")
             self.update_status("Retrieval unavailable")
             return
 
@@ -766,22 +766,22 @@ class MainWindow(QMainWindow):
         try:
             response = tool.run(**args)
         except Exception as exc:  # pragma: no cover - defensive path
-            _LOGGER.debug("Manual find sections command failed", exc_info=True)
-            self._post_assistant_notice(f"Find sections command failed: {exc}")
-            self.update_status("Find sections failed")
+            _LOGGER.debug("Manual find text command failed", exc_info=True)
+            self._post_assistant_notice(f"Find text command failed: {exc}")
+            self.update_status("Find text failed")
             return
 
         message = self._render_manual_retrieval_response(response, args.get("query"), doc_reference)
         self._post_assistant_notice(message)
         status_text = str(response.get("status") or "ok") if isinstance(response, Mapping) else "ok"
         self._record_manual_tool_trace(
-            name="manual:document_find_sections",
-            input_summary=self._summarize_manual_input("document_find_sections", args),
+            name="manual:document_find_text",
+            input_summary=self._summarize_manual_input("document_find_text", args),
             output_summary=status_text,
             args=args,
             response=response,
         )
-        self.update_status("Find sections ready")
+        self.update_status("Find text ready")
 
     def _handle_manual_analyze_command(self, request: ManualCommandRequest) -> None:
         controller = self._context.ai_controller
@@ -1294,9 +1294,9 @@ class MainWindow(QMainWindow):
         doc_label = self._document_label_from_id(response.get("document_id"), fallback=requested_document_label)
         query_text = response.get("query") or (requested_query or "")
         if query_text:
-            header = f"Find sections ({status}) for {doc_label} — \"{query_text}\""
+            header = f"Find text ({status}) for {doc_label} — \"{query_text}\""
         else:
-            header = f"Find sections ({status}) for {doc_label}."
+            header = f"Find text ({status}) for {doc_label}."
         parts = [header]
 
         details: list[str] = []
@@ -1320,7 +1320,7 @@ class MainWindow(QMainWindow):
             if extra:
                 parts.append(f"… {extra} additional match(es).")
         else:
-            parts.append("No matching sections were found.")
+            parts.append("No matching spans were found.")
 
         return "\n".join(parts)
 
@@ -2131,18 +2131,18 @@ class MainWindow(QMainWindow):
         setattr(provider, "_outline_tool", tool)
 
     @property
-    def _find_sections_tool(self) -> Any | None:  # pragma: no cover - legacy shim for tests
+    def _find_text_tool(self) -> Any | None:  # pragma: no cover - legacy shim for tests
         provider = self._tool_provider
         if provider is None:
             return None
-        return getattr(provider, "_find_sections_tool", None)
+        return getattr(provider, "_find_text_tool", None)
 
-    @_find_sections_tool.setter
-    def _find_sections_tool(self, tool: Any | None) -> None:  # pragma: no cover - legacy shim for tests
+    @_find_text_tool.setter
+    def _find_text_tool(self, tool: Any | None) -> None:  # pragma: no cover - legacy shim for tests
         provider = self._tool_provider
         if provider is None:
             raise RuntimeError("Tool provider is not initialized")
-        setattr(provider, "_find_sections_tool", tool)
+        setattr(provider, "_find_text_tool", tool)
 
     @property
     def _plot_state_tool(self) -> Any | None:  # pragma: no cover - legacy shim for tests

@@ -26,7 +26,7 @@ class _GatewayStub:
             selection_start=0,
             selection_end=0,
             length=0,
-            line_offsets=(0,),
+            line_start_offsets=(0,),
         )
 
 
@@ -101,17 +101,17 @@ def test_ensure_outline_tool_memoizes_and_resets(monkeypatch: pytest.MonkeyPatch
     assert len(created) == 2
 
 
-def test_ensure_find_sections_tool_handles_constructor_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ensure_find_text_tool_handles_constructor_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     class _ExplodingSections:
         def __init__(self, **_: object) -> None:
             raise RuntimeError("boom")
 
-    monkeypatch.setattr(provider_module, "DocumentFindSectionsTool", _ExplodingSections)
+    monkeypatch.setattr(provider_module, "DocumentFindTextTool", _ExplodingSections)
     provider = _make_provider()
 
-    assert provider.ensure_find_sections_tool() is None
+    assert provider.ensure_find_text_tool() is None
     # After a failure the provider should still attempt re-instantiation when called again.
-    assert provider.ensure_find_sections_tool() is None
+    assert provider.ensure_find_text_tool() is None
 
 
 def test_plot_state_tool_respects_feature_flag(monkeypatch: pytest.MonkeyPatch) -> None:

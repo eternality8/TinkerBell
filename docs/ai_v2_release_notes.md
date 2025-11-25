@@ -12,6 +12,7 @@ _Last updated: 19 Nov 2025_
 - **Preflight analysis & tool recommendations (Phase 5.2)** – Rule-based analyzer feeds proactive tool hints into the controller, status bar/chat badges, manual `/analyze`, ContextUsage exports, and telemetry (`analysis.advisor_tool.*`, `analysis.ui_override.*`).
 - **Caret-free AI editing (Workstream 1)** – `DocumentBridge` applies patches with `preserve_selection`, so AI edits can no longer move the user’s caret. Partners must rely on `document_snapshot` + `selection_range` spans, honor explicit `target_span`/`match_text` anchors, and monitor `caret_call_blocked` telemetry until all clients migrate.
 - **Configurable sampling temperature** – The AI settings dialog now exposes the OpenAI-compatible temperature control (0.0–2.0) so creative writing sessions can lean toward higher variety without editing `settings.json` manually.
+- **Explicit deletions via empty content** – `validate_directive` now permits `content=""` to signal span removals while still rejecting whitespace-only payloads, so agents can delete sections without fabricating placeholder text.
 - **Per-turn debug event logs** – When `debug_logging` (or `TINKERBELL_DEBUG=1`) is enabled, every AI turn now emits a JSONL trace under `~/.tinkerbell/logs/events/` capturing the active snapshot text, assistant messages, tool payloads, and edit outcomes for easier post-mortem debugging. The Settings dialog (Features tab) exposes a “Capture per-chat event logs (JSONL)” toggle so you can enable/disable this without editing `settings.json`.
 
 ## Feature flags

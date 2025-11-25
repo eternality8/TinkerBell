@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import hashlib
@@ -333,6 +334,65 @@ class _ChunkFlowTracker:
 
 
 @dataclass(slots=True)
+class _SnapshotRefreshTracker:
+    """Warns when the agent applies too many edits without a fresh snapshot."""
+
+    document_id: str | None
+    threshold: int
+    edits_since_snapshot: int = 0
+    last_snapshot_version: str | None = None
+    warning_active: bool = False
+
+    def __post_init__(self) -> None:
+        try:
+            value = int(self.threshold)
+        except (TypeError, ValueError):  # pragma: no cover - defensive cast
+            value = 1
+        self.threshold = max(1, value)
+
+    def observe_tool(self, record: Mapping[str, Any], payload: Mapping[str, Any] | None) -> list[str] | None:
+        name = str(record.get("name") or "").lower()
+        status = str(record.get("status") or "ok").lower()
+        succeeded = status == "ok"
+        if name == "document_snapshot":
+            if succeeded:
+                self._note_snapshot(payload)
+            return None
+        if name not in {"document_apply_patch", "document_edit"} or not succeeded:
+            return None
+        self.edits_since_snapshot += 1
+        if not self.warning_active and self.edits_since_snapshot >= self.threshold:
+            self.warning_active = True
+            return self._warning_lines()
+        return None
+
+    def _note_snapshot(self, payload: Mapping[str, Any] | None) -> None:
+        self.edits_since_snapshot = 0
+        self.warning_active = False
+        self.last_snapshot_version = self._extract_version(payload)
+
+    def _extract_version(self, payload: Mapping[str, Any] | None) -> str | None:
+        if not isinstance(payload, Mapping):
+            return None
+        for key in ("version", "document_version", "version_id"):
+            value = payload.get(key)
+            if value in (None, ""):
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return None
+
+    def _warning_lines(self) -> list[str]:
+        target = self.document_id or "this document"
+        version = self.last_snapshot_version or "unknown"
+        return [
+            f"{self.edits_since_snapshot} edits have landed on {target} since the last DocumentSnapshot (version {version}).",
+            "Offsets drift after multiple edits off a single snapshot. Call DocumentSnapshot to capture a fresh span before drafting another diff and narrate the refresh to the user.",
+        ]
+
+
+@dataclass(slots=True)
 class _PlotLoopTracker:
     """Ensures the agent follows the plot-outline → edit → update contract."""
 
@@ -340,11 +400,13 @@ class _PlotLoopTracker:
     outline_called: bool = False
     pending_update: bool = False
     blocked_edits: int = 0
+    snapshot_prompt_pending: bool = False
 
     def before_tool(self, tool_name: str | None) -> str | None:
         name = (tool_name or "").strip().lower()
         if name in {"document_apply_patch", "document_edit"} and not self.outline_called:
             self.blocked_edits += 1
+            self.snapshot_prompt_pending = True
             return (
                 "Plot loop guardrail: call PlotOutlineTool for continuity context before applying edits."
             )
@@ -356,6 +418,12 @@ class _PlotLoopTracker:
         succeeded = status == "ok"
         if name in {"plot_outline", "document_plot_state"} and succeeded:
             self.outline_called = True
+            if self.snapshot_prompt_pending:
+                self.snapshot_prompt_pending = False
+                target = self.document_id or "this document"
+                return [
+                    f"Plot loop guardrail satisfied for {target}: capture a fresh DocumentSnapshot before drafting your next diff so offsets stay in sync.",
+                ]
             return None
         if name == "plot_state_update":
             if succeeded and self.pending_update:
@@ -459,6 +527,7 @@ class AIController:
     tools: MutableMapping[str, ToolRegistration] = field(default_factory=dict)
     max_tool_iterations: int = 8
     diff_builder_reminder_threshold: int = 3
+    max_edits_without_snapshot: int = 4
     max_pending_patch_reminders: int = 2
     max_tool_followup_prompts: int = 2
     max_tool_followup_user_prompts: int = 1
@@ -487,6 +556,7 @@ class AIController:
     _chunk_config: ChunkingRuntimeConfig = field(default_factory=ChunkingRuntimeConfig, init=False, repr=False)
     _chunk_index: ChunkIndex | None = field(default=None, init=False, repr=False)
     _chunk_flow_tracker: _ChunkFlowTracker | None = field(default=None, init=False, repr=False)
+    _snapshot_refresh_tracker: _SnapshotRefreshTracker | None = field(default=None, init=False, repr=False)
     _plot_loop_tracker: _PlotLoopTracker | None = field(default=None, init=False, repr=False)
     _subagent_doc_states: dict[str, _SubagentDocumentState] = field(default_factory=dict, init=False, repr=False)
     _analysis_agent: AnalysisAgent | None = field(default=None, init=False, repr=False)
@@ -510,6 +580,11 @@ class AIController:
         self.agent_config = config.clamp()
         self.max_tool_iterations = self.agent_config.max_iterations
         self.temperature = self._normalize_temperature(self.temperature)
+        try:
+            snapshot_limit = int(self.max_edits_without_snapshot)
+        except (TypeError, ValueError):  # pragma: no cover - defensive cast
+            snapshot_limit = 0
+        self.max_edits_without_snapshot = max(0, snapshot_limit)
         self._rebuild_graph()
         self._subagent_runtime = SubagentRuntimeManager(tool_resolver=self._tool_registry_snapshot)
         self.configure_context_window(
@@ -1221,6 +1296,13 @@ class AIController:
                 self._trace_compactor.reset()
             chunk_tracker = _ChunkFlowTracker(document_id=self._resolve_document_id(snapshot))
             self._chunk_flow_tracker = chunk_tracker
+            refresh_tracker: _SnapshotRefreshTracker | None = None
+            if self.max_edits_without_snapshot > 0:
+                refresh_tracker = _SnapshotRefreshTracker(
+                    document_id=self._resolve_document_id(snapshot),
+                    threshold=self.max_edits_without_snapshot,
+                )
+            self._snapshot_refresh_tracker = refresh_tracker
             plot_tracker: _PlotLoopTracker | None = None
             if self._should_enforce_plot_loop(snapshot):
                 plot_tracker = _PlotLoopTracker(document_id=self._resolve_document_id(snapshot))
@@ -1483,6 +1565,8 @@ class AIController:
                     completion_warnings.append("pending_patch_pending")
                 if chunk_tracker.warning_active:
                     completion_warnings.append("chunk_flow_warning")
+                if refresh_tracker is not None and refresh_tracker.warning_active:
+                    completion_warnings.append("snapshot_drift_warning")
                 if plot_tracker is not None and plot_tracker.pending_update:
                     completion_warnings.append("plot_state_pending_update")
                 active_log.log_completion(
@@ -1510,6 +1594,8 @@ class AIController:
             finally:
                 if self._chunk_flow_tracker is chunk_tracker:
                     self._chunk_flow_tracker = None
+                if self._snapshot_refresh_tracker is refresh_tracker:
+                    self._snapshot_refresh_tracker = None
                 if self._plot_loop_tracker is plot_tracker:
                     self._plot_loop_tracker = None
 
@@ -1874,7 +1960,7 @@ class AIController:
             name = str(record.get("name") or "").strip().lower()
             if name == "document_outline":
                 self._capture_outline_tool_metrics(context, record)
-            elif name == "document_find_sections":
+            elif name == "document_find_text":
                 self._capture_retrieval_tool_metrics(context, record)
         self._record_scope_metrics(context, records)
 
@@ -1932,6 +2018,7 @@ class AIController:
         seen: set[str] = set()
         chunk_tracker = self._chunk_flow_tracker
         plot_tracker = self._plot_loop_tracker
+        refresh_tracker = self._snapshot_refresh_tracker
         for record in records:
             payload = self._deserialize_tool_result(record)
             if chunk_tracker is not None:
@@ -1941,6 +2028,13 @@ class AIController:
                     if chunk_hint and chunk_hint not in seen:
                         hints.append(chunk_hint)
                         seen.add(chunk_hint)
+            if refresh_tracker is not None:
+                drift_lines = refresh_tracker.observe_tool(record, payload if isinstance(payload, Mapping) else None)
+                if drift_lines:
+                    drift_hint = self._format_guardrail_hint("Snapshot Drift", drift_lines)
+                    if drift_hint and drift_hint not in seen:
+                        hints.append(drift_hint)
+                        seen.add(drift_hint)
             if plot_tracker is not None:
                 plot_lines = plot_tracker.observe_tool(record, payload if isinstance(payload, Mapping) else None)
                 if plot_lines:
@@ -1954,7 +2048,7 @@ class AIController:
             candidate: Sequence[str] | None = None
             if name == "document_outline":
                 candidate = self._outline_guardrail_hints(payload)
-            elif name == "document_find_sections":
+            elif name == "document_find_text":
                 candidate = self._retrieval_guardrail_hints(payload)
             if not candidate:
                 continue
@@ -2047,20 +2141,20 @@ class AIController:
                 f"Retrieval disabled for {document_id}: {detail}.",
                 "Use DocumentSnapshot, manual navigation, or outline pointers instead.",
             ]
-            hints.append(self._format_guardrail_hint("DocumentFindSectionsTool", lines))
+            hints.append(self._format_guardrail_hint("DocumentFindTextTool", lines))
         if offline_mode or status in {"offline_fallback", "offline_no_results"}:
             label_reason = fallback_reason or ("offline mode" if offline_mode else "fallback strategy")
             lines = [
                 f"Retrieval is running without embeddings ({label_reason}).",
                 "Treat matches as low-confidence hints and rehydrate via DocumentSnapshot before editing.",
             ]
-            hints.append(self._format_guardrail_hint("DocumentFindSectionsTool", lines))
+            hints.append(self._format_guardrail_hint("DocumentFindTextTool", lines))
         if status == "offline_no_results":
             lines = [
                 f"Offline fallback could not find matches for {document_id}.",
                 "Try a different query or scan the outline/snapshot manually.",
             ]
-            hints.append(self._format_guardrail_hint("DocumentFindSectionsTool", lines))
+            hints.append(self._format_guardrail_hint("DocumentFindTextTool", lines))
         return [hint for hint in hints if hint]
 
     def _format_guardrail_hint(self, source: str, lines: Sequence[str]) -> str:
@@ -3076,7 +3170,7 @@ class AIController:
             )
         if mentions_retrieval:
             guidance.append(
-                "After reviewing the outline, call DocumentFindSectionsTool to pull the passages requested before drafting edits."
+                "After reviewing the outline, call DocumentFindTextTool to pull the passages requested before drafting edits."
             )
 
         digest_hint: str | None = None
@@ -4181,7 +4275,18 @@ class AIController:
         try:
             return json.loads(text, strict=False)
         except (ValueError, TypeError):
+            fallback = self._literal_tool_arguments(text)
+            if fallback is not None:
+                return fallback
             return text
+
+    def _literal_tool_arguments(self, text: str) -> Any | None:
+        if not text or text[0] not in "{[":
+            return None
+        try:
+            return ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            return None
 
     def _normalize_tool_arguments(self, call: _ToolCallRequest, arguments: Any) -> Any:
         if not isinstance(arguments, Mapping):

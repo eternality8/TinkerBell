@@ -9,7 +9,7 @@ Use these mini playbooks whenever you need to trigger a specific outline/retriev
    - `DocumentOutlineTool` returns `guardrails[0].type = "huge_document"`.
    - `trimmed_reason = "token_budget"` and reduced `node_count`.
    - Controller injects `Guardrail hint (DocumentOutlineTool)` reminding you to work in chunks.
-4. Follow-up: request targeted `DocumentFindSectionsTool` calls for the pointer IDs that remain.
+4. Follow-up: request targeted `DocumentFindTextTool` calls for the pointer IDs that remain.
 
 ## 2. Pending outline rebuild
 1. Open `test_data/1MB.json`.
@@ -31,7 +31,7 @@ Use these mini playbooks whenever you need to trigger a specific outline/retriev
 2. Open any Markdown/YAML doc (for example `test_data/phase3/stacked_outline_demo.md`).
 3. Ask the agent: “Find the telemetry TODO paragraph.”
 4. Expected signals:
-   - `DocumentFindSectionsTool` returns `status = "offline_fallback"`, `strategy = "fallback"`, and `offline_mode = true`.
+   - `DocumentFindTextTool` returns `status = "offline_fallback"`, `strategy = "fallback"`, and `offline_mode = true`.
    - Controller guardrail hint explains previews are heuristic only.
 5. Follow-up: run DocumentSnapshot on the pointer range before editing.
 

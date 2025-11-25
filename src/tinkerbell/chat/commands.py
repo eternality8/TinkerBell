@@ -186,7 +186,7 @@ def parse_manual_command(text: str) -> ManualCommandRequest | None:
     elif command is ManualCommandType.STATUS:
         args = _parse_status_command(tokens)
     else:
-        args = _parse_find_sections_command(tokens)
+        args = _parse_find_text_command(tokens)
     return ManualCommandRequest(command=command, args=args, raw=normalized)
 
 
@@ -246,7 +246,7 @@ def _parse_outline_command(tokens: deque[str]) -> dict[str, Any]:
     return args
 
 
-def _parse_find_sections_command(tokens: deque[str]) -> dict[str, Any]:
+def _parse_find_text_command(tokens: deque[str]) -> dict[str, Any]:
     args: dict[str, Any] = {}
     query_tokens: list[str] = []
     while tokens:
@@ -287,7 +287,7 @@ def _parse_find_sections_command(tokens: deque[str]) -> dict[str, Any]:
         args["query"] = suffix if not existing else f"{existing} {suffix}".strip()
     query_text = (args.get("query") or "").strip()
     if not query_text:
-        raise ValueError("Find sections command requires a query, e.g., /find introduction paragraph")
+        raise ValueError("Find text command requires a query, e.g., /find introduction paragraph")
     args["query"] = query_text
     return args
 
@@ -460,7 +460,7 @@ DIRECTIVE_SCHEMA: Dict[str, Any] = {
             "type": "string",
             "enum": [item.value for item in ActionType],
         },
-        "content": {"type": "string", "minLength": 1},
+        "content": {"type": "string"},
         "diff": {"type": "string", "minLength": 1},
         "rationale": {"type": "string"},
         "target_range": {
@@ -549,8 +549,14 @@ def validate_directive(payload: Mapping[str, Any]) -> ValidationResult:
         return ValidationResult(ok=False, message=_format_validation_error(error))
 
     content = candidate.get("content")
-    if isinstance(content, str) and not content.strip():
-        return ValidationResult(ok=False, message="content must not be empty")
+    if isinstance(content, str):
+        if content == "":
+            pass  # Empty string denotes a deletion request.
+        elif not content.strip():
+            return ValidationResult(
+                ok=False,
+                message="content must include non-whitespace characters; use an empty string to delete the target span",
+            )
 
     deprecated_fields = _collect_deprecated_caret_fields(candidate)
     if deprecated_fields:

@@ -135,7 +135,7 @@ class _SnapshotProviderStub:
             "text": text,
             "version": "base",
             "document_id": "doc-stub",
-            "line_offsets": [0, len(text)],
+            "line_start_offsets": [0, len(text)],
             "length": len(text),
             "content_hash": hashlib.sha1(text.encode("utf-8")).hexdigest(),
             "window": {"start": 0, "end": len(text)},
@@ -168,7 +168,7 @@ class _SelectionGatewayStub:
             selection_start=0,
             selection_end=length,
             length=length,
-            line_offsets=(0, length),
+            line_start_offsets=(0, length),
         )
         self.capture_calls: list[str | None] = []
 
@@ -183,7 +183,7 @@ class _SelectionGatewayStub:
             selection_start=self.snapshot.selection_start,
             selection_end=self.snapshot.selection_end,
             length=self.snapshot.length,
-            line_offsets=self.snapshot.line_offsets,
+            line_start_offsets=self.snapshot.line_start_offsets,
         )
 
 
@@ -1008,7 +1008,7 @@ def test_selection_range_tool_returns_line_bounds():
         selection_start=6,
         selection_end=12,
         length=12,
-        line_offsets=(0, 6, 12),
+        line_start_offsets=(0, 6, 12),
     )
 
     tool = SelectionRangeTool(gateway=gateway)
@@ -1028,7 +1028,7 @@ def test_selection_range_tool_emits_telemetry(monkeypatch: pytest.MonkeyPatch):
         selection_start=2,
         selection_end=4,
         length=gateway.snapshot.length,
-        line_offsets=gateway.snapshot.line_offsets,
+        line_start_offsets=gateway.snapshot.line_start_offsets,
     )
     captured: list[tuple[str, dict | None]] = []
 

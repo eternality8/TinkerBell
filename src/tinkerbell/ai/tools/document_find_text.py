@@ -1,4 +1,4 @@
-"""Tool exposing embedding-backed document section retrieval."""
+"""Tool exposing embedding-backed document span retrieval."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ OutlineMemoryResolver = Callable[[], DocumentSummaryMemory | None]
 
 
 @dataclass(slots=True)
-class DocumentFindSectionsTool:
+class DocumentFindTextTool:
     """Retrieve document chunk pointers by querying the embedding index."""
 
     embedding_index: DocumentEmbeddingIndex | None = None
@@ -395,10 +395,12 @@ class DocumentFindSectionsTool:
         index: dict[str, OutlineNode] = {}
         if not nodes:
             return index
+
         def visit(node: OutlineNode) -> None:
             index[node.id] = node
             for child in node.children:
                 visit(child)
+
         for node in nodes:
             visit(node)
         return index

@@ -12,7 +12,12 @@ import pytest
 
 from tinkerbell.ai.client import AIClient
 from tinkerbell.ai.orchestration import controller as controller_module
-from tinkerbell.ai.orchestration.controller import AIController, ToolRegistration, _ToolCallRequest
+from tinkerbell.ai.orchestration.controller import (
+    AIController,
+    ToolRegistration,
+    _SnapshotRefreshTracker,
+    _ToolCallRequest,
+)
 from tinkerbell.ai.tools.document_apply_patch import NeedsRangeError
 from tinkerbell.services.bridge import DocumentVersionMismatchError
 
@@ -236,6 +241,24 @@ def test_ai_controller_retry_event_includes_scope_metadata(monkeypatch) -> None:
     assert event_payload["scope_range"] == {"start": 100, "end": 106}
 
 
+def test_snapshot_refresh_tracker_warns_after_threshold() -> None:
+    tracker = _SnapshotRefreshTracker(document_id="doc-7", threshold=2)
+    snapshot_record = {"name": "document_snapshot", "status": "ok"}
+    assert tracker.observe_tool(snapshot_record, {"document_version": "alpha"}) is None
+
+    edit_record = {"name": "document_apply_patch", "status": "ok"}
+    assert tracker.observe_tool(edit_record, None) is None
+    warning_lines = tracker.observe_tool(edit_record, None)
+
+    assert warning_lines is not None
+    assert warning_lines[0].startswith("2 edits have landed")
+    assert tracker.warning_active is True
+
+    tracker.observe_tool(snapshot_record, {"version": "beta"})
+    assert tracker.warning_active is False
+    assert tracker.edits_since_snapshot == 0
+
+
 def test_ai_controller_surfaces_needs_range_error() -> None:
     selection_tool = _SelectionRangeToolStub(start_line=12, end_line=14)
     controller = AIController(
@@ -386,6 +409,48 @@ def test_ai_controller_needs_range_prefers_metadata_span_hint() -> None:
     assert payload["scope_origin"] == "explicit_span"
     assert payload["scope_range"] == {"start": 20, "end": 28}
     assert selection_tool.calls == 0
+
+
+def test_ai_controller_coerces_literal_tool_arguments() -> None:
+    controller = AIController(
+        client=cast(AIClient, SimpleNamespace()),
+        tools=cast(MutableMapping[str, ToolRegistration], {}),
+    )
+
+    raw = "{'window': {'start': 8000, 'end': 8449}, 'include_text': True, 'delta_only': False}"
+    parsed = controller._coerce_tool_arguments(raw, None)
+
+    assert isinstance(parsed, Mapping)
+    window = parsed.get("window")
+    assert isinstance(window, Mapping)
+    assert window["start"] == 8000
+    assert window["end"] == 8449
+    assert parsed["include_text"] is True
+    assert parsed["delta_only"] is False
+
+
+def test_guardrail_hint_emits_snapshot_drift_warning() -> None:
+    controller = AIController(
+        client=cast(AIClient, SimpleNamespace()),
+        tools=cast(MutableMapping[str, ToolRegistration], {}),
+        max_edits_without_snapshot=1,
+    )
+    controller._snapshot_refresh_tracker = _SnapshotRefreshTracker(document_id="doc-guard", threshold=1)
+
+    records = [
+        {
+            "name": "document_apply_patch",
+            "status": "ok",
+            "result": "{}",
+            "resolved_arguments": {},
+        }
+    ]
+
+    hints = controller._guardrail_hints_from_records(records)
+
+    assert any("Snapshot Drift" in hint for hint in hints)
+    assert controller._snapshot_refresh_tracker is not None
+    assert controller._snapshot_refresh_tracker.warning_active is True
 
 
 def test_ai_controller_records_scope_metrics_across_batches() -> None:

@@ -215,7 +215,7 @@ class DocumentBridge:
         document = self.editor.to_document()
         snapshot = document.snapshot(delta_only=delta_only)
         snapshot["length"] = len(document.text)
-        snapshot["line_offsets"] = self._compute_line_offsets(document.text)
+        snapshot["line_start_offsets"] = self._compute_line_start_offsets(document.text)
         window_range = self._resolve_window(
             window,
             length=len(document.text),
@@ -1500,7 +1500,7 @@ class DocumentBridge:
         return (start, end)
 
     @staticmethod
-    def _compute_line_offsets(text: str) -> list[int]:
+    def _compute_line_start_offsets(text: str) -> list[int]:
         offsets = [0]
         if not text:
             return offsets

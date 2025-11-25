@@ -9,7 +9,7 @@ Phase 3 layers guardrail-aware outline/retrieval tooling on top of the Phase 0
 ### Feature highlights
 
 - **DocumentOutlineTool vNext** – Returns nested headings, blurbs, pointer IDs, digest hashes, and guardrail metadata (`status`, `guardrails`, `trimmed_reason`, `retry_after_ms`).
-- **DocumentFindSectionsTool** – Queries the embedding index (OpenAI or LangChain) and falls back to regex/outline heuristics when offline. Responses now flag `offline_mode`, `fallback_reason`, and per-pointer outline context.
+- **DocumentFindTextTool** – Queries the embedding index (OpenAI or LangChain) and falls back to regex/outline heuristics when offline. Responses now flag `offline_mode`, `fallback_reason`, and per-pointer outline context.
 - **Controller guardrail hints** – `AIController` injects `Guardrail hint (…)` system messages whenever a tool reports pending, unsupported, stale, trimmed, or offline states so the agent must acknowledge constraints before making edits.
 - **Telemetry** – Outline/retrieval events record latency, cache hits, and `tokens_saved`, and the trace compactor continues to pointerize oversized payloads whenever the budget policy demands it.
 
@@ -32,7 +32,7 @@ Open a sample, ask the agent to outline or retrieve, and observe the tool payloa
 
 | Tool status / hint | What it means | Next step |
 | --- | --- | --- |
-| `guardrails[].type = "huge_document"`, `trimmed_reason = token_budget` | Outline capped depth/size. | Work pointer-by-pointer (DocumentFindSectionsTool + DocumentSnapshot) and mention the guardrail in your reasoning. |
+| `guardrails[].type = "huge_document"`, `trimmed_reason = token_budget` | Outline capped depth/size. | Work pointer-by-pointer (DocumentFindTextTool + DocumentSnapshot) and mention the guardrail in your reasoning. |
 | `status = "offline_fallback"`, `offline_mode = true` | Embedding provider is offline, retrieval switched to heuristics. | Treat previews as hints, rehydrate via DocumentSnapshot before editing, and restore connectivity/backend when possible. |
 | `is_stale = true` | Cached outline digest no longer matches the current document version. | Trigger a rebuild (wait or poke the worker) and avoid committing edits that rely solely on stale headings. |
 
@@ -60,6 +60,7 @@ Workstream 1 removes every caret/selection mutation hook from the AI editing st
   - `replace_all=true` for full-document rewrites (requires hashing the entire snapshot).
 4. **Attach deterministic anchors** – Provide the `target_span` derived from snapshot/manifest hints (or, as a fallback, returned by `selection_range`) or include `match_text`/`expected_text` snippets from the snapshot window so the bridge can relocate the slice deterministically.
 5. **Handle guardrails** – When the runtime raises `caret_call_blocked` or `Edits must include target_span...`, refresh the snapshot/selection pair and rebuild the edit rather than retrying with caret metadata.
+6. **Delete spans intentionally** – When the desired result is removal, send `content` as an empty string alongside the same `target_span`/scope metadata you would provide for replacements. Any other whitespace-only payloads are still rejected so accidental blanks do not sneak through.
 
 ### Partner changelog
 
@@ -234,7 +235,7 @@ Phase 5.2 layers a rule-based analyzer (`tinkerbell.ai.analysis`) on top of the
 - **Settings & UI** – The Settings dialog now exposes **Debug → Token logging enabled** and **Token log limit**. When enabled, the status bar shows running totals and the in-memory sink keeps the last *N* events for inspection/test assertions.
 - **Programmatic access** – `AIController.get_recent_context_events()` exposes the rolling buffer for tests or external dashboards. Additional sinks can be registered via `TelemetrySink` to stream events elsewhere.
 - **Export script** – `uv run python -m tinkerbell.scripts.export_context_usage --format csv --limit 50` dumps the persisted buffer (JSON/CSV) from `~/.tinkerbell/telemetry/context_usage.json` for audits or support bundles.
-- **Outline/Retrieval telemetry** – Outline builder (`ai/services/outline_worker.py`), `DocumentOutlineTool`, `DocumentFindSectionsTool`, and `DocumentEmbeddingIndex` now emit structured events (`outline.build.start/end`, `outline.tool.hit/miss`, `outline.stale`, `retrieval.query`, `retrieval.provider.error`, `embedding.cache.hit/miss`) that include latency, cache hit counts, provider names, and `tokens_saved` deltas. Dashboards can subscribe via `TelemetrySink` or reuse `scripts/export_context_usage.py` to trend outline freshness, retrieval performance, and embedding cost spikes.
+- **Outline/Retrieval telemetry** – Outline builder (`ai/services/outline_worker.py`), `DocumentOutlineTool`, `DocumentFindTextTool`, and `DocumentEmbeddingIndex` now emit structured events (`outline.build.start/end`, `outline.tool.hit/miss`, `outline.stale`, `retrieval.query`, `retrieval.provider.error`, `embedding.cache.hit/miss`) that include latency, cache hit counts, provider names, and `tokens_saved` deltas. Dashboards can subscribe via `TelemetrySink` or reuse `scripts/export_context_usage.py` to trend outline freshness, retrieval performance, and embedding cost spikes.
 - **Scope provenance metrics** – Context usage events now include per-turn scope aggregates (`scope_origin_counts`, `scope_missing_count`, `scope_total_length`). Use them to confirm chunk-first editing is enforced (chunk/explicit spans should dominate, `scope_missing_count` should remain zero) and to spot suspicious full-document rewrites when `scope_total_length` spikes.
 
 ## 3. Document version IDs & optimistic patching
@@ -393,6 +394,6 @@ Sprint 3 flips the context policy + trace compactor stack to General Availabili
 - **Document checks** – `ai/utils/document_checks.py` centralizes size + MIME heuristics (`document_size_bytes`, `is_huge_document`, `unsupported_format_reason`). Both the outline worker and retrieval tool reuse these helpers so every entry point agrees on what “unsupported” means.
 - **Huge doc throttling** – `OutlineBuilderWorker` switches to top-level headings once `is_huge_document()` trips, tags the cache entry with `huge_document_guardrail`, and `DocumentOutlineTool` relays those guardrails + byte counts to the controller along with guidance to run targeted scans.
 - **Unsupported / pending statuses** – Outline/retrieval tools now respond with `status="unsupported_format"` (reason string included) whenever binary files slip in, and they advertise `status="pending"` with a `retry_after_ms` when edits arrive faster than the worker debounce window.
-- **Offline embeddings** – `DocumentFindSectionsTool` reports `offline_mode=True` and `status="offline_fallback"` whenever the embedding provider is unavailable so calling agents can treat results as heuristic-only.
+- **Offline embeddings** – `DocumentFindTextTool` reports `offline_mode=True` and `status="offline_fallback"` whenever the embedding provider is unavailable so calling agents can treat results as heuristic-only.
 - **Cache validation** – Outline cache entries persist the originating `content_hash`; mismatches trigger `_schedule_rebuild`, ensuring corrupted files never hydrate stale outlines.
 - **Regression coverage** – Tests in `tests/test_outline_worker.py`, `tests/test_document_outline_tool.py`, `tests/test_retrieval_tool.py`, and `tests/test_memory_buffers.py` cover guardrails, unsupported flows, offline fallbacks, and metadata persistence.

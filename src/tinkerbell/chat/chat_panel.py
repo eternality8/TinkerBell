@@ -41,6 +41,7 @@ QAbstractItemView: Any = None
 Qt: Any = None
 QEvent: Any = None
 QColor: Any = None
+QSizePolicy: Any = None
 
 # Fallback Qt constants for environments where PySide6 isn't available during tests.
 FALLBACK_ENTER_KEYS = (0x01000004, 0x01000005)  # Qt.Key_Return, Qt.Key_Enter
@@ -64,6 +65,7 @@ try:  # pragma: no cover - PySide6 optional in CI
         QVBoxLayout as _QtVBoxLayout,
         QWidget as _QtWidget,
         QAbstractItemView as _QtAbstractItemView,
+        QSizePolicy as _QtSizePolicy,
     )
 
     QApplication = _QtApplication
@@ -82,6 +84,7 @@ try:  # pragma: no cover - PySide6 optional in CI
     Qt = _Qt
     QEvent = _QtEvent
     QColor = _QtColor
+    QSizePolicy = _QtSizePolicy
 except Exception:  # pragma: no cover - runtime fallback keeps dependencies optional
 
     class _StubQWidget:  # type: ignore[too-many-ancestors]
@@ -1383,8 +1386,14 @@ class ChatPanel(QWidgetBase):
         bubble = QFrame(container)
         bubble.setObjectName(f"tb-chat-bubble-{message.role}")
         bubble_layout = QVBoxLayout(bubble)
-        bubble_layout.setContentsMargins(12, 8, 12, 8)
+        bubble_layout.setContentsMargins(12, 4, 12, 4)
         bubble_layout.setSpacing(4)
+
+        if QSizePolicy is not None:
+            try:
+                bubble.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
 
         text_label = QLabel(message.content.strip() or "\u200b", bubble)
         text_label.setWordWrap(True)
@@ -1408,10 +1417,10 @@ class ChatPanel(QWidgetBase):
         if message.role == "user":
             bubble.setStyleSheet("background-color: #2d7dff; color: white; border-radius: 16px;")
             row_layout.addStretch(1)
-            row_layout.addWidget(bubble, 0)
+            row_layout.addWidget(bubble, 1)
         else:
             bubble.setStyleSheet("background-color: #2f333a; color: #f5f5f5; border-radius: 16px;")
-            row_layout.addWidget(bubble, 0)
+            row_layout.addWidget(bubble, 1)
             row_layout.addStretch(1)
 
         self._attach_bubble_context_menu(bubble, message)

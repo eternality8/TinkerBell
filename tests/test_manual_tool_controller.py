@@ -68,7 +68,7 @@ def test_render_retrieval_response_formats_details_and_matches() -> None:
 
     message = controller.render_retrieval_response(response, None, None)
 
-    assert "Find sections (ok) for Doc B" in message
+    assert "Find text (ok) for Doc B" in message
     assert "Matches:" in message
     assert "1. p1 · Intro" in message
     assert "… 1 additional match(es)." in message
@@ -94,7 +94,7 @@ def test_record_manual_tool_trace_attaches_metadata() -> None:
 
 def test_summarize_manual_input_prefers_known_fields() -> None:
     summary = ManualToolController.summarize_manual_input(
-        "document_find_sections",
+        "document_find_text",
         {"query": "foo", "document_id": "doc", "extra": 1},
     )
 

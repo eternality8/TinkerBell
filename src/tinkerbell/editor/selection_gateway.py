@@ -18,7 +18,7 @@ class SelectionSnapshot:
     selection_start: int
     selection_end: int
     length: int
-    line_offsets: tuple[int, ...]
+    line_start_offsets: tuple[int, ...]
 
 
 class SelectionSnapshotProvider(Protocol):
@@ -41,7 +41,7 @@ class SelectionGateway(SelectionSnapshotProvider):
         length = len(text)
         start, end = tab.editor.selection_span()
         start, end = self._clamp_range(start, end, length)
-        line_offsets = self._normalize_offsets(text)
+        line_start_offsets = self._normalize_offsets(text)
         return SelectionSnapshot(
             tab_id=tab.id,
             document_id=document.document_id,
@@ -49,7 +49,7 @@ class SelectionGateway(SelectionSnapshotProvider):
             selection_start=start,
             selection_end=end,
             length=length,
-            line_offsets=line_offsets,
+            line_start_offsets=line_start_offsets,
         )
 
     def _resolve_tab(self, tab_id: str | None):

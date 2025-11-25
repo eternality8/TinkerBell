@@ -4,10 +4,10 @@ These fixtures live under `test_data/phase3/` so you can reproduce the new outli
 
 ## Outline walkthrough (fast)
 
-- **`stacked_outline_demo.md`** – Deeply nested Markdown with pointer-friendly headings. Ideal for verifying that DocumentOutlineTool returns hierarchies, pointer IDs, and blurbs, and that DocumentFindSectionsTool can hydrate targeted sections before diffing.
+- **`stacked_outline_demo.md`** – Deeply nested Markdown with pointer-friendly headings. Ideal for verifying that DocumentOutlineTool returns hierarchies, pointer IDs, and blurbs, and that DocumentFindTextTool can hydrate targeted sections before diffing.
 - Suggested flow:
   1. Load the file, send “Summarize the architecture table by heading,” and confirm the agent calls DocumentOutlineTool.
-  2. Ask the agent to "find the telemetry TODO"; it should follow the outline pointer, call DocumentFindSectionsTool, and hydrate the referenced chunk before editing.
+  2. Ask the agent to "find the telemetry TODO"; it should follow the outline pointer, call DocumentFindTextTool, and hydrate the referenced chunk before editing.
   3. Approve the diff and note the guardrail-free trace.
 
 ## Guardrail + resilience scenarios

@@ -204,7 +204,7 @@ class SubagentRuntimeConfig:
     allowed_tools: tuple[str, ...] = (
         "document_snapshot",
         "document_outline",
-        "document_find_sections",
+        "document_find_text",
     )
     instructions_template: str = (
         "You are a focused editing subagent. Analyze only the provided chunk, summarize its intent, "
@@ -236,7 +236,7 @@ class SubagentRuntimeConfig:
         self.allowed_tools = allowed or (
             "document_snapshot",
             "document_outline",
-            "document_find_sections",
+            "document_find_text",
         )
         self.plot_scaffolding_enabled = bool(self.plot_scaffolding_enabled)
         return self

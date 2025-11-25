@@ -56,9 +56,12 @@ class OutlineFreshnessRule:
 
     def evaluate(self, analysis_input: AnalysisInput, context: RuleContext) -> AnalysisFinding | None:
         age = analysis_input.outline_age_seconds
+        has_outline = bool(analysis_input.outline_digest or analysis_input.outline_version_id)
         if age is None:
-            warning = _warning("outline.missing", "Outline has never been generated for this document")
-            return AnalysisFinding(trace="outline:missing", warnings=(warning,), must_refresh_outline=True)
+            if not has_outline:
+                warning = _warning("outline.missing", "Outline has never been generated for this document")
+                return AnalysisFinding(trace="outline:missing", warnings=(warning,), must_refresh_outline=True)
+            return AnalysisFinding(trace="outline:present", must_refresh_outline=False)
         if age > context.outline_stale_after_seconds:
             warning = _warning("outline.stale", f"Outline is {int(age)}s old; refresh recommended")
             return AnalysisFinding(

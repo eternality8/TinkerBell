@@ -23,7 +23,7 @@
 - rehydrate pointer IDs via `DocumentSnapshot`
 
 ### 2.2 Retrieval loop
-1. Call `DocumentFindSectionsTool` with a natural-language query
+1. Call `DocumentFindTextTool` with a natural-language query
 2. If `offline_mode=true`, warn the user and rehydrate snippets manually
 3. Track which outline node each pointer maps back to
 

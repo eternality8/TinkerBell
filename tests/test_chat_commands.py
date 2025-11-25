@@ -88,7 +88,15 @@ def test_validate_rejects_whitespace_content() -> None:
     result = validate_directive({"action": "insert", "content": "   "})
 
     assert not result.ok
-    assert "content must not be empty" in result.message
+    assert "include non-whitespace" in result.message
+
+
+def test_validate_accepts_empty_string_deletion() -> None:
+    payload = {"action": "replace", "content": "", "target_range": [0, 4]}
+
+    result = validate_directive(payload)
+
+    assert result.ok
 
 
 def test_validate_rejects_bad_target_range_type() -> None:

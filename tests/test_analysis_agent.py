@@ -37,6 +37,14 @@ def test_outline_staleness_sets_flag_and_warning() -> None:
     assert "outline.stale" in warning_codes or "outline.missing" in warning_codes
 
 
+def test_outline_digest_avoids_missing_warning() -> None:
+    agent = AnalysisAgent()
+    advice = agent.analyze(_make_input(outline_age_seconds=None, outline_digest="abc123"))
+    assert advice.must_refresh_outline is False
+    warning_codes = {warning.code for warning in advice.warnings}
+    assert "outline.missing" not in warning_codes
+
+
 def test_cache_hit_short_circuits_analysis() -> None:
     agent = AnalysisAgent()
     analysis_input = _make_input(document_chars=10_000, span_end=500)

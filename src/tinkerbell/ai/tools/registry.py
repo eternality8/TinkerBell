@@ -14,7 +14,7 @@ from .diff_builder import DiffBuilderTool
 from .document_apply_patch import DocumentApplyPatchTool
 from .document_chunk import DocumentChunkTool
 from .document_edit import DocumentEditTool
-from .document_find_sections import DocumentFindSectionsTool
+from .document_find_text import DocumentFindTextTool
 from .document_outline import DocumentOutlineTool
 from .document_plot_state import DocumentPlotStateTool, PlotOutlineTool
 from .document_snapshot import DocumentSnapshotTool
@@ -59,7 +59,7 @@ class ToolRegistryContext:
     plot_scaffolding_enabled: bool = False
     plot_state_store_resolver: Callable[[], DocumentPlotStateStore | None] | None = None
     ensure_outline_tool: Callable[[], DocumentOutlineTool | None] | None = None
-    ensure_find_sections_tool: Callable[[], DocumentFindSectionsTool | None] | None = None
+    ensure_find_text_tool: Callable[[], DocumentFindTextTool | None] | None = None
     ensure_plot_state_tool: Callable[[], PlotOutlineTool | None] | None = None
     ensure_plot_outline_tool: Callable[[], PlotOutlineTool | None] | None = None
     ensure_plot_state_update_tool: Callable[[], PlotStateUpdateTool | None] | None = None
@@ -732,20 +732,20 @@ def register_phase3_tools(
             else:
                 registered.append("document_outline")
 
-    find_sections_factory = context.ensure_find_sections_tool
-    if find_sections_factory is not None:
+    find_text_factory = context.ensure_find_text_tool
+    if find_text_factory is not None:
         try:
-            find_sections_tool = find_sections_factory()
+            find_text_tool = find_text_factory()
         except Exception as exc:
             if failures is not None:
-                failures.append(ToolRegistrationFailure(name="document_find_sections", error=exc))
-            LOGGER.warning("Failed to build document_find_sections tool: %s", exc, exc_info=True)
-            find_sections_tool = None
-        if find_sections_tool is not None:
+                failures.append(ToolRegistrationFailure(name="document_find_text", error=exc))
+            LOGGER.warning("Failed to build document_find_text tool: %s", exc, exc_info=True)
+            find_text_tool = None
+        if find_text_tool is not None:
             try:
                 register(
-                    "document_find_sections",
-                    find_sections_tool,
+                    "document_find_text",
+                    find_text_tool,
                     description=(
                         "Return the best-matching document chunks for a natural language query using embeddings or fallback heuristics."
                     ),
@@ -788,10 +788,10 @@ def register_phase3_tools(
                 )
             except Exception as exc:
                 if failures is not None:
-                    failures.append(ToolRegistrationFailure(name="document_find_sections", error=exc))
-                LOGGER.warning("Failed to register document_find_sections: %s", exc, exc_info=True)
+                    failures.append(ToolRegistrationFailure(name="document_find_text", error=exc))
+                LOGGER.warning("Failed to register document_find_text: %s", exc, exc_info=True)
             else:
-                registered.append("document_find_sections")
+                registered.append("document_find_text")
 
     return registered
 
@@ -804,7 +804,7 @@ def unregister_phase3_tools(controller: Any) -> None:
     unregister = getattr(controller, "unregister_tool", None)
     if not callable(unregister):
         return
-    for name in ("document_outline", "document_find_sections"):
+    for name in ("document_outline", "document_find_text"):
         try:
             unregister(name)
         except Exception:  # pragma: no cover - defensive

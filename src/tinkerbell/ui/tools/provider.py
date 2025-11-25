@@ -10,7 +10,7 @@ from ...ai.memory.character_map import CharacterMapStore
 from ...ai.tools.character_edit_planner import CharacterEditPlannerTool
 from ...ai.tools.character_map import CharacterMapTool
 from ...ai.tools.document_apply_patch import DocumentApplyPatchTool
-from ...ai.tools.document_find_sections import DocumentFindSectionsTool
+from ...ai.tools.document_find_text import DocumentFindTextTool
 from ...ai.tools.document_outline import DocumentOutlineTool
 from ...ai.tools.document_plot_state import PlotOutlineTool, DocumentPlotStateTool
 from ...ai.tools.plot_state_update import PlotStateUpdateTool
@@ -65,7 +65,7 @@ class ToolProvider:
     plot_scaffolding_enabled: bool = False
 
     _outline_tool: DocumentOutlineTool | None = field(default=None, init=False)
-    _find_sections_tool: DocumentFindSectionsTool | None = field(default=None, init=False)
+    _find_text_tool: DocumentFindTextTool | None = field(default=None, init=False)
     _plot_outline_tool: PlotOutlineTool | None = field(default=None, init=False)
     _plot_state_update_tool: PlotStateUpdateTool | None = field(default=None, init=False)
     _character_map_tool: CharacterMapTool | None = field(default=None, init=False)
@@ -88,7 +88,7 @@ class ToolProvider:
             plot_scaffolding_enabled=self.plot_scaffolding_enabled,
              plot_state_store_resolver=self.plot_state_store_resolver,
             ensure_outline_tool=self.ensure_outline_tool,
-            ensure_find_sections_tool=self.ensure_find_sections_tool,
+            ensure_find_text_tool=self.ensure_find_text_tool,
             ensure_plot_state_tool=self.ensure_plot_state_tool,
             ensure_plot_outline_tool=self.ensure_plot_outline_tool,
             ensure_plot_state_update_tool=self.ensure_plot_state_update_tool,
@@ -116,7 +116,7 @@ class ToolProvider:
 
     def reset_outline_tools(self) -> None:
         self._outline_tool = None
-        self._find_sections_tool = None
+        self._find_text_tool = None
 
     def reset_plot_state_tool(self) -> None:
         self._plot_outline_tool = None
@@ -161,24 +161,24 @@ class ToolProvider:
         self._outline_tool = tool
         return tool
 
-    def ensure_find_sections_tool(self) -> DocumentFindSectionsTool | None:
+    def ensure_find_text_tool(self) -> DocumentFindTextTool | None:
         if not self.phase3_outline_enabled:
             return None
-        if self._find_sections_tool is not None:
-            return self._find_sections_tool
+        if self._find_text_tool is not None:
+            return self._find_text_tool
 
         try:
-            tool = DocumentFindSectionsTool(
+            tool = DocumentFindTextTool(
                 embedding_index_resolver=self.embedding_index_resolver,
                 document_lookup=self.document_lookup,
                 active_document_provider=self.active_document_provider,
                 outline_memory=self.outline_memory_resolver,
             )
         except Exception:  # pragma: no cover - defensive guard
-            LOGGER.debug("Unable to initialize DocumentFindSectionsTool", exc_info=True)
+            LOGGER.debug("Unable to initialize DocumentFindTextTool", exc_info=True)
             return None
 
-        self._find_sections_tool = tool
+        self._find_text_tool = tool
         return tool
 
     def ensure_plot_outline_tool(self) -> PlotOutlineTool | None:

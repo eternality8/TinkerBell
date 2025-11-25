@@ -1616,7 +1616,7 @@ def test_manual_outline_command_disabled_without_flag():
     assert window.last_status_message == "Outline disabled"
 
 
-def test_manual_find_sections_command_uses_tool():
+def test_manual_find_text_command_uses_tool():
     window = _make_window(settings=Settings(phase3_outline_tools=True))
     document = window.editor_widget.to_document()
 
@@ -1642,7 +1642,7 @@ def test_manual_find_sections_command_uses_tool():
             }
 
     stub_tool = _StubFindTool()
-    window._find_sections_tool = stub_tool  # type: ignore[assignment]
+    window._find_text_tool = stub_tool  # type: ignore[assignment]
 
     panel = window.chat_panel
     panel.set_composer_text("/find introduction")
@@ -1650,12 +1650,12 @@ def test_manual_find_sections_command_uses_tool():
 
     assert stub_tool.calls and stub_tool.calls[0]["query"] == "introduction"
     response = panel.history()[-1].content
-    assert "Find sections" in response
+    assert "Find text" in response
     assert "introduction" in response.lower()
     assert "Example paragraph" in response
 
 
-def test_manual_find_sections_command_disabled_without_flag():
+def test_manual_find_text_command_disabled_without_flag():
     window = _make_window(settings=Settings(phase3_outline_tools=False))
     panel = window.chat_panel
     panel.set_composer_text("/find intro")

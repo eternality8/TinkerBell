@@ -99,3 +99,29 @@ def test_document_snapshot_tool_respects_explicit_window_and_include_text_flag()
     window_arg = provider.calls[-1].get("window")
     assert window_arg == "document"
     assert provider.calls[-1].get("include_text") is False
+
+
+def test_document_snapshot_tool_accepts_positional_request_mapping():
+    provider = _SnapshotProviderStub()
+    tool = DocumentSnapshotTool(provider=provider)
+
+    tool.run({"window": {"kind": "range", "start": 0, "end": 360}, "document_id": "doc-alt"})
+
+    call = provider.calls[-1]
+    assert call["window"]["kind"] == "range"
+    assert call["window"]["start"] == 0
+    assert call["window"]["end"] == 360
+    assert call.get("tab_id") == "doc-alt"
+
+
+def test_document_snapshot_tool_parses_string_request_payload():
+    provider = _SnapshotProviderStub()
+    tool = DocumentSnapshotTool(provider=provider)
+
+    request = "{'window': {'kind': 'range', 'start': 10, 'end': 20}, 'include_text': False}"
+    tool.run(request)
+
+    call = provider.calls[-1]
+    assert call["window"]["start"] == 10
+    assert call["window"]["end"] == 20
+    assert call["include_text"] is False

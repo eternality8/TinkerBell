@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import re
+import logging
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import List, Optional, Sequence, Tuple
+
+_LOGGER = logging.getLogger(__name__)
+
 
 _PATCH_HEADER_RE = re.compile(
     r"@@\s+-?(?P<old_start>\d+)(?:,(?P<old_len>\d+))?\s+\+(?P<new_start>\d+)(?:,(?P<new_len>\d+))?\s+@@"
@@ -174,6 +178,14 @@ def apply_streamed_ranges(original_text: str, ranges: Sequence[RangePatch]) -> P
 
 def _assert_line_matches(entry: _HunkLine, lines: Sequence[str], index: int, header: str) -> None:
     if index >= len(lines):
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "Patch context overflow (expected=%r, index=%s, len=%s, hunk=%s)",
+                entry.text,
+                index,
+                len(lines),
+                header,
+            )
         raise PatchApplyError(
             "Patch context lines exceed document length",
             reason="context_overflow",
@@ -183,6 +195,14 @@ def _assert_line_matches(entry: _HunkLine, lines: Sequence[str], index: int, hea
         )
     probe = lines[index]
     if probe != entry.text:
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "Patch context mismatch (expected=%r, actual=%r, index=%s, hunk=%s)",
+                entry.text,
+                probe,
+                index,
+                header,
+            )
         raise PatchApplyError(
             "Context mismatch while applying patch",
             reason="context_mismatch",
@@ -257,6 +277,19 @@ def _locate_hunk(lines: Sequence[str], hunk: _Hunk, start_index: int) -> int:
 
     if match_index is None:
         preview = old_lines[0] if old_lines else None
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            head_sample = lines[: min(len(lines), 5)]
+            _LOGGER.debug(
+                "Hunk context not found (header=%s, preview=%r, anchor=%s, start=%s, head=%r, old_lines=%r, doc_len=%s, context_len=%s)",
+                hunk.header,
+                preview,
+                anchor,
+                start_index,
+                head_sample,
+                old_lines,
+                len(lines),
+                len(old_lines),
+            )
         if _sequence_occurs_multiple_times(lines, old_lines):
             raise PatchApplyError(
                 "Context matched multiple locations; provide explicit range/anchors before retrying",
@@ -276,21 +309,9 @@ def _locate_hunk(lines: Sequence[str], hunk: _Hunk, start_index: int) -> int:
 
 def _hunk_old_lines(hunk: _Hunk) -> Tuple[str, ...]:
     lines: list[str] = []
-    blank_context_active = False
     for entry in hunk.lines:
-        if entry.op == "-":
+        if entry.op in {"-", " "}:
             lines.append(entry.text)
-            blank_context_active = False
-        elif entry.op == " ":
-            if entry.text == "":
-                if not blank_context_active:
-                    lines.append("")
-                    blank_context_active = True
-            else:
-                lines.append(entry.text)
-                blank_context_active = False
-        else:
-            blank_context_active = False
     if any(segment != "" for segment in lines):
         return tuple(lines)
     return tuple()
@@ -392,6 +413,8 @@ def _parse_hunk(lines: Sequence[str], start_index: int) -> tuple[_Hunk, int, boo
         if op not in {" ", "+", "-"}:
             break
         text = line[1:]
+        if text.endswith("\r") or text.endswith("\n"):
+            text = text.rstrip("\r\n")
         hunk_lines.append(_HunkLine(op=op, text=text))
         last_op = op
         index += 1

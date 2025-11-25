@@ -20,7 +20,7 @@ class SelectionRangeTool:
     def run(self, *, tab_id: str | None = None) -> dict[str, int | str]:
         snapshot = self.gateway.capture(tab_id=tab_id)
         selection = self._clamp_range(snapshot.selection_start, snapshot.selection_end, snapshot.length)
-        offsets = self._normalize_offsets(snapshot.line_offsets, snapshot.length)
+        offsets = self._normalize_offsets(snapshot.line_start_offsets, snapshot.length)
         start_line = self._line_for_offset(selection[0], offsets)
         end_anchor = selection[1] - 1 if selection[1] > selection[0] else selection[1]
         end_line = self._line_for_offset(max(end_anchor, selection[0]), offsets)

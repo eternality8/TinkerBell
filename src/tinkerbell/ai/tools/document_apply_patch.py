@@ -374,7 +374,7 @@ class DocumentApplyPatchTool:
             end = max(0, min(text_range.end, length))
             if end < start:
                 start, end = end, start
-            offsets = self._resolve_line_offsets(snapshot, document_text)
+            offsets = self._resolve_line_start_offsets(snapshot, document_text)
             resolved_span = self._line_span_from_offsets((start, end), offsets)
             self._emit_legacy_range_event(
                 snapshot=snapshot,
@@ -386,7 +386,8 @@ class DocumentApplyPatchTool:
             resolved_range = (start, end)
         if resolved_span is not None:
             if offsets is None:
-                offsets = self._resolve_line_offsets(snapshot, document_text)
+                offsets = self._resolve_line_start_offsets(snapshot, document_text)
+            self._validate_line_span_bounds(resolved_span, offsets, snapshot)
             if resolved_range is None:
                 resolved_range = self._line_span_to_offsets(resolved_span, offsets)
         if resolved_range is None:
@@ -394,7 +395,7 @@ class DocumentApplyPatchTool:
             resolved_range = context_range
             if resolved_span is None:
                 if offsets is None:
-                    offsets = self._resolve_line_offsets(snapshot, document_text)
+                    offsets = self._resolve_line_start_offsets(snapshot, document_text)
                 if offsets:
                     resolved_span = self._line_span_from_offsets(context_range, offsets)
         return resolved_span, resolved_range
@@ -424,8 +425,10 @@ class DocumentApplyPatchTool:
             start, end = end, start
         return start, end
 
-    def _resolve_line_offsets(self, snapshot: Mapping[str, Any], text: str) -> Sequence[int]:
-        raw = snapshot.get("line_offsets")
+    def _resolve_line_start_offsets(self, snapshot: Mapping[str, Any], text: str) -> Sequence[int]:
+        raw = snapshot.get("line_start_offsets")
+        if raw is None:
+            raw = snapshot.get("line_offsets")
         offsets: list[int] = []
         if isinstance(raw, Sequence):
             for value in raw:
@@ -438,7 +441,7 @@ class DocumentApplyPatchTool:
                     cursor = offsets[-1]
                 offsets.append(cursor)
         if not offsets:
-            offsets = self._build_line_offsets(text)
+            offsets = self._build_line_start_offsets(text)
         if not offsets:
             offsets = [0]
         if offsets[0] != 0:
@@ -449,6 +452,32 @@ class DocumentApplyPatchTool:
         elif offsets[-1] > length:
             offsets[-1] = length
         return offsets
+
+    def _validate_line_span_bounds(
+        self,
+        span: LineRange,
+        offsets: Sequence[int],
+        snapshot: Mapping[str, Any],
+    ) -> None:
+        if not offsets:
+            return
+        max_index = len(offsets) - 2
+        if max_index < 0:
+            max_index = 0
+        if span.start_line <= max_index and span.end_line <= max_index:
+            return
+        line_count = max_index + 1
+        doc_id = snapshot.get("document_id")
+        parts = [
+            "target_span lines",
+            f"[{span.start_line}, {span.end_line}]",
+            "exceed this document's line count",
+            f"(line count {line_count}, max index {max_index}).",
+            "Capture a fresh DocumentSnapshot and retry with valid bounds.",
+        ]
+        if doc_id:
+            parts.insert(0, f"Document '{doc_id}':")
+        raise ValueError(" ".join(parts))
 
     def _line_span_from_offsets(self, bounds: tuple[int, int], offsets: Sequence[int]) -> LineRange:
         start, end = bounds
@@ -478,7 +507,7 @@ class DocumentApplyPatchTool:
         return max(0, index)
 
     @staticmethod
-    def _build_line_offsets(text: str) -> list[int]:
+    def _build_line_start_offsets(text: str) -> list[int]:
         offsets = [0]
         if not text:
             return offsets

@@ -104,9 +104,9 @@ class ManualToolController:
         doc_label = self.document_label_resolver(response.get("document_id"), requested_document_label)
         query_text = response.get("query") or (requested_query or "")
         if query_text:
-            header = f"Find sections ({status}) for {doc_label} — \"{query_text}\""
+            header = f"Find text ({status}) for {doc_label} — \"{query_text}\""
         else:
-            header = f"Find sections ({status}) for {doc_label}."
+            header = f"Find text ({status}) for {doc_label}."
         parts = [header]
 
         details: list[str] = []
@@ -130,7 +130,7 @@ class ManualToolController:
             if extra:
                 parts.append(f"… {extra} additional match(es).")
         else:
-            parts.append("No matching sections were found.")
+            parts.append("No matching spans were found.")
 
         return "\n".join(parts)
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import json
 import logging
 from copy import deepcopy
 from dataclasses import dataclass
@@ -47,6 +49,7 @@ class DocumentSnapshotTool:
 
     def run(
         self,
+        request: Mapping[str, Any] | str | None = None,
         *,
         delta_only: bool = False,
         include_diff: bool = True,
@@ -58,6 +61,26 @@ class DocumentSnapshotTool:
         max_tokens: int | None = None,
         include_text: bool = True,
     ) -> dict:
+        request_kwargs = self._coerce_request_mapping(request)
+        if request_kwargs:
+            delta_only = request_kwargs.pop("delta_only", delta_only)
+            include_diff = request_kwargs.pop("include_diff", include_diff)
+            source_tab_ids = request_kwargs.pop("source_tab_ids", source_tab_ids)
+            include_open_documents = request_kwargs.pop("include_open_documents", include_open_documents)
+            window = request_kwargs.pop("window", window)
+            chunk_profile = request_kwargs.pop("chunk_profile", chunk_profile)
+            max_tokens = request_kwargs.pop("max_tokens", max_tokens)
+            include_text = request_kwargs.pop("include_text", include_text)
+            tab_id = request_kwargs.pop("tab_id", tab_id)
+            document_id = request_kwargs.pop("document_id", None)
+            alias = str(document_id).strip() if document_id is not None else ""
+            if (tab_id is None or not str(tab_id).strip()) and alias:
+                tab_id = alias
+            if request_kwargs:
+                LOGGER.debug(
+                    "DocumentSnapshotTool ignoring unsupported request keys: %s",
+                    ", ".join(sorted(request_kwargs.keys())),
+                )
         resolved_window = self._resolve_window(window)
         snapshot = self._build_snapshot(
             delta_only=delta_only,
@@ -241,4 +264,36 @@ class DocumentSnapshotTool:
         if isinstance(window, Mapping):
             return dict(window)
         return window
+
+    def _coerce_request_mapping(self, request: Mapping[str, Any] | str | None) -> dict[str, Any]:
+        if request is None:
+            return {}
+        if isinstance(request, Mapping):
+            return dict(request)
+        if isinstance(request, str):
+            text = request.strip()
+            if not text:
+                return {}
+            for parser in (self._parse_json, self._parse_literal):
+                parsed = parser(text)
+                if isinstance(parsed, Mapping):
+                    return dict(parsed)
+            LOGGER.debug("DocumentSnapshotTool received unparseable request payload: %s", text)
+            return {}
+        LOGGER.debug("DocumentSnapshotTool received unsupported request payload type: %s", type(request).__name__)
+        return {}
+
+    @staticmethod
+    def _parse_json(text: str) -> Any:
+        try:
+            return json.loads(text)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_literal(text: str) -> Any:
+        try:
+            return ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            return None
 

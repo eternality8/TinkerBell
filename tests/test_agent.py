@@ -1009,7 +1009,7 @@ def test_ai_controller_injects_retrieval_guardrail_hint(sample_snapshot):
     first_turn = [
         AIStreamEvent(
             type="tool_calls.function.arguments.done",
-            tool_name="document_find_sections",
+            tool_name="document_find_text",
             tool_index=0,
             tool_arguments='{"query": "intro"}',
             parsed={"query": "intro"},
@@ -1031,7 +1031,7 @@ def test_ai_controller_injects_retrieval_guardrail_hint(sample_snapshot):
                 "pointers": [],
             }
 
-    controller.register_tool("document_find_sections", _RetrievalTool())
+    controller.register_tool("document_find_text", _RetrievalTool())
 
     async def run() -> dict:
         return await controller.run_chat("find intro", sample_snapshot)
@@ -1046,7 +1046,7 @@ def test_ai_controller_injects_retrieval_guardrail_hint(sample_snapshot):
         if msg.get("role") == "system" and isinstance(msg.get("content"), str) and "Guardrail hint" in msg.get("content", "")
     ]
     assert hint_messages, second_messages
-    assert any("DocumentFindSectionsTool" in msg["content"] for msg in hint_messages)
+    assert any("DocumentFindTextTool" in msg["content"] for msg in hint_messages)
     assert any("embeddings" in msg["content"].lower() for msg in hint_messages)
 
 
@@ -1194,7 +1194,7 @@ def test_outline_routing_hint_promotes_retrieval_requests(sample_snapshot):
     hint = controller._outline_routing_hint("Can you find section about safety policies?", snapshot)
 
     assert hint is not None
-    assert "DocumentFindSectionsTool" in hint
+    assert "DocumentFindTextTool" in hint
 
 
 def test_outline_routing_hint_tracks_outline_digest(sample_snapshot):
@@ -1414,6 +1414,52 @@ def test_plot_loop_allows_edit_after_outline_and_requires_update(sample_snapshot
 
     update_trace = [entry for entry in result["tool_calls"] if entry["name"] == "plot_state_update"]
     assert update_trace and json.loads(update_trace[0]["result"])["status"] == "ok"
+
+
+def test_plot_loop_outline_completion_prompts_snapshot(sample_snapshot):
+    edit_turn = [_build_tool_call_event("document_edit", {"action": "insert", "position": 0, "content": "Blocked"})]
+    outline_turn = [_build_tool_call_event("plot_outline", {})]
+    final_turn = [AIStreamEvent(type="content.done", content="done")]
+    stub_client = _StubClient([edit_turn, outline_turn, final_turn])
+    config = SubagentRuntimeConfig(enabled=False, plot_scaffolding_enabled=True)
+    controller = AIController(client=cast(AIClient, stub_client), subagent_config=config)
+
+    class _EditTool:
+        def run(self, action: str, position: int, content: str) -> dict[str, Any]:
+            raise AssertionError("document_edit should be guardrail-blocked before outline runs")
+
+    class _OutlineTool:
+        def run(self) -> dict[str, Any]:
+            return {"status": "ok", "document_id": "doc-plot-reminder"}
+
+    controller.register_tools(
+        {
+            "document_edit": _EditTool(),
+            "plot_outline": _OutlineTool(),
+        }
+    )
+
+    snapshot = dict(sample_snapshot)
+    snapshot["document_id"] = "doc-plot-reminder"
+    long_text = "Long document " * 200
+    snapshot["text"] = long_text
+    snapshot["length"] = len(long_text)
+
+    result = asyncio.run(controller.run_chat("remind snapshot", snapshot))
+
+    blocked_call = result["tool_calls"][0]
+    assert blocked_call["name"] == "document_edit"
+    raw_result = blocked_call.get("raw_result")
+    assert isinstance(raw_result, Mapping)
+    assert raw_result.get("status") == "plot_loop_blocked"
+
+    # Third model turn (index 2) should include the reminder to grab a fresh DocumentSnapshot.
+    reminder_messages = [
+        entry
+        for entry in stub_client.calls[2]["messages"]
+        if entry.get("role") == "system" and "DocumentSnapshot" in str(entry.get("content", ""))
+    ]
+    assert reminder_messages
 
 
 def test_plot_loop_skips_guard_for_short_document(sample_snapshot):

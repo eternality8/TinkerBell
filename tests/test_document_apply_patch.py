@@ -26,7 +26,7 @@ class _StreamingBridgeStub:
             "length": len(text),
             "window": {"start": 0, "end": len(text)},
             "text_range": {"start": 0, "end": len(text)},
-            "line_offsets": self._build_line_offsets(text),
+            "line_start_offsets": self._build_line_start_offsets(text),
         }
         self.calls: list[dict[str, Any]] = []
         self.snapshot_requests: list[dict[str, Any]] = []
@@ -74,7 +74,7 @@ class _StreamingBridgeStub:
         doc_text = text if isinstance(text, str) else ""
         length = len(doc_text)
         snapshot["length"] = length
-        snapshot["line_offsets"] = self._build_line_offsets(self._text)
+        snapshot["line_start_offsets"] = self._build_line_start_offsets(self._text)
         if isinstance(window, Mapping):
             start = max(0, min(int(window.get("start", 0)), length))
             end = max(start, min(int(window.get("end", length)), length))
@@ -90,7 +90,7 @@ class _StreamingBridgeStub:
         return snapshot
 
     @staticmethod
-    def _build_line_offsets(text: str) -> list[int]:
+    def _build_line_start_offsets(text: str) -> list[int]:
         offsets = [0]
         cursor = 0
         for segment in text.splitlines(keepends=True):
@@ -216,6 +216,19 @@ def test_document_apply_patch_accepts_target_span():
         "end": len("Alpha\nBeta\n"),
     }
     assert range_payload["scope"]["origin"] == "explicit_span"
+
+
+def test_document_apply_patch_rejects_out_of_bounds_line_span():
+    tool, bridge = _patch_tool("Alpha\nBeta\n")
+
+    with pytest.raises(ValueError, match="line count"):
+        _run_with_meta(
+            tool,
+            content="Gamma\n",
+            target_span={"start_line": 10, "end_line": 12},
+        )
+
+    assert bridge.calls == []
 
 
 def test_document_apply_patch_marks_document_scope_metadata():

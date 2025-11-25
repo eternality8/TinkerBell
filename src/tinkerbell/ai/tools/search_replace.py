@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import re
+import logging
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, Mapping, Protocol, Sequence
 
@@ -51,6 +52,7 @@ class SearchReplaceTool:
     default_max_replacements: int = 200
     diff_builder: DiffBuilderTool = field(default_factory=DiffBuilderTool)
     summarizable: ClassVar[bool] = False
+    _logger: ClassVar[logging.Logger] = logging.getLogger(__name__)
 
     def __post_init__(self) -> None:
         if self.default_max_replacements <= 0:
@@ -116,6 +118,14 @@ class SearchReplaceTool:
                 updated_document,
                 filename=self._resolve_document_label(snapshot),
                 context=5,
+            )
+            self._log_diff_preview(
+                diff_text,
+                replacements=replacements,
+                scope=active_scope,
+                limited=limited,
+                document_id=str(snapshot.get("document_id")) if snapshot.get("document_id") else None,
+                document_version=self._resolve_document_version(snapshot, directive_version) if directive_version else None,
             )
             patch_payload: dict[str, Any] = {
                 "action": "patch",
@@ -264,6 +274,31 @@ class SearchReplaceTool:
         if isinstance(token, str) and token.strip():
             return token.strip()
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+    def _log_diff_preview(
+        self,
+        diff_text: str,
+        *,
+        replacements: int,
+        scope: str,
+        limited: bool,
+        document_id: str | None,
+        document_version: str | None,
+    ) -> None:
+        logger = self._logger
+        if not diff_text or not logger.isEnabledFor(logging.DEBUG):
+            return
+        lines = diff_text.splitlines()
+        excerpt = "\n".join(lines[: min(20, len(lines))])
+        logger.debug(
+            "SearchReplace diff preview (doc_id=%s, version=%s, scope=%s, replacements=%s, limited=%s):\n%s",
+            document_id,
+            document_version,
+            scope,
+            replacements,
+            limited,
+            excerpt,
+        )
 
     @staticmethod
     def _resolve_target_range(
