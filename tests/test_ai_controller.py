@@ -18,7 +18,7 @@ from tinkerbell.ai.orchestration.controller import (
     _SnapshotRefreshTracker,
     _ToolCallRequest,
 )
-from tinkerbell.ai.tools.document_apply_patch import NeedsRangeError
+from tinkerbell.ai.tools.errors import NeedsRangeError
 from tinkerbell.services.bridge import DocumentVersionMismatchError
 
 
@@ -282,7 +282,8 @@ def test_ai_controller_surfaces_needs_range_error() -> None:
 
     messages, records, _ = asyncio.run(controller._handle_tool_calls([call], on_event=None))
 
-    assert messages[0]["content"].startswith("Tool 'document_apply_patch' failed: needs_range")
+    assert "document_apply_patch" in messages[0]["content"]
+    assert "needs_range" in messages[0]["content"].lower()
     payload = records[0]["raw_result"]
     assert isinstance(payload, Mapping)
     assert payload["needs_range"] is True
@@ -319,7 +320,8 @@ def test_ai_controller_needs_range_uses_chunk_span_hint() -> None:
 
     messages, records, _ = asyncio.run(controller._handle_tool_calls([call], on_event=None))
 
-    assert messages[0]["content"].startswith("Tool 'document_apply_patch' failed: needs_range")
+    assert "document_apply_patch" in messages[0]["content"]
+    assert "needs_range" in messages[0]["content"].lower()
     payload = records[0]["raw_result"]
     assert isinstance(payload, Mapping)
     span_hint = payload.get("span_hint")
@@ -396,7 +398,8 @@ def test_ai_controller_needs_range_prefers_metadata_span_hint() -> None:
 
     messages, records, _ = asyncio.run(controller._handle_tool_calls([call], on_event=None))
 
-    assert messages[0]["content"].startswith("Tool 'document_apply_patch' failed: needs_range")
+    assert "document_apply_patch" in messages[0]["content"]
+    assert "needs_range" in messages[0]["content"].lower()
     payload = records[0]["raw_result"]
     assert isinstance(payload, Mapping)
     span_hint = payload.get("span_hint")

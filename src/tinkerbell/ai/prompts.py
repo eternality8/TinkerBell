@@ -43,8 +43,8 @@ def planner_instructions() -> str:
     """
 
     return (
-        "1. **Snapshot first**: Call document_snapshot to get `snapshot_token` and `suggested_span`.\n"
-        "2. **Edit**: Pass `snapshot_token`, `target_span` (from suggested_span), and `content` to document_apply_patch.\n"
+        "1. **Snapshot first**: Call read_document to get document content and version.\n"
+        "2. **Edit**: Use replace_lines with `start_line`, `end_line`, and `content` for targeted edits.\n"
         "3. **Refresh**: Get a fresh snapshot before making another change.\n"
         "4. **On error**: Refresh snapshot and retry once."
     )
@@ -58,9 +58,9 @@ def outline_retrieval_instructions() -> str:
     """
 
     return (
-        "- **document_outline**: Returns document structure (headings/sections).\n"
-        "- **document_find_text**: Locates text and returns `line_span`. Use when text is outside your snapshot.\n"
-        "- When results show `confidence=\"low\"`, verify with document_snapshot before editing."
+        "- **get_outline**: Returns document structure (headings/sections).\n"
+        "- **search_document**: Locates text and returns `line_span`. Use when text is outside your snapshot.\n"
+        "- When results show `confidence=\"low\"`, verify with read_document before editing."
     )
 
 
@@ -69,26 +69,26 @@ def tool_use_instructions() -> str:
 
     return (
         "## Edit Recipe\n"
-        "1. **document_snapshot** → get `snapshot_token` and `suggested_span`\n"
+        "1. **read_document** → get document content and version token\n"
         "2. Choose the right edit tool:\n"
-        "   - **document_insert** → add NEW content between existing lines (use `after_line`)\n"
-        "   - **document_apply_patch** → REPLACE existing content with new content (use `target_span`)\n"
-        "   - **document_replace_all** → rewrite the ENTIRE document\n"
+        "   - **insert_lines** → add NEW content between existing lines (use `after_line`)\n"
+        "   - **replace_lines** → REPLACE existing content with new content (use `start_line`, `end_line`)\n"
+        "   - **write_document** → rewrite the ENTIRE document\n"
         "3. Repeat from step 1 for additional edits (always refresh snapshot first)\n\n"
         "## Choosing Insert vs Replace\n"
-        "- **INSERT** (`document_insert`): Adding a new paragraph, section, or content WITHOUT touching existing text\n"
-        "  - Example: \"Add a paragraph after the introduction\" → use `document_insert` with `after_line`\n"
-        "- **REPLACE** (`document_apply_patch`): Changing, rewriting, or removing existing content\n"
-        "  - Example: \"Rewrite this paragraph\" → use `document_apply_patch` with `target_span`\n\n"
+        "- **INSERT** (`insert_lines`): Adding a new paragraph, section, or content WITHOUT touching existing text\n"
+        "  - Example: \"Add a paragraph after the introduction\" → use `insert_lines` with `after_line`\n"
+        "- **REPLACE** (`replace_lines`): Changing, rewriting, or removing existing content\n"
+        "  - Example: \"Rewrite this paragraph\" → use `replace_lines` with `start_line`, `end_line`\n\n"
         "## Finding Text\n"
-        "- Use **document_find_text** when your target text is outside the current snapshot window\n"
+        "- Use **search_document** when your target text is outside the current snapshot window\n"
         "- If results show `confidence=\"low\"` or `status=\"offline_fallback\"`:\n"
         "  - **DO NOT repeat the same query** - results won't improve\n"
-        "  - Use the `line_span` from pointers with **document_snapshot** to verify the actual content\n"
-        "- Use **document_outline** to navigate by heading/section structure\n\n"
+        "  - Use the `line_span` from pointers with **read_document** to verify the actual content\n"
+        "- Use **get_outline** to navigate by heading/section structure\n\n"
         "## Error Recovery\n"
-        "- `stale snapshot` / `hash mismatch`: Refresh snapshot and rebuild your edit\n"
-        "- `needs_range`: You must provide `target_span`; call document_snapshot first\n"
+        "- `stale snapshot` / `version mismatch`: Refresh snapshot and rebuild your edit\n"
+        "- `needs_range`: You must provide line range; call read_document first\n"
         "- `match_text mismatch`: Document changed; refresh and verify your target"
     )
 

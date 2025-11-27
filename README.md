@@ -221,30 +221,60 @@ Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat m
 
 ## Built-in agent tools
 
+### New Tools (WS1-6)
+
+| Tool | Module | Purpose |
+| --- | --- | --- |
+| `read_document` | `tinkerbell.ai.tools.read_document` | Read document content with automatic pagination, version tokens, and line metadata. |
+| `search_document` | `tinkerbell.ai.tools.search_document` | Search with exact match, regex, or semantic search. Returns line numbers with context. |
+| `get_outline` | `tinkerbell.ai.tools.get_outline` | Extract document structure (headings, sections) for Markdown, JSON, YAML, or plain text. |
+| `insert_lines` | `tinkerbell.ai.tools.insert_lines` | Insert new content after a specific line without touching existing text. |
+| `replace_lines` | `tinkerbell.ai.tools.replace_lines` | Replace a range of lines with new content. Supports drift recovery. |
+| `delete_lines` | `tinkerbell.ai.tools.delete_lines` | Delete a range of lines and return deleted content for reference. |
+| `write_document` | `tinkerbell.ai.tools.write_document` | Replace entire document content (requires version token). |
+| `find_and_replace` | `tinkerbell.ai.tools.find_and_replace` | Batch find/replace with regex support, previews, and max replacement caps. |
+| `create_document` | `tinkerbell.ai.tools.create_document` | Create a new document tab with optional initial content. |
+| `analyze_document` | `tinkerbell.ai.tools.analyze_document` | Subagent tool for document analysis (characters, plot, style, summary). |
+| `transform_document` | `tinkerbell.ai.tools.transform_document` | Subagent tool for document transformation (rename, setting change, style rewrite). |
+| `list_tabs` | `tinkerbell.ai.tools.list_tabs` | List open tabs with version info, file type, and size. |
+
+### Legacy Tools (Deprecated)
+
+The following tools are deprecated but retained for backward compatibility:
+
 | Tool | Module | Purpose |
 | --- | --- | --- |
 | `DocumentSnapshotTool` | `tinkerbell.ai.tools.document_snapshot` | Returns the latest document text, metadata, span window (`snapshot_span`/`text_range`), chunk manifest, preview flag, and diff token so the agent can reason safely.
 | `DocumentEditTool` | `tinkerbell.ai.tools.document_edit` | Applies validated insert/replace/annotate directives and patch diffs through the bridge with undo support and diff summaries.
-| `DocumentApplyPatchTool` | `tinkerbell.ai.tools.document_apply_patch` | Uses the live snapshot to build a diff for the requested range/content, then routes it through `DocumentEdit` so the agent never forgets to apply the edit.
 | `DiffBuilderTool` | `tinkerbell.ai.tools.diff_builder` | Generates unified diffs from before/after snippets so agents never have to handcraft patch formatting.
 | `SearchReplaceTool` | `tinkerbell.ai.tools.search_replace` | Provides regex/literal transforms with capped replacements, explicit target-range support, diff previews, and optional dry-run summaries before edits are enqueued.
 | `ValidationTool` | `tinkerbell.ai.tools.validation` | Checks YAML/JSON snippets via `ruamel.yaml`/`jsonschema`, lint-stubs Markdown for heading/fence issues, and exposes hooks for custom validators.
-| `ListTabsTool` | `tinkerbell.ai.tools.list_tabs` | Enumerates open tabs (`tab_id`, title, path, dirty flag) so agents can target any document without stealing focus.
-| `DocumentPlotStateTool` *(flagged)* | `tinkerbell.ai.tools.document_plot_state` | Returns cached character/entity rosters plus plot arc beats assembled from recent subagent summaries; available only when plot scaffolding is enabled.
 | `Memory Buffers` | `tinkerbell.ai.memory.buffers` | Maintains conversation + document summaries so prompts stay concise without losing context.
 
 You can register custom tools at runtime via `AIController.register_tool`, and the LangGraph plan automatically picks them up.
 
-### Tool parameter reference
+### New Tool Parameters (WS1-6)
+
+- **`read_document`** — accepts `tab_id` (optional, defaults to active tab), `start_line` and `end_line` (0-indexed, inclusive), `max_tokens` (default ~6000). Returns `content`, `lines.start/end/total`, `version_token`, `has_more`, and `continuation_hint` for pagination.
+- **`search_document`** — accepts `query` (required), `tab_id`, `search_type` (`exact`, `regex`, `semantic`), `case_sensitive`, `whole_word`, `max_results`. Returns `matches[]` with `line`, `score`, `preview`, and `context` fields.
+- **`get_outline`** — accepts `tab_id`. Returns hierarchical `outline[]` with `title`, `level`, `line_start`, `line_end`, `children[]`, plus `detection_confidence` and `detection_method`.
+- **`insert_lines`** — accepts `tab_id`, `version_token` (required), `after_line` (-1 for start), `content`, `dry_run`, `match_text` (optional drift anchor). Returns `inserted_at.after_line/lines_added/new_lines`, new `version_token`.
+- **`replace_lines`** — accepts `tab_id`, `version_token` (required), `start_line`, `end_line`, `content`, `dry_run`, `match_text`. Returns `lines_affected.removed/added/net_change`, new `version_token`.
+- **`delete_lines`** — accepts `tab_id`, `version_token` (required), `start_line`, `end_line`, `dry_run`. Returns `lines_deleted`, `deleted_content`, new `version_token`.
+- **`write_document`** — accepts `tab_id`, `version_token` (required), `content`. Returns `lines_affected.previous/current`, `size_affected.previous/current`, new `version_token`.
+- **`find_and_replace`** — accepts `tab_id`, `version_token` (required for apply), `pattern`, `replacement`, `is_regex`, `case_sensitive`, `whole_word`, `scope.start_line/end_line`, `max_replacements`, `preview` (bool). Returns `matches_found`, `replacements_made`, `preview[]` with before/after.
+- **`create_document`** — accepts `title` (required), `content` (optional), `file_type` (optional). Returns `tab_id`, `version_token`, `file_type`.
+- **`analyze_document`** — accepts `tab_id`, `analysis_type` (`characters`, `plot`, `style`, `summary`, `custom`), `custom_prompt`, `output_format` (`markdown`, `json`, `plain`). Returns `analysis` with structured findings.
+- **`transform_document`** — accepts `tab_id`, `version_token`, `transformation_type` (`character_rename`, `setting_change`, `style_rewrite`, `tense_change`, `pov_change`, `custom`), type-specific parameters, `output_mode` (`new_tab`, `in_place`). Returns transformed content or new tab info.
+- **`list_tabs`** — no required parameters; returns `{tabs: [...], active_tab_id, total}` with `version`, `size_chars`, `line_count`, `file_type` per tab.
+
+### Legacy Tool Parameters (Deprecated)
 
 - **`document_snapshot`** — accepts `delta_only` (bool) to request only changed fields, `tab_id` to target a non-active document, `source_tab_ids` to batch additional read-only snapshots, and `include_open_documents` to embed lightweight metadata for every tab. Each response still carries the latest diff summary and digest so agents can detect drift.
 - **`document_edit`** — consumes either a native `EditDirective` or a JSON/mapping payload matching the schema exposed during registration. Prefer `action="patch"` plus a unified diff and `document_version`; legacy `insert`/`replace` actions remain available for small, cursor-relative tweaks. Provide `tab_id` whenever the edit should be applied to a background tab.
-- **`document_apply_patch`** — requires `content` (replacement text) and optionally `target_range`, `document_version`, `rationale`, `context_lines`, and `tab_id`. It snapshots the targeted document, builds a diff for the requested range, and immediately sends it through `document_edit` so diff construction + application happen in one step.
 - **`diff_builder`** — accepts `original`, `updated`, optional `filename`, and optional `context` (default 3) to produce a ready-to-send unified diff string compatible with `document_edit` patch directives.
 - **`search_replace`** — parameters include `pattern`, `replacement`, `is_regex`, optional `target_range` (`{start, end}` offsets), `dry_run`, `max_replacements` (defaults to a guarded cap), `match_case`, and `whole_word`. Each call reports replacement counts, whether the cap was hit, and a unified diff preview; with `dry_run=True`, no edit occurs and only previews/diff metadata are returned.
 - **`validate_snippet`** — requires `text` and `fmt` (`yaml`, `yml`, `json`, `markdown`, or `md`) and responds with a `ValidationOutcome` describing the first issue plus a count of remaining problems. JSON calls optionally accept a schema, Markdown checks flag heading jumps/unclosed fences, and you can register additional formats at runtime via `tinkerbell.ai.tools.validation.register_snippet_validator`.
-- **`list_tabs`** — no parameters; returns `{tabs: [...], active_tab_id, total}` so the agent can map natural-language references ("roadmap tab") to actual `tab_id` values before issuing snapshot/edit requests.
-- **`document_plot_state`** *(experimental)* — accepts optional `document_id`, `include_entities`, `include_arcs`, `max_entities`, and `max_beats` arguments. Returns `status="ok"` with cached entities/arcs when plot scaffolding is enabled and the active document has ingested subagent summaries; otherwise surfaces diagnostic statuses (`plot_state_disabled`, `plot_state_unavailable`, `no_plot_state`).
 
 ## Phase 0 instrumentation & observability
 

@@ -46,7 +46,8 @@ class ChunkProfileRule:
                 profile = "prose"
             else:
                 profile = context.default_profile
-        required_tools: tuple[str, ...] = ("document_chunk",)
+        # analyze_document replaces document_chunk for chunk processing
+        required_tools: tuple[str, ...] = ("analyze_document",)
         trace = f"chunk_profile:{profile}:{char_count}"
         return AnalysisFinding(trace=trace, chunk_profile=profile, required_tools=required_tools)
 
@@ -82,7 +83,8 @@ class PlotStateRule:
         status_lower = status.lower()
         if status_lower in {"missing", "stale"}:
             warning = _warning("plot_state." + status_lower, "Plot state requires an update before editing")
-            required = ("plot_state_update",)
+            # transform_document replaces plot_state_update
+            required = ("transform_document",)
             return AnalysisFinding(
                 trace=f"plot_state:{status_lower}",
                 plot_state_status=status_lower,
@@ -102,7 +104,8 @@ class ConcordanceRule:
             return None
         if status in {"missing", "stale"} or (age and age > context.concordance_stale_after_seconds):
             warning = _warning("concordance.stale", "Character/concordance data is missing or stale")
-            optional = ("character_map",)
+            # analyze_document replaces character_map
+            optional = ("analyze_document",)
             return AnalysisFinding(
                 trace="concordance:stale",
                 concordance_status=status or "stale",
@@ -120,8 +123,10 @@ class RetrievalRule:
         selection_len = analysis_input.span_length()
         if char_count < 5_000 and selection_len < 2_000:
             return None
-        required = ("document_snapshot",)
-        optional = ("document_chunk",) if char_count < 20_000 else ()
+        # read_document replaces document_snapshot
+        required = ("read_document",)
+        # analyze_document replaces document_chunk for large documents
+        optional = ("analyze_document",) if char_count < 20_000 else ()
         return AnalysisFinding(
             trace=f"retrieval:{char_count}:{selection_len}",
             required_tools=required,

@@ -77,12 +77,14 @@ class SubagentRuntimeManager:
             if self.character_map_store is None:
                 self.character_map_store = CharacterMapStore()
                 LOGGER.debug("Initialized character map store")
+            # New tool names that replace legacy plot scaffolding tools:
+            # - get_outline: replaces plot_outline
+            # - analyze_document: replaces document_plot_state, character_map
+            # - transform_document: replaces plot_state_update, character_edit_planner
             extras = (
-                "plot_outline",
-                "document_plot_state",
-                "plot_state_update",
-                "character_map",
-                "character_edit_planner",
+                "get_outline",
+                "analyze_document",
+                "transform_document",
             )
             current = list(runtime.allowed_tools)
             for tool in extras:

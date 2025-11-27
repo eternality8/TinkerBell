@@ -25,7 +25,8 @@ def test_large_document_prefers_prose_chunk_profile() -> None:
     advice = agent.analyze(_make_input())
     assert advice.chunk_profile == "prose"
     assert "chunk_profile:prose" in "".join(advice.rule_trace)
-    assert "document_chunk" in advice.required_tools
+    # analyze_document replaces document_chunk
+    assert "analyze_document" in advice.required_tools
 
 
 def test_outline_staleness_sets_flag_and_warning() -> None:
@@ -66,10 +67,12 @@ def test_force_refresh_bypasses_cache() -> None:
 def test_plot_state_rule_recommends_update_tool() -> None:
     agent = AnalysisAgent()
     advice = agent.analyze(_make_input(plot_state_status="stale"))
-    assert "plot_state_update" in advice.required_tools
+    # transform_document replaces plot_state_update
+    assert "transform_document" in advice.required_tools
 
 
 def test_small_document_skips_retrieval_rule() -> None:
     agent = AnalysisAgent()
     advice = agent.analyze(_make_input(document_chars=1_000, span_end=1000))
-    assert "document_snapshot" not in advice.required_tools
+    # read_document replaces document_snapshot
+    assert "read_document" not in advice.required_tools

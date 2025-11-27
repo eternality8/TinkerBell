@@ -33,7 +33,6 @@ class SettingsRuntime:
         telemetry_controller: Any,
         embedding_controller: Any,
         register_default_ai_tools: Callable[[], None],
-        outline_tool_provider: Callable[[], Any | None],
         ai_task_getter: Callable[[], Any | None],
         ai_task_setter: Callable[[Any | None], None],
         ai_stream_state_setter: Callable[[bool], None],
@@ -44,7 +43,6 @@ class SettingsRuntime:
         self._telemetry_controller = telemetry_controller
         self._embedding_controller = embedding_controller
         self._register_default_ai_tools = register_default_ai_tools
-        self._outline_tool_provider = outline_tool_provider
         self._get_ai_task = ai_task_getter
         self._set_ai_task = ai_task_setter
         self._set_ai_stream_state = ai_stream_state_setter
@@ -307,9 +305,6 @@ class SettingsRuntime:
                 configurator(policy)
             except Exception as exc:  # pragma: no cover - defensive guard
                 _LOGGER.debug("Unable to update context budget policy: %s", exc)
-        outline_tool = self._outline_tool_provider()
-        if outline_tool is not None:
-            outline_tool.budget_policy = policy
 
     def _build_context_budget_policy(self, settings: Settings):
         try:

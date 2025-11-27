@@ -36,28 +36,22 @@ from .services import telemetry as telemetry_service
 from .ai.ai_types import SubagentRuntimeConfig
 from .ai.memory import EmbeddingProvider, DocumentEmbeddingIndex, LangChainEmbeddingProvider, OpenAIEmbeddingProvider
 from .ai.memory.buffers import DocumentSummaryMemory
-from .ai.services import OutlineBuilderWorker
 from .services.bridge_router import WorkspaceBridgeRouter
 from .services.importers import FileImporter, ImportResult, ImporterError
 from .services.settings import Settings, SettingsStore
 from .utils import file_io, logging as logging_utils
 from .widgets.status_bar import StatusBar
-from .ai.tools.diff_builder import DiffBuilderTool
-from .ai.tools.document_snapshot import DocumentSnapshotTool
-from .ai.tools.document_edit import DocumentEditTool
-from .ai.tools.document_apply_patch import DocumentApplyPatchTool
-from .ai.tools.document_find_text import DocumentFindTextTool
-from .ai.tools.document_outline import DocumentOutlineTool
-from .ai.tools.document_plot_state import DocumentPlotStateTool
-from .ai.tools.list_tabs import ListTabsTool
-from .ai.tools.search_replace import SearchReplaceTool
-from .ai.tools.validation import validate_snippet
+from .ai.tools.tool_wiring import (
+    ToolWiringContext,
+    register_new_tools,
+    unregister_tools,
+)
+from .ai.tools.search_document import SearchDocumentTool
 from .theme import load_theme, theme_manager
 
 if TYPE_CHECKING:  # pragma: no cover - import only for static analysis
     from .ai.orchestration import AIController
     from .ai.client import AIStreamEvent
-    from .ai.memory.plot_state import DocumentPlotStateStore
     from .widgets.dialogs import SettingsDialogResult
 
 QApplication: Any
@@ -249,23 +243,6 @@ class PendingTurnReview:
 
 
 @dataclass(slots=True)
-class OutlineStatusInfo:
-    """Tracks outline freshness/latency metadata per document."""
-
-    status_label: str = ""
-    status_code: str = ""
-    tooltip: str = ""
-    version_id: int | None = None
-    outline_hash: str | None = None
-    latency_ms: float | None = None
-    completed_at: float | None = None
-    node_count: int | None = None
-    token_count: int | None = None
-    stale: bool = False
-    stale_since: float | None = None
-
-
-@dataclass(slots=True)
 class EmbeddingRuntimeState:
     """Bookkeeping structure describing the active embedding backend."""
 
@@ -375,8 +352,6 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._context = context
         initial_settings = context.settings
-        self._phase3_outline_enabled = bool(getattr(initial_settings, "phase3_outline_tools", False))
-        self._plot_scaffolding_enabled = bool(getattr(initial_settings, "enable_plot_scaffolding", False))
         show_tool_panel = bool(getattr(initial_settings, "show_tool_activity_panel", False))
         self._editor = TabbedEditorWidget()
         self._workspace = self._editor.workspace
@@ -416,38 +391,28 @@ class MainWindow(QMainWindow):
         self._suggestion_cache_key: str | None = None
         self._suggestion_cache_values: tuple[str, ...] | None = None
         self._unsaved_snapshot_digests: dict[str, str] = {}
-        self._outline_digest_cache: dict[str, str] = {}
-        self._outline_status_by_document: dict[str, OutlineStatusInfo] = {}
         self._snapshot_persistence_block = 0
         self._debug_logging_enabled = bool(getattr(initial_settings, "debug_logging", False))
         self._active_theme: str | None = None
         self._active_theme_request: str | None = None
-        self._auto_patch_tool: DocumentApplyPatchTool | None = None
         self._ai_client_signature: tuple[Any, ...] | None = self._ai_settings_signature(initial_settings)
         self._restoring_workspace = False
         self._tabs_with_overlay: set[str] = set()
         self._last_autosave_at: datetime | None = None
         self._last_review_summary: str | None = None
         self._suppress_cancel_abort = False
-        self._outline_worker: OutlineBuilderWorker | None = None
-        self._outline_tool: DocumentOutlineTool | None = None
-        self._find_text_tool: DocumentFindTextTool | None = None
-        self._plot_state_tool: DocumentPlotStateTool | None = None
+        self._search_tool: SearchDocumentTool | None = None
         self._embedding_index: DocumentEmbeddingIndex | None = None
         self._embedding_state = EmbeddingRuntimeState()
         self._embedding_signature: tuple[Any, ...] | None = None
         self._embedding_snapshot_metadata: dict[str, Any] = {}
         self._embedding_resource: Any | None = None
-        self._last_outline_status: tuple[str, str] | None = None
         self._initialize_ui()
         self._register_subagent_listeners()
         self._update_subagent_indicator()
         if initial_settings is not None:
             self._apply_theme_setting(initial_settings)
         self._refresh_embedding_runtime(initial_settings)
-        if self._phase3_outline_enabled:
-            self._outline_worker = self._create_outline_worker()
-            self._propagate_embedding_index_to_worker()
 
     # ------------------------------------------------------------------
     # Qt lifecycle hooks
@@ -458,7 +423,6 @@ class MainWindow(QMainWindow):
         self._cancel_active_ai_turn()
         self._cancel_dynamic_suggestions()
         self._clear_suggestion_cache()
-        self._shutdown_outline_worker()
         self._request_app_shutdown()
 
         super_close = getattr(super(), "closeEvent", None)
@@ -550,55 +514,6 @@ class MainWindow(QMainWindow):
         self._restore_last_session_document()
         self._update_autosave_indicator(document=self._editor.to_document())
 
-    def _create_outline_worker(self) -> OutlineBuilderWorker | None:
-        loop = self._resolve_async_loop()
-        if loop is None:
-            return None
-        if loop.is_running():
-            return self._start_outline_worker(loop)
-        try:
-            loop.call_soon(self._start_outline_worker, loop)
-        except RuntimeError:  # pragma: no cover - loop may be closed in tests
-            return None
-        return None
-
-    def _start_outline_worker(self, loop: asyncio.AbstractEventLoop) -> OutlineBuilderWorker | None:
-        if getattr(self, "_outline_worker", None):
-            return self._outline_worker
-        cache_dir = self._resolve_outline_cache_root()
-        try:
-            worker = OutlineBuilderWorker(
-                document_provider=self._workspace.find_document_by_id,
-                storage_dir=cache_dir,
-                loop=loop,
-            )
-        except Exception:  # pragma: no cover - background worker optional in tests
-            _LOGGER.debug("Outline worker unavailable; continuing without outlines.", exc_info=True)
-            return None
-        self._outline_worker = worker
-        return worker
-
-    def _shutdown_outline_worker(self) -> None:
-        worker = getattr(self, "_outline_worker", None)
-        if worker is None:
-            return
-        self._outline_worker = None
-        close_coro = worker.aclose()
-        loop = worker.loop
-        if loop.is_running():
-            loop.create_task(close_coro)
-            return
-        try:
-            loop.run_until_complete(close_coro)
-        except RuntimeError:
-            asyncio.run(close_coro)
-
-    def _outline_memory(self) -> DocumentSummaryMemory | None:
-        worker = getattr(self, "_outline_worker", None)
-        if worker is None:
-            return None
-        return getattr(worker, "memory", None)
-
     def _resolve_embedding_index(self) -> DocumentEmbeddingIndex | None:
         return getattr(self, "_embedding_index", None)
 
@@ -607,19 +522,6 @@ class MainWindow(QMainWindow):
             return self._workspace.active_document()
         except Exception:
             return None
-
-    def _resolve_outline_digest(self, document_id: str | None) -> str | None:
-        doc_id = str(document_id).strip() if document_id else ""
-        if not doc_id:
-            document = self._safe_active_document()
-            if document is None:
-                return None
-            doc_id = document.document_id
-        memory = self._outline_memory()
-        if memory is None:
-            return None
-        record = memory.get(doc_id)
-        return record.outline_hash if record else None
 
     def _resolve_async_loop(self) -> asyncio.AbstractEventLoop | None:
         try:
@@ -650,14 +552,6 @@ class MainWindow(QMainWindow):
                     new_loop.close()
         except Exception:  # pragma: no cover - defensive guard
             _LOGGER.debug("Background task failed", exc_info=True)
-
-    def _resolve_outline_cache_root(self) -> Path:
-        store = getattr(self._context, "settings_store", None)
-        if store is not None:
-            base_dir = store.path.parent
-        else:
-            base_dir = Path.home() / ".tinkerbell"
-        return base_dir / "cache" / "outline_builder"
 
     def _build_splitter(self) -> Any:
         """Create the editor/chat splitter, falling back to a lightweight state."""
@@ -875,492 +769,52 @@ class MainWindow(QMainWindow):
         self._bridge.add_failure_listener(self._handle_edit_failure)
         self._refresh_chat_suggestions()
 
+    def _create_tool_wiring_context(self) -> ToolWiringContext:
+        """Create the context for tool wiring with all dependencies."""
+        return ToolWiringContext(
+            controller=self._context.ai_controller,
+            bridge=self._bridge,
+            workspace=self._workspace,
+            selection_gateway=self._selection_gateway,
+            embedding_index_resolver=self._resolve_embedding_index,
+            active_document_provider=self._safe_active_document,
+        )
+
     def _register_default_ai_tools(self) -> None:
-        """Register the default document-aware tools with the AI controller."""
+        """Register the default document-aware tools with the AI controller.
+        
+        Uses the extracted tool_wiring module to handle registration,
+        keeping main_window.py focused on UI concerns.
+        
+        As of WS8.1, only new WS1-6 tools are registered. Legacy tools
+        (document_snapshot, document_edit, etc.) have been replaced by
+        read_document, replace_lines, etc.
+        """
+        ctx = self._create_tool_wiring_context()
+        
+        # Register new WS1-6 tools (replaces legacy tools)
+        result = register_new_tools(ctx)
+        if result.registered:
+            _LOGGER.debug("AI tools registered: %s", ", ".join(result.registered))
+        if result.failed:
+            _LOGGER.warning("Some AI tools failed to register: %s", ", ".join(result.failed))
 
-        controller = self._context.ai_controller
-        if controller is None:
-            return
-
-        register = getattr(controller, "register_tool", None)
-        if not callable(register):
-            _LOGGER.debug("AI controller does not expose register_tool; skipping tool wiring.")
-            return
-
+    def _ensure_search_tool(self) -> SearchDocumentTool | None:
+        """Get or create the search document tool for /find command."""
+        if self._search_tool is not None:
+            return self._search_tool
         try:
-            snapshot_tool = DocumentSnapshotTool(
-                provider=self._bridge,
-                outline_digest_resolver=self._resolve_outline_digest,
-            )
-            register(
-                "document_snapshot",
-                snapshot_tool,
-                description=(
-                    "Return the freshest document snapshot (text, metadata, diff summaries) for the active or specified tab."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "delta_only": {
-                            "type": "boolean",
-                            "description": "When true, include only the selection and surrounding context instead of the full document.",
-                        },
-                        "include_diff": {
-                            "type": "boolean",
-                            "description": "Attach the most recent diff summary when available (default true).",
-                        },
-                        "tab_id": {
-                            "type": "string",
-                            "description": "Target a specific tab instead of the active document.",
-                        },
-                        "source_tab_ids": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional list of additional tab snapshots to gather alongside the active document.",
-                        },
-                        "include_open_documents": {
-                            "type": "boolean",
-                            "description": "When true, include a summary of all open documents in the snapshot payload.",
-                        },
-                    },
-                    "additionalProperties": False,
-                },
-            )
-
-            self._register_phase3_ai_tools(register_fn=register)
-            self._register_plot_state_tool(register_fn=register)
-
-            edit_tool = DocumentEditTool(bridge=self._bridge, patch_only=True)
-            register(
-                "document_edit",
-                edit_tool,
-                description=(
-                    "Apply a structured edit directive (insert, replace, annotate, or unified diff patch) against the active document."
-                ),
-                parameters=self._directive_parameters_schema(),
-            )
-
-            apply_patch_tool = DocumentApplyPatchTool(bridge=self._bridge, edit_tool=edit_tool)
-            self._auto_patch_tool = apply_patch_tool
-            register(
-                "document_apply_patch",
-                apply_patch_tool,
-                description=(
-                    "Replace a target_range with new content by automatically building and applying a unified diff."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "Replacement text that should occupy the specified target_range.",
-                        },
-                        "target_range": DIRECTIVE_SCHEMA["properties"]["target_range"],
-                        "document_version": {
-                            "type": "string",
-                            "description": "Document snapshot version captured before drafting the edit.",
-                        },
-                        "rationale": {
-                            "type": "string",
-                            "description": "Optional explanation stored alongside the edit directive.",
-                        },
-                        "context_lines": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "description": "Override the number of context lines included in the generated diff.",
-                        },
-                        "tab_id": {
-                            "type": "string",
-                            "description": "Optional tab identifier; defaults to the active tab when omitted.",
-                        },
-                    },
-                    "required": ["content"],
-                    "additionalProperties": False,
-                },
-            )
-
-            tab_listing_tool = ListTabsTool(provider=self._bridge)
-            register(
-                "list_tabs",
-                tab_listing_tool,
-                description="Enumerate the open tabs (tab_id, title, path, dirty) so agents can target specific documents.",
-                parameters={
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-            )
-
-            diff_tool = DiffBuilderTool()
-            register(
-                "diff_builder",
-                diff_tool,
-                description=(
-                    "Return a unified diff given original and updated text snippets to drive patch directives."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "original": {
-                            "type": "string",
-                            "description": "The prior version of the text block.",
-                        },
-                        "updated": {
-                            "type": "string",
-                            "description": "The revised text block.",
-                        },
-                        "filename": {
-                            "type": "string",
-                            "description": "Optional virtual filename used in diff headers.",
-                        },
-                        "context": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "description": "Number of context lines to include in the diff (default 3).",
-                        },
-                    },
-                    "required": ["original", "updated"],
-                    "additionalProperties": False,
-                },
-            )
-
-            search_tool = SearchReplaceTool(bridge=self._bridge)
-            register(
-                "search_replace",
-                search_tool,
-                description=(
-                    "Search the current document or an explicit byte range and optionally apply replacements with regex/literal matching."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": "Text or regex pattern to find.",
-                        },
-                        "replacement": {
-                            "type": "string",
-                            "description": "Content that will replace each match.",
-                        },
-                        "is_regex": {
-                            "type": "boolean",
-                            "description": "Interpret the pattern as a regular expression.",
-                        },
-                        "target_range": {
-                            "type": "object",
-                            "properties": {
-                                "start": {
-                                    "type": "integer",
-                                    "minimum": 0,
-                                },
-                                "end": {
-                                    "type": "integer",
-                                    "minimum": 0,
-                                },
-                            },
-                            "required": ["start", "end"],
-                            "description": "Optional document offsets to confine matches; omit to operate on the full document.",
-                        },
-                        "dry_run": {
-                            "type": "boolean",
-                            "description": "When true, do not apply edits—only preview the outcome.",
-                        },
-                        "max_replacements": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "description": "Optional cap on the number of replacements to perform.",
-                        },
-                        "match_case": {
-                            "type": "boolean",
-                            "description": "Respect character casing when matching (defaults to true).",
-                        },
-                        "whole_word": {
-                            "type": "boolean",
-                            "description": "Only match full words when true.",
-                        },
-                    },
-                    "required": ["pattern", "replacement"],
-                    "additionalProperties": False,
-                },
-            )
-
-            register(
-                "validate_snippet",
-                validate_snippet,
-                description="Validate YAML/JSON snippets before inserting them into the document.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "Snippet contents that should be validated.",
-                        },
-                        "fmt": {
-                            "type": "string",
-                            "description": "Declared format of the snippet.",
-                            "enum": ["yaml", "yml", "json", "markdown", "md"],
-                        },
-                    },
-                    "required": ["text", "fmt"],
-                    "additionalProperties": False,
-                },
-            )
-
-            registered = [
-                "document_snapshot",
-                "document_edit",
-                "document_apply_patch",
-                "diff_builder",
-                "search_replace",
-                "validate_snippet",
-                "list_tabs",
-            ]
-            if self._phase3_outline_enabled:
-                registered.insert(1, "document_outline")
-                registered.insert(2, "document_find_text")
-            if self._plot_scaffolding_enabled:
-                registered.append("document_plot_state")
-            _LOGGER.debug("Default AI tools registered: %s", ", ".join(registered))
-        except Exception as exc:  # pragma: no cover - defensive logging
-            _LOGGER.warning("Failed to register default AI tools: %s", exc)
-
-    def _register_phase3_ai_tools(self, *, register_fn: Callable[..., Any] | None = None) -> None:
-        if not self._phase3_outline_enabled:
-            return
-
-        controller = self._context.ai_controller
-        if controller is None:
-            return
-
-        register = register_fn or getattr(controller, "register_tool", None)
-        if not callable(register):
-            _LOGGER.debug("AI controller does not expose register_tool; skipping phase3 tool wiring.")
-            return
-
-        outline_tool = self._ensure_outline_tool()
-        if outline_tool is not None:
-            register(
-                "document_outline",
-                outline_tool,
-                description=(
-                    "Return the most recent outline for the active document, including pointer IDs, blurbs, and staleness metadata."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "document_id": {
-                            "type": "string",
-                            "description": "Optional explicit document identifier; defaults to the active tab.",
-                        },
-                        "desired_levels": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "description": "Limit the outline depth to this heading level before budgeting.",
-                        },
-                        "include_blurbs": {
-                            "type": "boolean",
-                            "description": "When false, omit excerpt blurbs to conserve tokens.",
-                        },
-                        "max_nodes": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 1000,
-                            "description": "Cap the number of nodes returned prior to budget enforcement.",
-                        },
-                    },
-                    "additionalProperties": False,
-                },
-            )
-
-            find_text_tool = self._ensure_find_text_tool()
-            if find_text_tool is not None:
-            register(
-                "document_find_text",
-                find_text_tool,
-                description=(
-                    "Return the best-matching document chunks for a natural language query using embeddings or fallback heuristics."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "document_id": {
-                            "type": "string",
-                            "description": "Optional target document identifier; defaults to the active document.",
-                        },
-                        "query": {
-                            "type": "string",
-                            "minLength": 1,
-                            "description": "Natural-language description of the section(s) to find.",
-                        },
-                        "top_k": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 12,
-                            "description": "Maximum number of pointers to return.",
-                        },
-                        "min_confidence": {
-                            "type": "number",
-                            "minimum": 0.0,
-                            "maximum": 1.0,
-                            "description": "Minimum embedding match score before falling back to heuristics.",
-                        },
-                        "filters": {
-                            "type": "object",
-                            "description": "Optional additional filtering hints understood by custom index providers.",
-                        },
-                        "include_outline_context": {
-                            "type": "boolean",
-                            "description": "When true, include nearby outline headings for each pointer.",
-                        },
-                    },
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
-            )
-
-    def _unregister_phase3_ai_tools(self) -> None:
-        controller = self._context.ai_controller
-        if controller is None:
-            return
-        unregister = getattr(controller, "unregister_tool", None)
-        if not callable(unregister):
-            return
-        for name in ("document_outline", "document_find_text"):
-            try:
-                unregister(name)
-            except Exception:  # pragma: no cover - defensive
-                _LOGGER.debug("Failed to unregister tool %s", name, exc_info=True)
-
-    def _register_plot_state_tool(self, *, register_fn: Callable[..., Any] | None = None) -> None:
-        if not self._plot_scaffolding_enabled:
-            return
-        controller = self._context.ai_controller
-        if controller is None:
-            return
-        register = register_fn or getattr(controller, "register_tool", None)
-        if not callable(register):
-            _LOGGER.debug("AI controller does not expose register_tool; skipping plot-state wiring.")
-            return
-
-        tool = self._ensure_plot_state_tool()
-        if tool is None:
-            return
-
-        try:
-            register(
-                "document_plot_state",
-                tool,
-                description=(
-                    "Return cached character/entity scaffolding and plot arcs extracted from recent subagent runs."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "document_id": {
-                            "type": "string",
-                            "description": "Optional explicit target; defaults to the active document.",
-                        },
-                        "include_entities": {
-                            "type": "boolean",
-                            "description": "When false, omit entity payloads to conserve tokens.",
-                        },
-                        "include_arcs": {
-                            "type": "boolean",
-                            "description": "When false, omit plot arc beats from the response.",
-                        },
-                        "max_entities": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 50,
-                            "description": "Limit the number of entities returned before budgeting.",
-                        },
-                        "max_beats": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 50,
-                            "description": "Limit the number of beats returned per arc before budgeting.",
-                        },
-                    },
-                    "additionalProperties": False,
-                },
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            _LOGGER.warning("Failed to register DocumentPlotStateTool: %s", exc)
-
-    def _unregister_plot_state_tool(self) -> None:
-        controller = self._context.ai_controller
-        if controller is None:
-            return
-        unregister = getattr(controller, "unregister_tool", None)
-        if not callable(unregister):
-            return
-        try:
-            unregister("document_plot_state")
-        except Exception:  # pragma: no cover - defensive
-            _LOGGER.debug("Failed to unregister document_plot_state", exc_info=True)
-
-    def _ensure_plot_state_tool(self) -> DocumentPlotStateTool | None:
-        if self._plot_state_tool is not None:
-            return self._plot_state_tool
-        try:
-            tool = DocumentPlotStateTool(
-                plot_state_resolver=self._resolve_plot_state_store,
-                active_document_provider=self._safe_active_document,
-                feature_enabled=lambda: self._plot_scaffolding_enabled,
+            from .ai.tools.base import ToolContext
+            from .ai.tools.version import get_version_manager
+            
+            tool = SearchDocumentTool(
+                version_manager=get_version_manager(),
+                embedding_provider=self._resolve_embedding_index(),
             )
         except Exception:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to initialize DocumentPlotStateTool", exc_info=True)
+            _LOGGER.debug("Unable to initialize SearchDocumentTool", exc_info=True)
             return None
-        self._plot_state_tool = tool
-        return tool
-
-    def _resolve_plot_state_store(self) -> DocumentPlotStateStore | None:
-        controller = self._context.ai_controller
-        if controller is None:
-            return None
-        return getattr(controller, "plot_state_store", None)
-
-    def _ensure_outline_tool(self) -> DocumentOutlineTool | None:
-        if not self._phase3_outline_enabled:
-            return None
-        if self._outline_tool is not None:
-            return self._outline_tool
-        try:
-            def _pending_outline(document_id: str) -> bool:
-                worker = getattr(self, "_outline_worker", None)
-                if worker is None:
-                    return False
-                return worker.is_rebuild_pending(document_id)
-
-            tool = DocumentOutlineTool(
-                memory_resolver=self._outline_memory,
-                document_lookup=self._workspace.find_document_by_id,
-                active_document_provider=self._safe_active_document,
-                budget_policy=None,
-                pending_outline_checker=_pending_outline,
-            )
-        except Exception:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to initialize DocumentOutlineTool", exc_info=True)
-            return None
-        self._outline_tool = tool
-        return tool
-
-    def _ensure_find_text_tool(self) -> DocumentFindTextTool | None:
-        if not self._phase3_outline_enabled:
-            return None
-        if self._find_text_tool is not None:
-            return self._find_text_tool
-        try:
-            tool = DocumentFindTextTool(
-                embedding_index_resolver=self._resolve_embedding_index,
-                document_lookup=self._workspace.find_document_by_id,
-                active_document_provider=self._safe_active_document,
-                outline_memory=self._outline_memory,
-            )
-        except Exception:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to initialize DocumentFindTextTool", exc_info=True)
-            return None
-        self._find_text_tool = tool
+        self._search_tool = tool
         return tool
 
     @staticmethod
@@ -1613,7 +1067,8 @@ class MainWindow(QMainWindow):
 
     def _handle_manual_command(self, request: ManualCommandRequest) -> None:
         if request.command is ManualCommandType.OUTLINE:
-            self._handle_manual_outline_command(request)
+            self._post_assistant_notice("Outline tooling has been removed. Use /find for document search.")
+            self.update_status("Outline removed")
             return
         if request.command is ManualCommandType.FIND_SECTIONS:
             self._handle_manual_find_text_command(request)
@@ -1621,93 +1076,196 @@ class MainWindow(QMainWindow):
         self._post_assistant_notice(f"Unsupported manual command '{request.command.value}'.")
         self.update_status("Manual command unsupported")
 
-    def _handle_manual_outline_command(self, request: ManualCommandRequest) -> None:
-        if not self._phase3_outline_enabled:
-            self._post_assistant_notice("Outline tooling is disabled. Enable it in Settings > AI to use /outline.")
-            self.update_status("Outline disabled")
-            return
-
-        tool = self._ensure_outline_tool()
-        if tool is None:
-            self._post_assistant_notice("Outline tool is unavailable.")
-            self.update_status("Outline unavailable")
-            return
-
-        args = dict(request.args)
-        doc_reference = args.get("document_id")
-        resolved_id = self._resolve_manual_document_id(doc_reference)
-        if doc_reference and resolved_id is None:
-            self._post_assistant_notice(f"Couldn't find a document matching '{doc_reference}'.")
-            self.update_status("Document not found")
-            return
-        if resolved_id:
-            args["document_id"] = resolved_id
-        else:
-            args.pop("document_id", None)
-
-        try:
-            response = tool.run(**args)
-        except Exception as exc:  # pragma: no cover - defensive path
-            _LOGGER.debug("Manual outline command failed", exc_info=True)
-            self._post_assistant_notice(f"Outline command failed: {exc}")
-            self.update_status("Outline command failed")
-            return
-
-        message = self._render_manual_outline_response(response, doc_reference)
-        self._post_assistant_notice(message)
-        status_text = str(response.get("status") or "ok") if isinstance(response, Mapping) else "ok"
-        self._record_manual_tool_trace(
-            name="manual:document_outline",
-            input_summary=self._summarize_manual_input("document_outline", args),
-            output_summary=status_text,
-            args=args,
-            response=response,
-        )
-        self.update_status("Outline ready")
-
     def _handle_manual_find_text_command(self, request: ManualCommandRequest) -> None:
-        if not self._phase3_outline_enabled:
-            self._post_assistant_notice("Retrieval tooling is disabled. Enable it in Settings > AI to use /find.")
-            self.update_status("Retrieval disabled")
-            return
-
-        tool = self._ensure_find_text_tool()
+        """Handle /find command using the new SearchDocumentTool."""
+        tool = self._ensure_search_tool()
         if tool is None:
-            self._post_assistant_notice("Find text tool is unavailable.")
-            self.update_status("Retrieval unavailable")
+            self._post_assistant_notice("Search tool is unavailable.")
+            self.update_status("Search unavailable")
             return
 
         args = dict(request.args)
         doc_reference = args.get("document_id")
+        
+        # Resolve document reference to tab_id
         resolved_id = self._resolve_manual_document_id(doc_reference)
         if doc_reference and resolved_id is None:
             self._post_assistant_notice(f"Couldn't find a document matching '{doc_reference}'.")
             self.update_status("Document not found")
             return
-        if resolved_id:
-            args["document_id"] = resolved_id
-        else:
-            args.pop("document_id", None)
+        
+        # Convert old API params to new SearchDocumentTool params
+        query = args.get("query", "")
+        if not query:
+            self._post_assistant_notice("Please provide a search query: /find <query>")
+            self.update_status("Missing query")
+            return
 
+        # Determine search mode - default to semantic if embeddings available
+        mode = args.get("mode", "semantic")
+        search_params = {
+            "query": query,
+            "mode": mode,
+            "max_results": args.get("top_k", 10),
+            "context_lines": 2,
+        }
+        
+        # Add tab_id if resolved
+        if resolved_id:
+            # Find tab_id from document_id
+            tab_id = self._resolve_tab_id_from_document_id(resolved_id)
+            if tab_id:
+                search_params["tab_id"] = tab_id
+        
         try:
-            response = tool.run(**args)
+            # Create context for the tool
+            from .ai.tools.base import ToolContext
+            from .ai.tools.version import get_version_manager
+            
+            context = ToolContext(
+                document_provider=self._create_document_provider_adapter(),
+                version_manager=get_version_manager(),
+            )
+            
+            result = tool.run(context, search_params)
+            
+            if not result.success:
+                error_msg = result.error.message if result.error else "Unknown error"
+                self._post_assistant_notice(f"Search failed: {error_msg}")
+                self.update_status("Search failed")
+                return
+            
+            response = result.data or {}
         except Exception as exc:  # pragma: no cover - defensive path
             _LOGGER.debug("Manual find text command failed", exc_info=True)
-            self._post_assistant_notice(f"Find text command failed: {exc}")
-            self.update_status("Find text failed")
+            self._post_assistant_notice(f"Search command failed: {exc}")
+            self.update_status("Search failed")
             return
 
-        message = self._render_manual_retrieval_response(response, args.get("query"), doc_reference)
+        message = self._render_search_response(response, query, doc_reference)
         self._post_assistant_notice(message)
-        status_text = str(response.get("status") or "ok") if isinstance(response, Mapping) else "ok"
+        
+        match_count = response.get("total_matches", 0)
+        status_text = f"{match_count} match(es) found"
         self._record_manual_tool_trace(
-            name="manual:document_find_text",
-            input_summary=self._summarize_manual_input("document_find_text", args),
+            name="manual:search_document",
+            input_summary=self._summarize_manual_input("search_document", search_params),
             output_summary=status_text,
-            args=args,
+            args=search_params,
             response=response,
         )
-        self.update_status("Find text ready")
+        self.update_status("Search complete")
+
+    def _resolve_tab_id_from_document_id(self, document_id: str) -> str | None:
+        """Find the tab_id for a given document_id."""
+        for tab in self._workspace.iter_tabs():
+            doc = tab.document()
+            if doc.document_id == document_id:
+                return tab.id
+        return None
+
+    def _create_document_provider_adapter(self) -> Any:
+        """Create a DocumentProvider adapter for the workspace/bridge."""
+        workspace = self._workspace
+        
+        class DocumentProviderAdapter:
+            def get_document_text(self, tab_id: str | None = None) -> str:
+                if tab_id:
+                    doc = workspace.find_document_by_id(tab_id)
+                    if doc:
+                        return doc.text
+                    try:
+                        tab = workspace.get_tab(tab_id)
+                        return tab.document().text
+                    except KeyError:
+                        return ""
+                active = workspace.active_document()
+                return active.text if active else ""
+
+            def get_active_tab_id(self) -> str | None:
+                return workspace.active_tab_id
+
+            def get_document_content(self, tab_id: str) -> str | None:
+                try:
+                    tab = workspace.get_tab(tab_id)
+                    return tab.document().text
+                except KeyError:
+                    return None
+
+            def get_document_metadata(self, tab_id: str) -> dict[str, Any] | None:
+                try:
+                    tab = workspace.get_tab(tab_id)
+                    doc = tab.document()
+                    return {
+                        "path": str(doc.metadata.path) if doc.metadata.path else None,
+                        "language": doc.metadata.language,
+                    }
+                except KeyError:
+                    return None
+
+        return DocumentProviderAdapter()
+
+    def _render_search_response(
+        self,
+        response: Mapping[str, Any],
+        requested_query: str | None,
+        requested_document_label: str | None,
+    ) -> str:
+        """Render search results for display in the chat panel."""
+        mode = str(response.get("mode") or "exact")
+        total_matches = response.get("total_matches", 0)
+        doc_label = self._document_label_from_id(response.get("tab_id"), fallback=requested_document_label)
+        query_text = requested_query or ""
+        
+        if query_text:
+            header = f"Search ({mode}) for {doc_label} — \"{query_text}\""
+        else:
+            header = f"Search ({mode}) for {doc_label}."
+        parts = [header]
+
+        details: list[str] = []
+        details.append(f"matches={total_matches}")
+        embedding_status = response.get("embedding_status")
+        if embedding_status and embedding_status != "not_available":
+            details.append(f"embeddings={embedding_status}")
+        if details:
+            parts.append("Details: " + ", ".join(details) + ".")
+
+        matches = response.get("matches") or []
+        if matches:
+            parts.append("Results:")
+            parts.extend(self._format_search_matches(matches))
+            extra = max(0, total_matches - 5)
+            if extra:
+                parts.append(f"… {extra} additional match(es).")
+        else:
+            parts.append("No matches found.")
+
+        return "\n".join(parts)
+
+    def _format_search_matches(
+        self,
+        matches: Sequence[Mapping[str, Any]],
+        *,
+        limit: int = 5,
+    ) -> list[str]:
+        """Format search matches for display."""
+        lines: list[str] = []
+        for index, match in enumerate(matches[:limit], start=1):
+            if not isinstance(match, Mapping):
+                continue
+            line_num = match.get("line", 0)
+            preview = match.get("preview", "")
+            score = match.get("score", 1.0)
+            
+            # Truncate preview if too long
+            preview_text = str(preview).strip()
+            if len(preview_text) > 80:
+                preview_text = preview_text[:77] + "..."
+            
+            score_text = f"{float(score):.2f}" if isinstance(score, (int, float)) else "n/a"
+            lines.append(f"{index}. Line {line_num} (score {score_text}): {preview_text}")
+        return lines
 
     def _resolve_manual_document_id(self, reference: str | None) -> str | None:
         text = (reference or "").strip()
@@ -1766,146 +1324,6 @@ class MainWindow(QMainWindow):
         if document is not None:
             return self._document_display_name(document)
         return WINDOW_APP_NAME
-
-    def _render_manual_outline_response(
-        self,
-        response: Mapping[str, Any],
-        requested_label: str | None,
-    ) -> str:
-        status = str(response.get("status") or "unknown")
-        doc_label = self._document_label_from_id(response.get("document_id"), fallback=requested_label)
-        parts = [f"Document outline ({status}) for {doc_label}."]
-        reason = response.get("reason")
-        if reason:
-            parts.append(f"Reason: {reason}.")
-
-        nodes = response.get("nodes") or []
-        if nodes:
-            parts.append("Headings:")
-            parts.extend(self._render_outline_tree_lines(nodes))
-        else:
-            outline_available = response.get("outline_available")
-            if outline_available is False:
-                parts.append("No outline is available for this document yet.")
-
-        notes: list[str] = []
-        if response.get("trimmed"):
-            reason_text = response.get("trimmed_reason") or "request limits"
-            notes.append(f"trimmed={reason_text}")
-        if response.get("is_stale"):
-            notes.append("stale compared to current document")
-        if notes:
-            parts.append("Notes: " + ", ".join(notes) + ".")
-
-        generated = response.get("generated_at")
-        if generated:
-            parts.append(f"Generated at {generated}.")
-        outline_digest = response.get("outline_digest")
-        if outline_digest:
-            parts.append(f"Digest: {outline_digest}.")
-
-        return "\n".join(part for part in parts if part)
-
-    def _render_outline_tree_lines(self, nodes: Sequence[Mapping[str, Any]], limit: int = 24) -> list[str]:
-        lines: list[str] = []
-        truncated = False
-
-        def visit(node: Mapping[str, Any], level_hint: int) -> None:
-            nonlocal truncated
-            if len(lines) >= limit:
-                truncated = True
-                return
-            level = int(node.get("level") or level_hint or 1)
-            indent = "  " * max(0, level - 1)
-            text = str(node.get("text") or "Untitled").strip() or "Untitled"
-            pointer = node.get("pointer_id") or node.get("id")
-            suffix = f" ({pointer})" if pointer else ""
-            lines.append(f"{indent}- {text}{suffix}")
-            children = node.get("children") or []
-            for child in children:
-                if not isinstance(child, Mapping):
-                    continue
-                visit(child, level + 1)
-                if truncated:
-                    return
-
-        for entry in nodes:
-            if not isinstance(entry, Mapping):
-                continue
-            visit(entry, int(entry.get("level") or 1))
-            if truncated:
-                break
-
-        if truncated:
-            lines.append("  … additional headings omitted.")
-        return lines
-
-    def _render_manual_retrieval_response(
-        self,
-        response: Mapping[str, Any],
-        requested_query: str | None,
-        requested_document_label: str | None,
-    ) -> str:
-        status = str(response.get("status") or "unknown")
-        doc_label = self._document_label_from_id(response.get("document_id"), fallback=requested_document_label)
-        query_text = response.get("query") or (requested_query or "")
-        if query_text:
-            header = f"Find text ({status}) for {doc_label} — \"{query_text}\""
-        else:
-            header = f"Find text ({status}) for {doc_label}."
-        parts = [header]
-
-        details: list[str] = []
-        strategy = response.get("strategy")
-        if strategy:
-            details.append(f"strategy={strategy}")
-        fallback_reason = response.get("fallback_reason")
-        if fallback_reason:
-            details.append(f"fallback={fallback_reason}")
-        latency = response.get("latency_ms")
-        if isinstance(latency, (int, float)):
-            details.append(f"latency={latency:.1f} ms")
-        if details:
-            parts.append("Details: " + ", ".join(details) + ".")
-
-        pointers = response.get("pointers") or []
-        if pointers:
-            parts.append("Matches:")
-            parts.extend(self._format_retrieval_pointers(pointers))
-            extra = max(0, len(pointers) - 5)
-            if extra:
-                parts.append(f"… {extra} additional match(es).")
-        else:
-            parts.append("No matching spans were found.")
-
-        return "\n".join(parts)
-
-    def _format_retrieval_pointers(
-        self,
-        pointers: Sequence[Mapping[str, Any]],
-        *,
-        limit: int = 5,
-    ) -> list[str]:
-        lines: list[str] = []
-        for index, pointer in enumerate(pointers[:limit], start=1):
-            if not isinstance(pointer, Mapping):
-                continue
-            pointer_id = pointer.get("pointer_id") or pointer.get("chunk_id") or f"chunk-{index}"
-            outline_context = pointer.get("outline_context")
-            heading = outline_context.get("heading") if isinstance(outline_context, Mapping) else None
-            label_parts = [str(pointer_id)]
-            if heading:
-                label_parts.append(str(heading))
-            score = pointer.get("score")
-            score_text = f"{float(score):.2f}" if isinstance(score, (int, float)) else "n/a"
-            lines.append(f"{index}. {' · '.join(label_parts)} (score {score_text})")
-            preview = pointer.get("preview")
-            snippet = self._condense_whitespace(str(preview)) if isinstance(preview, str) else ""
-            if snippet:
-                if len(snippet) > 180:
-                    snippet = f"{snippet[:177]}…"
-                lines.append(f"    {snippet}")
-        return lines
 
     def _summarize_manual_input(self, label: str, args: Mapping[str, Any]) -> str:
         if not args:
@@ -4358,22 +3776,11 @@ class MainWindow(QMainWindow):
         self._shutdown_outline_worker()
         self._outline_worker = None
         self._outline_tool = None
-        self._find_text_tool = None
+        self._search_tool = None
         self._outline_digest_cache.clear()
         if self._status_bar is not None:
             self._status_bar.set_outline_status("")
         self._unregister_phase3_ai_tools()
-
-    def _apply_plot_scaffolding_setting(self, settings: Settings) -> None:
-        enabled = bool(getattr(settings, "enable_plot_scaffolding", False))
-        if enabled == self._plot_scaffolding_enabled:
-            return
-        self._plot_scaffolding_enabled = enabled
-        if enabled:
-            self._register_plot_state_tool()
-            return
-        self._unregister_plot_state_tool()
-        self._plot_state_tool = None
 
     def _apply_chat_panel_settings(self, settings: Settings) -> None:
         visible = bool(getattr(settings, "show_tool_activity_panel", False))

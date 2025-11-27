@@ -82,7 +82,6 @@ def _runtime_bundle(initial_settings: Settings | None = None):
     editor = _EditorStub()
     telemetry = _TelemetryStub()
     embedding = _EmbeddingStub()
-    outline_tool = SimpleNamespace(budget_policy=None)
     register_state = {"count": 0}
     ai_state = {"task": None, "streaming": False}
 
@@ -92,7 +91,6 @@ def _runtime_bundle(initial_settings: Settings | None = None):
         telemetry_controller=telemetry,
         embedding_controller=embedding,
         register_default_ai_tools=lambda: register_state.__setitem__("count", register_state["count"] + 1),
-        outline_tool_provider=lambda: outline_tool,
         ai_task_getter=lambda: ai_state["task"],
         ai_task_setter=lambda task: ai_state.__setitem__("task", task),
         ai_stream_state_setter=lambda active: ai_state.__setitem__("streaming", active),
@@ -105,7 +103,6 @@ def _runtime_bundle(initial_settings: Settings | None = None):
         "editor": editor,
         "telemetry": telemetry,
         "embedding": embedding,
-        "outline_tool": outline_tool,
         "register_state": register_state,
         "ai_state": ai_state,
     }
@@ -149,7 +146,6 @@ def test_apply_runtime_settings_creates_controller_and_refreshes_runtime(monkeyp
     context = bundle["context"]
     telemetry = bundle["telemetry"]
     embedding = bundle["embedding"]
-    outline_tool = bundle["outline_tool"]
 
     controller = _ControllerStub()
     monkeypatch.setattr(runtime, "build_ai_controller_from_settings", lambda cfg: controller)
@@ -178,7 +174,6 @@ def test_apply_runtime_settings_creates_controller_and_refreshes_runtime(monkeyp
     }
     assert controller.policy == "policy"
     assert controller.subagent_config == "subagent-config"
-    assert outline_tool.budget_policy == "policy"
 
 
 def test_apply_runtime_settings_disables_controller_without_credentials() -> None:

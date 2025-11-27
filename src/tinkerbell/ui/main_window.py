@@ -38,19 +38,9 @@ from ..utils import file_io
 from ..utils import file_io
 from ..services import telemetry as telemetry_service
 from ..widgets.status_bar import StatusBar
-from ..ai.tools.document_apply_patch import DocumentApplyPatchTool
-from ..ai.tools.registry import (
-    ToolRegistryContext,
-    ToolRegistrationError,
-    register_character_map_tool,
-    register_character_planner_tool,
-    register_default_tools,
-    register_phase3_tools,
-    register_plot_state_tool,
-    unregister_character_map_tool,
-    unregister_character_planner_tool,
-    unregister_phase3_tools,
-    unregister_plot_state_tool,
+from ..ai.tools.tool_wiring import (
+    ToolWiringContext,
+    register_new_tools,
 )
 from .settings_runtime import SettingsRuntime
 from .ai_review_controller import AIReviewController, EditSummary, PendingReviewSession, PendingTurnReview
@@ -232,7 +222,6 @@ class MainWindow(QMainWindow):
         self._suggestion_cache_key: str | None = None
         self._suggestion_cache_values: tuple[str, ...] | None = None
         self._outline_status_by_document: dict[str, OutlineStatusInfo] = {}
-        self._auto_patch_tool: DocumentApplyPatchTool | None = None
         self._suppress_cancel_abort = False
         self._outline_runtime: OutlineRuntime | None = None
         self._tool_provider: ToolProvider | None = None
@@ -253,18 +242,8 @@ class MainWindow(QMainWindow):
         self._tool_provider = ToolProvider(
             controller_resolver=lambda: self._context.ai_controller,
             bridge=self._bridge,
+            workspace=self._workspace,
             selection_gateway=self._selection_gateway,
-            document_lookup=self._workspace.find_document_by_id,
-            active_document_provider=self._safe_active_document,
-            outline_worker_resolver=lambda: self._outline_runtime.worker() if self._outline_runtime else None,
-            outline_memory_resolver=lambda: self._outline_runtime.outline_memory() if self._outline_runtime else None,
-            embedding_index_resolver=self._resolve_embedding_index,
-            outline_digest_resolver=self._resolve_outline_digest,
-            directive_schema_provider=self._directive_parameters_schema,
-            plot_state_store_resolver=self._resolve_plot_state_store,
-            character_map_store_resolver=self._resolve_character_map_store,
-            phase3_outline_enabled=self._phase3_outline_enabled,
-            plot_scaffolding_enabled=self._plot_scaffolding_enabled,
         )
         self._ai_turn_coordinator = AITurnCoordinator(
             controller_resolver=lambda: self._context.ai_controller,
@@ -284,7 +263,6 @@ class MainWindow(QMainWindow):
             telemetry_controller=self._telemetry_controller,
             embedding_controller=self._embedding_controller,
             register_default_ai_tools=self._register_default_ai_tools,
-            outline_tool_provider=lambda: self._tool_provider.peek_outline_tool() if self._tool_provider else None,
             ai_task_getter=lambda: self._ai_task,
             ai_task_setter=lambda task: setattr(self, "_ai_task", task),
             ai_stream_state_setter=self._set_ai_stream_active,
@@ -558,41 +536,36 @@ class MainWindow(QMainWindow):
         except Exception:  # pragma: no cover - defensive guard
             _LOGGER.debug("Background task failed", exc_info=True)
 
-    def _tool_registry_context(self) -> ToolRegistryContext:
+    def _tool_wiring_context(self) -> ToolWiringContext:
         if self._tool_provider is None:
             raise RuntimeError("Tool provider is not initialized")
-        return self._tool_provider.build_tool_registry_context(auto_patch_consumer=self._set_auto_patch_tool)
-
-    def _set_auto_patch_tool(self, tool: DocumentApplyPatchTool) -> None:
-        self._auto_patch_tool = tool
-        self._configure_auto_patch_span_policy()
+        return self._tool_provider.build_tool_wiring_context()
 
     def _register_default_ai_tools(self, *, register_fn: Callable[..., Any] | None = None) -> None:
-        context = self._tool_registry_context()
-        try:
-            register_default_tools(context, register_fn=register_fn)
-        except ToolRegistrationError as exc:  # pragma: no cover - defensive logging
-            _LOGGER.warning("Default tool registration failed: %s", exc)
-            self.update_status("AI tools unavailable")
+        context = self._tool_wiring_context()
+        result = register_new_tools(context)
+        if result.registered:
+            _LOGGER.debug("AI tools registered: %s", ", ".join(result.registered))
+        if result.failed:
+            _LOGGER.warning("Some AI tools failed to register: %s", ", ".join(result.failed))
+            self.update_status("Some AI tools unavailable")
             self._post_assistant_notice("Some AI tools could not be registered; check logs for details.")
 
     def _register_phase3_ai_tools(self, *, register_fn: Callable[..., Any] | None = None) -> None:
-        context = self._tool_registry_context()
-        register_phase3_tools(context, register_fn=register_fn)
+        # Phase3 tools have been deprecated; this is now a no-op
+        pass
 
     def _unregister_phase3_ai_tools(self) -> None:
-        unregister_phase3_tools(self._context.ai_controller)
+        # Phase3 tools have been deprecated; this is now a no-op
+        pass
 
     def _register_plot_state_tool(self, *, register_fn: Callable[..., Any] | None = None) -> None:
-        context = self._tool_registry_context()
-        register_plot_state_tool(context, register_fn=register_fn)
-        register_character_map_tool(context, register_fn=register_fn)
-        register_character_planner_tool(context, register_fn=register_fn)
+        # Plot state tools have been deprecated; this is now a no-op
+        pass
 
     def _unregister_plot_state_tool(self) -> None:
-        unregister_plot_state_tool(self._context.ai_controller)
-        unregister_character_map_tool(self._context.ai_controller)
-        unregister_character_planner_tool(self._context.ai_controller)
+        # Plot state tools have been deprecated; this is now a no-op
+        pass
 
     def _resolve_plot_state_store(self) -> DocumentPlotStateStore | None:
         controller = self._context.ai_controller
@@ -679,10 +652,12 @@ class MainWindow(QMainWindow):
 
     def _handle_manual_command(self, request: ManualCommandRequest) -> None:
         if request.command is ManualCommandType.OUTLINE:
-            self._handle_manual_outline_command(request)
+            self._post_assistant_notice("Outline tooling has been removed. Use /find for document search.")
+            self.update_status("Outline removed")
             return
         if request.command is ManualCommandType.FIND_SECTIONS:
-            self._handle_manual_find_text_command(request)
+            self._post_assistant_notice("Find sections tool has been removed. The AI assistant uses search_document tool automatically.")
+            self.update_status("Find sections removed")
             return
         if request.command is ManualCommandType.ANALYZE:
             self._handle_manual_analyze_command(request)
@@ -692,96 +667,6 @@ class MainWindow(QMainWindow):
             return
         self._post_assistant_notice(f"Unsupported manual command '{request.command.value}'.")
         self.update_status("Manual command unsupported")
-
-    def _handle_manual_outline_command(self, request: ManualCommandRequest) -> None:
-        if not self._phase3_outline_enabled:
-            self._post_assistant_notice("Outline tooling is disabled. Enable it in Settings > AI to use /outline.")
-            self.update_status("Outline disabled")
-            return
-
-        provider = self._tool_provider
-        tool = provider.ensure_outline_tool() if provider is not None else None
-        if tool is None:
-            self._post_assistant_notice("Outline tool is unavailable.")
-            self.update_status("Outline unavailable")
-            return
-
-        args = dict(request.args)
-        doc_reference = args.get("document_id")
-        resolved_id = self._resolve_manual_document_id(doc_reference)
-        if doc_reference and resolved_id is None:
-            self._post_assistant_notice(f"Couldn't find a document matching '{doc_reference}'.")
-            self.update_status("Document not found")
-            return
-        if resolved_id:
-            args["document_id"] = resolved_id
-        else:
-            args.pop("document_id", None)
-
-        try:
-            response = tool.run(**args)
-        except Exception as exc:  # pragma: no cover - defensive path
-            _LOGGER.debug("Manual outline command failed", exc_info=True)
-            self._post_assistant_notice(f"Outline command failed: {exc}")
-            self.update_status("Outline command failed")
-            return
-
-        message = self._render_manual_outline_response(response, doc_reference)
-        self._post_assistant_notice(message)
-        status_text = str(response.get("status") or "ok") if isinstance(response, Mapping) else "ok"
-        self._record_manual_tool_trace(
-            name="manual:document_outline",
-            input_summary=self._summarize_manual_input("document_outline", args),
-            output_summary=status_text,
-            args=args,
-            response=response,
-        )
-        self.update_status("Outline ready")
-
-    def _handle_manual_find_text_command(self, request: ManualCommandRequest) -> None:
-        if not self._phase3_outline_enabled:
-            self._post_assistant_notice("Retrieval tooling is disabled. Enable it in Settings > AI to use /find.")
-            self.update_status("Retrieval disabled")
-            return
-
-        provider = self._tool_provider
-        tool = provider.ensure_find_text_tool() if provider is not None else None
-        if tool is None:
-            self._post_assistant_notice("Find text tool is unavailable.")
-            self.update_status("Retrieval unavailable")
-            return
-
-        args = dict(request.args)
-        doc_reference = args.get("document_id")
-        resolved_id = self._resolve_manual_document_id(doc_reference)
-        if doc_reference and resolved_id is None:
-            self._post_assistant_notice(f"Couldn't find a document matching '{doc_reference}'.")
-            self.update_status("Document not found")
-            return
-        if resolved_id:
-            args["document_id"] = resolved_id
-        else:
-            args.pop("document_id", None)
-
-        try:
-            response = tool.run(**args)
-        except Exception as exc:  # pragma: no cover - defensive path
-            _LOGGER.debug("Manual find text command failed", exc_info=True)
-            self._post_assistant_notice(f"Find text command failed: {exc}")
-            self.update_status("Find text failed")
-            return
-
-        message = self._render_manual_retrieval_response(response, args.get("query"), doc_reference)
-        self._post_assistant_notice(message)
-        status_text = str(response.get("status") or "ok") if isinstance(response, Mapping) else "ok"
-        self._record_manual_tool_trace(
-            name="manual:document_find_text",
-            input_summary=self._summarize_manual_input("document_find_text", args),
-            output_summary=status_text,
-            args=args,
-            response=response,
-        )
-        self.update_status("Find text ready")
 
     def _handle_manual_analyze_command(self, request: ManualCommandRequest) -> None:
         controller = self._context.ai_controller
@@ -2117,48 +2002,6 @@ class MainWindow(QMainWindow):
         self._import_controller.file_importer = importer
 
     @property
-    def _outline_tool(self) -> Any | None:  # pragma: no cover - legacy shim for tests
-        provider = self._tool_provider
-        if provider is None:
-            return None
-        return provider.peek_outline_tool()
-
-    @_outline_tool.setter
-    def _outline_tool(self, tool: Any | None) -> None:  # pragma: no cover - legacy shim for tests
-        provider = self._tool_provider
-        if provider is None:
-            raise RuntimeError("Tool provider is not initialized")
-        setattr(provider, "_outline_tool", tool)
-
-    @property
-    def _find_text_tool(self) -> Any | None:  # pragma: no cover - legacy shim for tests
-        provider = self._tool_provider
-        if provider is None:
-            return None
-        return getattr(provider, "_find_text_tool", None)
-
-    @_find_text_tool.setter
-    def _find_text_tool(self, tool: Any | None) -> None:  # pragma: no cover - legacy shim for tests
-        provider = self._tool_provider
-        if provider is None:
-            raise RuntimeError("Tool provider is not initialized")
-        setattr(provider, "_find_text_tool", tool)
-
-    @property
-    def _plot_state_tool(self) -> Any | None:  # pragma: no cover - legacy shim for tests
-        provider = self._tool_provider
-        if provider is None:
-            return None
-        return getattr(provider, "_plot_state_tool", None)
-
-    @_plot_state_tool.setter
-    def _plot_state_tool(self, tool: Any | None) -> None:  # pragma: no cover - legacy shim for tests
-        provider = self._tool_provider
-        if provider is None:
-            raise RuntimeError("Tool provider is not initialized")
-        setattr(provider, "_plot_state_tool", tool)
-
-    @property
     def actions(self) -> Dict[str, WindowAction]:
         """Return the registered window actions keyed by identifier."""
 
@@ -2386,7 +2229,6 @@ class MainWindow(QMainWindow):
         self._safe_ai_config = config
         for tab in self._workspace.iter_tabs():
             self._configure_bridge_safe_edits(tab.bridge, config)
-        self._configure_auto_patch_span_policy()
 
     def _configure_bridge_safe_edits(self, bridge: Any, config: tuple[bool, int, float]) -> None:
         configure = getattr(bridge, "configure_safe_editing", None)
@@ -2401,21 +2243,6 @@ class MainWindow(QMainWindow):
             )
         except Exception:  # pragma: no cover - defensive guard
             _LOGGER.debug("Unable to configure safe AI edits", exc_info=True)
-
-    def _configure_auto_patch_span_policy(self) -> None:
-        tool = getattr(self, "_auto_patch_tool", None)
-        if tool is None:
-            return
-        config = getattr(self, "_safe_ai_config", (False, 2, 0.05))
-        require_spans = bool(config[0])
-        adapt_legacy = not require_spans
-        try:
-            tool.configure_line_span_policy(
-                require_line_spans=require_spans,
-                adapt_legacy_ranges=adapt_legacy,
-            )
-        except Exception:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to configure document_apply_patch span policy", exc_info=True)
 
     @staticmethod
     def _coerce_safe_ai_config(settings: Settings | None) -> tuple[bool, int, float]:

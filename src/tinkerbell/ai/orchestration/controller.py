@@ -50,11 +50,13 @@ from ..memory.plot_state import DocumentPlotStateStore
 from ..services.context_policy import ContextBudgetPolicy
 from ..services.summarizer import ToolPayload, build_pointer, summarize_tool_content
 from ..services.trace_compactor import TraceCompactor
-from ..tools.document_apply_patch import NeedsRangeError
+from ..tools.errors import NeedsRangeError
+from ..tools.version import get_version_manager, VersionManager
 from .budget_manager import BudgetManager
 from .event_log import ChatEventLogger
 from .subagent_runtime import SubagentRuntimeManager
 from .telemetry_manager import TelemetryManager
+from .tool_dispatcher import ToolDispatcher, DispatchResult, ToolContextProvider
 
 # Normalizes stylized glyphs inside <|tool ...|> markers emitted by some models.
 _TOOL_MARKER_TRANSLATION = str.maketrans(
@@ -158,24 +160,33 @@ class _ChunkContext:
 
 @dataclass(slots=True)
 class _ChunkFlowTracker:
-    """Tracks whether the agent stays on the chunk-first path during a run."""
+    """Tracks whether the agent stays on the chunk-first path during a run.
+    
+    Recognizes both legacy and new tool names:
+    - document_snapshot / read_document
+    - document_chunk / analyze_document
+    """
 
     document_id: str | None
     warning_active: bool = False
     last_reason: str | None = None
 
+    # Tool name sets for matching (legacy + new names)
+    _SNAPSHOT_TOOLS: frozenset[str] = frozenset({"document_snapshot", "read_document"})
+    _CHUNK_TOOLS: frozenset[str] = frozenset({"document_chunk", "analyze_document"})
+
     def observe_tool(self, record: Mapping[str, Any], payload: Mapping[str, Any] | None) -> list[str] | None:
         name = str(record.get("name") or "").lower()
-        if name == "document_snapshot":
-            return self._handle_snapshot(record, payload)
-        if name == "document_chunk":
-            self._handle_chunk_tool(payload)
+        if name in self._SNAPSHOT_TOOLS:
+            return self._handle_snapshot(record, payload, source=name)
+        if name in self._CHUNK_TOOLS:
+            self._handle_chunk_tool(payload, source=name)
         return None
 
     # ------------------------------------------------------------------
     # Snapshot handling
     # ------------------------------------------------------------------
-    def _handle_snapshot(self, record: Mapping[str, Any], payload: Mapping[str, Any] | None) -> list[str] | None:
+    def _handle_snapshot(self, record: Mapping[str, Any], payload: Mapping[str, Any] | None, *, source: str = "read_document") -> list[str] | None:
         if not isinstance(payload, Mapping):
             return None
         window = payload.get("window") if isinstance(payload.get("window"), Mapping) else None
@@ -194,7 +205,7 @@ class _ChunkFlowTracker:
             "window_kind": str(window.get("kind") or ""),
             "requested_window": str(window.get("requested_kind") or ""),
             "defaulted": bool(window.get("defaulted")),
-            "source": "document_snapshot",
+            "source": source,
         }
         if manifest:
             chunks = manifest.get("chunks")
@@ -210,7 +221,7 @@ class _ChunkFlowTracker:
         self._emit_request(metadata)
         if self.warning_active:
             recovery = dict(metadata)
-            recovery["recovered_via"] = "document_snapshot"
+            recovery["recovered_via"] = source
             self._emit_recovery(recovery)
         return None
 
@@ -265,7 +276,7 @@ class _ChunkFlowTracker:
     # ------------------------------------------------------------------
     # Chunk tool handling
     # ------------------------------------------------------------------
-    def _handle_chunk_tool(self, payload: Mapping[str, Any] | None) -> None:
+    def _handle_chunk_tool(self, payload: Mapping[str, Any] | None, *, source: str = "analyze_document") -> None:
         if not isinstance(payload, Mapping):
             return
         chunk = payload.get("chunk")
@@ -283,12 +294,12 @@ class _ChunkFlowTracker:
             "window_start": start,
             "window_end": end,
             "pointerized": bool(chunk.get("pointer")),
-            "source": "document_chunk",
+            "source": source,
         }
         self._emit_request(metadata)
         if self.warning_active:
             recovery = dict(metadata)
-            recovery["recovered_via"] = "document_chunk"
+            recovery["recovered_via"] = source
             self._emit_recovery(recovery)
 
     # ------------------------------------------------------------------
@@ -307,9 +318,9 @@ class _ChunkFlowTracker:
         doc_length = self._coerce_int(metadata.get("document_length"))
         approx = f" (~{doc_length:,} chars)" if doc_length else ""
         return [
-            f"DocumentSnapshot fetched the entire document{approx}.",
-            "Request a selection-scoped snapshot or hydrate a chunk via DocumentChunkTool before editing.",
-            "If a full snapshot is unavoidable, explain the fallback to the user and immediately return to chunked context.",
+            f"read_document fetched the entire document{approx}.",
+            "Request a selection-scoped read or analyze a chunk via analyze_document before editing.",
+            "If a full read is unavoidable, explain the fallback to the user and immediately return to chunked context.",
         ]
 
     def _emit_recovery(self, metadata: Mapping[str, Any]) -> None:
@@ -335,13 +346,25 @@ class _ChunkFlowTracker:
 
 @dataclass(slots=True)
 class _SnapshotRefreshTracker:
-    """Warns when the agent applies too many edits without a fresh snapshot."""
+    """Warns when the agent applies too many edits without a fresh snapshot.
+    
+    Recognizes both legacy and new tool names:
+    - document_snapshot / read_document
+    - document_apply_patch, document_edit / replace_lines, insert_lines, delete_lines
+    """
 
     document_id: str | None
     threshold: int
     edits_since_snapshot: int = 0
     last_snapshot_version: str | None = None
     warning_active: bool = False
+
+    # Tool name sets for matching (legacy + new names)
+    _SNAPSHOT_TOOLS: frozenset[str] = frozenset({"document_snapshot", "read_document"})
+    _EDIT_TOOLS: frozenset[str] = frozenset({
+        "document_apply_patch", "document_edit",
+        "replace_lines", "insert_lines", "delete_lines", "write_document",
+    })
 
     def __post_init__(self) -> None:
         try:
@@ -354,11 +377,11 @@ class _SnapshotRefreshTracker:
         name = str(record.get("name") or "").lower()
         status = str(record.get("status") or "ok").lower()
         succeeded = status == "ok"
-        if name == "document_snapshot":
+        if name in self._SNAPSHOT_TOOLS:
             if succeeded:
                 self._note_snapshot(payload)
             return None
-        if name not in {"document_apply_patch", "document_edit"} or not succeeded:
+        if name not in self._EDIT_TOOLS or not succeeded:
             return None
         self.edits_since_snapshot += 1
         if not self.warning_active and self.edits_since_snapshot >= self.threshold:
@@ -387,14 +410,21 @@ class _SnapshotRefreshTracker:
         target = self.document_id or "this document"
         version = self.last_snapshot_version or "unknown"
         return [
-            f"{self.edits_since_snapshot} edits have landed on {target} since the last DocumentSnapshot (version {version}).",
-            "Offsets drift after multiple edits off a single snapshot. Call DocumentSnapshot to capture a fresh span before drafting another diff and narrate the refresh to the user.",
+            f"{self.edits_since_snapshot} edits have landed on {target} since the last read_document (version {version}).",
+            "Offsets drift after multiple edits off a single snapshot. Call read_document to capture a fresh span before drafting another edit and narrate the refresh to the user.",
         ]
 
 
 @dataclass(slots=True)
 class _PlotLoopTracker:
-    """Ensures the agent follows the plot-outline → edit → update contract."""
+    """Ensures the agent follows the outline → edit → update contract.
+    
+    Tool name mapping (legacy → new):
+    - plot_outline → get_outline
+    - document_plot_state → analyze_document
+    - plot_state_update → transform_document
+    - document_apply_patch, document_edit → replace_lines, insert_lines, delete_lines
+    """
 
     document_id: str | None
     outline_called: bool = False
@@ -402,13 +432,30 @@ class _PlotLoopTracker:
     blocked_edits: int = 0
     snapshot_prompt_pending: bool = False
 
+    # Tool name sets for matching
+    _OUTLINE_TOOLS: frozenset[str] = frozenset({
+        "get_outline", "analyze_document",
+        # Legacy names for backward compatibility
+        "plot_outline", "document_plot_state",
+    })
+    _EDIT_TOOLS: frozenset[str] = frozenset({
+        "replace_lines", "insert_lines", "delete_lines", "write_document",
+        # Legacy names for backward compatibility
+        "document_apply_patch", "document_edit",
+    })
+    _UPDATE_TOOLS: frozenset[str] = frozenset({
+        "transform_document",
+        # Legacy name for backward compatibility
+        "plot_state_update",
+    })
+
     def before_tool(self, tool_name: str | None) -> str | None:
         name = (tool_name or "").strip().lower()
-        if name in {"document_apply_patch", "document_edit"} and not self.outline_called:
+        if name in self._EDIT_TOOLS and not self.outline_called:
             self.blocked_edits += 1
             self.snapshot_prompt_pending = True
             return (
-                "Plot loop guardrail: call PlotOutlineTool for continuity context before applying edits."
+                "Plot loop guardrail: call get_outline or analyze_document for continuity context before applying edits."
             )
         return None
 
@@ -416,28 +463,28 @@ class _PlotLoopTracker:
         name = str(record.get("name") or "").lower()
         status = str(record.get("status") or "ok").lower()
         succeeded = status == "ok"
-        if name in {"plot_outline", "document_plot_state"} and succeeded:
+        if name in self._OUTLINE_TOOLS and succeeded:
             self.outline_called = True
             if self.snapshot_prompt_pending:
                 self.snapshot_prompt_pending = False
                 target = self.document_id or "this document"
                 return [
-                    f"Plot loop guardrail satisfied for {target}: capture a fresh DocumentSnapshot before drafting your next diff so offsets stay in sync.",
+                    f"Plot loop guardrail satisfied for {target}: capture a fresh read_document before drafting your next edit so offsets stay in sync.",
                 ]
             return None
-        if name == "plot_state_update":
+        if name in self._UPDATE_TOOLS:
             if succeeded and self.pending_update:
                 self.pending_update = False
                 return [
-                    "PlotStateUpdateTool received your changes. You may proceed to the next edit after reading the outline if needed.",
+                    "transform_document received your changes. You may proceed to the next edit after reading the outline if needed.",
                 ]
             if succeeded:
                 self.pending_update = False
             return None
-        if name in {"document_apply_patch", "document_edit"} and succeeded:
+        if name in self._EDIT_TOOLS and succeeded:
             self.pending_update = True
             return [
-                "Plot loop reminder: call PlotStateUpdateTool to log the changes you just applied so downstream agents stay in sync.",
+                "Plot loop reminder: call transform_document to log the changes you just applied so downstream agents stay in sync.",
             ]
         return None
 
@@ -447,7 +494,7 @@ class _PlotLoopTracker:
     def update_prompt(self) -> str:
         target = self.document_id or "this document"
         return (
-            f"Plot loop requirement: run PlotStateUpdateTool for {target} before finishing this turn so plot scaffolding reflects your edits."
+            f"Plot loop requirement: run transform_document for {target} before finishing this turn so plot scaffolding reflects your edits."
         )
 
 
@@ -564,7 +611,15 @@ class AIController:
     _latest_snapshot_cache: dict[str, Mapping[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _cache_bus: DocumentCacheBus | None = field(default=None, init=False, repr=False)
     _event_logger: ChatEventLogger | None = field(default=None, init=False, repr=False)
+    _tool_dispatcher: ToolDispatcher | None = field(default=None, init=False, repr=False)
+    _version_manager: VersionManager | None = field(default=None, init=False, repr=False)
     _RETRYABLE_VERSION_TOOLS: ClassVar[frozenset[str]] = frozenset({"document_apply_patch", "search_replace"})
+    # New tools that should be dispatched through ToolDispatcher
+    _NEW_TOOL_NAMES: ClassVar[frozenset[str]] = frozenset({
+        "read_document", "search_document", "get_outline", "list_tabs",
+        "create_document", "insert_lines", "replace_lines", "delete_lines",
+        "write_document", "find_and_replace", "analyze_document", "transform_document",
+    })
 
     def __post_init__(self) -> None:
         if self.tools:
@@ -601,6 +656,62 @@ class AIController:
             estimate_message_tokens=self._estimate_message_tokens,
         )
         self.configure_debug_event_logging(enabled=self.debug_event_logging, event_log_dir=self.event_log_dir)
+        self._initialize_tool_dispatcher()
+
+    def _initialize_tool_dispatcher(self) -> None:
+        """Initialize the new tool dispatcher for WS1-6 tools."""
+        self._version_manager = get_version_manager()
+        # ToolDispatcher is initialized lazily when context_provider is available
+        # This is because the controller may not have access to document context at init time
+        self._tool_dispatcher = None
+
+    def configure_tool_dispatcher(
+        self,
+        context_provider: ToolContextProvider | None = None,
+    ) -> None:
+        """Configure the tool dispatcher with a context provider.
+        
+        This should be called after the controller has access to document
+        context (e.g., after workspace/bridge is available).
+        
+        Args:
+            context_provider: Provider for document context operations.
+        """
+        from ..tools.tool_registry import get_tool_registry
+        from .transaction import TransactionManager
+        from .editor_lock import EditorLockManager
+        
+        self._tool_dispatcher = ToolDispatcher(
+            registry=get_tool_registry(),
+            context_provider=context_provider,
+            version_manager=self._version_manager,
+            transaction_manager=TransactionManager(),
+            lock_manager=EditorLockManager(),
+        )
+        LOGGER.debug("Tool dispatcher configured with context provider")
+
+    @property
+    def tool_dispatcher(self) -> ToolDispatcher | None:
+        """Return the tool dispatcher instance (if configured)."""
+        return self._tool_dispatcher
+
+    def _is_new_registry_tool(self, tool_name: str) -> bool:
+        """Check if a tool is registered in the new ToolRegistry.
+        
+        This is used to determine whether to dispatch through the new
+        ToolDispatcher or use the legacy invocation path.
+        
+        Args:
+            tool_name: Name of the tool to check.
+            
+        Returns:
+            True if tool exists in the new registry and dispatcher is configured.
+        """
+        if self._tool_dispatcher is None:
+            return False
+        from ..tools.tool_registry import get_tool_registry
+        registry = get_tool_registry()
+        return registry.has_tool(tool_name)
 
     @property
     def graph(self) -> Dict[str, Any]:
@@ -845,7 +956,8 @@ class AIController:
             LOGGER.debug("Chunk manifest ingestion failed", exc_info=True)
 
     def _resolve_chunk_tool(self) -> Any | None:
-        registration = self.tools.get("document_chunk")
+        # Try new tool name first, fallback to legacy
+        registration = self.tools.get("analyze_document") or self.tools.get("document_chunk")
         if registration is None:
             return None
         impl = getattr(registration, "impl", registration)
@@ -2075,7 +2187,7 @@ class AIController:
                     lines.append(message)
                 if action:
                     lines.append(f"Action: {action}")
-                hint = self._format_guardrail_hint(f"DocumentOutlineTool • {guardrail_type}", lines)
+                hint = self._format_guardrail_hint(f"get_outline • {guardrail_type}", lines)
                 if hint:
                     hints.append(hint)
         status = str(payload.get("status") or "").lower()
@@ -2089,43 +2201,43 @@ class AIController:
             retry_hint = None
             if isinstance(retry_after_ms, (int, float)) and retry_after_ms > 0:
                 retry_seconds = retry_after_ms / 1000.0
-                retry_hint = f"Retry after ~{retry_seconds:.1f}s or continue with DocumentSnapshot while the worker rebuilds."
+                retry_hint = f"Retry after ~{retry_seconds:.1f}s or continue with read_document while the worker rebuilds."
             lines = [f"Outline for {document_id} is still building; treat existing nodes as stale hints only."]
             if retry_hint:
                 lines.append(retry_hint)
-            hints.append(self._format_guardrail_hint("DocumentOutlineTool", lines))
+            hints.append(self._format_guardrail_hint("get_outline", lines))
         elif status == "unsupported_format":
             detail = reason or "unsupported format"
             lines = [
                 f"Outline unavailable for {document_id}: {detail}.",
-                "Navigate manually with DocumentSnapshot or other tools.",
+                "Navigate manually with read_document or other tools.",
             ]
-            hints.append(self._format_guardrail_hint("DocumentOutlineTool", lines))
+            hints.append(self._format_guardrail_hint("get_outline", lines))
         elif status in {"outline_missing", "outline_unavailable", "no_document"}:
             detail = reason or "outline not cached yet"
             lines = [
                 f"Outline missing for {document_id} ({detail}).",
                 "Queue the worker or rely on selection-scoped snapshots until it exists.",
             ]
-            hints.append(self._format_guardrail_hint("DocumentOutlineTool", lines))
+            hints.append(self._format_guardrail_hint("get_outline", lines))
         if is_stale:
             lines = [
-                f"Outline for {document_id} is stale compared to the latest DocumentSnapshot.",
+                f"Outline for {document_id} is stale compared to the latest read_document.",
                 "Refresh the outline or treat headings as hints only before editing.",
             ]
-            hints.append(self._format_guardrail_hint("DocumentOutlineTool", lines))
+            hints.append(self._format_guardrail_hint("get_outline", lines))
         if trimmed_reason == "token_budget":
             lines = [
                 "Outline was trimmed by the token budget.",
                 "Request fewer levels or hydrate specific pointers before editing deeper sections.",
             ]
-            hints.append(self._format_guardrail_hint("DocumentOutlineTool", lines))
+            hints.append(self._format_guardrail_hint("get_outline", lines))
         if outline_available is False and status not in {"pending", "unsupported_format", "outline_missing", "outline_unavailable"}:
             lines = [
                 f"Outline payload for {document_id} indicated no nodes were returned.",
                 "Avoid planning edits that rely on missing structure until the worker succeeds.",
             ]
-            hints.append(self._format_guardrail_hint("DocumentOutlineTool", lines))
+            hints.append(self._format_guardrail_hint("get_outline", lines))
         return [hint for hint in hints if hint]
 
     def _retrieval_guardrail_hints(self, payload: Mapping[str, Any]) -> list[str]:
@@ -2139,22 +2251,22 @@ class AIController:
             detail = reason or "unsupported format"
             lines = [
                 f"Retrieval disabled for {document_id}: {detail}.",
-                "Use DocumentSnapshot, manual navigation, or outline pointers instead.",
+                "Use read_document, manual navigation, or outline pointers instead.",
             ]
-            hints.append(self._format_guardrail_hint("DocumentFindTextTool", lines))
+            hints.append(self._format_guardrail_hint("search_document", lines))
         if offline_mode or status in {"offline_fallback", "offline_no_results"}:
             label_reason = fallback_reason or ("offline mode" if offline_mode else "fallback strategy")
             lines = [
                 f"Retrieval is running without embeddings ({label_reason}).",
-                "Treat matches as low-confidence hints and rehydrate via DocumentSnapshot before editing.",
+                "Treat matches as low-confidence hints and rehydrate via read_document before editing.",
             ]
-            hints.append(self._format_guardrail_hint("DocumentFindTextTool", lines))
+            hints.append(self._format_guardrail_hint("search_document", lines))
         if status == "offline_no_results":
             lines = [
                 f"Offline fallback could not find matches for {document_id}.",
                 "Try a different query or scan the outline/snapshot manually.",
             ]
-            hints.append(self._format_guardrail_hint("DocumentFindTextTool", lines))
+            hints.append(self._format_guardrail_hint("search_document", lines))
         return [hint for hint in hints if hint]
 
     def _format_guardrail_hint(self, source: str, lines: Sequence[str]) -> str:
@@ -2237,15 +2349,8 @@ class AIController:
         digest = snapshot.get("outline_digest")
         if digest:
             context["outline_digest"] = str(digest)
-            telemetry_service.emit("chunk_flow.requested", {
-                "document_id": chunk.get("document_id") or self.document_id,
-                "chunk_id": chunk.get("chunk_id"),
-                "chunk_length": length,
-                "window_start": start,
-                "window_end": end,
-                "pointerized": bool(chunk.get("pointer")),
-                "source": "document_chunk",
-            })
+        token_count = self._coerce_optional_int(snapshot.get("outline_token_count"))
+        if token_count is not None:
             context["outline_token_count"] = token_count
         trimmed = snapshot.get("outline_trimmed")
         if isinstance(trimmed, bool):
@@ -3166,11 +3271,11 @@ class AIController:
                 reasons.append("the user referenced headings/sections")
             reason_text = " and ".join(reasons) if reasons else "document context"
             guidance.append(
-                f"Call DocumentOutlineTool first because {reason_text}. Compare outline_digest values to avoid redundant calls."
+                f"Call get_outline first because {reason_text}. Compare outline_digest values to avoid redundant calls."
             )
         if mentions_retrieval:
             guidance.append(
-                "After reviewing the outline, call DocumentFindTextTool to pull the passages requested before drafting edits."
+                "After reviewing the outline, call search_document to pull the passages requested before drafting edits."
             )
 
         digest_hint: str | None = None
@@ -3197,7 +3302,7 @@ class AIController:
         if digest_hint:
             lines.append(f"- {digest_hint}")
         if not guidance and digest_hint:
-            lines.append("- Only re-run DocumentOutlineTool if the digest changes or the tool reports stale data.")
+            lines.append("- Only re-run get_outline if the digest changes or the tool reports stale data.")
         return "\n".join(lines)
 
     def _log_response_text(self, response_text: str) -> None:
@@ -3619,6 +3724,12 @@ class AIController:
             await self._emit_tool_result_event(call, block_reason, payload, on_event)
             return block_reason, resolved_arguments, payload, None
 
+        # Check if tool is in new registry - dispatch through ToolDispatcher if so
+        tool_name = call.name or ""
+        if self._is_new_registry_tool(tool_name):
+            return await self._execute_via_dispatcher(call, resolved_arguments, on_event)
+
+        # Legacy path: use _invoke_tool_impl directly
         retry_context: dict[str, Any] | None = None
         serialized_override: str | None = None
         try:
@@ -3642,6 +3753,68 @@ class AIController:
         serialized = serialized_override or self._serialize_tool_result(result)
         await self._emit_tool_result_event(call, serialized, result, on_event)
         return serialized, resolved_arguments, result, retry_context
+
+    async def _execute_via_dispatcher(
+        self,
+        call: _ToolCallRequest,
+        resolved_arguments: Any,
+        on_event: ToolCallback | None,
+    ) -> tuple[str, Any, Any, dict[str, Any] | None]:
+        """Execute a tool call through the new ToolDispatcher.
+        
+        This method handles dispatch of WS1-6 tools through the new
+        dispatch system, converting DispatchResult to the expected
+        return format.
+        
+        Args:
+            call: Tool call request.
+            resolved_arguments: Coerced and normalized arguments.
+            on_event: Callback for streaming events.
+            
+        Returns:
+            Tuple of (serialized_result, resolved_arguments, raw_result, retry_context).
+        """
+        tool_name = call.name or ""
+        arguments = dict(resolved_arguments) if isinstance(resolved_arguments, dict) else {}
+        
+        # Dispatch through the new system
+        dispatch_result = await self._tool_dispatcher.dispatch(tool_name, arguments)
+        
+        if dispatch_result.success:
+            result = dispatch_result.result
+            serialized = self._serialize_tool_result(result)
+            await self._emit_tool_result_event(call, serialized, result, on_event)
+            return serialized, resolved_arguments, result, None
+        else:
+            # Handle error from dispatcher
+            error = dispatch_result.error
+            error_message = error.message if error else "Unknown error"
+            
+            # Check for version mismatch errors that should trigger retry
+            from ..tools.errors import VersionMismatchToolError
+            if isinstance(error, VersionMismatchToolError) and self._supports_version_retry(tool_name):
+                # Convert to legacy exception and handle retry
+                exc = DocumentVersionMismatchError(cause="version_mismatch")
+                try:
+                    # Get registration from legacy registry for retry
+                    registration = self._tools.get(tool_name)
+                    if registration:
+                        result, retry_context = await self._handle_version_mismatch_retry(
+                            call,
+                            registration,
+                            resolved_arguments,
+                            exc,
+                        )
+                        serialized = self._serialize_tool_result(result)
+                        await self._emit_tool_result_event(call, serialized, result, on_event)
+                        return serialized, resolved_arguments, result, retry_context
+                except Exception:
+                    pass  # Fall through to error handling
+            
+            # Format error as result
+            result = f"Tool '{tool_name}' failed: {error_message}"
+            await self._emit_tool_result_event(call, result, dispatch_result.to_dict(), on_event)
+            return result, resolved_arguments, dispatch_result.to_dict(), None
 
     async def _emit_tool_result_event(
         self,
@@ -3743,7 +3916,8 @@ class AIController:
         return None
 
     async def _refresh_document_snapshot(self, tab_id: str | None) -> Mapping[str, Any] | None:
-        registration = self.tools.get("document_snapshot")
+        # Try new tool name first, fallback to legacy
+        registration = self.tools.get("read_document") or self.tools.get("document_snapshot")
         if registration is None:
             return None
         runner = getattr(registration.impl, "run", registration.impl)
@@ -4315,18 +4489,9 @@ class AIController:
         return tracker.before_tool(tool_name)
 
     def _should_enforce_plot_loop(self, snapshot: Mapping[str, Any]) -> bool:
-        if not getattr(self.subagent_config, "plot_scaffolding_enabled", False):
-            return False
-        document_chars = self._snapshot_document_chars(snapshot) or 0
-        if document_chars <= 0:
-            return False
-        min_chars_raw = getattr(self.subagent_config, "plot_outline_min_chars", 0)
-        try:
-            min_chars = int(min_chars_raw or 0)
-        except (TypeError, ValueError):  # pragma: no cover - defensive cast
-            min_chars = 0
-        min_threshold = max(1, min_chars)
-        return document_chars >= min_threshold
+        # Plot loop enforcement disabled - plot_outline/plot_state_update tools were removed.
+        # Kept for potential future use with get_outline tool integration.
+        return False
 
     def _snapshot_document_chars(self, snapshot: Mapping[str, Any]) -> int | None:
         document_chars = self._coerce_optional_int(snapshot.get("length"))

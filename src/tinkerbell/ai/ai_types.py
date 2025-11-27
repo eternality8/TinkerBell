@@ -202,9 +202,10 @@ class SubagentRuntimeConfig:
     chunk_preview_chars: int = 1_200
     plot_outline_min_chars: int = 400
     allowed_tools: tuple[str, ...] = (
-        "document_snapshot",
-        "document_outline",
-        "document_find_text",
+        # New tool names (WS8.4 update)
+        "read_document",
+        "get_outline",
+        "search_document",
     )
     instructions_template: str = (
         "You are a focused editing subagent. Analyze only the provided chunk, summarize its intent, "
@@ -234,9 +235,10 @@ class SubagentRuntimeConfig:
             self.helper_cooldown_seconds = 0.0
         allowed = tuple(tool.strip() for tool in self.allowed_tools if tool)
         self.allowed_tools = allowed or (
-            "document_snapshot",
-            "document_outline",
-            "document_find_text",
+            # Fallback defaults (new tool names)
+            "read_document",
+            "get_outline",
+            "search_document",
         )
         self.plot_scaffolding_enabled = bool(self.plot_scaffolding_enabled)
         return self

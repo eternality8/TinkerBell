@@ -28,6 +28,7 @@ from .plot_state import DocumentPlotState, DocumentPlotStateStore, PlotArc, Plot
 from .plot_memory import PlotDependency, PlotOverride, PlotOverrideStore, PlotStateMemory
 from .character_map import CharacterMapStore, CharacterMapDocument, CharacterRecord, CharacterMention
 from .result_cache import SubagentResultCache
+from .analysis_adapter import AnalysisResult, AnalysisMemoryAdapter, AnalysisResultCache
 
 __all__ = [
 	"ConversationMemory",
@@ -52,6 +53,9 @@ __all__ = [
 	"CharacterRecord",
 	"CharacterMention",
 	"SubagentResultCache",
+	"AnalysisResult",
+	"AnalysisMemoryAdapter",
+	"AnalysisResultCache",
 	"ChunkEmbeddingRecord",
 	"DocumentEmbeddingIndex",
 	"EmbeddingProvider",

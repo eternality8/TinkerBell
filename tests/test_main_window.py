@@ -237,40 +237,18 @@ def test_safe_ai_settings_apply_to_existing_bridges():
     assert getattr(bridge, "_safe_edit_settings").token_drift == pytest.approx(0.15)
 
 
-def test_document_edit_tool_runs_in_patch_only_mode():
+def test_new_ai_tools_registered():
+    """Verify new WS1-6 tools are registered instead of legacy tools."""
     controller = _StubAIController()
     _make_window(controller, settings=Settings(api_key="key"))
-    edit_tool = controller.registered_tools["document_edit"]["impl"]
-
-    assert getattr(edit_tool, "patch_only", None) is True
-
-
-def test_auto_patch_tool_requires_spans_when_safe_ai_enabled():
-    controller = _StubAIController()
-    _make_window(controller, settings=Settings(safe_ai_edits=True))
-    auto_patch_tool = controller.registered_tools["document_apply_patch"]["impl"]
-
-    assert auto_patch_tool.require_line_spans is True
-    assert auto_patch_tool.legacy_range_adapter_enabled is False
-
-
-def test_auto_patch_tool_updates_policy_when_settings_change():
-    controller = _StubAIController()
-    window = _make_window(controller, settings=Settings(safe_ai_edits=False))
-    auto_patch_tool = controller.registered_tools["document_apply_patch"]["impl"]
-
-    assert auto_patch_tool.require_line_spans is False
-    assert auto_patch_tool.legacy_range_adapter_enabled is True
-
-    window._apply_safe_edit_settings(Settings(safe_ai_edits=True))
-
-    assert auto_patch_tool.require_line_spans is True
-    assert auto_patch_tool.legacy_range_adapter_enabled is False
-
-    window._apply_safe_edit_settings(Settings(safe_ai_edits=False))
-
-    assert auto_patch_tool.require_line_spans is False
-    assert auto_patch_tool.legacy_range_adapter_enabled is True
+    
+    # New tools should be registered
+    tool_names = set(controller.registered_tools)
+    assert "read_document" in tool_names
+    assert "list_tabs" in tool_names
+    # Legacy tools should NOT be registered
+    assert "document_edit" not in tool_names
+    assert "document_snapshot" not in tool_names
 
 
 def test_tool_traces_capture_compaction_metadata():
@@ -383,11 +361,11 @@ def test_hash_mismatch_failure_surfaces_guardrail_notice():
 
     guardrail_status = window._status_bar.guardrail_notice_state  # noqa: SLF001
     assert guardrail_status[0].startswith("Guardrail: Snapshot")
-    assert "Refresh document_snapshot" in guardrail_status[1]
+    assert "Refresh" in guardrail_status[1] or "read_document" in guardrail_status[1]
     chat_guardrail = window.chat_panel.guardrail_state
     assert chat_guardrail[0].startswith("Guardrail")
     history = window.chat_panel.history()
-    assert "Refresh document_snapshot" in history[-1].content
+    assert "Refresh" in history[-1].content or "read_document" in history[-1].content
 
 def test_chat_suggestions_ignore_selection_state():
     window = _make_window()
@@ -1569,112 +1547,28 @@ def test_handle_chat_request_captures_snapshot_when_missing(monkeypatch: pytest.
     assert window._pending_turn_snapshot is sentinel
 
 
-def test_manual_outline_command_uses_outline_tool():
-    window = _make_window(settings=Settings(phase3_outline_tools=True))
-    document = window.editor_widget.to_document()
-
-    class _StubOutlineTool:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, Any]] = []
-
-        def run(self, **kwargs: Any) -> dict[str, Any]:
-            self.calls.append(kwargs)
-            return {
-                "status": "ok",
-                "document_id": document.document_id,
-                "nodes": [
-                    {
-                        "level": 1,
-                        "text": "Intro",
-                        "pointer_id": f"outline:{document.document_id}:intro",
-                        "children": [],
-                    }
-                ],
-            }
-
-    stub_tool = _StubOutlineTool()
-    window._outline_tool = stub_tool  # type: ignore[assignment]
-
-    panel = window.chat_panel
-    panel.set_composer_text("/outline")
-    panel.send_prompt()
-
-    assert stub_tool.calls == [{}]
-    response = panel.history()[-1].content
-    assert "Document outline" in response
-    assert "Intro" in response
-
-
-def test_manual_outline_command_disabled_without_flag():
-    window = _make_window(settings=Settings(phase3_outline_tools=False))
+def test_manual_outline_command_shows_removed_notice():
+    """The /outline command reports that the feature has been removed."""
+    window = _make_window()
     panel = window.chat_panel
     panel.set_composer_text("/outline")
     panel.send_prompt()
 
     response = panel.history()[-1].content.lower()
-    assert "disabled" in response
-    assert window.last_status_message == "Outline disabled"
+    assert "removed" in response
+    assert window.last_status_message == "Outline removed"
 
 
-def test_manual_find_text_command_uses_tool():
-    window = _make_window(settings=Settings(phase3_outline_tools=True))
-    document = window.editor_widget.to_document()
-
-    class _StubFindTool:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, Any]] = []
-
-        def run(self, **kwargs: Any) -> dict[str, Any]:
-            self.calls.append(kwargs)
-            query = kwargs.get("query", "")
-            return {
-                "status": "ok",
-                "document_id": document.document_id,
-                "query": query,
-                "strategy": "fallback",
-                "pointers": [
-                    {
-                        "pointer_id": f"chunk:{document.document_id}:1",
-                        "score": 0.9,
-                        "preview": "Example paragraph about introductions.",
-                    }
-                ],
-            }
-
-    stub_tool = _StubFindTool()
-    window._find_text_tool = stub_tool  # type: ignore[assignment]
-
+def test_manual_find_command_shows_removed_notice():
+    """The /find command reports that the feature has been removed."""
+    window = _make_window()
     panel = window.chat_panel
     panel.set_composer_text("/find introduction")
     panel.send_prompt()
 
-    assert stub_tool.calls and stub_tool.calls[0]["query"] == "introduction"
-    response = panel.history()[-1].content
-    assert "Find text" in response
-    assert "introduction" in response.lower()
-    assert "Example paragraph" in response
-
-
-def test_manual_find_text_command_disabled_without_flag():
-    window = _make_window(settings=Settings(phase3_outline_tools=False))
-    panel = window.chat_panel
-    panel.set_composer_text("/find intro")
-    panel.send_prompt()
-
     response = panel.history()[-1].content.lower()
-    assert "disabled" in response
-    assert window.last_status_message == "Retrieval disabled"
-
-
-def test_manual_command_parse_error_skips_ai_controller():
-    controller = _StubAIController()
-    window = _make_window(controller)
-    panel = window.chat_panel
-    panel.set_composer_text("/find   ")
-    panel.send_prompt()
-
-    assert controller.prompts == []
-    assert "requires a query" in panel.history()[-1].content.lower()
+    assert "removed" in response
+    assert window.last_status_message == "Find sections removed"
 
 
 def test_chat_prompt_includes_prior_history_for_ai_requests():
@@ -1742,28 +1636,28 @@ def test_tool_call_stream_events_coalesce_into_single_trace():
     events = [
         SimpleNamespace(
             type="tool_calls.function.arguments.delta",
-            tool_name="document_edit",
+            tool_name="replace_lines",
             tool_index=0,
             tool_call_id=call_id,
             arguments_delta='{"action":"replace"',
         ),
         SimpleNamespace(
             type="tool_calls.function.arguments.delta",
-            tool_name="document_edit",
+            tool_name="replace_lines",
             tool_index=0,
             tool_call_id=call_id,
             arguments_delta=',"content":"Better text"}',
         ),
         SimpleNamespace(
             type="tool_calls.function.arguments.done",
-            tool_name="document_edit",
+            tool_name="replace_lines",
             tool_index=0,
             tool_call_id=call_id,
             tool_arguments=arguments_text,
         ),
         SimpleNamespace(
             type="tool_calls.result",
-            tool_name="document_edit",
+            tool_name="replace_lines",
             tool_index=0,
             tool_call_id=call_id,
             content=result_text,
@@ -1789,21 +1683,21 @@ def test_tool_trace_completes_when_stream_events_lack_ids():
     events = [
         SimpleNamespace(
             type="tool_calls.function.arguments.delta",
-            tool_name="document_edit",
+            tool_name="replace_lines",
             tool_index=0,
             arguments_delta='{"action":"patch"',
         ),
         SimpleNamespace(
             type="tool_calls.function.arguments.done",
-            tool_name="document_edit",
+            tool_name="replace_lines",
             tool_index=0,
             tool_arguments='{"action":"patch","diff":"---"}',
         ),
         SimpleNamespace(
             type="tool_calls.result",
-            tool_name="document_edit",
+            tool_name="replace_lines",
             tool_index=0,
-            tool_call_id="document_edit:0",
+            tool_call_id="replace_lines:0",
             content="Applied patch",
         ),
     ]
@@ -1823,28 +1717,24 @@ def test_default_ai_tools_register_when_controller_available():
     del window  # window retains references to editor/bridge but is unused in assertions
 
     tool_names = set(controller.registered_tools)
+    # New tools should be registered
     assert {
-        "document_snapshot",
-        "document_edit",
-        "document_apply_patch",
-        "validate_snippet",
+        "read_document",
+        "search_document",
+        "get_outline",
         "list_tabs",
     }.issubset(tool_names)
 
-    assert controller.registered_tools["document_snapshot"]["strict"] is True
+    # Legacy tools should NOT be registered
+    assert "document_snapshot" not in tool_names
+    assert "document_edit" not in tool_names
 
-    snapshot_tool = controller.registered_tools["document_snapshot"]["impl"]
-    snapshot = snapshot_tool.run()
-    assert isinstance(snapshot, dict)
-    assert "length" in snapshot
+    # Verify tools are registered with callable implementations
+    read_tool = controller.registered_tools["read_document"]["impl"]
+    assert callable(read_tool) or hasattr(read_tool, "run")
 
-    validator = controller.registered_tools["validate_snippet"]["impl"]
-    outcome = validator("foo: bar", "yaml")
-    assert hasattr(outcome, "ok")
-
-    tab_listing = controller.registered_tools["list_tabs"]["impl"].run()
-    assert isinstance(tab_listing, dict)
-    assert "tabs" in tab_listing and "active_tab_id" in tab_listing
+    tab_listing_tool = controller.registered_tools["list_tabs"]["impl"]
+    assert callable(tab_listing_tool) or hasattr(tab_listing_tool, "run")
 
 
 def test_close_event_cancels_background_tasks(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -23,8 +23,6 @@ from tinkerbell.ai.ai_types import (
 from tinkerbell.ai.client import AIClient, AIStreamEvent
 from tinkerbell.ai.services.context_policy import BudgetDecision, ContextBudgetPolicy
 from tinkerbell.ai import prompts
-from tinkerbell.ai.tools.document_chunk import DocumentChunkTool
-from tinkerbell.ai.tools.tool_usage_advisor import ToolUsageAdvisorTool
 from tinkerbell.ai.memory.cache_bus import DocumentChangedEvent
 from tinkerbell.services.settings import ContextPolicySettings
 from tinkerbell.services import telemetry
@@ -256,34 +254,6 @@ def test_analysis_cache_invalidation_on_document_change():
     assert "doc" not in controller._analysis_advice_cache
     assert "doc" not in controller._latest_snapshot_cache
     assert fake_agent.invalidated == ["doc"]
-
-
-def test_tool_usage_advisor_emits_telemetry(sample_snapshot):
-    captured: list[dict[str, object]] = []
-
-    def listener(payload: dict[str, object]) -> None:
-        captured.append(payload)
-
-    telemetry.register_event_listener("analysis.advisor_tool.invoked", listener)
-    try:
-        stub_client = _StubClient([[]])
-        controller = AIController(client=cast(AIClient, stub_client))
-        snapshot = dict(sample_snapshot)
-        snapshot.update({"document_id": "doc-telemetry", "version": "v1"})
-        tool = ToolUsageAdvisorTool(controller._advisor_tool_entrypoint)
-        result = tool.run(snapshot=snapshot, force_refresh=True, reason="manual test")
-
-        assert result["status"] == "ok"
-        assert captured, "Telemetry listener did not receive advisor invocation event"
-        event = captured[-1]
-        assert event["event"] == "analysis.advisor_tool.invoked"
-        assert event["document_id"] == "doc-telemetry"
-        assert event["force_refresh"] is True
-        assert event["reason"] == "manual test"
-    finally:
-        listeners = telemetry._EVENT_LISTENERS.get("analysis.advisor_tool.invoked", [])
-        if listener in listeners:
-            listeners.remove(listener)
 
 
 def test_ai_controller_updates_max_tool_iterations():
@@ -554,51 +524,6 @@ def test_ai_controller_ingests_chunk_manifest_on_run():
     entry = index.get_chunk(chunk_id, document_id="doc-ingest", cache_key=manifest["cache_key"])
     assert entry is not None
     assert entry.chunk_id == chunk_id
-
-
-def test_subagent_jobs_use_chunk_manifest_outside_window():
-    stub_client = _StubClient([AIStreamEvent(type="content.done", content="ok")])
-    runtime_config = SubagentRuntimeConfig(enabled=True, chunk_preview_chars=32)
-    controller = AIController(client=cast(AIClient, stub_client), subagent_config=runtime_config)
-    controller.configure_subagents(runtime_config)
-
-    doc_text = ("abcdefghijklmnopqrstuvwxyz" * 3)[:78]
-    manifest = _build_chunk_manifest("doc-chunk", [(0, 24), (24, 56), (56, len(doc_text))], cache_key="chunk-cache")
-    chunk_index = controller.ensure_chunk_index()
-    chunk_index.ingest_manifest(manifest)
-    bridge = _ChunkBridgeStub(doc_text)
-    chunk_tool = DocumentChunkTool(
-        bridge=bridge,
-        chunk_index=chunk_index,
-        chunk_config_resolver=controller.get_chunking_config,
-    )
-    controller.register_tool(
-        "document_chunk",
-        chunk_tool,
-        description="Chunk fetcher",
-        parameters={"type": "object", "properties": {"chunk_id": {"type": "string"}}},
-    )
-
-    snapshot = {
-        "document_id": "doc-chunk",
-        "text": doc_text[:16],
-        "text_range": {"start": 0, "end": 16},
-        "window": {"start": 30, "end": 50},
-        "snapshot_span": {"start": 30, "end": 50},
-        "length": len(doc_text),
-        "chunk_manifest": manifest,
-    }
-    controller._ingest_snapshot_manifest(snapshot)
-
-    jobs = controller._plan_subagent_jobs("analyze", snapshot, {"run_id": "run-chunk"})
-    assert len(jobs) == 1
-    job = jobs[0]
-    assert job.chunk_ref.document_id == "doc-chunk"
-    assert job.chunk_ref.chunk_id == "chunk:doc-chunk:24:56"
-    assert job.chunk_ref.char_range == (24, 56)
-    assert job.chunk_ref.pointer_id == "outline:doc-chunk:1"
-    assert job.dedup_hash == "hash-1"
-    assert job.chunk_ref.preview.startswith(doc_text[24:56][: runtime_config.chunk_preview_chars].strip())
 
 
 def test_ai_controller_executes_tool_and_continues(sample_snapshot):
@@ -1001,7 +926,7 @@ def test_ai_controller_injects_outline_guardrail_hint(sample_snapshot):
         if msg.get("role") == "system" and isinstance(msg.get("content"), str) and "Guardrail hint" in msg.get("content", "")
     ]
     assert hint_messages, second_messages
-    assert any("DocumentOutlineTool" in msg["content"] for msg in hint_messages)
+    assert any("get_outline" in msg["content"] for msg in hint_messages)
     assert any("still building" in msg["content"].lower() for msg in hint_messages)
 
 
@@ -1046,7 +971,7 @@ def test_ai_controller_injects_retrieval_guardrail_hint(sample_snapshot):
         if msg.get("role") == "system" and isinstance(msg.get("content"), str) and "Guardrail hint" in msg.get("content", "")
     ]
     assert hint_messages, second_messages
-    assert any("DocumentFindTextTool" in msg["content"] for msg in hint_messages)
+    assert any("search_document" in msg["content"] for msg in hint_messages)
     assert any("embeddings" in msg["content"].lower() for msg in hint_messages)
 
 
@@ -1178,7 +1103,7 @@ def test_outline_routing_hint_flags_large_documents(sample_snapshot):
     hint = controller._outline_routing_hint("Please outline this document", snapshot)
 
     assert hint is not None
-    assert "DocumentOutlineTool" in hint
+    assert "get_outline" in hint
     assert "large" in hint.lower()
 
 
@@ -1193,7 +1118,7 @@ def test_outline_routing_hint_promotes_retrieval_requests(sample_snapshot):
     hint = controller._outline_routing_hint("Can you find section about safety policies?", snapshot)
 
     assert hint is not None
-    assert "DocumentFindTextTool" in hint
+    assert "search_document" in hint
 
 
 def test_outline_routing_hint_tracks_outline_digest(sample_snapshot):
@@ -1282,210 +1207,6 @@ def _build_tool_call_event(name: str, arguments: Mapping[str, Any]) -> AIStreamE
         tool_arguments=json.dumps(arguments, ensure_ascii=False),
         parsed=dict(arguments),
     )
-
-
-def test_plot_loop_blocks_edit_without_outline(sample_snapshot):
-    edit_turn = [_build_tool_call_event("document_edit", {"action": "insert", "position": 0, "content": "Plot move"})]
-    final_turn = [AIStreamEvent(type="content.done", content="Returning summary")]  # Model stops after guardrail reminder
-    stub_client = _StubClient([edit_turn, final_turn])
-    config = SubagentRuntimeConfig(enabled=False, plot_scaffolding_enabled=True)
-    controller = AIController(client=cast(AIClient, stub_client), subagent_config=config)
-
-    edit_calls: list[dict[str, Any]] = []
-
-    class _EditTool:
-        def run(self, action: str, position: int, content: str) -> dict[str, Any]:
-            edit_calls.append({"action": action, "position": position, "content": content})
-            return {"status": "ok"}
-
-    controller.register_tool("document_edit", _EditTool())
-
-    snapshot = dict(sample_snapshot)
-    snapshot["document_id"] = "doc-plot-block"
-    long_text = "Long document " * 200
-    snapshot["text"] = long_text
-    snapshot["length"] = len(long_text)
-
-    result = asyncio.run(controller.run_chat("draft scene", snapshot))
-
-    assert edit_calls == []
-    assert result["tool_calls"][0]["name"] == "document_edit"
-    assert "Plot loop guardrail" in result["tool_calls"][0]["result"]
-
-
-def test_plot_loop_respects_flag_disabled(sample_snapshot):
-    edit_turn = [_build_tool_call_event("document_edit", {"action": "insert", "position": 0, "content": "Flag off"})]
-    final_turn = [AIStreamEvent(type="content.done", content="Applied")]
-    stub_client = _StubClient([edit_turn, final_turn])
-    config = SubagentRuntimeConfig(enabled=False, plot_scaffolding_enabled=False)
-    controller = AIController(client=cast(AIClient, stub_client), subagent_config=config)
-
-    edit_calls: list[dict[str, Any]] = []
-
-    class _EditTool:
-        def run(self, action: str, position: int, content: str) -> dict[str, Any]:
-            edit_calls.append({"action": action, "position": position, "content": content})
-            return {"status": "ok"}
-
-    controller.register_tool("document_edit", _EditTool())
-
-    snapshot = dict(sample_snapshot)
-    snapshot["document_id"] = "doc-plot-off"
-    long_text = "Long document " * 200
-    snapshot["text"] = long_text
-    snapshot["length"] = len(long_text)
-
-    result = asyncio.run(controller.run_chat("draft scene", snapshot))
-
-    assert len(edit_calls) == 1
-    assert result["tool_calls"][0]["status"] == "ok"
-
-
-def test_plot_loop_allows_edit_after_outline_and_requires_update(sample_snapshot):
-    outline_turn = [_build_tool_call_event("plot_outline", {})]
-    edit_turn = [_build_tool_call_event("document_edit", {"action": "insert", "position": 0, "content": "Keep arcs aligned"})]
-    update_turn = [
-        _build_tool_call_event(
-            "plot_state_update",
-            {
-                "overrides": [
-                    {
-                        "override_id": "manual",
-                        "summary": "Recorded manual adjustment",
-                    }
-                ]
-            },
-        )
-    ]
-    final_turn = [AIStreamEvent(type="content.done", content="All synced")]
-    stub_client = _StubClient([outline_turn, edit_turn, update_turn, final_turn])
-    config = SubagentRuntimeConfig(enabled=False, plot_scaffolding_enabled=True)
-    controller = AIController(client=cast(AIClient, stub_client), subagent_config=config)
-
-    outline_calls: list[dict[str, Any]] = []
-    edit_calls: list[dict[str, Any]] = []
-    update_calls: list[dict[str, Any]] = []
-
-    class _OutlineTool:
-        def run(self) -> dict[str, Any]:
-            outline_calls.append({"status": "ok"})
-            return {"status": "ok", "document_id": "doc-plot"}
-
-    class _EditTool:
-        def run(self, action: str, position: int, content: str) -> dict[str, Any]:
-            edit_calls.append({"action": action, "position": position, "content": content})
-            return {"status": "ok"}
-
-    class _UpdateTool:
-        def run(self, overrides: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-            update_calls.append({"overrides": overrides or []})
-            return {"status": "ok"}
-
-    controller.register_tools(
-        {
-            "plot_outline": _OutlineTool(),
-            "document_edit": _EditTool(),
-            "plot_state_update": _UpdateTool(),
-        }
-    )
-
-    snapshot = dict(sample_snapshot)
-    snapshot["document_id"] = "doc-plot"
-    long_text = "Long document " * 200
-    snapshot["text"] = long_text
-    snapshot["length"] = len(long_text)
-
-    result = asyncio.run(controller.run_chat("keep plot aligned", snapshot))
-
-    assert len(outline_calls) == 1
-    assert len(edit_calls) == 1
-    assert len(update_calls) == 1
-
-    recorded_names = [entry["name"] for entry in result["tool_calls"][:3]]
-    assert recorded_names == ["plot_outline", "document_edit", "plot_state_update"]
-
-    reminder_messages = [
-        entry
-        for entry in stub_client.calls[2]["messages"]
-        if entry.get("role") == "system" and "PlotStateUpdateTool" in str(entry.get("content", ""))
-    ]
-    assert reminder_messages
-
-    update_trace = [entry for entry in result["tool_calls"] if entry["name"] == "plot_state_update"]
-    assert update_trace and json.loads(update_trace[0]["result"])["status"] == "ok"
-
-
-def test_plot_loop_outline_completion_prompts_snapshot(sample_snapshot):
-    edit_turn = [_build_tool_call_event("document_edit", {"action": "insert", "position": 0, "content": "Blocked"})]
-    outline_turn = [_build_tool_call_event("plot_outline", {})]
-    final_turn = [AIStreamEvent(type="content.done", content="done")]
-    stub_client = _StubClient([edit_turn, outline_turn, final_turn])
-    config = SubagentRuntimeConfig(enabled=False, plot_scaffolding_enabled=True)
-    controller = AIController(client=cast(AIClient, stub_client), subagent_config=config)
-
-    class _EditTool:
-        def run(self, action: str, position: int, content: str) -> dict[str, Any]:
-            raise AssertionError("document_edit should be guardrail-blocked before outline runs")
-
-    class _OutlineTool:
-        def run(self) -> dict[str, Any]:
-            return {"status": "ok", "document_id": "doc-plot-reminder"}
-
-    controller.register_tools(
-        {
-            "document_edit": _EditTool(),
-            "plot_outline": _OutlineTool(),
-        }
-    )
-
-    snapshot = dict(sample_snapshot)
-    snapshot["document_id"] = "doc-plot-reminder"
-    long_text = "Long document " * 200
-    snapshot["text"] = long_text
-    snapshot["length"] = len(long_text)
-
-    result = asyncio.run(controller.run_chat("remind snapshot", snapshot))
-
-    blocked_call = result["tool_calls"][0]
-    assert blocked_call["name"] == "document_edit"
-    raw_result = blocked_call.get("raw_result")
-    assert isinstance(raw_result, Mapping)
-    assert raw_result.get("status") == "plot_loop_blocked"
-
-    # Third model turn (index 2) should include the reminder to grab a fresh DocumentSnapshot.
-    reminder_messages = [
-        entry
-        for entry in stub_client.calls[2]["messages"]
-        if entry.get("role") == "system" and "DocumentSnapshot" in str(entry.get("content", ""))
-    ]
-    assert reminder_messages
-
-
-def test_plot_loop_skips_guard_for_short_document(sample_snapshot):
-    edit_turn = [_build_tool_call_event("document_edit", {"action": "insert", "position": 0, "content": "New story"})]
-    final_turn = [AIStreamEvent(type="content.done", content="done")]
-    stub_client = _StubClient([edit_turn, final_turn])
-    config = SubagentRuntimeConfig(enabled=False, plot_scaffolding_enabled=True)
-    controller = AIController(client=cast(AIClient, stub_client), subagent_config=config)
-
-    edit_calls: list[dict[str, Any]] = []
-
-    class _EditTool:
-        def run(self, action: str, position: int, content: str) -> dict[str, Any]:
-            edit_calls.append({"action": action, "position": position, "content": content})
-            return {"status": "ok"}
-
-    controller.register_tool("document_edit", _EditTool())
-
-    snapshot = dict(sample_snapshot)
-    snapshot["document_id"] = "doc-short"
-    snapshot["text"] = ""
-    snapshot["length"] = 0
-
-    result = asyncio.run(controller.run_chat("draft intro", snapshot))
-
-    assert len(edit_calls) == 1
-    assert result["tool_calls"][0]["status"] == "ok"
 
 
 def test_ai_controller_compacts_tool_output_with_pointer(sample_snapshot):

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from tinkerbell.ai.tools.diff_builder import DiffBuilderTool
 from tinkerbell.editor.patches import PatchApplyError, RangePatch, apply_streamed_ranges, apply_unified_diff
 
 
@@ -111,8 +110,17 @@ def test_apply_unified_diff_inserts_into_empty_document():
 
 def test_apply_unified_diff_handles_blank_context_lines():
     original = "# Title\n\nLine one\n\nLine two\n"
-    updated = "# Title\n\nLine one with Barnaby.\n\nLine two\n"
-    diff = DiffBuilderTool().run(original, updated, filename="story.md", context=3)
+    # Pre-computed diff for updated text: "# Title\n\nLine one with Barnaby.\n\nLine two\n"
+    diff = """--- a/story.md
++++ b/story.md
+@@ -1,5 +1,5 @@
+ # Title
+ 
+-Line one
++Line one with Barnaby.
+ 
+ Line two
+"""
 
     result = apply_unified_diff(original, diff)
 

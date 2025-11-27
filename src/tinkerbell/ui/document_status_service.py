@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
 
 from ..ai.analysis import AnalysisAdvice
 from ..ai.memory.buffers import DocumentSummaryMemory, SummaryRecord
@@ -17,6 +17,9 @@ from ..editor.workspace import DocumentTab, DocumentWorkspace
 from ..services.bridge_router import WorkspaceBridgeRouter
 from .document_status import DocumentDescriptor, format_document_status_summary
 from .telemetry_controller import TelemetryController
+
+if TYPE_CHECKING:
+    from ..ai.memory.analysis_adapter import AnalysisResultCache
 
 LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +43,7 @@ class DocumentStatusService:
         outline_memory_resolver: Callable[[], DocumentSummaryMemory | None],
         plot_state_resolver: Callable[[], DocumentPlotStateStore | None],
         character_map_resolver: Callable[[], CharacterMapStore | None],
+        analysis_cache_resolver: Callable[[], "AnalysisResultCache | None"] | None = None,
         snapshot_provider: Callable[[DocumentTab | None, DocumentState | None], Mapping[str, Any] | None] | None = None,
     ) -> None:
         self._workspace = workspace
@@ -49,6 +53,7 @@ class DocumentStatusService:
         self._outline_memory_resolver = outline_memory_resolver
         self._plot_state_resolver = plot_state_resolver
         self._character_map_resolver = character_map_resolver
+        self._analysis_cache_resolver = analysis_cache_resolver
         self._snapshot_provider = snapshot_provider or self._default_snapshot_provider
 
     # ------------------------------------------------------------------
@@ -216,11 +221,79 @@ class DocumentStatusService:
     def _build_plot_payload(self, document_id: str | None) -> dict[str, Any] | None:
         if not document_id:
             return None
+        
+        # Prefer analyze_document results from the new cache
+        if self._analysis_cache_resolver is not None:
+            cache = self._analysis_cache_resolver()
+            if cache is not None:
+                analysis_snapshot = cache.snapshot(document_id)
+                if analysis_snapshot is not None:
+                    # Convert analysis format to plot format
+                    return self._convert_analysis_to_plot_payload(analysis_snapshot)
+        
+        # Fall back to legacy plot state store
         store = self._plot_state_resolver()
         if store is None:
             return None
         snapshot = self._build_plot_snapshot(store, document_id)
         return dict(snapshot) if isinstance(snapshot, Mapping) else None
+
+    def _convert_analysis_to_plot_payload(self, analysis: Mapping[str, Any]) -> dict[str, Any]:
+        """Convert analyze_document results to plot payload format."""
+        entities = []
+        for char in analysis.get("characters", []):
+            entities.append({
+                "entity_id": char.get("name", "").lower().replace(" ", "-"),
+                "name": char.get("name", ""),
+                "kind": "character",
+                "summary": f"Role: {char.get('role', 'unknown')}",
+                "salience": 0.0,
+                "supporting_pointers": [],
+                "attributes": {
+                    "aliases": char.get("aliases", []),
+                    "traits": char.get("traits", []),
+                },
+            })
+        
+        arcs = []
+        plot_points = analysis.get("plot_points", [])
+        if plot_points:
+            beats = []
+            for point in plot_points:
+                beats.append({
+                    "beat_id": str(hash(point.get("summary", ""))),
+                    "arc_id": "primary",
+                    "summary": point.get("summary", ""),
+                    "pointer_id": None,
+                    "chunk_hash": None,
+                    "metadata": {
+                        "type": point.get("type"),
+                        "significance": point.get("significance"),
+                        "characters_involved": point.get("characters_involved"),
+                    },
+                })
+            arcs.append({
+                "arc_id": "primary",
+                "name": "Primary Arc",
+                "summary": "",
+                "beats": beats,
+            })
+        
+        return {
+            "document_id": analysis.get("document_id"),
+            "version_id": analysis.get("version_id"),
+            "generated_at": analysis.get("generated_at"),
+            "entity_count": len(entities),
+            "arc_count": len(arcs),
+            "entities": entities,
+            "arcs": arcs,
+            "metadata": {
+                "themes": analysis.get("themes", []),
+                "summary": analysis.get("summary"),
+                "source": "analyze_document",
+                "chunks_processed": analysis.get("chunks_processed", 0),
+            },
+        }
 
     @staticmethod
     def _build_plot_snapshot(store: Any, document_id: str) -> Mapping[str, Any] | None:
@@ -251,11 +324,55 @@ class DocumentStatusService:
     def _build_concordance_payload(self, document_id: str | None) -> dict[str, Any] | None:
         if not document_id:
             return None
+        
+        # Prefer analyze_document results from the new cache
+        if self._analysis_cache_resolver is not None:
+            cache = self._analysis_cache_resolver()
+            if cache is not None:
+                analysis_snapshot = cache.snapshot(document_id)
+                if analysis_snapshot is not None:
+                    return self._convert_analysis_to_concordance_payload(analysis_snapshot)
+        
+        # Fall back to legacy character map store
         store = self._character_map_resolver()
         if store is None:
             return None
         snapshot = store.snapshot(document_id)
         return snapshot if isinstance(snapshot, Mapping) else None
+
+    def _convert_analysis_to_concordance_payload(self, analysis: Mapping[str, Any]) -> dict[str, Any]:
+        """Convert analyze_document results to concordance payload format."""
+        entities = []
+        for char in analysis.get("characters", []):
+            name = char.get("name", "")
+            entity_id = name.lower().replace(" ", "-")
+            entities.append({
+                "entity_id": entity_id,
+                "name": name,
+                "aliases": char.get("aliases", []),
+                "pronouns": [],
+                "mention_count": len(char.get("mentions", [])),
+                "first_seen_at": analysis.get("generated_at"),
+                "last_seen_at": analysis.get("generated_at"),
+                "mentions": char.get("mentions", []),
+            })
+        
+        return {
+            "document_id": analysis.get("document_id"),
+            "version_id": analysis.get("version_id"),
+            "generated_at": analysis.get("generated_at"),
+            "entity_count": len(entities),
+            "entities": entities,
+            "stats": {
+                "source": "analyze_document",
+                "chunks_processed": analysis.get("chunks_processed", 0),
+            },
+            "planner_progress": {
+                "tasks": [],
+                "completed": 0,
+                "pending": 0,
+            },
+        }
 
     def _build_planner_payload(self, concordance_payload: Mapping[str, Any] | None) -> dict[str, Any]:
         payload: dict[str, Any] = {"pending": 0, "completed": 0, "tasks": []}
