@@ -1,853 +1,774 @@
-# AI Toolset Redesign - Technical Implementation Plan
+# AI Toolset Refactor - Technical Implementation Plan
 
-This document provides a detailed, trackable implementation plan for the AI toolset redesign outlined in `ai_refactor.md`. The plan is organized into parallel workstreams with dependency tracking.
+This document provides a detailed technical implementation plan for the complete rewrite of TinkerBell's AI toolset, as designed in `ai_refactor.md`.
 
 ---
 
 ## Overview
 
-| Workstream | Description | Est. Effort | Dependencies |
-|------------|-------------|-------------|--------------|
-| WS1: Core Infrastructure | Version tokens, locking, atomicity | 5-7 days | None |
-| WS2: Navigation Tools | `list_tabs`, `read_document`, `get_outline` | 3-4 days | WS1.1 |
-| WS3: Search Tools | `search_document` with semantic/exact/regex | 3-4 days | WS2.1 |
-| WS4: Writing Tools | `insert_lines`, `replace_lines`, `delete_lines` | 4-5 days | WS1, WS2 |
-| WS5: Bulk Operations | `find_and_replace`, `write_document` | 2-3 days | WS4 |
-| WS6: Subagent System | `analyze_document`, `transform_document` | 6-8 days | WS1-WS5 |
-| WS7: UI Integration | Diff review, turn checkpoints, editor locking | 4-5 days | WS1 |
-| WS8: Migration & Cleanup | Deprecation, prompt updates, tests | 3-4 days | WS1-WS7 |
+**Objective**: Replace the existing complex, overlapping AI tool system with a clean, minimal toolset organized around clear responsibilities.
 
-**Total Estimated Effort:** 30-40 days (can be parallelized to ~15-20 days with 2 developers)
+**Approach**: Complete rewrite—remove all legacy tools and code, implement new tools from scratch.
+
+**Timeline Reference**: 5 phases as outlined in the design document.
+
+---
+
+## Current Code Inventory (To Be Removed)
+
+### Tools to Delete (`src/tinkerbell/ai/tools/`)
+- [ ] `document_snapshot.py` - Replaced by `read_document`
+- [ ] `document_apply_patch.py` - Replaced by `replace_lines` + `insert_lines`
+- [ ] `document_chunk.py` - Automatic via subagents
+- [ ] `document_edit.py` - Replaced by explicit edit tools
+- [ ] `document_find_text.py` - Replaced by `search_document`
+- [ ] `document_insert.py` - Replaced by `insert_lines`
+- [ ] `document_replace_all.py` - Replaced by `write_document`
+- [ ] `document_outline.py` - Replaced by `get_outline`
+- [ ] `document_plot_state.py` - Replaced by `analyze_document`
+- [ ] `plot_state_update.py` - Replaced by `transform_document`
+- [ ] `character_edit_planner.py` - Replaced by `transform_document`
+- [ ] `character_map.py` - Replaced by `analyze_document`
+- [ ] `diff_builder.py` - No longer needed (edits are direct)
+- [ ] `search_replace.py` - Replaced by `find_and_replace`
+- [ ] `selection_range.py` - Remove (not in new design)
+- [ ] `tool_usage_advisor.py` - Remove (simplified flow)
+- [ ] `validation.py` - Keep/adapt for format validation
+- [ ] `registry.py` - Complete rewrite
+
+### Memory/State to Delete or Refactor (`src/tinkerbell/ai/memory/`)
+- [ ] `chunk_index.py` - Rewrite for new chunking system
+- [ ] `plot_memory.py` - Absorbed into `analyze_document` subagent
+- [ ] `plot_state.py` - Absorbed into `analyze_document` subagent
+- [ ] `character_map.py` - Absorbed into `analyze_document` subagent
+- [ ] `buffers.py` - Review for relevance
+- [ ] `cache_bus.py` - Keep, adapt for new version system
+- [ ] `embeddings.py` - Keep for semantic search
+- [ ] `result_cache.py` - Keep, adapt for new caching needs
+
+### Services to Refactor (`src/tinkerbell/ai/services/`)
+- [ ] `context_policy.py` - Adapt for new token budgeting
+- [ ] `outline_worker.py` - Rewrite for new `get_outline` tool
+- [ ] `summarizer.py` - Keep for subagent summarization
+- [ ] `telemetry.py` - Keep, update event names
+- [ ] `trace_compactor.py` - Review for relevance
+
+### Orchestration to Refactor (`src/tinkerbell/ai/orchestration/`)
+- [ ] `controller.py` - Major refactor for new tool dispatch
+- [ ] `budget_manager.py` - Adapt for new budget system
+- [ ] `event_log.py` - Keep, update for new tools
+- [ ] `subagent_runtime.py` - Major refactor for new subagent architecture
+- [ ] `telemetry_manager.py` - Keep, update event types
+
+### Tests to Rewrite (`tests/`)
+- [ ] `test_document_snapshot.py` → `test_read_document.py`
+- [ ] `test_document_apply_patch.py` → `test_replace_lines.py`
+- [ ] `test_document_chunk_tool.py` → Remove (automatic chunking)
+- [ ] `test_document_insert.py` → `test_insert_lines.py`
+- [ ] `test_document_replace_all.py` → `test_write_document.py`
+- [ ] `test_document_outline_tool.py` → `test_get_outline.py`
+- [ ] `test_character_map_tool.py` → Remove
+- [ ] `test_character_edit_planner_tool.py` → Remove
+- [ ] `test_document_plot_state_tool.py` → Remove
+- [ ] All other tool tests need review/rewrite
 
 ---
 
 ## Workstream 1: Core Infrastructure
 
-### 1.1 Simplified Version Token System
+### WS1.1: Version Token System
+**Files**: New `src/tinkerbell/ai/tools/version.py`, modify `src/tinkerbell/services/bridge.py`
 
-**Goal:** Replace complex `snapshot_token = "tab_id:version_id"` with simple opaque `version = "42"` integer string.
+- [ ] **WS1.1.1**: Design `VersionManager` class
+  - Per-tab version tracking (simple incrementing integer)
+  - Version validation on write operations
+  - Version bump on successful edits
 
-#### Current State
-- `DocumentSnapshotTool` emits `snapshot_token = f"{tab_id}:{version_id}"`
-- `DocumentApplyPatchTool` parses token to extract components
-- Version tracking tied to `DocumentState.version_id`
+- [ ] **WS1.1.2**: Implement version storage in `DocumentBridge`
+  - Add `_version: int` field to bridge/tab state
+  - Increment on any document mutation
+  - Reset to `1` on reload from disk
 
-#### Implementation Tasks
+- [ ] **WS1.1.3**: Create `VersionMismatchError` exception
+  - Include `your_version`, `current_version`, `suggestion`
+  - JSON-serializable for tool responses
 
-- [ ] **1.1.1** Add `version` field to `DocumentState`
-  - File: `src/tinkerbell/editor/document_model.py`
-  - Add `version: str` field (simple incrementing integer as string)
-  - Increment on every content modification
-  - Separate from internal `version_id` used for conflict detection
+- [ ] **WS1.1.4**: Add version to all document state responses
+  - Ensure `read_document`, `search_document`, `get_outline` all return version
 
-- [ ] **1.1.2** Update `DocumentBridge.generate_snapshot()` to emit `version`
-  - File: `src/tinkerbell/services/bridge.py`
-  - Add `version` to snapshot response (alongside existing fields for compatibility)
-  - Version should be the simple string format: `"1"`, `"2"`, etc.
+- [ ] **WS1.1.5**: Unit tests for version system
+  - Test increment behavior
+  - Test mismatch detection
+  - Test reset on reload
 
-- [ ] **1.1.3** Create version validation utility
-  - File: `src/tinkerbell/ai/tools/validation.py`
-  - Add `validate_version(provided: str, current: str) -> bool`
-  - Add `VersionMismatchError` exception class
+### WS1.2: Tool Base Classes
+**Files**: New `src/tinkerbell/ai/tools/base.py`
 
-- [ ] **1.1.4** Add version reset behavior
-  - File: `src/tinkerbell/editor/document_model.py`
-  - Reset to `"1"` on document reload from disk
-  - Continue incrementing on save (no reset)
+- [ ] **WS1.2.1**: Create `BaseTool` abstract class
+  - Standardized `execute()` signature
+  - Built-in error formatting
+  - Telemetry hooks
 
-- [ ] **1.1.5** Add unit tests for version system
-  - File: `tests/test_version_tokens.py` (new)
-  - Test increment, validation, reset behaviors
+- [ ] **WS1.2.2**: Create `ReadOnlyTool` base class
+  - For tools that don't require version token
+  - Standardized response format with version
 
----
+- [ ] **WS1.2.3**: Create `WriteTool` base class
+  - Requires version token validation
+  - Automatic version bump on success
+  - Dry-run support built-in
 
-### 1.2 Global Editor Lock During AI Turns
+- [ ] **WS1.2.4**: Create `SubagentTool` base class
+  - Spawns subagents for execution
+  - Progress tracking
+  - Result aggregation
 
-**Goal:** Lock all editor tabs to view-only mode while AI is working.
+### WS1.3: Error Response System
+**Files**: New `src/tinkerbell/ai/tools/errors.py`
 
-#### Implementation Tasks
+- [ ] **WS1.3.1**: Define error code constants
+  - `version_mismatch`, `invalid_tab_id`, `invalid_line_range`, etc.
 
-- [ ] **1.2.1** Create `AITurnLock` class
-  - File: `src/tinkerbell/ai/orchestration/turn_lock.py` (new)
-  - Methods: `acquire()`, `release()`, `is_locked() -> bool`
-  - Signal/callback for UI to respond to lock state changes
+- [ ] **WS1.3.2**: Create `ToolError` base exception
+  - `error_code`, `message`, `details` fields
+  - `to_dict()` for JSON serialization
 
-- [ ] **1.2.2** Integrate lock into `AIController`
-  - File: `src/tinkerbell/ai/orchestration/controller.py`
-  - Acquire lock at turn start
-  - Release lock at turn end (success, error, or cancel)
+- [ ] **WS1.3.3**: Create specific error subclasses
+  - `VersionMismatchError`
+  - `InvalidTabIdError`
+  - `InvalidLineRangeError`
+  - `UnsupportedFileTypeError`
+  - `ContentRequiredError`
 
-- [ ] **1.2.3** Add lock status to `EditorWidget`
-  - File: `src/tinkerbell/editor/editor_widget.py`
-  - Connect to lock signal
-  - Set read-only mode when locked
-
-- [ ] **1.2.4** Add status bar indicator
-  - File: `src/tinkerbell/ui/status_bar.py` (or similar)
-  - Show "🤖 AI working..." when locked
-  - Show subagent count if applicable
-
-- [ ] **1.2.5** Add cancel mechanism
-  - File: `src/tinkerbell/ai/orchestration/controller.py`
-  - User can cancel AI turn, releasing lock immediately
-  - Emit cancellation telemetry
-
-- [ ] **1.2.6** Add tests for lock behavior
-  - File: `tests/test_turn_lock.py` (new)
-  - Test acquire/release, cancel, concurrent access
+- [ ] **WS1.3.4**: Unit tests for error serialization
 
 ---
 
-### 1.3 Atomic Operations with Rollback
+## Workstream 2: Navigation & Reading Tools
 
-**Goal:** Stage all edits within a turn; commit on success, rollback on failure.
+### WS2.1: `list_tabs` Tool
+**Files**: Modify `src/tinkerbell/ai/tools/list_tabs.py`
 
-#### Implementation Tasks
+- [ ] **WS2.1.1**: Update response format
+  - Add `version`, `size_chars`, `line_count` to each tab
+  - Add `is_active` flag
+  - Add `file_type` detection
 
-- [ ] **1.3.1** Create `EditTransaction` class
-  - File: `src/tinkerbell/ai/orchestration/transaction.py` (new)
-  - Collect pending edits per tab
-  - Methods: `stage(tab_id, edit)`, `commit()`, `rollback()`
-  - Store pre-edit snapshots for rollback
+- [ ] **WS2.1.2**: Add file type detection
+  - Based on extension: `.md`, `.txt`, `.json`, `.yaml`
+  - Flag `binary` or `unknown` for unsupported types
 
-- [ ] **1.3.2** Integrate transaction into `AIController`
-  - File: `src/tinkerbell/ai/orchestration/controller.py`
-  - Create transaction at turn start
-  - Tools stage edits to transaction instead of applying directly
-  - Commit/rollback at turn end
+- [ ] **WS2.1.3**: Unit tests for list_tabs
 
-- [ ] **1.3.3** Update `DocumentBridge` to support staged edits
-  - File: `src/tinkerbell/services/bridge.py`
-  - Add `stage_edit()` method (does not apply immediately)
-  - Add `apply_staged_edits()` method (batch apply)
-  - Add `discard_staged_edits()` method
+### WS2.2: `read_document` Tool
+**Files**: New `src/tinkerbell/ai/tools/read_document.py`
 
-- [ ] **1.3.4** Update writing tools to use staging
-  - Files: All new writing tools
-  - Call `transaction.stage()` instead of direct bridge methods
+- [ ] **WS2.2.1**: Implement basic line-range reading
+  - 0-indexed, inclusive ranges
+  - Default to active tab if `tab_id` omitted
+  - Return content with line metadata
 
-- [ ] **1.3.5** Add transaction telemetry
-  - Emit `transaction.commit` / `transaction.rollback` events
-  - Include edit count, affected tabs, duration
+- [ ] **WS2.2.2**: Implement automatic pagination
+  - Default ~6000 token window
+  - `has_more` flag
+  - `continuation_hint` with next `start_line`
 
-- [ ] **1.3.6** Add tests for transaction system
-  - File: `tests/test_transaction.py` (new)
-  - Test multi-edit commit, partial failure rollback
+- [ ] **WS2.2.3**: Implement token estimation
+  - `tokens.returned` (actual)
+  - `tokens.total_estimate` (whole document)
 
----
+- [ ] **WS2.2.4**: Handle empty documents
+  - Return `content: ""`, `lines.total: 0`
+  - Version still valid for editing
 
-### 1.4 Turn Checkpoint System
+- [ ] **WS2.2.5**: Handle unsupported file types
+  - Return `unsupported_file_type` error for binary
 
-**Goal:** Create restorable checkpoints after each AI turn.
+- [ ] **WS2.2.6**: Unit tests for read_document
+  - Normal reading
+  - Pagination
+  - Empty documents
+  - Error cases
 
-#### Implementation Tasks
+### WS2.3: `search_document` Tool
+**Files**: New `src/tinkerbell/ai/tools/search_document.py`
 
-- [ ] **1.4.1** Create `TurnCheckpoint` dataclass
-  - File: `src/tinkerbell/ai/orchestration/checkpoints.py` (new)
-  - Fields: `turn_id`, `timestamp`, `summary`, `tab_snapshots: dict[str, DocumentState]`
+- [ ] **WS2.3.1**: Implement exact text search
+  - Literal string matching
+  - Case sensitivity option
+  - Return line numbers with context
 
-- [ ] **1.4.2** Create `CheckpointManager` class
-  - File: `src/tinkerbell/ai/orchestration/checkpoints.py`
-  - Methods: `create_checkpoint()`, `restore_checkpoint()`, `list_checkpoints()`
-  - Per-document checkpoint storage
-  - Configurable max checkpoints (default: 20)
+- [ ] **WS2.3.2**: Implement regex search
+  - Pattern validation
+  - Match highlighting
+  - Multiple results
 
-- [ ] **1.4.3** Integrate checkpoints into `AIController`
-  - File: `src/tinkerbell/ai/orchestration/controller.py`
-  - Create checkpoint before each turn
-  - Store turn summary in checkpoint
+- [ ] **WS2.3.3**: Integrate semantic search
+  - Use existing `embeddings.py`
+  - Just-in-time indexing if not ready
+  - `embedding_status` field in response
 
-- [ ] **1.4.4** Add checkpoint UI panel (optional for Phase 1)
-  - File: `src/tinkerbell/ui/checkpoint_panel.py` (new)
-  - List checkpoints with timestamps and summaries
-  - Restore button with confirmation
+- [ ] **WS2.3.4**: Result formatting
+  - `line`, `score`, `preview`
+  - Context window with `start_line`, `end_line`
 
-- [ ] **1.4.5** Add tests for checkpoint system
-  - File: `tests/test_checkpoints.py` (new)
+- [ ] **WS2.3.5**: Handle unavailable embeddings
+  - Graceful fallback to exact search
+  - Clear error message with suggestion
 
----
+- [ ] **WS2.3.6**: Unit tests for search_document
+  - Each match type
+  - Embedding availability scenarios
+  - Context extraction
 
-## Workstream 2: Navigation Tools
+### WS2.4: `get_outline` Tool
+**Files**: New `src/tinkerbell/ai/tools/get_outline.py`
 
-### 2.1 `list_tabs` Tool
+- [ ] **WS2.4.1**: Implement Markdown heading detection
+  - `#`, `##`, `###` markers
+  - Proper nesting hierarchy
 
-**Goal:** Refactor existing `ListTabsTool` to match new schema.
+- [ ] **WS2.4.2**: Implement JSON/YAML structure detection
+  - Top-level keys
+  - Nested structure representation
 
-#### Current State
-- `ListTabsTool` exists in `src/tinkerbell/ai/tools/list_tabs.py`
-- Returns basic tab metadata
-
-#### Implementation Tasks
-
-- [ ] **2.1.1** Extend `ListTabsTool` response schema
-  - File: `src/tinkerbell/ai/tools/list_tabs.py`
-  - Add `file_type`, `version`, `size_chars`, `line_count` fields
-  - Add `is_active` boolean per tab
-  - Rename internal fields for consistency
-
-- [ ] **2.1.2** Update `TabListingProvider` protocol
-  - File: `src/tinkerbell/ai/tools/list_tabs.py`
-  - Add methods for additional metadata retrieval
-
-- [ ] **2.1.3** Update `DocumentWorkspace` to provide extended metadata
-  - File: `src/tinkerbell/documents/workspace.py` (or equivalent)
-  - Implement new protocol methods
-
-- [ ] **2.1.4** Update tool registry schema
-  - File: `src/tinkerbell/ai/tools/registry.py`
-  - Update `list_tabs` description and response schema
-
-- [ ] **2.1.5** Add/update tests
-  - File: `tests/test_list_tabs.py` (new or existing)
-
----
-
-### 2.2 `read_document` Tool
-
-**Goal:** Create new tool replacing `document_snapshot` with simpler line-based reading.
-
-#### Implementation Tasks
-
-- [ ] **2.2.1** Create `ReadDocumentTool` class
-  - File: `src/tinkerbell/ai/tools/read_document.py` (new)
-  - Parameters: `tab_id`, `start_line`, `end_line`
-  - Returns: `content`, `version`, `lines` metadata, `has_more`, `continuation_hint`
-
-- [ ] **2.2.2** Implement automatic token budgeting
-  - File: `src/tinkerbell/ai/tools/read_document.py`
-  - Default max ~6000 tokens per response
-  - Calculate end_line automatically if not specified
-
-- [ ] **2.2.3** Add line offset tracking to `DocumentState`
-  - File: `src/tinkerbell/editor/document_model.py`
-  - Efficiently convert between line numbers and character offsets
-
-- [ ] **2.2.4** Handle empty document case
-  - Return `content: ""`, `lines.total: 0`, valid version
-
-- [ ] **2.2.5** Register tool in registry
-  - File: `src/tinkerbell/ai/tools/registry.py`
-  - Add schema and description
-
-- [ ] **2.2.6** Add comprehensive tests
-  - File: `tests/test_read_document.py` (new)
-  - Test pagination, empty docs, token limiting
-
----
-
-### 2.3 `get_outline` Tool
-
-**Goal:** Refactor `DocumentOutlineTool` to match new schema with file-type-aware detection.
-
-#### Current State
-- `DocumentOutlineTool` exists with budget-aware trimming
-- Uses cached outlines from `DocumentSummaryMemory`
-
-#### Implementation Tasks
-
-- [ ] **2.3.1** Add file-type detection to outline generation
-  - File: `src/tinkerbell/ai/tools/document_outline.py`
-  - Detect markdown headings (`#`, `##`)
-  - Detect JSON/YAML structure (top-level keys)
-  - Add `detection_method` to response
-
-- [ ] **2.3.2** Implement plain text heuristics
-  - File: `src/tinkerbell/ai/tools/document_outline.py`
-  - Chapter marker detection (Chapter 1, CHAPTER ONE, etc.)
-  - Centered/emphasized title detection
+- [ ] **WS2.4.3**: Implement plain text heuristics
+  - Chapter markers (`Chapter 1`, `CHAPTER ONE`, etc.)
+  - Visual patterns (ALL CAPS, separators)
   - Paragraph break fallback
-  - Add `detection_confidence` field
 
-- [ ] **2.3.3** Update response schema
-  - File: `src/tinkerbell/ai/tools/document_outline.py`
-  - Add `line_start`, `line_end` to each node
-  - Add `file_type`, `detection_method`, `detection_confidence`
-  - Remove internal fields not needed by AI
+- [ ] **WS2.4.4**: Confidence scoring
+  - `detection_confidence`: high/medium/low
+  - `detection_method` field
+  - Suggestion for unstructured text
 
-- [ ] **2.3.4** Handle unstructured documents
-  - Return empty outline with helpful suggestion
-  - Guide AI to use `search_document` instead
+- [ ] **WS2.4.5**: Response formatting
+  - Hierarchical `outline` array
+  - `line_start`, `line_end` (null for last section)
+  - `children` for nested sections
 
-- [ ] **2.3.5** Update tool registry
-  - File: `src/tinkerbell/ai/tools/registry.py`
-
-- [ ] **2.3.6** Add tests for all detection methods
-  - File: `tests/test_document_outline_tool.py`
+- [ ] **WS2.4.6**: Unit tests for get_outline
+  - Each file type
+  - Heuristic detection cases
+  - Edge cases (empty, unstructured)
 
 ---
 
-## Workstream 3: Search Tools
+## Workstream 3: Writing Tools
 
-### 3.1 `search_document` Tool
+### WS3.1: `create_document` Tool
+**Files**: New `src/tinkerbell/ai/tools/create_document.py`
 
-**Goal:** Create unified search tool combining semantic, exact, and regex modes.
+- [ ] **WS3.1.1**: Implement tab creation
+  - Title/filename parameter
+  - Optional initial content
+  - File type hint
 
-#### Current State
-- `DocumentFindTextTool` handles embedding-based search with fallback
-- `SearchReplaceTool` has regex/exact matching logic
+- [ ] **WS3.1.2**: Integrate with workspace
+  - Create new tab via `TabbedEditorWidget`
+  - Return `tab_id` and initial `version`
 
-#### Implementation Tasks
+- [ ] **WS3.1.3**: Handle title conflicts
+  - Return `title_exists` error
 
-- [ ] **3.1.1** Create `SearchDocumentTool` class
-  - File: `src/tinkerbell/ai/tools/search_document.py` (new)
-  - Parameters: `tab_id`, `query`, `match_type`, `max_results`, `include_context`
-  - Returns: matches with `line`, `score`, `preview`, `context`
+- [ ] **WS3.1.4**: Unit tests for create_document
 
-- [ ] **3.1.2** Implement semantic search mode
-  - Integrate with `DocumentEmbeddingIndex`
-  - Add `embedding_status` to response ("ready", "indexing", "unavailable")
-  - Just-in-time indexing for first search
+### WS3.2: `insert_lines` Tool
+**Files**: New `src/tinkerbell/ai/tools/insert_lines.py`
 
-- [ ] **3.1.3** Implement exact search mode
-  - Case-sensitive literal text matching
-  - Return all occurrences with context
+- [ ] **WS3.2.1**: Implement insertion logic
+  - `after_line` parameter (-1 for start)
+  - Never deletes existing content
+  - Multi-line content support
 
-- [ ] **3.1.4** Implement regex search mode
-  - Pattern validation with helpful error messages
-  - Support common flags (case-insensitive, multiline)
+- [ ] **WS3.2.2**: Version token validation
+  - Require valid version
+  - Return new version on success
 
-- [ ] **3.1.5** Add context extraction
-  - Configurable context lines before/after match
-  - Include `start_line`, `end_line` for direct use in edits
-
-- [ ] **3.1.6** Register tool and add tests
-  - File: `src/tinkerbell/ai/tools/registry.py`
-  - File: `tests/test_search_document.py` (new)
-
----
-
-## Workstream 4: Writing Tools
-
-### 4.1 `create_document` Tool
-
-**Goal:** Simple tool for creating new documents.
-
-#### Implementation Tasks
-
-- [ ] **4.1.1** Create `CreateDocumentTool` class
-  - File: `src/tinkerbell/ai/tools/create_document.py` (new)
-  - Parameters: `title`, `content`, `file_type`
-  - Returns: `tab_id`, `title`, `version`
-
-- [ ] **4.1.2** Integrate with `DocumentWorkspace`
-  - Create new tab with specified content
-  - Auto-detect file type from extension if not specified
-
-- [ ] **4.1.3** Handle title conflicts
-  - Return `title_exists` error if duplicate
-  - Suggest alternative name
-
-- [ ] **4.1.4** Register and test
-  - File: `src/tinkerbell/ai/tools/registry.py`
-  - File: `tests/test_create_document.py` (new)
-
----
-
-### 4.2 `insert_lines` Tool
-
-**Goal:** Purely additive insertion tool.
-
-#### Current State
-- `DocumentInsertTool` exists but uses different parameter schema
-- Delegates to `DocumentApplyPatchTool`
-
-#### Implementation Tasks
-
-- [ ] **4.2.1** Create `InsertLinesTool` class
-  - File: `src/tinkerbell/ai/tools/insert_lines.py` (new)
-  - Parameters: `version`, `after_line`, `content`, `tab_id`, `dry_run`, `match_text`
-  - Returns: `version` (new), `status`, `inserted_at` details
-
-- [ ] **4.2.2** Implement insertion logic
-  - Convert line number to character offset
-  - Ensure newline handling is consistent
-  - Support `-1` for document start
-
-- [ ] **4.2.3** Implement dry_run mode
+- [ ] **WS3.2.3**: Dry-run support
   - Validate without applying
-  - Return what would happen
+  - Version not consumed
 
-- [ ] **4.2.4** Implement match_text drift recovery
-  - If provided, locate text and adjust insertion point
-  - Error if not found or ambiguous
+- [ ] **WS3.2.4**: Optional `match_text` drift recovery
+  - Find anchor text
+  - Adjust insertion point if lines shifted
 
-- [ ] **4.2.5** Integrate with transaction system (WS1.3)
-  - Stage edit instead of direct apply
+- [ ] **WS3.2.5**: Response formatting
+  - `inserted_at.after_line`
+  - `inserted_at.lines_added`
+  - `inserted_at.new_lines.start/end`
 
-- [ ] **4.2.6** Register and test
-  - File: `src/tinkerbell/ai/tools/registry.py`
-  - File: `tests/test_insert_lines.py` (new)
+- [ ] **WS3.2.6**: Unit tests for insert_lines
+  - Normal insertion
+  - Start/end insertion
+  - Dry-run
+  - Drift recovery
 
----
+### WS3.3: `replace_lines` Tool
+**Files**: New `src/tinkerbell/ai/tools/replace_lines.py`
 
-### 4.3 `replace_lines` Tool
+- [ ] **WS3.3.1**: Implement replacement logic
+  - `start_line`, `end_line` (inclusive)
+  - `content` parameter (empty for delete)
 
-**Goal:** Line-range replacement tool.
+- [ ] **WS3.3.2**: Version token validation
+  - Same pattern as insert_lines
 
-#### Implementation Tasks
+- [ ] **WS3.3.3**: Dry-run support
 
-- [ ] **4.3.1** Create `ReplaceLinesTool` class
-  - File: `src/tinkerbell/ai/tools/replace_lines.py` (new)
-  - Parameters: `version`, `start_line`, `end_line`, `content`, `tab_id`, `dry_run`, `match_text`
-  - Returns: `version` (new), `status`, `lines_affected`
+- [ ] **WS3.3.4**: Optional `match_text` drift recovery
 
-- [ ] **4.3.2** Implement replacement logic
-  - Validate line range (end >= start)
-  - Convert to character offsets
-  - Support empty content for deletion
+- [ ] **WS3.3.5**: Response formatting
+  - `lines_affected.removed`, `.added`, `.net_change`
 
-- [ ] **4.3.3** Implement dry_run mode
-  - Return preview without applying
+- [ ] **WS3.3.6**: Unit tests for replace_lines
 
-- [ ] **4.3.4** Implement match_text drift recovery
-  - Locate anchor text and adjust range
+### WS3.4: `delete_lines` Tool
+**Files**: New `src/tinkerbell/ai/tools/delete_lines.py`
 
-- [ ] **4.3.5** Integrate with transaction system
-  - Stage edit for atomic commit
+- [ ] **WS3.4.1**: Implement as wrapper around replace_lines
+  - `content=""` internally
+  - Clear intent in API
 
-- [ ] **4.3.6** Register and test
-  - File: `src/tinkerbell/ai/tools/registry.py`
-  - File: `tests/test_replace_lines.py` (new)
+- [ ] **WS3.4.2**: Response formatting
+  - `lines_deleted` count
 
----
+- [ ] **WS3.4.3**: Unit tests for delete_lines
 
-### 4.4 `delete_lines` Tool
+### WS3.5: `write_document` Tool
+**Files**: New `src/tinkerbell/ai/tools/write_document.py`
 
-**Goal:** Explicit deletion tool (convenience wrapper).
+- [ ] **WS3.5.1**: Implement full document replacement
+  - Version token required
+  - Complete content parameter
 
-#### Implementation Tasks
+- [ ] **WS3.5.2**: Response formatting
+  - `lines_affected.previous`, `.current`
 
-- [ ] **4.4.1** Create `DeleteLinesTool` class
-  - File: `src/tinkerbell/ai/tools/delete_lines.py` (new)
-  - Parameters: `version`, `start_line`, `end_line`, `tab_id`, `dry_run`
-  - Internally calls `ReplaceLinesTool` with `content=""`
+- [ ] **WS3.5.3**: Unit tests for write_document
 
-- [ ] **4.4.2** Register and test
-  - File: `src/tinkerbell/ai/tools/registry.py`
-  - File: `tests/test_delete_lines.py` (new)
+### WS3.6: `find_and_replace` Tool
+**Files**: New `src/tinkerbell/ai/tools/find_and_replace.py`
 
----
+- [ ] **WS3.6.1**: Implement search logic
+  - Literal and regex modes
+  - Case sensitivity, whole word options
+  - Scope limiting by line range
 
-## Workstream 5: Bulk Operations
+- [ ] **WS3.6.2**: Implement replacement logic
+  - Batch replacement
+  - `max_replacements` cap
+  - Version token required
 
-### 5.1 `find_and_replace` Tool
+- [ ] **WS3.6.3**: Preview mode
+  - `preview=true` doesn't apply changes
+  - Version not consumed in preview
+  - Truncate preview to 20 matches
 
-**Goal:** Document-wide or scoped search/replace with preview.
+- [ ] **WS3.6.4**: Response formatting
+  - `matches_found`, `replacements_made`
+  - `preview` array with before/after
 
-#### Current State
-- `SearchReplaceTool` exists with similar functionality
-- Needs schema alignment and preview mode refinement
-
-#### Implementation Tasks
-
-- [ ] **5.1.1** Create `FindAndReplaceTool` class
-  - File: `src/tinkerbell/ai/tools/find_and_replace.py` (new)
-  - Parameters: `version`, `find`, `replace`, `is_regex`, `case_sensitive`, `whole_word`, `max_replacements`, `tab_id`, `preview`, `scope`
-
-- [ ] **5.1.2** Implement preview mode
-  - When `preview=true`, don't modify document
-  - Return match list with before/after snippets
-  - Truncate to 20 matches with `preview_truncated` flag
-
-- [ ] **5.1.3** Implement scoped replacement
-  - Accept `scope: {start_line, end_line}`
-  - Limit replacements to specified range
-
-- [ ] **5.1.4** Integrate with transaction system
-  - Stage changes for atomic commit
-
-- [ ] **5.1.5** Register and test
-  - File: `src/tinkerbell/ai/tools/registry.py`
-  - File: `tests/test_find_and_replace.py` (new)
+- [ ] **WS3.6.5**: Unit tests for find_and_replace
 
 ---
 
-### 5.2 `write_document` Tool
+## Workstream 4: Editor Lock & Diff Review
 
-**Goal:** Full document replacement (refactor existing).
+### WS4.1: Global Editor Lock
+**Files**: Modify `src/tinkerbell/ui/ai_turn_coordinator.py`, `src/tinkerbell/editor/tabbed_editor.py`
 
-#### Current State
-- `DocumentReplaceAllTool` exists
-- Needs schema alignment
+- [ ] **WS4.1.1**: Implement lock acquisition
+  - Lock all tabs on AI turn start
+  - Visual indicator in status bar
 
-#### Implementation Tasks
+- [ ] **WS4.1.2**: Implement lock release
+  - Release on turn completion
+  - Release on cancel
+  - Release on error/timeout
 
-- [ ] **5.2.1** Refactor `DocumentReplaceAllTool` to `WriteDocumentTool`
-  - File: `src/tinkerbell/ai/tools/write_document.py` (new or rename)
-  - Parameters: `version`, `content`, `tab_id`
-  - Returns: `version` (new), `lines_affected`
+- [ ] **WS4.1.3**: Cancel functionality
+  - User-triggered cancel button
+  - Immediate lock release
 
-- [ ] **5.2.2** Integrate with transaction system
+- [ ] **WS4.1.4**: Unit tests for editor lock
 
-- [ ] **5.2.3** Update registry and tests
+### WS4.2: Atomic Operations & Rollback
+**Files**: New `src/tinkerbell/ai/orchestration/transaction.py`
 
----
+- [ ] **WS4.2.1**: Implement staged changes
+  - Buffer edits in memory
+  - Don't apply to document immediately
 
-## Workstream 6: Subagent System
+- [ ] **WS4.2.2**: Implement commit
+  - Apply all staged changes atomically
+  - Single version bump
 
-### 6.1 Subagent Coordinator Enhancement
+- [ ] **WS4.2.3**: Implement rollback
+  - Discard staged changes on failure
+  - Document remains unchanged
 
-**Goal:** Enhance existing `SubagentManager` for document-wide operations.
+- [ ] **WS4.2.4**: Multi-document transaction support
+  - Track changes across tabs
+  - All-or-nothing commit
 
-#### Current State
-- `SubagentManager` exists with job queue and executor
-- Handles chunk-based processing
+- [ ] **WS4.2.5**: Unit tests for transactions
 
-#### Implementation Tasks
+### WS4.3: Diff Review UI
+**Files**: Modify `src/tinkerbell/ui/review_overlay_manager.py`, `src/tinkerbell/editor/editor_widget.py`
 
-- [ ] **6.1.1** Create document chunking strategy
-  - File: `src/tinkerbell/ai/agents/subagents/chunking.py` (new)
-  - Auto-chunk documents exceeding ~20,000 characters
-  - Target ~4,000 tokens per chunk
-  - Overlap for context continuity
-
-- [ ] **6.1.2** Create result aggregator
-  - File: `src/tinkerbell/ai/agents/subagents/aggregator.py` (new)
-  - Combine chunk results into unified output
-  - Deduplication and conflict resolution
-
-- [ ] **6.1.3** Add subagent status to UI
-  - Show active subagent count in status bar
-  - Update `AITurnLock` to track subagent state
-
----
-
-### 6.2 `analyze_document` Tool
-
-**Goal:** Subagent-powered document analysis.
-
-#### Implementation Tasks
-
-- [ ] **6.2.1** Create `AnalyzeDocumentTool` class
-  - File: `src/tinkerbell/ai/tools/analyze_document.py` (new)
-  - Parameters: `tab_id`, `task`, `custom_prompt`, `output_tab`
-  - Tasks: "characters", "plot", "style", "summary", "custom"
-
-- [ ] **6.2.2** Implement analysis task handlers
-  - Character extraction: names, mentions, first appearance
-  - Plot analysis: threads, conflicts, resolutions
-  - Style analysis: tone, vocabulary, sentence structure
-  - Summary: condensed document overview
-
-- [ ] **6.2.3** Implement output tab creation
-  - Auto-create tab named `"{source} - {task}"`
-  - Overwrite if `output_tab` specified
-
-- [ ] **6.2.4** Integrate with `SubagentManager`
-  - Spawn chunk analyzers in parallel
-  - Aggregate results
-
-- [ ] **6.2.5** Register and test
-  - File: `src/tinkerbell/ai/tools/registry.py`
-  - File: `tests/test_analyze_document.py` (new)
-
----
-
-### 6.3 `transform_document` Tool
-
-**Goal:** Subagent-powered document transformation.
-
-#### Implementation Tasks
-
-- [ ] **6.3.1** Create `TransformDocumentTool` class
-  - File: `src/tinkerbell/ai/tools/transform_document.py` (new)
-  - Parameters: `tab_id`, `transformation`, `params`, `custom_prompt`, `output_mode`, `version`
-
-- [ ] **6.3.2** Implement transformation handlers
-  - `character_rename`: Name + pronoun updates
-  - `setting_change`: Location + cultural detail adaptation
-  - `style_rewrite`: Tone/formality conversion
-  - `custom`: User-defined transformation
-
-- [ ] **6.3.3** Implement consistency checker
-  - Validate changes don't break continuity
-  - Track entity references across chunks
-
-- [ ] **6.3.4** Implement output modes
-  - `new_tab`: Create new document with result
-  - `in_place`: Modify source (requires version, goes through diff review)
-
-- [ ] **6.3.5** Integrate with transaction system
-  - Stage all chunk transformations
-  - Atomic commit/rollback
-
-- [ ] **6.3.6** Register and test
-  - File: `src/tinkerbell/ai/tools/registry.py`
-  - File: `tests/test_transform_document.py` (new)
-
----
-
-## Workstream 7: UI Integration
-
-### 7.1 Diff Review System
-
-**Goal:** Show diff view after AI turn completes, user accepts/rejects.
-
-#### Implementation Tasks
-
-- [ ] **7.1.1** Create `DiffReviewPanel` widget
-  - File: `src/tinkerbell/ui/diff_review_panel.py` (new)
-  - Side-by-side or unified diff view
-  - Syntax highlighting for changes
+- [ ] **WS4.3.1**: Single-document diff view
+  - Red/green highlighting
   - Accept/Reject buttons
 
-- [ ] **7.1.2** Create `DiffReviewManager` class
-  - File: `src/tinkerbell/ai/orchestration/diff_review.py` (new)
-  - Generate diff from staged edits
-  - Handle multi-tab diffs with tabbed view
+- [ ] **WS4.3.2**: Multi-document diff view
+  - Tabbed interface for multiple files
+  - Accept All / Reject All (no partial)
 
-- [ ] **7.1.3** Integrate with `AIController`
-  - After turn completes, show diff review
-  - Block until user accepts/rejects
-  - On accept: commit transaction
-  - On reject: rollback transaction
+- [ ] **WS4.3.3**: Accept flow
+  - Commit staged changes
+  - Increment versions
+  - Create checkpoint
 
-- [ ] **7.1.4** Add keyboard shortcuts
-  - Accept: Ctrl+Enter or similar
-  - Reject: Escape
+- [ ] **WS4.3.4**: Reject flow
+  - Discard staged changes
+  - Restore pre-turn state
 
-- [ ] **7.1.5** Add tests
-  - File: `tests/test_diff_review.py` (new)
+- [ ] **WS4.3.5**: Unit tests for diff review
 
----
+### WS4.4: Turn Checkpoints
+**Files**: New `src/tinkerbell/ai/memory/checkpoints.py`
 
-### 7.2 Turn History Panel
+- [ ] **WS4.4.1**: Checkpoint creation
+  - Capture document state
+  - Store turn number, timestamp, action summary
 
-**Goal:** Browse and restore past checkpoints.
+- [ ] **WS4.4.2**: Checkpoint storage
+  - Per-document checkpoint list
+  - Session-scoped (cleared on close)
 
-#### Implementation Tasks
+- [ ] **WS4.4.3**: Checkpoint restoration
+  - Restore document to checkpoint state
+  - Create new checkpoint (non-destructive)
 
-- [ ] **7.2.1** Create `TurnHistoryPanel` widget
-  - File: `src/tinkerbell/ui/turn_history_panel.py` (new)
-  - List checkpoints with timestamp, summary
-  - Select to preview diff from current
+- [ ] **WS4.4.4**: Turn history UI
+  - List of checkpoints
+  - Diff from current state
   - Restore button
 
-- [ ] **7.2.2** Integrate with `CheckpointManager`
-  - Subscribe to checkpoint creation events
-  - Update panel on new checkpoints
-
-- [ ] **7.2.3** Implement restore confirmation
-  - Show diff before restore
-  - Create new checkpoint on restore (non-destructive)
+- [ ] **WS4.4.5**: Unit tests for checkpoints
 
 ---
 
-### 7.3 Status Bar Integration
+## Workstream 5: Subagent Architecture
 
-**Goal:** Show AI turn status in status bar.
+### WS5.1: Subagent Infrastructure
+**Files**: Major refactor of `src/tinkerbell/ai/orchestration/subagent_runtime.py`
 
-#### Implementation Tasks
+- [ ] **WS5.1.1**: Define subagent types
+  - Chunk Analyzer
+  - Consistency Checker
+  - Transformer
 
-- [ ] **7.3.1** Add AI status section to status bar
-  - Show when AI is idle/working
-  - Show subagent count when active
-  - Show cancel button
+- [ ] **WS5.1.2**: Implement chunk coordination
+  - Automatic document chunking (~4000 tokens)
+  - Parallel chunk processing
+  - Result aggregation
 
-- [ ] **7.3.2** Connect to `AITurnLock` signals
+- [ ] **WS5.1.3**: Implement progress tracking
+  - Active subagent counter
+  - Status bar integration
+
+- [ ] **WS5.1.4**: Error handling
+  - Partial failure rollback
+  - Clear error messages
+
+- [ ] **WS5.1.5**: Unit tests for subagent runtime
+
+### WS5.2: `analyze_document` Tool
+**Files**: New `src/tinkerbell/ai/tools/analyze_document.py`
+
+- [ ] **WS5.2.1**: Implement task routing
+  - `characters`, `plot`, `style`, `summary`, `custom`
+  - Task-specific subagent prompts
+
+- [ ] **WS5.2.2**: Implement chunking strategy
+  - Auto-chunk documents > 20k chars
+  - Parallel chunk analysis
+
+- [ ] **WS5.2.3**: Result aggregation
+  - Synthesize chunk results
+  - Write to output tab
+
+- [ ] **WS5.2.4**: Output tab management
+  - Auto-create if not specified
+  - Overwrite existing with diff review
+
+- [ ] **WS5.2.5**: Unit tests for analyze_document
+
+### WS5.3: `transform_document` Tool
+**Files**: New `src/tinkerbell/ai/tools/transform_document.py`
+
+- [ ] **WS5.3.1**: Implement transformation types
+  - `character_rename`
+  - `setting_change`
+  - `style_rewrite`
+  - `custom`
+
+- [ ] **WS5.3.2**: Character rename implementation
+  - Find all mentions
+  - Update pronouns if requested
+  - Maintain consistency
+
+- [ ] **WS5.3.3**: Setting change implementation
+  - Find setting references
+  - Adapt cultural details
+
+- [ ] **WS5.3.4**: Output mode handling
+  - `new_tab` (default)
+  - `in_place` (requires version, uses diff review)
+
+- [ ] **WS5.3.5**: Consistency checking
+  - Validate no continuity breaks
+  - Flag ambiguous cases
+
+- [ ] **WS5.3.6**: Unit tests for transform_document
 
 ---
 
-## Workstream 8: Migration & Cleanup
+## Workstream 6: Tool Registry & Integration
 
-### 8.1 Deprecate Old Tools
+### WS6.1: New Tool Registry
+**Files**: Complete rewrite of `src/tinkerbell/ai/tools/registry.py`
 
-**Goal:** Mark old tools as deprecated, guide migration.
+- [ ] **WS6.1.1**: Define new tool registration
+  - Register only new tools
+  - Clean parameter schemas
 
-#### Implementation Tasks
+- [ ] **WS6.1.2**: Remove all legacy tool registration
+  - Delete all old tool imports
+  - Remove feature flags for old tools
 
-- [ ] **8.1.1** Add deprecation warnings to old tools
-  - `document_snapshot` → `read_document`
-  - `document_apply_patch` → `insert_lines`/`replace_lines`
-  - `document_insert` → `insert_lines`
-  - `document_replace_all` → `write_document`
+- [ ] **WS6.1.3**: Implement tool schema generation
+  - JSON Schema for each tool
+  - Consistent parameter naming
 
-- [ ] **8.1.2** Update tool registry to show deprecation
-  - Add `deprecated: true` flag
-  - Add `replacement` suggestion
+- [ ] **WS6.1.4**: Unit tests for registry
 
-- [ ] **8.1.3** Add migration guide to documentation
-  - Map old tool calls to new equivalents
-  - Sample code transformations
+### WS6.2: Controller Integration
+**Files**: Major refactor of `src/tinkerbell/ai/orchestration/controller.py`
 
----
+- [ ] **WS6.2.1**: Update tool dispatch
+  - Route to new tool implementations
+  - Remove legacy tool handling
 
-### 8.2 Update Prompts
+- [ ] **WS6.2.2**: Integrate transaction system
+  - Wrap tool calls in transactions
+  - Handle atomic commit/rollback
 
-**Goal:** Update AI prompts to use new tools.
+- [ ] **WS6.2.3**: Update telemetry
+  - New tool names in events
+  - New metrics for subagents
 
-#### Implementation Tasks
+- [ ] **WS6.2.4**: Integration tests
 
-- [ ] **8.2.1** Rewrite `planner_instructions()`
-  - File: `src/tinkerbell/ai/prompts.py`
-  - Focus on new tool workflow
+### WS6.3: Prompt Updates
+**Files**: Modify `src/tinkerbell/ai/prompts.py`
+
+- [ ] **WS6.3.1**: Update system prompt
+  - Document new tool names
   - Remove references to old tools
 
-- [ ] **8.2.2** Rewrite `tool_use_instructions()`
-  - File: `src/tinkerbell/ai/prompts.py`
-  - Document new tool parameters
-  - Include error recovery guidance
+- [ ] **WS6.3.2**: Update tool usage instructions
+  - New workflow examples
+  - Version token handling
 
-- [ ] **8.2.3** Update sample workflows in prompts
-  - Show read → find → edit patterns
-  - Show subagent usage patterns
+- [ ] **WS6.3.3**: Review all prompt templates
 
 ---
 
-### 8.3 Comprehensive Testing
+## Workstream 7: Cleanup & Testing
 
-**Goal:** Ensure all new tools are thoroughly tested.
+### WS7.1: Delete Legacy Code
+**Files**: Multiple deletions
 
-#### Implementation Tasks
+- [ ] **WS7.1.1**: Delete old tool files
+  - All files listed in inventory above
+  - Remove from `__init__.py`
 
-- [ ] **8.3.1** Unit tests for all new tools
-  - Cover happy path and error cases
-  - Test parameter validation
+- [ ] **WS7.1.2**: Delete old memory components
+  - `plot_memory.py`, `plot_state.py` if fully replaced
+  - `character_map.py` memory component
 
-- [ ] **8.3.2** Integration tests
-  - End-to-end read → edit → verify cycles
-  - Multi-tab edit scenarios
-  - Subagent workflows
+- [ ] **WS7.1.3**: Clean up imports
+  - Remove unused imports across codebase
+  - Fix any broken references
 
-- [ ] **8.3.3** Performance tests
-  - Large document handling
-  - Many-chunk subagent processing
+- [ ] **WS7.1.4**: Delete old tests
+  - All tests for removed tools
 
----
+### WS7.2: New Test Suite
+**Files**: New test files in `tests/`
 
-### 8.4 Documentation Update
+- [ ] **WS7.2.1**: Unit tests for each new tool
+  - `test_list_tabs.py`
+  - `test_read_document.py`
+  - `test_search_document.py`
+  - `test_get_outline.py`
+  - `test_create_document.py`
+  - `test_insert_lines.py`
+  - `test_replace_lines.py`
+  - `test_delete_lines.py`
+  - `test_write_document.py`
+  - `test_find_and_replace.py`
+  - `test_analyze_document.py`
+  - `test_transform_document.py`
 
-**Goal:** Update all documentation for new system.
+- [ ] **WS7.2.2**: Integration tests
+  - Multi-tool workflows
+  - Version token flows
+  - Transaction commit/rollback
 
-#### Implementation Tasks
+- [ ] **WS7.2.3**: End-to-end tests
+  - Sample workflow: "Write me a story"
+  - Sample workflow: "Change John to James"
+  - Sample workflow: "Find and expand scene"
 
-- [ ] **8.4.1** Update README.md
-  - New tool table
-  - Updated architecture diagram
+### WS7.3: Documentation
+**Files**: Update `README.md`, `docs/`
 
-- [ ] **8.4.2** Update docs/operations/*.md
-  - New telemetry events
-  - New error codes
+- [ ] **WS7.3.1**: Update API documentation
+  - New tool reference
+  - Parameter schemas
 
-- [ ] **8.4.3** Create migration guide
-  - File: `docs/tool_migration_guide.md` (new)
+- [ ] **WS7.3.2**: Update user guide
+  - New workflow examples
+  - UI changes (diff review)
 
----
-
-## Implementation Order & Dependencies
-
-### Phase 1: Foundation (Week 1-2)
-```
-WS1.1 (Version Tokens) ──────────────┐
-WS1.2 (Editor Lock) ─────────────────┼──► WS2 (Navigation Tools)
-WS1.3 (Transactions) ────────────────┤
-WS1.4 (Checkpoints) ─────────────────┘
-```
-
-### Phase 2: Core Tools (Week 2-3)
-```
-WS2 (Navigation) ──────────────────┐
-                                   ├──► WS4 (Writing Tools)
-WS3 (Search) ──────────────────────┘
-```
-
-### Phase 3: Advanced Features (Week 3-4)
-```
-WS4 (Writing) ─────────────────────┐
-                                   ├──► WS5 (Bulk Operations)
-WS3 (Search) ──────────────────────┘    WS6 (Subagents)
-```
-
-### Phase 4: UI & Polish (Week 4-5)
-```
-WS1-6 ─────────────────────────────┬──► WS7 (UI Integration)
-                                   └──► WS8 (Migration & Cleanup)
-```
+- [ ] **WS7.3.3**: Update developer guide
+  - Architecture overview
+  - Adding new tools
 
 ---
 
-## File Change Summary
+## Implementation Order
 
-### New Files to Create
-| File | Purpose |
-|------|---------|
-| `src/tinkerbell/ai/tools/read_document.py` | `read_document` tool |
-| `src/tinkerbell/ai/tools/search_document.py` | `search_document` tool |
-| `src/tinkerbell/ai/tools/create_document.py` | `create_document` tool |
-| `src/tinkerbell/ai/tools/insert_lines.py` | `insert_lines` tool |
-| `src/tinkerbell/ai/tools/replace_lines.py` | `replace_lines` tool |
-| `src/tinkerbell/ai/tools/delete_lines.py` | `delete_lines` tool |
-| `src/tinkerbell/ai/tools/find_and_replace.py` | `find_and_replace` tool |
-| `src/tinkerbell/ai/tools/write_document.py` | `write_document` tool |
-| `src/tinkerbell/ai/tools/analyze_document.py` | `analyze_document` tool |
-| `src/tinkerbell/ai/tools/transform_document.py` | `transform_document` tool |
-| `src/tinkerbell/ai/orchestration/turn_lock.py` | Editor lock during AI turns |
-| `src/tinkerbell/ai/orchestration/transaction.py` | Atomic edit transactions |
-| `src/tinkerbell/ai/orchestration/checkpoints.py` | Turn checkpoint system |
-| `src/tinkerbell/ai/orchestration/diff_review.py` | Diff review manager |
-| `src/tinkerbell/ai/agents/subagents/chunking.py` | Document chunking strategy |
-| `src/tinkerbell/ai/agents/subagents/aggregator.py` | Result aggregation |
-| `src/tinkerbell/ui/diff_review_panel.py` | Diff review UI widget |
-| `src/tinkerbell/ui/turn_history_panel.py` | Turn history UI widget |
-| `tests/test_version_tokens.py` | Version system tests |
-| `tests/test_turn_lock.py` | Lock system tests |
-| `tests/test_transaction.py` | Transaction tests |
-| `tests/test_checkpoints.py` | Checkpoint tests |
-| `tests/test_read_document.py` | `read_document` tests |
-| `tests/test_search_document.py` | `search_document` tests |
-| `tests/test_create_document.py` | `create_document` tests |
-| `tests/test_insert_lines.py` | `insert_lines` tests |
-| `tests/test_replace_lines.py` | `replace_lines` tests |
-| `tests/test_delete_lines.py` | `delete_lines` tests |
-| `tests/test_find_and_replace.py` | `find_and_replace` tests |
-| `tests/test_analyze_document.py` | `analyze_document` tests |
-| `tests/test_transform_document.py` | `transform_document` tests |
-| `tests/test_diff_review.py` | Diff review tests |
-| `docs/tool_migration_guide.md` | Migration documentation |
+### Phase 1: Core Foundation (WS1, WS2.1, WS2.2)
+1. Version token system (WS1.1)
+2. Tool base classes (WS1.2)
+3. Error response system (WS1.3)
+4. `list_tabs` update (WS2.1)
+5. `read_document` implementation (WS2.2)
 
-### Files to Modify
-| File | Changes |
-|------|---------|
-| `src/tinkerbell/editor/document_model.py` | Add `version` field, line offset tracking |
-| `src/tinkerbell/services/bridge.py` | Add staged edit support, emit `version` |
-| `src/tinkerbell/ai/tools/list_tabs.py` | Extend response schema |
-| `src/tinkerbell/ai/tools/document_outline.py` | File-type detection, line numbers |
-| `src/tinkerbell/ai/tools/registry.py` | Register new tools, deprecate old |
-| `src/tinkerbell/ai/orchestration/controller.py` | Integrate lock, transaction, checkpoints |
-| `src/tinkerbell/ai/agents/subagents/manager.py` | Enhanced chunking/aggregation |
-| `src/tinkerbell/ai/prompts.py` | Update for new tools |
-| `src/tinkerbell/editor/editor_widget.py` | Read-only mode for lock |
-| `README.md` | Updated tool documentation |
+### Phase 2: Navigation & Search (WS2.3, WS2.4)
+1. `search_document` with exact/regex (WS2.3.1-2)
+2. `search_document` semantic integration (WS2.3.3-5)
+3. `get_outline` implementation (WS2.4)
 
----
+### Phase 3: Writing Tools (WS3)
+1. `create_document` (WS3.1)
+2. `insert_lines` (WS3.2)
+3. `replace_lines` (WS3.3)
+4. `delete_lines` (WS3.4)
+5. `write_document` (WS3.5)
+6. `find_and_replace` (WS3.6)
 
-## Success Metrics
+### Phase 4: Editor Integration (WS4)
+1. Global editor lock (WS4.1)
+2. Atomic operations & rollback (WS4.2)
+3. Diff review UI (WS4.3)
+4. Turn checkpoints (WS4.4)
 
-| Metric | Baseline | Target |
-|--------|----------|--------|
-| Tool call error rate | TBD | -60% |
-| Tokens per edit cycle | ~60+ | ~10-15 |
-| Version mismatch errors | TBD | -80% |
-| AI task completion rate | TBD | +25% |
-| User satisfaction (diff review) | N/A | >80% |
+### Phase 5: Subagents (WS5)
+1. Subagent infrastructure (WS5.1)
+2. `analyze_document` (WS5.2)
+3. `transform_document` (WS5.3)
+
+### Phase 6: Integration & Cleanup (WS6, WS7)
+1. New tool registry (WS6.1)
+2. Controller integration (WS6.2)
+3. Prompt updates (WS6.3)
+4. Delete legacy code (WS7.1)
+5. New test suite (WS7.2)
+6. Documentation (WS7.3)
 
 ---
 
 ## Risk Mitigation
 
-| Risk | Mitigation |
-|------|------------|
-| Breaking existing workflows | Deprecation period, not removal; dual support |
-| Performance regression | Benchmark before/after; lazy loading |
-| Subagent reliability | Result caching, retry logic, graceful degradation |
-| UI complexity | Phased rollout; simple defaults |
-| Test coverage gaps | Mandatory tests for each task |
+### Testing Strategy
+- Write tests for new tools before deleting old ones
+- Run full test suite after each phase
+- Manual testing of key workflows
+
+### Rollback Plan
+- Git tags at each phase completion
+- Feature branch until fully validated
+- No incremental deployment—big-bang switch
+
+### Dependencies
+- Embedding service must remain functional for semantic search
+- UI components (diff overlay) must be adapted, not replaced
+- Telemetry pipeline must be updated for new events
 
 ---
 
-## Notes
+## File Summary
 
-- All checkboxes can be checked off as tasks are completed
-- Each workstream can have multiple developers working in parallel on non-dependent tasks
-- Consider feature flags for gradual rollout of UI changes
-- Telemetry should be added for all new tools to track adoption and errors
+### New Files to Create
+```
+src/tinkerbell/ai/tools/
+├── base.py                    # Tool base classes
+├── errors.py                  # Error types
+├── version.py                 # Version management
+├── read_document.py           # WS2.2
+├── search_document.py         # WS2.3
+├── get_outline.py             # WS2.4
+├── create_document.py         # WS3.1
+├── insert_lines.py            # WS3.2
+├── replace_lines.py           # WS3.3
+├── delete_lines.py            # WS3.4
+├── write_document.py          # WS3.5
+├── find_and_replace.py        # WS3.6
+├── analyze_document.py        # WS5.2
+└── transform_document.py      # WS5.3
+
+src/tinkerbell/ai/orchestration/
+└── transaction.py             # WS4.2
+
+src/tinkerbell/ai/memory/
+└── checkpoints.py             # WS4.4
+```
+
+### Files to Delete
+```
+src/tinkerbell/ai/tools/
+├── document_snapshot.py
+├── document_apply_patch.py
+├── document_chunk.py
+├── document_edit.py
+├── document_find_text.py
+├── document_insert.py
+├── document_replace_all.py
+├── document_outline.py
+├── document_plot_state.py
+├── plot_state_update.py
+├── character_edit_planner.py
+├── character_map.py
+├── diff_builder.py
+├── search_replace.py
+├── selection_range.py
+└── tool_usage_advisor.py
+```
+
+### Files to Heavily Modify
+```
+src/tinkerbell/ai/tools/registry.py          # Complete rewrite
+src/tinkerbell/ai/tools/__init__.py          # Update exports
+src/tinkerbell/ai/orchestration/controller.py # Major refactor
+src/tinkerbell/ai/orchestration/subagent_runtime.py # Major refactor
+src/tinkerbell/ai/prompts.py                 # Update for new tools
+src/tinkerbell/ui/ai_turn_coordinator.py     # Add lock mechanism
+src/tinkerbell/ui/review_overlay_manager.py  # Enhance diff review
+src/tinkerbell/services/bridge.py            # Version system integration
+```
