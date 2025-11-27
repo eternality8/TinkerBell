@@ -9,6 +9,7 @@ from typing import Any, Callable, ClassVar, Mapping
 from ..memory.chunk_index import ChunkIndex, ChunkIndexEntry, ChunkManifestRecord
 from ...services.telemetry import count_text_tokens, emit
 from .document_snapshot import SnapshotProvider
+from .validation import parse_snapshot_token
 
 LOGGER = logging.getLogger(__name__)
 
@@ -115,19 +116,11 @@ class DocumentChunkTool:
         }
 
     def _parse_snapshot_token(self, token: str | None) -> tuple[str | None, str | None]:
-        """Parse snapshot_token into (tab_id, version_id) components."""
-        if token is None:
-            return (None, None)
-        token_str = str(token).strip()
-        if not token_str:
-            return (None, None)
-        if ":" not in token_str:
-            return (None, None)
-        parts = token_str.split(":", 1)
-        if len(parts) != 2:
-            return (None, None)
-        tab_id, version_id = parts
-        return (tab_id.strip() or None, version_id.strip() or None)
+        """Parse snapshot_token into (tab_id, version_id) components.
+
+        Uses non-strict mode to gracefully handle malformed tokens.
+        """
+        return parse_snapshot_token(token, strict=False)
 
     # ------------------------------------------------------------------
     # Internal helpers

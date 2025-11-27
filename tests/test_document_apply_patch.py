@@ -297,7 +297,7 @@ def test_document_apply_patch_allows_span_when_required():
 def test_document_apply_patch_requires_range_or_anchor_when_selection_unknown():
     tool, bridge = _patch_tool("Hello world")
 
-    with pytest.raises(ValueError, match="target_span .*target_range"):
+    with pytest.raises(ValueError, match="Missing target_span"):
         _run_with_meta(tool, content="Hi there")
 
     assert bridge.calls == []

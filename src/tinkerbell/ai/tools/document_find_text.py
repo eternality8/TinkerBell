@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -13,6 +14,9 @@ from ..memory.buffers import DocumentSummaryMemory, OutlineNode
 from ..memory.embeddings import DocumentEmbeddingIndex, EmbeddingMatch
 from ...services.telemetry import count_text_tokens, emit
 from ..utils.document_checks import unsupported_format_reason
+from .validation import parse_snapshot_token
+
+LOGGER = logging.getLogger(__name__)
 
 DocumentResolver = Callable[[str], DocumentState | None]
 EmbeddingIndexResolver = Callable[[], DocumentEmbeddingIndex | None]
@@ -95,7 +99,14 @@ class DocumentFindTextTool:
             try:
                 matches = self._similarity_search(index, document.document_id, query_text, limit, confidence)
             except Exception as exc:
-                provider_error = str(exc)
+                import traceback
+                provider_error = f"{exc.__class__.__name__}: {exc}"
+                LOGGER.warning(
+                    "Embedding search failed for document %s: %s\n%s",
+                    document.document_id,
+                    provider_error,
+                    traceback.format_exc(),
+                )
                 emit(
                     "retrieval.provider.error",
                     {
@@ -157,6 +168,7 @@ class DocumentFindTextTool:
             "query": query_text,
             "strategy": strategy,
             "fallback_reason": fallback_reason,
+            "provider_error": provider_error[:200] if provider_error else None,
             "confidence": result_confidence,
             "warning": warning,
             "latency_ms": round(latency_ms, 3),
@@ -236,19 +248,11 @@ class DocumentFindTextTool:
         return None
 
     def _parse_snapshot_token(self, token: str | None) -> tuple[str | None, str | None]:
-        """Parse snapshot_token into (tab_id, version_id) components."""
-        if token is None:
-            return (None, None)
-        token_str = str(token).strip()
-        if not token_str:
-            return (None, None)
-        if ":" not in token_str:
-            return (None, None)
-        parts = token_str.split(":", 1)
-        if len(parts) != 2:
-            return (None, None)
-        tab_id, version_id = parts
-        return (tab_id.strip() or None, version_id.strip() or None)
+        """Parse snapshot_token into (tab_id, version_id) components.
+
+        Uses non-strict mode to gracefully handle malformed tokens.
+        """
+        return parse_snapshot_token(token, strict=False)
 
     # ------------------------------------------------------------------
     # Core helpers
@@ -284,13 +288,20 @@ class DocumentFindTextTool:
         """WS3 4.1.1: Build warning message for low-confidence results."""
         if confidence == "high":
             return None
+        # All low-confidence warnings now include explicit next-step guidance
+        base_msg = ""
         if offline_mode:
-            return "Embeddings unavailable; using heuristic search. Results may be less accurate."
-        if fallback_reason == "no_embedding_matches":
-            return "No semantic matches found; using regex/outline fallback. Consider refining query."
-        if fallback_reason == "embedding_unavailable":
-            return "Embedding index not ready; using heuristic search."
-        return "Low confidence results. Verify retrieved spans match intent."
+            base_msg = "Embeddings unavailable; using heuristic search."
+        elif fallback_reason == "no_embedding_matches":
+            base_msg = "No semantic matches found; using regex/outline fallback."
+        elif fallback_reason == "embedding_unavailable":
+            base_msg = "Embedding index not ready; using heuristic search."
+        elif fallback_reason == "provider_error":
+            base_msg = "Embedding provider error; using regex fallback."
+        else:
+            base_msg = "Low confidence results."
+        # Always add next-step guidance for low-confidence results
+        return f"{base_msg} Use line_span with document_snapshot to verify content. Do NOT repeat this query."
 
     def _similarity_search(
         self,
@@ -308,14 +319,33 @@ class DocumentFindTextTool:
                 min_score=min_confidence,
             )
 
+        # Check if there's already a running event loop (common in Qt apps with qasync).
         try:
-            return asyncio.run(_invoke())
+            asyncio.get_running_loop()
+            has_running_loop = True
         except RuntimeError:
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(_invoke())
-            finally:
-                loop.close()
+            has_running_loop = False
+
+        if has_running_loop:
+            # We're inside an existing event loop - run in a separate thread with its own loop.
+            # This avoids "Cannot run the event loop while another loop is running".
+            import concurrent.futures
+
+            def _run_in_thread() -> Sequence[EmbeddingMatch]:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(_invoke())
+                finally:
+                    loop.close()
+                    asyncio.set_event_loop(None)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_run_in_thread)
+                return future.result(timeout=60.0)
+        else:
+            # No running loop - safe to use asyncio.run()
+            return asyncio.run(_invoke())
 
     def _pointers_from_matches(
         self,

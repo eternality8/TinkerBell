@@ -61,12 +61,9 @@ _TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
 _API_KEY_FIELD = "api_key_ciphertext"
 _SECRET_BACKEND_ENV = "TINKERBELL_SECRET_BACKEND"
 DEFAULT_EMBEDDING_MODE = "same-api"
-EMBEDDING_MODE_CHOICES: tuple[str, ...] = ("same-api", "custom-api", "local")
-_REMOTE_EMBEDDING_BACKENDS = {"auto", "openai", "langchain"}
-_DISABLED_EMBEDDING_BACKEND = "disabled"
+EMBEDDING_MODE_CHOICES: tuple[str, ...] = ("disabled", "same-api", "custom-api", "local")
 _LOCAL_EMBEDDING_BACKEND = "sentence-transformers"
-_BACKEND_ALIASES = {"st": _LOCAL_EMBEDDING_BACKEND, "sentence_transformers": _LOCAL_EMBEDDING_BACKEND}
-EmbeddingMode = Literal["same-api", "custom-api", "local"]
+EmbeddingMode = Literal["disabled", "same-api", "custom-api", "local"]
 
 
 @dataclass(slots=True)
@@ -245,8 +242,11 @@ class SettingsStore:
             ) = self._normalize_metadata(metadata_payload)
             data["metadata"] = metadata
             needs_migration = needs_migration or metadata_migrated
-            if embedding_mode_was_missing and data.get("embedding_backend") != _DISABLED_EMBEDDING_BACKEND:
-                data["embedding_backend"] = _DISABLED_EMBEDDING_BACKEND
+            # If embedding_mode was missing from old settings, disable embeddings to preserve old behavior
+            if embedding_mode_was_missing and data.get("embedding_backend") != "disabled":
+                data["embedding_backend"] = "disabled"
+                metadata["embedding_mode"] = "disabled"
+                data["metadata"] = metadata
                 needs_migration = True
             debug_payload = data.get("debug")
             if isinstance(debug_payload, Mapping):
@@ -382,53 +382,34 @@ class SettingsStore:
         return settings
 
     def _apply_embedding_policy(self, settings: Settings) -> tuple[Settings, bool]:
+        """Derive embedding_backend from embedding_mode for backwards compatibility."""
         original_metadata = getattr(settings, "metadata", {}) or {}
         metadata = dict(original_metadata)
         raw_mode = metadata.get("embedding_mode")
         mode, mode_changed, _ = _normalize_embedding_mode_value(raw_mode)
         if mode_changed or raw_mode != mode:
             metadata["embedding_mode"] = mode
-        backend = self._normalize_backend_value(getattr(settings, "embedding_backend", "auto"))
-        backend, backend_changed = self._resolve_backend_for_mode(mode, backend)
+        # Derive backend from mode:
+        # - disabled -> disabled
+        # - local -> sentence-transformers
+        # - same-api / custom-api -> langchain (flexible for any OpenAI-compatible API)
+        if mode == "disabled":
+            desired_backend = "disabled"
+        elif mode == "local":
+            desired_backend = _LOCAL_EMBEDDING_BACKEND
+        else:
+            desired_backend = "langchain"
+        current_backend = getattr(settings, "embedding_backend", "auto")
+        backend_changed = current_backend != desired_backend
         mutated = backend_changed or metadata != original_metadata
         if not mutated:
             return settings, False
         updates: Dict[str, Any] = {}
         if metadata != original_metadata:
             updates["metadata"] = metadata
-        if backend != settings.embedding_backend:
-            updates["embedding_backend"] = backend
+        if backend_changed:
+            updates["embedding_backend"] = desired_backend
         return replace(settings, **updates), True
-
-    def _normalize_backend_value(self, backend: Any) -> str:
-        if backend is None:
-            return "auto"
-        normalized = str(backend).strip().lower()
-        if not normalized:
-            return "auto"
-        return _BACKEND_ALIASES.get(normalized, normalized)
-
-    def _resolve_backend_for_mode(self, mode: EmbeddingMode, backend: str) -> tuple[str, bool]:
-        if mode == "local":
-            desired = _LOCAL_EMBEDDING_BACKEND
-            return (desired, backend != desired)
-        allowed_remote = _REMOTE_EMBEDDING_BACKENDS
-        if mode == "custom-api":
-            if backend not in allowed_remote:
-                LOGGER.debug(
-                    "Embedding backend %s is not valid for custom-api mode; forcing openai.",
-                    backend,
-                )
-                return "openai", True
-            return backend, False
-        allowed_same_api = allowed_remote | {_DISABLED_EMBEDDING_BACKEND}
-        if backend not in allowed_same_api:
-            LOGGER.debug(
-                "Embedding backend %s is not valid for same-api mode; falling back to auto.",
-                backend,
-            )
-            return "auto", True
-        return backend, False
 
     def _normalize_metadata(self, payload: Any) -> tuple[dict[str, Any], bool, bool]:
         if isinstance(payload, Mapping):

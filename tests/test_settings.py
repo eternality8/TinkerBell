@@ -18,6 +18,8 @@ def test_load_returns_defaults_when_file_missing(tmp_path: Path) -> None:
 
     expected = Settings()
     expected.metadata["embedding_mode"] = "same-api"
+    # Backend is derived from mode: same-api -> langchain
+    expected = replace(expected, embedding_backend="langchain")
     assert settings == expected
 
 
@@ -44,7 +46,8 @@ def test_save_and_load_roundtrip(tmp_path: Path) -> None:
 
     expected_metadata = dict(original.metadata)
     expected_metadata["embedding_mode"] = "same-api"
-    expected = replace(original, metadata=expected_metadata)
+    # Backend is derived from mode: same-api -> langchain
+    expected = replace(original, metadata=expected_metadata, embedding_backend="langchain")
 
     assert reloaded == expected
 
@@ -187,17 +190,20 @@ def test_secret_vault_forced_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
 
 def test_embedding_mode_migration_disables_backend(tmp_path: Path) -> None:
+    """When loading old settings without embedding_mode, embeddings are disabled."""
     target = tmp_path / "settings.json"
+    # Old settings file with no embedding_mode
     target.write_text(json.dumps({"embedding_backend": "langchain", "version": 2}), encoding="utf-8")
 
     settings = SettingsStore(target).load()
 
+    # Missing embedding_mode causes both mode and backend to be set to disabled
     assert settings.embedding_backend == "disabled"
-    assert settings.metadata.get("embedding_mode") == "same-api"
+    assert settings.metadata.get("embedding_mode") == "disabled"
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload["version"] == 3
     assert payload.get("embedding_backend") == "disabled"
-    assert payload.get("metadata", {}).get("embedding_mode") == "same-api"
+    assert payload.get("metadata", {}).get("embedding_mode") == "disabled"
 
 
 def test_local_mode_forces_sentence_transformers(tmp_path: Path) -> None:
@@ -240,6 +246,7 @@ def test_embedding_api_secret_encrypted_and_roundtripped(tmp_path: Path) -> None
 
 
 def test_custom_api_mode_forces_remote_backend(tmp_path: Path) -> None:
+    """custom-api mode derives langchain backend regardless of stored value."""
     target = tmp_path / "settings.json"
     target.write_text(
         json.dumps(
@@ -254,13 +261,15 @@ def test_custom_api_mode_forces_remote_backend(tmp_path: Path) -> None:
 
     settings = SettingsStore(target).load()
 
-    assert settings.embedding_backend == "openai"
+    # custom-api mode -> langchain backend
+    assert settings.embedding_backend == "langchain"
     payload = json.loads(target.read_text(encoding="utf-8"))
-    assert payload.get("embedding_backend") == "openai"
+    assert payload.get("embedding_backend") == "langchain"
     assert payload.get("metadata", {}).get("embedding_mode") == "custom-api"
 
 
 def test_same_api_mode_resets_unknown_backend(tmp_path: Path) -> None:
+    """same-api mode derives langchain backend regardless of stored value."""
     target = tmp_path / "settings.json"
     target.write_text(
         json.dumps(
@@ -275,9 +284,10 @@ def test_same_api_mode_resets_unknown_backend(tmp_path: Path) -> None:
 
     settings = SettingsStore(target).load()
 
-    assert settings.embedding_backend == "auto"
+    # same-api mode -> langchain backend
+    assert settings.embedding_backend == "langchain"
     payload = json.loads(target.read_text(encoding="utf-8"))
-    assert payload.get("embedding_backend") == "auto"
+    assert payload.get("embedding_backend") == "langchain"
 
 
 def test_local_dtype_default_label_migrates(tmp_path: Path) -> None:

@@ -16,6 +16,7 @@ from .diff_builder import (
 )
 from .document_edit import DocumentEditTool, Bridge as EditBridge
 from .document_snapshot import SnapshotProvider
+from .validation import InvalidSnapshotTokenError, parse_snapshot_token
 from ...chat.commands import ActionType
 from ...documents.range_normalizer import NormalizedTextRange, compose_normalized_replacement, normalize_text_range
 from ...documents.ranges import LineRange, TextRange
@@ -46,17 +47,8 @@ class NeedsRangeError(ValueError):
             self.details["threshold"] = threshold
 
 
-class InvalidSnapshotTokenError(ValueError):
-    """Raised when a snapshot_token is malformed or cannot be parsed."""
-
-    code = "invalid_snapshot_token"
-
-    def __init__(self, message: str, *, token: str | None = None) -> None:
-        super().__init__(message)
-        self.token = token
-        self.details: dict[str, Any] = {"code": self.code}
-        if token is not None:
-            self.details["token"] = token
+# Re-export InvalidSnapshotTokenError for backwards compatibility
+# The canonical implementation is now in validation.py
 
 
 @dataclass(slots=True)
@@ -142,6 +134,13 @@ class DocumentApplyPatchTool:
                 raise ValueError("Snapshot did not provide document text")
             document_text = base_text
         normalization_text = document_text
+
+        # Auto-fill version fields from snapshot when snapshot_token is provided (simplification)
+        if snapshot_token is not None:
+            if document_version is None:
+                document_version = snapshot.get("version")
+            if content_hash is None:
+                content_hash = snapshot.get("content_hash")
 
         line_span = self._coerce_line_span(target_span)
         span_requested = line_span is not None
@@ -556,7 +555,9 @@ class DocumentApplyPatchTool:
         if target_range is not None:
             return
         raise ValueError(
-            "document_apply_patch requires target_span (preferred), target_range, or scope='document'/replace_all=true; call document_snapshot to capture explicit bounds before editing."
+            "Missing target_span. Recovery: Call document_snapshot first to get suggested_span, "
+            "then pass it as target_span to document_apply_patch. "
+            "For full-document replacement, use document_replace_all instead."
         )
 
     def _resolve_anchored_range(
@@ -966,15 +967,23 @@ class DocumentApplyPatchTool:
 
     def _resolve_version(self, snapshot: Mapping[str, Any], explicit: str | None, *, tab_id: str | None) -> str:
         if explicit is None:
-            raise ValueError("document_version is required; call document_snapshot before applying edits")
+            raise ValueError(
+                "Missing document_version. Recovery: Call document_snapshot first, "
+                "then use the returned snapshot_token (which includes version info) for your edit."
+            )
         candidate_text = str(explicit).strip()
         if not candidate_text:
-            raise ValueError("document_version is required; call document_snapshot before applying edits")
+            raise ValueError(
+                "Empty document_version. Recovery: Call document_snapshot to get a fresh "
+                "snapshot_token, then pass it to document_apply_patch."
+            )
         snapshot_version = snapshot.get("version")
         snapshot_text = str(snapshot_version).strip() if snapshot_version else None
         if snapshot_text and candidate_text != snapshot_text:
             reason = (
-                "Provided document_version does not match the latest snapshot; refresh document_snapshot and rebuild your diff."
+                "Version mismatch: your snapshot_token is stale. "
+                "Recovery: Call document_snapshot again to get a fresh snapshot_token, "
+                "then rebuild your edit with the new version."
             )
             self._emit_hash_mismatch_event(
                 snapshot=snapshot,
@@ -995,12 +1004,21 @@ class DocumentApplyPatchTool:
     ) -> str:
         token = self._normalize_version_id(provided)
         if token is None:
-            raise ValueError("version_id is required; call document_snapshot before applying edits")
+            raise ValueError(
+                "Missing version_id. Recovery: Call document_snapshot first, "
+                "then use the returned snapshot_token for your edit."
+            )
         snapshot_token = self._normalize_version_id(snapshot.get("version_id"))
         if snapshot_token is None:
-            raise ValueError("Snapshot did not expose version_id; call document_snapshot before editing")
+            raise ValueError(
+                "Snapshot missing version_id. Recovery: Call document_snapshot again "
+                "to get a valid snapshot with version information."
+            )
         if token != snapshot_token:
-            reason = "Provided version_id does not match the latest snapshot; refresh document_snapshot and rebuild your diff."
+            reason = (
+                "Version mismatch: your version_id is outdated. "
+                "Recovery: Call document_snapshot to get a fresh snapshot_token, then retry your edit."
+            )
             self._emit_hash_mismatch_event(
                 snapshot=snapshot,
                 tab_id=tab_id,
@@ -1021,11 +1039,15 @@ class DocumentApplyPatchTool:
     ) -> str:
         normalized = str(provided).strip() if isinstance(provided, str) else None
         if not normalized:
-            raise ValueError("content_hash is required; call document_snapshot before applying edits")
+            raise ValueError(
+                "Missing content_hash. Recovery: Call document_snapshot first, "
+                "then use the returned snapshot_token (which includes hash info) for your edit."
+            )
         snapshot_hash = self._resolve_snapshot_content_hash(snapshot, base_text)
         if normalized != snapshot_hash:
             reason = (
-                "Provided content_hash does not match the latest snapshot; refresh document_snapshot and rebuild your diff."
+                "Content hash mismatch: the document was modified since your snapshot. "
+                "Recovery: Call document_snapshot to get a fresh snapshot_token, then rebuild your edit."
             )
             self._emit_hash_mismatch_event(
                 snapshot=snapshot,
@@ -1043,7 +1065,10 @@ class DocumentApplyPatchTool:
         if isinstance(token, str) and token.strip():
             return token.strip()
         if base_text is None:
-            raise ValueError("Snapshot did not expose content_hash; call document_snapshot before editing")
+            raise ValueError(
+                "Snapshot missing content_hash. Recovery: Call document_snapshot again "
+                "with include_text=true to get complete version information."
+            )
         return hashlib.sha1(base_text.encode("utf-8")).hexdigest()
 
     @staticmethod
@@ -1374,39 +1399,10 @@ class DocumentApplyPatchTool:
 
     def _parse_snapshot_token(self, token: str | None) -> tuple[str | None, str | None]:
         """Parse snapshot_token into (tab_id, version_id) components.
-        
-        The token format is: `{tab_id}:{version_id}`
-        Returns (None, None) if token is None or empty.
-        Raises InvalidSnapshotTokenError if the token is malformed.
+
+        Uses strict mode to raise InvalidSnapshotTokenError for malformed tokens.
         """
-        if token is None:
-            return (None, None)
-        token_str = str(token).strip()
-        if not token_str:
-            return (None, None)
-        if ":" not in token_str:
-            raise InvalidSnapshotTokenError(
-                "snapshot_token must be in format 'tab_id:version_id'",
-                token=token_str,
-            )
-        parts = token_str.split(":", 1)
-        if len(parts) != 2:
-            raise InvalidSnapshotTokenError(
-                "snapshot_token must be in format 'tab_id:version_id'",
-                token=token_str,
-            )
-        tab_id, version_id = parts
-        if not tab_id.strip():
-            raise InvalidSnapshotTokenError(
-                "snapshot_token tab_id component cannot be empty",
-                token=token_str,
-            )
-        if not version_id.strip():
-            raise InvalidSnapshotTokenError(
-                "snapshot_token version_id component cannot be empty",
-                token=token_str,
-            )
-        return (tab_id.strip(), version_id.strip())
+        return parse_snapshot_token(token, strict=True)
 
     def _emit_auto_fill_event(
         self,

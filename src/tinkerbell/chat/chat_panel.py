@@ -42,6 +42,7 @@ Qt: Any = None
 QEvent: Any = None
 QColor: Any = None
 QSizePolicy: Any = None
+QSize: Any = None
 
 # Fallback Qt constants for environments where PySide6 isn't available during tests.
 FALLBACK_ENTER_KEYS = (0x01000004, 0x01000005)  # Qt.Key_Return, Qt.Key_Enter
@@ -49,7 +50,7 @@ FALLBACK_SHIFT_MODIFIER = 0x02000000  # Qt.ShiftModifier bit mask
 FALLBACK_KEY_PRESS_EVENT = 6  # QEvent.KeyPress
 
 try:  # pragma: no cover - PySide6 optional in CI
-    from PySide6.QtCore import Qt as _Qt, QEvent as _QtEvent
+    from PySide6.QtCore import Qt as _Qt, QEvent as _QtEvent, QSize as _QtSize
     from PySide6.QtGui import QColor as _QtColor
     from PySide6.QtWidgets import (
         QApplication as _QtApplication,
@@ -85,6 +86,7 @@ try:  # pragma: no cover - PySide6 optional in CI
     QEvent = _QtEvent
     QColor = _QtColor
     QSizePolicy = _QtSizePolicy
+    QSize = _QtSize
 except Exception:  # pragma: no cover - runtime fallback keeps dependencies optional
 
     class _StubQWidget:  # type: ignore[too-many-ancestors]
@@ -850,7 +852,32 @@ class ChatPanel(QWidgetBase):
                     widget.addItem(self._render_message_text(message))
                     continue
                 item = QListWidgetItem(widget)
-                item.setSizeHint(bubble_widget.sizeHint())
+                # Set fixed width first so heightForWidth can calculate properly
+                target_width = viewport_width - 8 if viewport_width > 8 else 400
+                bubble_widget.setFixedWidth(target_width)
+                # Force layout computation before getting size hint
+                layout = bubble_widget.layout()
+                if layout is not None:
+                    layout.activate()
+                bubble_widget.adjustSize()
+                
+                # Calculate height based on text label's heightForWidth
+                text_label = getattr(bubble_widget, '_text_label', None)
+                if text_label is not None:
+                    # Account for margins: container has 4+4=8 horizontal, bubble has 12+12=24
+                    label_width = target_width - 32
+                    label_height = text_label.heightForWidth(label_width)
+                    if label_height > 0:
+                        # Add vertical margins: bubble layout has 6+6=12, plus extra buffer for text rendering
+                        total_height = label_height + 24
+                        if QSize is not None:
+                            item.setSizeHint(QSize(target_width, total_height))
+                        else:
+                            item.setSizeHint(bubble_widget.sizeHint())
+                    else:
+                        item.setSizeHint(bubble_widget.sizeHint())
+                else:
+                    item.setSizeHint(bubble_widget.sizeHint())
                 item.setToolTip(self._tooltip_label_for_message(message))
                 widget.setItemWidget(item, bubble_widget)
         finally:  # pragma: no branch - ensure unblock
@@ -1380,23 +1407,39 @@ class ChatPanel(QWidgetBase):
         container = QFrame(self._history_widget)
         container.setObjectName("tb-chat-bubble-container")
         row_layout = QHBoxLayout(container)
-        row_layout.setContentsMargins(4, 2, 4, 2)
+        row_layout.setContentsMargins(4, 0, 4, 0)
         row_layout.setSpacing(4)
+        if QSizePolicy is not None:
+            try:
+                container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
 
         bubble = QFrame(container)
         bubble.setObjectName(f"tb-chat-bubble-{message.role}")
+        if hasattr(QFrame, 'NoFrame'):
+            try:
+                bubble.setFrameShape(QFrame.NoFrame)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
         bubble_layout = QVBoxLayout(bubble)
-        bubble_layout.setContentsMargins(12, 4, 12, 4)
-        bubble_layout.setSpacing(4)
+        bubble_layout.setContentsMargins(12, 6, 12, 6)
+        bubble_layout.setSpacing(2)
 
         if QSizePolicy is not None:
             try:
-                bubble.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+                bubble.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
             except Exception:  # pragma: no cover - Qt defensive guard
                 pass
 
         text_label = QLabel(message.content.strip() or "\u200b", bubble)
         text_label.setWordWrap(True)
+        text_label.setContentsMargins(0, 0, 0, 0)
+        if QSizePolicy is not None:
+            try:
+                text_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+            except Exception:  # pragma: no cover - Qt defensive guard
+                pass
         bubble_layout.addWidget(text_label)
 
         if message.metadata:
@@ -1415,15 +1458,18 @@ class ChatPanel(QWidgetBase):
             bubble_max_width = max(180, int(available * 0.92))
         bubble.setMaximumWidth(bubble_max_width)
         if message.role == "user":
-            bubble.setStyleSheet("background-color: #2d7dff; color: white; border-radius: 16px;")
+            bubble.setStyleSheet("background-color: #2d7dff; color: white; border-radius: 12px; padding: 0px;")
             row_layout.addStretch(1)
             row_layout.addWidget(bubble, 1)
         else:
-            bubble.setStyleSheet("background-color: #2f333a; color: #f5f5f5; border-radius: 16px;")
+            bubble.setStyleSheet("background-color: #2f333a; color: #f5f5f5; border-radius: 12px; padding: 0px;")
             row_layout.addWidget(bubble, 1)
             row_layout.addStretch(1)
 
         self._attach_bubble_context_menu(bubble, message)
+
+        # Store text_label reference for size calculations
+        container._text_label = text_label  # type: ignore[attr-defined]
 
         return container
 

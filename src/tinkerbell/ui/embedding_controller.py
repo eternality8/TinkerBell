@@ -291,14 +291,19 @@ class EmbeddingController:
         return DEFAULT_EMBEDDING_MODE
 
     def _normalize_backend(self, backend: str | None, mode: str) -> str:
-        normalized = (backend or "auto").strip().lower()
-        if normalized in {"", "auto"}:
-            normalized = "openai"
+        """Derive the internal backend from the embedding mode.
+        
+        The simplified UI only exposes mode; backend is derived:
+        - disabled -> disabled
+        - local -> sentence-transformers
+        - same-api / custom-api -> langchain (most flexible for OpenAI-compatible APIs)
+        """
+        if mode == "disabled":
+            return "disabled"
         if mode == "local":
             return "sentence-transformers"
-        if normalized == "sentence-transformers" and mode != "local":
-            return "openai"
-        return normalized
+        # For same-api and custom-api, always use langchain for flexibility
+        return "langchain"
 
     def _build_embedding_settings(self, settings: Settings, metadata: Mapping[str, Any], mode: str) -> Settings:
         if mode != "custom-api":

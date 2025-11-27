@@ -4341,15 +4341,12 @@ class AIController:
         if not callable(target):  # pragma: no cover - safety
             raise TypeError(f"Registered tool {tool_impl!r} is not callable")
 
-        try:
-            if isinstance(arguments, Mapping):
-                result = target(**arguments)
-            elif arguments in (None, {}):
-                result = target()
-            else:
-                result = target(arguments)
-        except TypeError:
-            # Fallback to positional invocation when kwargs mismatch.
+        if isinstance(arguments, Mapping):
+            result = target(**arguments)
+        elif arguments in (None, {}):
+            result = target()
+        else:
+            # Only use positional invocation for non-mapping arguments
             result = target(arguments)
 
         if inspect.isawaitable(result):

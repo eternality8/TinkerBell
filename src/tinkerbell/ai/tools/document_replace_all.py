@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar, Mapping, Protocol
 
-from .document_apply_patch import DocumentApplyPatchTool, InvalidSnapshotTokenError
+from .document_apply_patch import DocumentApplyPatchTool
+from .validation import InvalidSnapshotTokenError, parse_snapshot_token
 from ...services.telemetry import emit as telemetry_emit
 
 
@@ -112,39 +113,10 @@ class DocumentReplaceAllTool:
 
     def _parse_snapshot_token(self, token: str | None) -> tuple[str | None, str | None]:
         """Parse snapshot_token into (tab_id, version_id) components.
-        
-        The token format is: `{tab_id}:{version_id}`
-        Returns (None, None) if token is None or empty.
-        Raises InvalidSnapshotTokenError if the token is malformed.
+
+        Uses strict mode to raise InvalidSnapshotTokenError for malformed tokens.
         """
-        if token is None:
-            return (None, None)
-        token_str = str(token).strip()
-        if not token_str:
-            return (None, None)
-        if ":" not in token_str:
-            raise InvalidSnapshotTokenError(
-                "snapshot_token must be in format 'tab_id:version_id'",
-                token=token_str,
-            )
-        parts = token_str.split(":", 1)
-        if len(parts) != 2:
-            raise InvalidSnapshotTokenError(
-                "snapshot_token must be in format 'tab_id:version_id'",
-                token=token_str,
-            )
-        tab_id, version_id = parts
-        if not tab_id.strip():
-            raise InvalidSnapshotTokenError(
-                "snapshot_token tab_id component cannot be empty",
-                token=token_str,
-            )
-        if not version_id.strip():
-            raise InvalidSnapshotTokenError(
-                "snapshot_token version_id component cannot be empty",
-                token=token_str,
-            )
-        return (tab_id.strip(), version_id.strip())
+        return parse_snapshot_token(token, strict=True)
 
 
 __all__ = ["DocumentReplaceAllTool"]

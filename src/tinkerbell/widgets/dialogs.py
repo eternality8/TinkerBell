@@ -66,16 +66,10 @@ __all__ = [
 
 DEFAULT_FILE_FILTER = "Markdown / Text (*.md *.markdown *.mdx *.txt *.json *.yaml *.yml);;All Files (*)"
 _MODEL_SUGGESTIONS = ("gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "o4-mini")
-_EMBEDDING_BACKENDS: tuple[tuple[str, str], ...] = (
-    ("auto", "Auto (match chat model)"),
-    ("openai", "OpenAI (direct)"),
-    ("langchain", "LangChain (OpenAI-compatible)"),
-    ("sentence-transformers", "SentenceTransformers (local)"),
-    ("disabled", "Disabled"),
-)
 _EMBEDDING_MODE_LABELS: Mapping[str, str] = {
-    "same-api": "Same API (default)",
-    "custom-api": "Custom API (separate key)",
+    "disabled": "Disabled",
+    "same-api": "Same API as Chat Model",
+    "custom-api": "Separate OpenAI-Compatible API",
     "local": "Local (SentenceTransformers)",
 }
 _HINT_COLORS = {
@@ -731,24 +725,15 @@ class SettingsDialog(QDialog):
         self._theme_combo.setObjectName("theme_combo")
         self._theme_combo.setEditable(False)
         self._populate_theme_combo(self._original.theme)
-        self._embedding_backend_combo = QComboBox()
-        self._embedding_backend_combo.setObjectName("embedding_backend_combo")
-        for backend_value, backend_label in _EMBEDDING_BACKENDS:
-            self._embedding_backend_combo.addItem(backend_label, backend_value)
-        backend_default = (getattr(self._original, "embedding_backend", "auto") or "auto").lower()
-        backend_index = self._embedding_backend_combo.findData(backend_default)
-        self._embedding_backend_combo.setCurrentIndex(backend_index if backend_index >= 0 else 0)
-        self._embedding_backend_combo.currentIndexChanged.connect(self._handle_embedding_backend_changed)
-        self._embedding_backend_hint = QLabel("Use LangChain to reach DeepSeek, GLM, or other OpenAI-compatible APIs.")
-        self._embedding_backend_hint.setObjectName("embedding_backend_hint")
-        self._prepare_hint_label(self._embedding_backend_hint)
+        # Embedding model input (shown only for API modes)
         embedding_model_default = getattr(self._original, "embedding_model_name", "text-embedding-3-large") or "text-embedding-3-large"
         self._embedding_model_input = QLineEdit(embedding_model_default)
         self._embedding_model_input.setObjectName("embedding_model_input")
         self._embedding_model_input.textChanged.connect(self._validate_embedding_fields)
-        self._embedding_model_hint = QLabel("Defaults to text-embedding-3-large when left blank.")
+        self._embedding_model_hint = QLabel("Model name for the embedding API.")
         self._embedding_model_hint.setObjectName("embedding_model_hint")
         self._prepare_hint_label(self._embedding_model_hint)
+        # Embedding mode combo (single dropdown for all modes)
         self._embedding_mode_combo = QComboBox()
         self._embedding_mode_combo.setObjectName("embedding_mode_combo")
         for mode in EMBEDDING_MODE_CHOICES:
@@ -757,17 +742,20 @@ class SettingsDialog(QDialog):
         mode_index = self._embedding_mode_combo.findData(self._initial_embedding_mode)
         self._embedding_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
         self._embedding_mode_combo.currentIndexChanged.connect(self._handle_embedding_mode_changed)
-        self._embedding_mode_hint = QLabel("Embeddings reuse the same API credentials by default.")
+        self._embedding_mode_hint = QLabel("Choose how embeddings are generated for semantic search.")
         self._embedding_mode_hint.setObjectName("embedding_mode_hint")
         self._prepare_hint_label(self._embedding_mode_hint)
+        # Mode-specific settings panels
         self._embedding_mode_stack = QStackedWidget()
         self._embedding_mode_stack.setObjectName("embedding_mode_stack")
         self._mode_index_map: dict[str, int] = {}
+        disabled_panel = self._build_disabled_panel()
         same_panel = self._build_same_api_panel()
         custom_panel = self._build_custom_api_panel()
         local_panel = self._build_local_embedding_panel()
         for index, (mode, panel) in enumerate(
             (
+                ("disabled", disabled_panel),
                 ("same-api", same_panel),
                 ("custom-api", custom_panel),
                 ("local", local_panel),
@@ -961,26 +949,19 @@ class SettingsDialog(QDialog):
         temperature_layout.addWidget(self._temperature_input)
         temperature_layout.addWidget(self._temperature_hint)
 
-        embedding_backend_container = QWidget()
-        embedding_backend_layout = QVBoxLayout(embedding_backend_container)
-        embedding_backend_layout.setContentsMargins(0, 0, 0, 0)
-        embedding_backend_layout.setSpacing(2)
-        embedding_backend_layout.addWidget(self._embedding_backend_combo)
-        embedding_backend_layout.addWidget(self._embedding_backend_hint)
-
-        embedding_model_container = QWidget()
-        embedding_model_layout = QVBoxLayout(embedding_model_container)
-        embedding_model_layout.setContentsMargins(0, 0, 0, 0)
-        embedding_model_layout.setSpacing(2)
-        embedding_model_layout.addWidget(self._embedding_model_input)
-        embedding_model_layout.addWidget(self._embedding_model_hint)
-
         embedding_mode_container = QWidget()
         embedding_mode_layout = QVBoxLayout(embedding_mode_container)
         embedding_mode_layout.setContentsMargins(0, 0, 0, 0)
         embedding_mode_layout.setSpacing(2)
         embedding_mode_layout.addWidget(self._embedding_mode_combo)
         embedding_mode_layout.addWidget(self._embedding_mode_hint)
+
+        self._embedding_model_container = QWidget()
+        embedding_model_layout = QVBoxLayout(self._embedding_model_container)
+        embedding_model_layout.setContentsMargins(0, 0, 0, 0)
+        embedding_model_layout.setSpacing(2)
+        embedding_model_layout.addWidget(self._embedding_model_input)
+        embedding_model_layout.addWidget(self._embedding_model_hint)
 
         embedding_mode_stack_container = QWidget()
         embedding_mode_stack_layout = QVBoxLayout(embedding_mode_stack_container)
@@ -1080,10 +1061,9 @@ class SettingsDialog(QDialog):
 
         embedding_tab = _build_form_tab(
             [
-                ("Embedding Backend", embedding_backend_container),
-                ("Embedding Model", embedding_model_container),
-                ("Embeddings Mode", embedding_mode_container),
-                ("Embedding Options", embedding_mode_stack_container),
+                ("Mode", embedding_mode_container),
+                ("Embedding Model", self._embedding_model_container),
+                ("Settings", embedding_mode_stack_container),
             ]
         )
 
@@ -1166,7 +1146,6 @@ class SettingsDialog(QDialog):
         self._update_safe_ai_controls()
         self._update_context_policy_hint()
         self._handle_embedding_mode_changed()
-        self._handle_embedding_backend_changed()
         self._validate_embedding_fields()
         self._update_buttons_state()
 
@@ -1224,9 +1203,14 @@ class SettingsDialog(QDialog):
         theme = self._current_theme_name()
         temperature = float(self._temperature_input.value())
         embedding_mode = self._embedding_mode_value()
-        embedding_backend = self._selected_embedding_backend()
-        if embedding_mode == "local":
+        # Derive embedding_backend from mode for backwards compatibility
+        if embedding_mode == "disabled":
+            embedding_backend = "disabled"
+        elif embedding_mode == "local":
             embedding_backend = "sentence-transformers"
+        else:
+            # Both same-api and custom-api use langchain for flexibility
+            embedding_backend = "langchain"
         embedding_model = self._embedding_model_input.text().strip() or self._original.embedding_model_name
         debug_logging = self._debug_checkbox.isChecked()
         debug_event_logging = self._event_log_checkbox.isChecked()
@@ -1290,6 +1274,16 @@ class SettingsDialog(QDialog):
                 else:
                     metadata[key] = value
         return metadata
+
+    def _build_disabled_panel(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        label = QLabel("Embeddings disabled. Semantic search will fall back to regex and outline matching.")
+        self._prepare_hint_label(label)
+        layout.addWidget(label)
+        return container
 
     def _build_same_api_panel(self) -> QWidget:
         container = QWidget()
@@ -1768,59 +1762,33 @@ class SettingsDialog(QDialog):
         value = self._embedding_mode_combo.itemData(index)
         return str(value) if isinstance(value, str) and value else self._initial_embedding_mode
 
-    def _select_embedding_backend(self, backend: str) -> None:
-        index = self._embedding_backend_combo.findData(backend)
-        if index >= 0:
-            self._embedding_backend_combo.blockSignals(True)
-            self._embedding_backend_combo.setCurrentIndex(index)
-            self._embedding_backend_combo.blockSignals(False)
-
-    def _selected_embedding_backend(self) -> str:
-        index = self._embedding_backend_combo.currentIndex()
-        value = self._embedding_backend_combo.itemData(index)
-        if isinstance(value, str) and value:
-            return value
-        return "auto"
-
     def _handle_embedding_mode_changed(self) -> None:
         mode = self._embedding_mode_value()
         stack_index = self._mode_index_map.get(mode, 0)
         self._embedding_mode_stack.setCurrentIndex(stack_index)
-        if mode == "custom-api":
+        # Update hints based on mode
+        if mode == "disabled":
+            hint = "Semantic search will fall back to regex and outline matching."
+        elif mode == "custom-api":
             hint = "Configure a dedicated endpoint and API key just for embeddings."
         elif mode == "local":
-            hint = "Run embeddings locally via SentenceTransformers; install the embeddings extra."
+            hint = "Run embeddings locally via SentenceTransformers."
         else:
-            hint = "Reuse your chat API credentials for embeddings."
+            hint = "Uses your chat API credentials for embeddings."
         self._set_hint(self._embedding_mode_hint, hint)
-        self._handle_embedding_backend_changed()
-
-    def _handle_embedding_backend_changed(self) -> None:
-        backend = self._selected_embedding_backend()
-        mode = self._embedding_mode_value()
-        if mode == "local" and backend != "sentence-transformers":
-            self._select_embedding_backend("sentence-transformers")
-            backend = "sentence-transformers"
-        hint = (
-            "Embeddings disabled; retrieval falls back to regex + outlines."
-            if backend == "disabled"
-            else "LangChain adapters support OpenAI-compatible providers like DeepSeek or GLM."
-            if backend == "langchain"
-            else "Run embeddings locally via SentenceTransformers." if backend == "sentence-transformers" else "Use your configured OpenAI endpoint for embeddings."
-        )
-        self._set_hint(self._embedding_backend_hint, hint)
-        self._embedding_backend_combo.setEnabled(mode != "local")
-        self._embedding_model_input.setEnabled(backend != "disabled" and mode != "local")
+        # Show/hide model input based on mode (only needed for API modes)
+        show_model = mode in ("same-api", "custom-api")
+        self._embedding_model_container.setVisible(show_model)
         self._validate_embedding_fields()
 
     def _validate_embedding_fields(self) -> None:
         mode = self._embedding_mode_value()
-        backend = self._selected_embedding_backend()
         model = self._embedding_model_input.text().strip()
-        if mode == "local" or backend == "disabled":
+        # Model only required for API modes
+        if mode in ("disabled", "local"):
             self._set_field_error("embedding_model_name", None)
         elif not model:
-            self._set_field_error("embedding_model_name", "Embedding model is required unless embeddings are disabled.")
+            self._set_field_error("embedding_model_name", "Embedding model is required for API modes.")
         else:
             self._set_field_error("embedding_model_name", None)
         self._validate_custom_api_fields(mode)

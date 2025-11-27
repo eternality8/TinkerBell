@@ -61,6 +61,7 @@ class DocumentSnapshotTool:
         chunk_profile: str | None = None,
         max_tokens: int | None = None,
         include_text: bool = True,
+        offset: int | None = None,
     ) -> dict:
         request_kwargs = self._coerce_request_mapping(request)
         ignored_keys: list[str] = []  # WS3 4.4.1: Track ignored keys
@@ -73,6 +74,7 @@ class DocumentSnapshotTool:
             chunk_profile = request_kwargs.pop("chunk_profile", chunk_profile)
             max_tokens = request_kwargs.pop("max_tokens", max_tokens)
             include_text = request_kwargs.pop("include_text", include_text)
+            offset = request_kwargs.pop("offset", offset)
             tab_id = request_kwargs.pop("tab_id", tab_id)
             document_id = request_kwargs.pop("document_id", None)
             alias = str(document_id).strip() if document_id is not None else ""
@@ -86,6 +88,11 @@ class DocumentSnapshotTool:
                 )
                 # WS3 4.4.2: Telemetry for ignored fields
                 self._emit_ignored_keys(ignored_keys, tab_id=tab_id)
+        
+        # If offset is provided, build a window starting from that offset
+        if offset is not None and offset > 0:
+            window = {"start": offset, "kind": "range"}
+        
         resolved_window = self._resolve_window(window)
         snapshot = self._build_snapshot(
             delta_only=delta_only,
@@ -118,6 +125,9 @@ class DocumentSnapshotTool:
         if ignored_keys:
             snapshot["ignored_keys"] = ignored_keys
             snapshot["warning"] = f"The following request parameters were not recognized and ignored: {', '.join(ignored_keys)}"
+
+        # Clean up snapshot to remove fields that confuse the AI (after all internal processing)
+        self._simplify_snapshot_for_ai(snapshot)
 
         return snapshot
 
@@ -168,6 +178,56 @@ class DocumentSnapshotTool:
         self._add_suggested_span(snapshot)
 
         return snapshot
+
+    def _simplify_snapshot_for_ai(self, snapshot: dict) -> None:
+        """Remove or simplify fields that are internal or confuse the AI.
+        
+        The AI should use snapshot_token (contains tab_id:version_id) for all
+        edit operations. Fields like document_id are removed because the AI
+        often confuses them with tab_id when constructing snapshot_token.
+        """
+        # Remove document_id - AI often confuses it with tab_id
+        # The snapshot_token contains the correct tab_id
+        snapshot.pop("document_id", None)
+        
+        # Remove internal line offset array - not needed by AI
+        snapshot.pop("line_start_offsets", None)
+        snapshot.pop("line_offsets", None)
+        
+        # Simplify chunk_manifest - keep only cache_key and count for iteration
+        manifest = snapshot.get("chunk_manifest")
+        if isinstance(manifest, Mapping):
+            simplified_manifest = {}
+            if "cache_key" in manifest:
+                simplified_manifest["cache_key"] = manifest["cache_key"]
+            if "chunk_count" in manifest:
+                simplified_manifest["chunk_count"] = manifest["chunk_count"]
+            elif "chunks" in manifest and isinstance(manifest["chunks"], list):
+                simplified_manifest["chunk_count"] = len(manifest["chunks"])
+            snapshot["chunk_manifest"] = simplified_manifest if simplified_manifest else None
+            if not snapshot["chunk_manifest"]:
+                snapshot.pop("chunk_manifest", None)
+        
+        # Simplify window - just keep essential info
+        window = snapshot.get("window")
+        if isinstance(window, Mapping):
+            simplified_window = {
+                "start": window.get("start", 0),
+                "end": window.get("end", 0),
+            }
+            if window.get("includes_full_document"):
+                simplified_window["full_document"] = True
+            snapshot["window"] = simplified_window
+
+        # Add continuation hint when document is truncated
+        doc_length = snapshot.get("length", 0)
+        window_end = snapshot.get("window", {}).get("end", 0)
+        if doc_length and window_end and doc_length > window_end:
+            # Document is truncated - add simple hint to use offset parameter
+            snapshot["continuation_hint"] = (
+                f"Document truncated at {window_end}/{doc_length} chars. "
+                f"To read more, call document_snapshot with offset={window_end}."
+            )
 
     def _add_snapshot_token(self, snapshot: dict, tab_id: str | None) -> None:
         """Add compact snapshot_token combining tab_id and version_id."""

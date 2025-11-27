@@ -7,8 +7,8 @@ from tinkerbell.ai import prompts
 
 def test_base_system_prompt_includes_budget_and_fallback():
     content = prompts.base_system_prompt(model_name=None)
-    assert "Planning contract" in content
-    assert "Tool execution contract" in content
+    assert "Tool workflow" in content
+    assert "Edit Recipe" in content
     assert "Voice & tone" in content
     assert "collaborative peer" in content
     assert "TokenCounterRegistry" in content

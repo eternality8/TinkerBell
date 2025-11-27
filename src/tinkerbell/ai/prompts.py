@@ -16,8 +16,6 @@ def base_system_prompt(*, model_name: str | None = None) -> str:
     """Return the structured system prompt for agent conversations."""
 
     personality_section = user_personality_instructions()
-    planner_section = planner_instructions()
-    outline_section = outline_retrieval_instructions()
     tool_section = tool_use_instructions()
     budget_hint = _token_budget_hint(model_name)
     fallback_hint = _tokenizer_fallback_hint(model_name)
@@ -26,72 +24,72 @@ def base_system_prompt(*, model_name: str | None = None) -> str:
         "Your job is to be a collaborative peer who plans, executes, and validates multi-step edits on various types of documents.\n\n"
         "## Voice & tone\n"
         f"{personality_section}\n\n"
-        "## Planning contract\n"
-        f"{planner_section}\n\n"
-        "## Outline & retrieval tools\n"
-        f"{outline_section}\n\n"
-        "## Tool execution contract\n"
+        "## Tool workflow\n"
         f"{tool_section}\n\n"
         "## Safety & budgeting\n"
         f"- {budget_hint}\n"
-        "- Prefer windowed snapshots over full-document reads. Escalate only when necessary.\n"
-        "- Never apply multiple patches against the same snapshot. Refresh after every successful edit.\n"
-        "- Use DocumentFindTextTool when the target text is not in your active snapshot; never guess line numbers.\n"
-        f"- Tokenizer fallback: {fallback_hint}\n"
+        "- Prefer windowed snapshots over full-document reads.\n"
+        "- Never reuse a stale `snapshot_token`. Refresh after every successful edit.\n"
+        f"- Tokenizer: {fallback_hint}\n"
         "- Keep responses grounded in the tools you actually invoked."
     )
 
 
 def planner_instructions() -> str:
-    """Guidance for the planner node - 6 core rules for the snapshot → find → edit → refresh cycle."""
+    """Guidance for the planner node - concise snapshot → edit → refresh cycle.
+    
+    Note: This function is kept for backwards compatibility but its content
+    is now integrated into tool_use_instructions().
+    """
 
     return (
-        "1. **Snapshot first**: Inspect the latest DocumentSnapshot and record `snapshot_token`, `tab_id`, and `suggested_span`. These identify the document version and editing window.\n"
-        "2. **Find before edit**: If the user references text not in your snapshot, call DocumentFindTextTool to locate the exact `target_span`. Never guess line numbers.\n"
-        "3. **Edit with spans**: Pass `snapshot_token` and `target_span` to DocumentApplyPatch. Include `match_text` from the snapshot for anchor verification.\n"
-        "4. **Refresh after edit**: After each successful edit, capture a fresh DocumentSnapshot before making another change. Stale snapshots cause offset drift.\n"
-        "5. **Handle errors**: If tools report version mismatch, stale anchors, or `needs_range`, refresh the snapshot and retry with updated spans.\n"
-        "6. **Stay scoped**: Prefer windowed snapshots over full-document reads. Use DocumentReplaceAllTool only for intentional full-document replacements."
+        "1. **Snapshot first**: Call document_snapshot to get `snapshot_token` and `suggested_span`.\n"
+        "2. **Edit**: Pass `snapshot_token`, `target_span` (from suggested_span), and `content` to document_apply_patch.\n"
+        "3. **Refresh**: Get a fresh snapshot before making another change.\n"
+        "4. **On error**: Refresh snapshot and retry once."
     )
 
 
 def outline_retrieval_instructions() -> str:
-    """Guidance for when and how to use outline and retrieval tools."""
+    """Guidance for when and how to use outline and retrieval tools.
+    
+    Note: This function is kept for backwards compatibility but its content
+    is now integrated into tool_use_instructions().
+    """
 
     return (
-        "- **DocumentOutlineTool**: Returns document structure with `outline_digest`. Use for navigating headings/sections. "
-        "Skip re-requests when digest matches a previous call. Treat stale outlines as hints only.\n"
-        "- **DocumentFindTextTool**: Accepts literal text or descriptions and returns `target_span` plus chunk pointers. "
-        "Call when you need the exact location of quoted text or user-referenced passages.\n"
-        "- **Offline fallback**: When retrieval returns `status=\"offline_fallback\"`, treat results as low-confidence. "
-        "Always verify via DocumentSnapshot before editing.\n"
-        "- **Guardrails**: Honor `status`, `guardrails`, and `retry_after_ms` from tool responses. "
-        "Adapt your strategy when tools report pending, unsupported, or huge_document states."
+        "- **document_outline**: Returns document structure (headings/sections).\n"
+        "- **document_find_text**: Locates text and returns `line_span`. Use when text is outside your snapshot.\n"
+        "- When results show `confidence=\"low\"`, verify with document_snapshot before editing."
     )
 
 
 def tool_use_instructions() -> str:
-    """Guidance for the tool execution loop - Edit Recipe + Error Recovery."""
+    """Consolidated guidance for the tool execution loop."""
 
     return (
         "## Edit Recipe\n"
-        "1. **Snapshot**: Call DocumentSnapshot to get `snapshot_token` and `suggested_span` for your target window.\n"
-        "2. **Find** (if needed): Call DocumentFindTextTool when the target text is not in your snapshot. Use the returned `target_span`.\n"
-        "3. **Patch**: Call DocumentApplyPatch with `snapshot_token`, `target_span`, `content`, and `match_text` for anchor verification.\n"
-        "4. **Refresh**: After success, call DocumentSnapshot again before the next edit.\n\n"
-        "## Tool Quick Reference\n"
-        "- **DocumentSnapshot**: Returns `snapshot_token`, `suggested_span`, and document text. Always call first.\n"
-        "- **DocumentFindTextTool**: Locates text passages and returns `target_span`. Use when text is outside your snapshot window.\n"
-        "- **DocumentApplyPatch**: Applies edits. Requires `snapshot_token`, `target_span`, and `content`.\n"
-        "- **DocumentReplaceAllTool**: Full-document replacement. Only needs `snapshot_token` and `content`.\n"
-        "- **DocumentChunkTool**: Retrieves cached chunk content. Pass `snapshot_token` for version consistency.\n"
-        "- **DocumentOutlineTool**: Returns document structure for navigation. Check `outline_digest` to avoid redundant calls.\n\n"
+        "1. **document_snapshot** → get `snapshot_token` and `suggested_span`\n"
+        "2. Choose the right edit tool:\n"
+        "   - **document_insert** → add NEW content between existing lines (use `after_line`)\n"
+        "   - **document_apply_patch** → REPLACE existing content with new content (use `target_span`)\n"
+        "   - **document_replace_all** → rewrite the ENTIRE document\n"
+        "3. Repeat from step 1 for additional edits (always refresh snapshot first)\n\n"
+        "## Choosing Insert vs Replace\n"
+        "- **INSERT** (`document_insert`): Adding a new paragraph, section, or content WITHOUT touching existing text\n"
+        "  - Example: \"Add a paragraph after the introduction\" → use `document_insert` with `after_line`\n"
+        "- **REPLACE** (`document_apply_patch`): Changing, rewriting, or removing existing content\n"
+        "  - Example: \"Rewrite this paragraph\" → use `document_apply_patch` with `target_span`\n\n"
+        "## Finding Text\n"
+        "- Use **document_find_text** when your target text is outside the current snapshot window\n"
+        "- If results show `confidence=\"low\"` or `status=\"offline_fallback\"`:\n"
+        "  - **DO NOT repeat the same query** - results won't improve\n"
+        "  - Use the `line_span` from pointers with **document_snapshot** to verify the actual content\n"
+        "- Use **document_outline** to navigate by heading/section structure\n\n"
         "## Error Recovery\n"
-        "- **Version mismatch**: Refresh DocumentSnapshot and retry with new `snapshot_token`.\n"
-        "- **Anchor mismatch**: The document changed. Refresh snapshot and verify `match_text` still exists.\n"
-        "- **NeedsRange error**: Provide explicit `target_span` or use `scope='document'` for full replacements.\n"
-        "- **Snapshot drift warning**: Too many edits without refresh. Stop, get fresh snapshot, then continue.\n"
-        "- **Unknown tab_id**: Fetch the latest tab list before retrying."
+        "- `stale snapshot` / `hash mismatch`: Refresh snapshot and rebuild your edit\n"
+        "- `needs_range`: You must provide `target_span`; call document_snapshot first\n"
+        "- `match_text mismatch`: Document changed; refresh and verify your target"
     )
 
 

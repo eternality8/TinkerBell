@@ -17,6 +17,77 @@ class ValidationOutcome:
     message: str = ""
 
 
+class InvalidSnapshotTokenError(ValueError):
+    """Raised when a snapshot_token is malformed or cannot be parsed."""
+
+    code = "invalid_snapshot_token"
+
+    def __init__(self, message: str, *, token: str | None = None) -> None:
+        super().__init__(message)
+        self.token = token
+        self.details: dict[str, Any] = {"code": self.code}
+        if token is not None:
+            self.details["token"] = token
+
+
+def parse_snapshot_token(
+    token: str | None,
+    *,
+    strict: bool = False,
+) -> tuple[str | None, str | None]:
+    """Parse a snapshot_token into (tab_id, version_id) components.
+
+    The token format is: `{tab_id}:{version_id}`
+
+    Args:
+        token: The snapshot_token string to parse.
+        strict: If True, raise InvalidSnapshotTokenError for malformed tokens.
+                If False (default), return (None, None) for invalid tokens.
+
+    Returns:
+        A tuple of (tab_id, version_id). Both may be None if token is empty/None
+        and strict=False.
+
+    Raises:
+        InvalidSnapshotTokenError: If strict=True and the token is malformed.
+    """
+    if token is None:
+        return (None, None)
+    token_str = str(token).strip()
+    if not token_str:
+        return (None, None)
+    if ":" not in token_str:
+        if strict:
+            raise InvalidSnapshotTokenError(
+                "snapshot_token must be in format 'tab_id:version_id'",
+                token=token_str,
+            )
+        return (None, None)
+    parts = token_str.split(":", 1)
+    if len(parts) != 2:
+        if strict:
+            raise InvalidSnapshotTokenError(
+                "snapshot_token must be in format 'tab_id:version_id'",
+                token=token_str,
+            )
+        return (None, None)
+    tab_id, version_id = parts
+    tab_id_clean = tab_id.strip()
+    version_id_clean = version_id.strip()
+    if strict:
+        if not tab_id_clean:
+            raise InvalidSnapshotTokenError(
+                "snapshot_token tab_id component cannot be empty",
+                token=token_str,
+            )
+        if not version_id_clean:
+            raise InvalidSnapshotTokenError(
+                "snapshot_token version_id component cannot be empty",
+                token=token_str,
+            )
+    return (tab_id_clean or None, version_id_clean or None)
+
+
 SnippetValidator = Callable[[str], List[yaml_json.ValidationError]]
 
 
@@ -131,5 +202,11 @@ def _outcome_from_errors(errors: List[yaml_json.ValidationError]) -> ValidationO
 validate_snippet.summarizable = False
 
 
-__all__ = ["ValidationOutcome", "validate_snippet", "register_snippet_validator"]
+__all__ = [
+    "InvalidSnapshotTokenError",
+    "ValidationOutcome",
+    "parse_snapshot_token",
+    "register_snippet_validator",
+    "validate_snippet",
+]
 

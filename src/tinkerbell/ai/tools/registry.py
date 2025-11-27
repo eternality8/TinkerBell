@@ -15,6 +15,7 @@ from .document_apply_patch import DocumentApplyPatchTool
 from .document_chunk import DocumentChunkTool
 from .document_edit import DocumentEditTool
 from .document_find_text import DocumentFindTextTool
+from .document_insert import DocumentInsertTool
 from .document_outline import DocumentOutlineTool
 from .document_plot_state import DocumentPlotStateTool, PlotOutlineTool
 from .document_replace_all import DocumentReplaceAllTool
@@ -124,65 +125,29 @@ def register_default_tools(
                 "document_snapshot",
                 snapshot_tool,
                 description=(
-                    "Return the freshest document snapshot (text, metadata, diff summaries) for the active or specified tab."
+                    "CALL THIS FIRST before any edit. Returns snapshot_token (required for edits) "
+                    "and suggested_span (the line range you can edit). Use offset to read more of a long document."
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "delta_only": {
-                            "type": "boolean",
-                            "description": "When true, include only the requested span (plus nearby context) instead of the full document.",
-                        },
-                        "include_diff": {
-                            "type": "boolean",
-                            "description": "Attach the most recent diff summary when available (default true).",
-                        },
                         "tab_id": {
                             "type": "string",
                             "description": "Target a specific tab instead of the active document.",
                         },
-                        "source_tab_ids": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional list of additional tab snapshots to gather alongside the active document.",
-                        },
-                        "include_open_documents": {
-                            "type": "boolean",
-                            "description": "When true, include a summary of all open documents in the snapshot payload.",
-                        },
-                        "window": {
-                            "description": (
-                                "Controls which portion of the document is returned. Defaults to a span-directed window; set to 'document' to request the full text."
-                            ),
-                            "anyOf": [
-                                {"type": "string"},
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "kind": {"type": "string"},
-                                        "padding": {"type": "integer", "minimum": 0},
-                                        "max_chars": {"type": "integer", "minimum": 256},
-                                        "max_tokens": {"type": "integer", "minimum": 256},
-                                        "start": {"type": "integer", "minimum": 0},
-                                        "end": {"type": "integer", "minimum": 0},
-                                    },
-                                    "additionalProperties": False,
-                                },
-                            ],
-                        },
-                        "chunk_profile": {
-                            "type": "string",
-                            "enum": ["auto", "prose", "code", "notes"],
-                            "description": "Hint for chunk manifest sizing. Defaults to 'auto'.",
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Character offset to start reading from. Use this to get more of a long document (e.g., offset=8192 for chars after the first window).",
                         },
                         "max_tokens": {
                             "type": "integer",
                             "minimum": 256,
-                            "description": "Approximate token budget for the returned window; helps keep snapshots slim.",
+                            "description": "Approximate token budget for the returned window.",
                         },
                         "include_text": {
                             "type": "boolean",
-                            "description": "Set false to omit the text body and request only metadata + chunk manifests.",
+                            "description": "Set false to get only metadata without document text.",
                         },
                     },
                     "additionalProperties": False,
@@ -228,14 +193,16 @@ def register_default_tools(
                     "document_chunk",
                     chunk_tool,
                     description=(
-                        "Return cached chunk manifests or incremental chunk windows to guide chunk-first planning."
+                        "Fetch document chunks beyond the initial snapshot window. "
+                        "Use iterator with cache_key from chunk_manifest to read sequential chunks. "
+                        "Do NOT construct chunk_id manually - use the iterator pattern instead."
                     ),
                     parameters={
                         "type": "object",
                         "properties": {
                             "chunk_id": {
                                 "type": "string",
-                                "description": "Chunk identifier obtained from a chunk manifest or iterator response.",
+                                "description": "Chunk ID from a previous iterator response (not for manual construction).",
                             },
                             "snapshot_token": {
                                 "type": "string",
@@ -351,105 +318,37 @@ def register_default_tools(
                         "document_apply_patch",
                         apply_patch_tool,
                         description=(
-                            "Replace a target_span with new content by automatically building and applying a unified diff."
+                            "Edit document lines. REQUIRES: 1) snapshot_token from document_snapshot, "
+                            "2) target_span (use suggested_span from snapshot), 3) content (replacement text)."
                         ),
                         parameters={
                             "type": "object",
                             "properties": {
                                 "snapshot_token": {
                                     "type": "string",
-                                    "description": "Compact version identifier in format 'tab_id:version_id' from document_snapshot response.",
+                                    "description": "Version identifier from document_snapshot (format: 'tab_id:version_id').",
                                 },
                                 "content": {
                                     "type": "string",
-                                    "description": "Replacement text that should occupy the specified target_span.",
-                                },
-                                "operation": {
-                                    "type": "string",
-                                    "enum": ["replace"],
-                                    "description": "Declared intent for the edit; document_apply_patch currently supports only 'replace'.",
-                                },
-                                "replace_all": {
-                                    "type": "boolean",
-                                    "description": "When true, overwrite the entire document instead of a bounded range.",
+                                    "description": "Replacement text for the specified target_span.",
                                 },
                                 "target_span": {
-                                    "anyOf": [
-                                        {
-                                            "type": "object",
-                                            "properties": {
-                                                "start_line": {"type": "integer", "minimum": 0},
-                                                "end_line": {"type": "integer", "minimum": 0},
-                                            },
-                                            "required": ["start_line", "end_line"],
-                                            "additionalProperties": False,
-                                        },
-                                        {
-                                            "type": "array",
-                                            "items": {"type": "integer"},
-                                            "minItems": 2,
-                                            "maxItems": 2,
-                                        },
-                                    ],
-                                    "description": "Line-based span using inclusive line bounds (start_line, end_line). Preferred over target_range.",
-                                },
-                                "suggested_span": {
-                                    "anyOf": [
-                                        {
-                                            "type": "object",
-                                            "properties": {
-                                                "start_line": {"type": "integer", "minimum": 0},
-                                                "end_line": {"type": "integer", "minimum": 0},
-                                            },
-                                            "required": ["start_line", "end_line"],
-                                            "additionalProperties": False,
-                                        },
-                                        {
-                                            "type": "array",
-                                            "items": {"type": "integer"},
-                                            "minItems": 2,
-                                            "maxItems": 2,
-                                        },
-                                    ],
-                                    "description": "Fallback span from document_snapshot; auto-fills target_span when not explicitly provided.",
-                                },
-                                "scope": {
-                                    "type": "string",
-                                    "enum": ["document"],
-                                    "description": "Declare the intended scope; use 'document' only when overwriting the full file.",
-                                },
-                                "document_version": {
-                                    "type": "string",
-                                    "description": "Document snapshot version captured before drafting the edit.",
-                                },
-                                "version_id": {
-                                    "type": ["integer", "string"],
-                                    "description": "Monotonic version_id returned by document_snapshot; guards against stale outlines.",
-                                },
-                                "content_hash": {
-                                    "type": "string",
-                                    "description": "Content hash from document_snapshot; must match the live buffer when applying the patch.",
+                                    "type": "object",
+                                    "properties": {
+                                        "start_line": {"type": "integer", "minimum": 0},
+                                        "end_line": {"type": "integer", "minimum": 0},
+                                    },
+                                    "required": ["start_line", "end_line"],
+                                    "additionalProperties": False,
+                                    "description": "Line range to replace (from document_snapshot's suggested_span).",
                                 },
                                 "match_text": {
                                     "type": "string",
-                                    "description": "Optional anchor text used to realign the edit if offsets drift.",
-                                },
-                                "expected_text": {
-                                    "type": "string",
-                                    "description": "Alternate anchor text (must match match_text when provided).",
+                                    "description": "Optional anchor text for drift recovery.",
                                 },
                                 "rationale": {
                                     "type": "string",
-                                    "description": "Optional explanation stored alongside the edit directive.",
-                                },
-                                "context_lines": {
-                                    "type": "integer",
-                                    "minimum": 0,
-                                    "description": "Override the number of context lines included in the generated diff.",
-                                },
-                                "tab_id": {
-                                    "type": "string",
-                                    "description": "Optional tab identifier; defaults to the active tab when omitted.",
+                                    "description": "Optional explanation for the edit.",
                                 },
                             },
                             "required": ["snapshot_token", "content", "target_span"],
@@ -467,8 +366,8 @@ def register_default_tools(
                             "document_replace_all",
                             replace_all_tool,
                             description=(
-                                "Replace the entire document content with new text. Use this instead of document_apply_patch "
-                                "when you need to overwrite the full document."
+                                "Replace the ENTIRE document. Use instead of document_apply_patch when rewriting "
+                                "the whole file. Requires snapshot_token and content."
                             ),
                             parameters={
                                 "type": "object",
@@ -491,6 +390,46 @@ def register_default_tools(
                                     },
                                 },
                                 "required": ["snapshot_token", "content"],
+                                "additionalProperties": False,
+                            },
+                        )
+
+                    # Register DocumentInsertTool for pure insertions without overwriting
+                    try:
+                        insert_tool = DocumentInsertTool(patch_tool=apply_patch_tool)
+                    except Exception as exc:
+                        _record_failure("document_insert", exc)
+                    else:
+                        _safe_register(
+                            "document_insert",
+                            insert_tool,
+                            description=(
+                                "Insert NEW text after a specific line WITHOUT overwriting existing content. "
+                                "Use this when adding paragraphs, sections, or content between existing lines. "
+                                "For replacing or editing existing text, use document_apply_patch instead."
+                            ),
+                            parameters={
+                                "type": "object",
+                                "properties": {
+                                    "snapshot_token": {
+                                        "type": "string",
+                                        "description": "Version identifier from document_snapshot (format: 'tab_id:version_id').",
+                                    },
+                                    "after_line": {
+                                        "type": "integer",
+                                        "minimum": -1,
+                                        "description": "The 0-based line number after which to insert. Use -1 to insert at the very beginning.",
+                                    },
+                                    "content": {
+                                        "type": "string",
+                                        "description": "The text to insert. Will be placed after the specified line.",
+                                    },
+                                    "rationale": {
+                                        "type": "string",
+                                        "description": "Optional explanation for the insertion.",
+                                    },
+                                },
+                                "required": ["snapshot_token", "after_line", "content"],
                                 "additionalProperties": False,
                             },
                         )
@@ -727,7 +666,8 @@ def register_phase3_tools(
                     "document_outline",
                     outline_tool,
                     description=(
-                        "Return the most recent outline for the active document, including pointer IDs, blurbs, and staleness metadata."
+                        "Get document structure (headings/sections). Use to navigate large documents "
+                        "or find where to make edits. Returns pointer IDs for each section."
                     ),
                     parameters={
                         "type": "object",
@@ -797,7 +737,8 @@ def register_phase3_tools(
                 "document_find_text",
                 find_text_tool,
                 description=(
-                    "Return the best-matching document chunks for a natural language query using embeddings or fallback heuristics."
+                    "Find text in document by semantic search. Returns line_span you can use directly "
+                    "with document_apply_patch. Check 'confidence' field - if 'low', verify with document_snapshot first."
                 ),
                 parameters={
                     "type": "object",
@@ -1060,20 +1001,19 @@ def register_plot_memory_tools(
             _record_failure("plot_outline", exc)
             outline_tool = None
         if outline_tool is not None:
-            for name in ("plot_outline", "document_plot_state"):
-                try:
-                    register(
-                        name,
-                        outline_tool,
-                        description=(
-                            "Return cached character/entity scaffolding, arcs, overrides, and dependencies built from plot scouting runs."
-                        ),
-                        parameters=outline_schema,
-                    )
-                except Exception as exc:
-                    _record_failure(name, exc)
-                else:
-                    registered.append(name)
+            try:
+                register(
+                    "plot_outline",
+                    outline_tool,
+                    description=(
+                        "Return cached character/entity scaffolding, arcs, and plot beats."
+                    ),
+                    parameters=outline_schema,
+                )
+            except Exception as exc:
+                _record_failure("plot_outline", exc)
+            else:
+                registered.append("plot_outline")
 
     if update_factory is not None:
         try:
@@ -1107,7 +1047,7 @@ def unregister_plot_state_tool(controller: Any) -> None:
     unregister = getattr(controller, "unregister_tool", None)
     if not callable(unregister):
         return
-    for name in ("plot_outline", "document_plot_state", "plot_state_update"):
+    for name in ("plot_outline", "plot_state_update"):
         try:
             unregister(name)
         except Exception:  # pragma: no cover - defensive
