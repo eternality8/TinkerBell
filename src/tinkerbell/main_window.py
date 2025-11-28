@@ -798,6 +798,11 @@ class MainWindow(QMainWindow):
             _LOGGER.debug("AI tools registered: %s", ", ".join(result.registered))
         if result.failed:
             _LOGGER.warning("Some AI tools failed to register: %s", ", ".join(result.failed))
+        
+        # Configure the tool dispatcher for the new tool system
+        controller = ctx.controller
+        if controller is not None and hasattr(controller, "configure_tool_dispatcher"):
+            controller.configure_tool_dispatcher(context_provider=self._bridge)
 
     def _ensure_search_tool(self) -> SearchDocumentTool | None:
         """Get or create the search document tool for /find command."""

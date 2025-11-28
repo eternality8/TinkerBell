@@ -657,7 +657,7 @@ class TestAnalyzeDocumentTool:
         assert len(tasks) <= 2
 
     def test_execute_subagent(self, tool_context: ToolContext):
-        """execute_subagent returns result."""
+        """execute_subagent returns error without orchestrator."""
         tool = AnalyzeDocumentTool()
         task = {
             "chunk": ChunkSpec("c1", "d1", "Hello world"),
@@ -668,8 +668,10 @@ class TestAnalyzeDocumentTool:
 
         result = tool.execute_subagent(tool_context, task)
 
-        assert result["success"]
+        # Without orchestrator, subagent execution returns error
+        assert result["success"] is False
         assert result["chunk_id"] == "c1"
+        assert "not yet configured" in result["error"]
 
     def test_aggregate(self):
         """aggregate combines results."""
@@ -981,7 +983,7 @@ class TestWS5Integration:
     """Integration tests for WS5 components."""
 
     def test_chunking_analysis_workflow(self, long_document: str, version_manager: VersionManager):
-        """Full chunking and analysis workflow."""
+        """Full chunking and analysis workflow - without orchestrator, reports failures."""
         # Setup
         provider = MockDocumentProvider(
             documents={"tab1": long_document},
@@ -1011,8 +1013,12 @@ class TestWS5Integration:
         # Aggregate
         aggregated = tool.aggregate(results)
 
+        # Without orchestrator, all chunks fail with informative error
         assert aggregated["status"] == "complete"
-        assert aggregated["chunks_processed"] == len(tasks)
+        assert aggregated["chunks_failed"] == len(tasks)
+        assert aggregated["chunks_processed"] == 0
+        assert aggregated["errors"] is not None
+        assert "not yet configured" in aggregated["errors"][0]["error"]
 
     def test_transform_with_rename(self, version_manager: VersionManager, sample_document: str):
         """Full transformation workflow with character rename."""

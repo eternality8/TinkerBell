@@ -553,18 +553,15 @@ class TransformDocumentTool(SubagentTool):
                 "tokens_used": chunk.token_estimate,
             }
 
-        # Fallback: return placeholder result
+        # No orchestrator - return error indicating the feature isn't ready
         return {
             "task_id": subagent_task.task_id,
-            "success": True,
+            "success": False,
             "chunk_id": chunk.chunk_id,
-            "output": {
-                "transformation_type": transform_type.value,
-                "transformed_content": chunk.content,
-                "replacements": 0,
-                "note": "Transformation pending LLM execution",
-            },
-            "tokens_used": chunk.token_estimate // 2,
+            "error": f"Transformation type '{transform_type.value}' requires subagent execution which is not yet configured. "
+                     "Only 'character_rename' transformations are currently supported.",
+            "output": {},
+            "tokens_used": 0,
         }
 
     def _transform_character_rename(

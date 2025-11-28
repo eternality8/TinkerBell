@@ -291,12 +291,16 @@ class TestReadDocumentTool:
     def test_read_tab_not_found(
         self, doc_provider: MockDocumentProvider, version_manager: VersionManager
     ) -> None:
-        """Test error when tab doesn't exist."""
+        """Test error when tab doesn't exist includes helpful suggestion."""
         tool = ReadDocumentTool(version_manager=version_manager)
         context = ToolContext(document_provider=doc_provider, version_manager=version_manager)
         
-        with pytest.raises(TabNotFoundError):
+        with pytest.raises(TabNotFoundError) as exc_info:
             tool.read(context, {"tab_id": "nonexistent"})
+        
+        # Verify helpful suggestion is included
+        assert "omit tab_id" in exc_info.value.suggestion
+        assert "list_tabs" in exc_info.value.suggestion
     
     def test_read_invalid_line_range(
         self, doc_provider: MockDocumentProvider, version_manager: VersionManager

@@ -180,8 +180,10 @@ class DeleteLinesTool(WriteTool):
         result_lines = lines[:start_line] + lines[end_line + 1:]
         new_text = "\n".join(result_lines) if result_lines else ""
 
-        # Apply edit if editor available
-        if self.document_editor:
+        # Apply edit via document provider
+        if hasattr(context.document_provider, 'set_document_content'):
+            context.document_provider.set_document_content(tab_id, new_text)
+        elif self.document_editor:
             self.document_editor.set_document_text(tab_id, new_text)
 
         result: dict[str, Any] = {

@@ -955,18 +955,71 @@ class AIController:
         except Exception:  # pragma: no cover - defensive guard
             LOGGER.debug("Chunk manifest ingestion failed", exc_info=True)
 
-    def _resolve_chunk_tool(self) -> Any | None:
+    def _resolve_chunk_tool(self) -> tuple[str | None, Any | None]:
+        """Resolve the chunk tool and return (tool_name, tool_impl) tuple."""
         # Try new tool name first, fallback to legacy
-        registration = self.tools.get("analyze_document") or self.tools.get("document_chunk")
-        if registration is None:
-            return None
-        impl = getattr(registration, "impl", registration)
-        runner = getattr(impl, "run", None)
-        if callable(runner):
-            return impl
-        if callable(impl):
-            return impl
-        return None
+        for tool_name in ("analyze_document", "document_chunk"):
+            registration = self.tools.get(tool_name)
+            if registration is not None:
+                impl = getattr(registration, "impl", registration)
+                runner = getattr(impl, "run", None)
+                if callable(runner) or callable(impl):
+                    return tool_name, impl
+        return None, None
+
+    async def _hydrate_chunk_text_async(
+        self,
+        *,
+        chunk_id: str,
+        document_id: str | None,
+        cache_key: str | None,
+        version: str | None,
+    ) -> str:
+        """Async version of chunk text hydration using dispatcher."""
+        tool_name, tool = self._resolve_chunk_tool()
+        if tool is None or tool_name is None:
+            return ""
+        kwargs: dict[str, Any] = {"chunk_id": chunk_id, "include_text": True}
+        if document_id:
+            kwargs["document_id"] = document_id
+        if cache_key:
+            kwargs["cache_key"] = cache_key
+        if version:
+            kwargs["version"] = version
+        
+        # Use dispatcher for new registry tools
+        if self._is_new_registry_tool(tool_name) and self._tool_dispatcher is not None:
+            try:
+                dispatch_result = await self._tool_dispatcher.dispatch(tool_name, kwargs)
+                if dispatch_result.success and isinstance(dispatch_result.result, Mapping):
+                    chunk_payload = dispatch_result.result.get("chunk")
+                    if isinstance(chunk_payload, Mapping):
+                        text = chunk_payload.get("text")
+                        if isinstance(text, str):
+                            return text
+                return ""
+            except Exception:
+                LOGGER.debug("Chunk hydration via dispatcher failed for %s", chunk_id, exc_info=True)
+                return ""
+        
+        # Legacy path
+        try:
+            runner = getattr(tool, "run", None)
+            if callable(runner):
+                result = runner(**kwargs)
+            else:
+                result = tool(**kwargs)
+        except Exception:  # pragma: no cover - defensive guard
+            LOGGER.debug("Chunk hydration failed for %s", chunk_id, exc_info=True)
+            return ""
+        if not isinstance(result, Mapping):
+            return ""
+        chunk_payload = result.get("chunk")
+        if isinstance(chunk_payload, Mapping):
+            text = chunk_payload.get("text")
+            if isinstance(text, str):
+                return text
+        return ""
 
     def _hydrate_chunk_text(
         self,
@@ -976,9 +1029,14 @@ class AIController:
         cache_key: str | None,
         version: str | None,
     ) -> str:
-        tool = self._resolve_chunk_tool()
-        if tool is None:
+        """Synchronous wrapper for chunk text hydration (legacy compatibility)."""
+        tool_name, tool = self._resolve_chunk_tool()
+        if tool is None or tool_name is None:
             return ""
+        
+        # For new registry tools, we can't use the dispatcher synchronously
+        # Fall back to legacy invocation which won't work for BaseTool
+        # This path should rarely be hit; prefer async version
         kwargs: dict[str, Any] = {"chunk_id": chunk_id, "include_text": True}
         if document_id:
             kwargs["document_id"] = document_id
@@ -3917,9 +3975,26 @@ class AIController:
 
     async def _refresh_document_snapshot(self, tab_id: str | None) -> Mapping[str, Any] | None:
         # Try new tool name first, fallback to legacy
-        registration = self.tools.get("read_document") or self.tools.get("document_snapshot")
+        tool_name = "read_document" if self.tools.get("read_document") else "document_snapshot"
+        registration = self.tools.get(tool_name)
         if registration is None:
             return None
+        
+        # Use dispatcher for new registry tools (BaseTool subclasses)
+        if self._is_new_registry_tool(tool_name) and self._tool_dispatcher is not None:
+            params: dict[str, Any] = {}
+            if tab_id is not None:
+                params["tab_id"] = tab_id
+            try:
+                dispatch_result = await self._tool_dispatcher.dispatch(tool_name, params)
+                if dispatch_result.success and isinstance(dispatch_result.result, Mapping):
+                    return dict(dispatch_result.result)
+                return None
+            except Exception:
+                LOGGER.debug("Snapshot refresh via dispatcher failed", exc_info=True)
+                return None
+        
+        # Legacy path: direct invocation for old-style callable tools
         runner = getattr(registration.impl, "run", registration.impl)
         if not callable(runner):  # pragma: no cover - defensive guard
             return None

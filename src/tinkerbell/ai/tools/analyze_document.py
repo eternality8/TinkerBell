@@ -356,13 +356,15 @@ class AnalyzeDocumentTool(SubagentTool):
                 "tokens_used": chunk.token_estimate,
             }
 
-        # Fallback: return a placeholder result
+        # No orchestrator - return error indicating the feature isn't ready
         return {
             "task_id": subagent_task.task_id,
-            "success": True,
+            "success": False,
             "chunk_id": chunk.chunk_id,
-            "output": self._mock_analysis_result(analysis_type, chunk),
-            "tokens_used": chunk.token_estimate // 2,
+            "error": "Document analysis requires subagent execution which is not yet configured. "
+                     "This feature will be available in a future update.",
+            "output": {},
+            "tokens_used": 0,
         }
 
     def _mock_analysis_result(

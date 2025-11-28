@@ -57,6 +57,10 @@ class VersionToken:
         """
         return f"{self.tab_id}:{self.document_id}:{self.version_id}:{self.content_hash}"
 
+    def __str__(self) -> str:
+        """Return the compact string representation."""
+        return self.to_string()
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize the token to a dictionary."""
         return {

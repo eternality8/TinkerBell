@@ -550,6 +550,11 @@ class MainWindow(QMainWindow):
             _LOGGER.warning("Some AI tools failed to register: %s", ", ".join(result.failed))
             self.update_status("Some AI tools unavailable")
             self._post_assistant_notice("Some AI tools could not be registered; check logs for details.")
+        
+        # Configure the tool dispatcher for the new tool system
+        controller = context.controller
+        if controller is not None and hasattr(controller, "configure_tool_dispatcher"):
+            controller.configure_tool_dispatcher(context_provider=context.bridge)
 
     def _register_phase3_ai_tools(self, *, register_fn: Callable[..., Any] | None = None) -> None:
         # Phase3 tools have been deprecated; this is now a no-op

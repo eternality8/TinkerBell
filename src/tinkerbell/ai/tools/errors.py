@@ -184,7 +184,9 @@ class TabNotFoundError(ToolError):
     error_code: str = field(default=ErrorCode.TAB_NOT_FOUND)
     message: str = field(default="The specified tab was not found")
     details: dict[str, Any] = field(default_factory=dict)
-    suggestion: str = field(default="The tab may have been closed. Use list_tabs to see available tabs")
+    suggestion: str = field(
+        default="To use the active tab, omit tab_id. To get valid tab IDs, use list_tabs first."
+    )
 
     tab_id: str | None = field(default=None)
 

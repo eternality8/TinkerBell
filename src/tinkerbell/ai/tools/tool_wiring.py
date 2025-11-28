@@ -166,15 +166,35 @@ def register_new_tools(ctx: ToolWiringContext) -> ToolRegistrationResult:
         Result indicating which tools were registered/failed/skipped.
     """
     from .version import get_version_manager
+    # WS2: Navigation & Reading Tools
     from .list_tabs import create_list_tabs_tool
     from .read_document import create_read_document_tool
     from .search_document import create_search_document_tool
     from .get_outline import create_get_outline_tool
+    # WS3: Writing Tools
+    from .create_document import CreateDocumentTool
+    from .insert_lines import InsertLinesTool
+    from .replace_lines import ReplaceLinesTool
+    from .delete_lines import DeleteLinesTool
+    from .write_document import WriteDocumentTool
+    from .find_and_replace import FindAndReplaceTool
+    # WS5: Subagent Tools
+    from .analyze_document import AnalyzeDocumentTool
+    from .transform_document import TransformDocumentTool
+    # Schemas
     from .tool_registry import (
         LIST_TABS_SCHEMA,
         READ_DOCUMENT_SCHEMA,
         SEARCH_DOCUMENT_SCHEMA,
         GET_OUTLINE_SCHEMA,
+        CREATE_DOCUMENT_SCHEMA,
+        INSERT_LINES_SCHEMA,
+        REPLACE_LINES_SCHEMA,
+        DELETE_LINES_SCHEMA,
+        WRITE_DOCUMENT_SCHEMA,
+        FIND_AND_REPLACE_SCHEMA,
+        ANALYZE_DOCUMENT_SCHEMA,
+        TRANSFORM_DOCUMENT_SCHEMA,
         get_tool_registry,
     )
 
@@ -210,6 +230,10 @@ def register_new_tools(ctx: ToolWiringContext) -> ToolRegistrationResult:
             LOGGER.warning("Failed to register %s: %s", name, exc)
             result.failed.append(name)
             return False
+
+    # =========================================================================
+    # WS2: Navigation & Reading Tools
+    # =========================================================================
 
     # -------------------------------------------------------------------------
     # list_tabs
@@ -250,6 +274,94 @@ def register_new_tools(ctx: ToolWiringContext) -> ToolRegistrationResult:
     except Exception as exc:
         LOGGER.warning("Failed to create get_outline tool: %s", exc)
         result.failed.append("get_outline")
+
+    # =========================================================================
+    # WS3: Writing Tools
+    # =========================================================================
+
+    # -------------------------------------------------------------------------
+    # create_document
+    # -------------------------------------------------------------------------
+    try:
+        create_doc_tool = CreateDocumentTool(version_manager=version_manager)
+        _safe_register("create_document", create_doc_tool, CREATE_DOCUMENT_SCHEMA)
+    except Exception as exc:
+        LOGGER.warning("Failed to create create_document tool: %s", exc)
+        result.failed.append("create_document")
+
+    # -------------------------------------------------------------------------
+    # insert_lines
+    # -------------------------------------------------------------------------
+    try:
+        insert_tool = InsertLinesTool(version_manager=version_manager)
+        _safe_register("insert_lines", insert_tool, INSERT_LINES_SCHEMA)
+    except Exception as exc:
+        LOGGER.warning("Failed to create insert_lines tool: %s", exc)
+        result.failed.append("insert_lines")
+
+    # -------------------------------------------------------------------------
+    # replace_lines (replaces document_apply_patch)
+    # -------------------------------------------------------------------------
+    try:
+        replace_tool = ReplaceLinesTool(version_manager=version_manager)
+        _safe_register("replace_lines", replace_tool, REPLACE_LINES_SCHEMA)
+    except Exception as exc:
+        LOGGER.warning("Failed to create replace_lines tool: %s", exc)
+        result.failed.append("replace_lines")
+
+    # -------------------------------------------------------------------------
+    # delete_lines
+    # -------------------------------------------------------------------------
+    try:
+        delete_tool = DeleteLinesTool(version_manager=version_manager)
+        _safe_register("delete_lines", delete_tool, DELETE_LINES_SCHEMA)
+    except Exception as exc:
+        LOGGER.warning("Failed to create delete_lines tool: %s", exc)
+        result.failed.append("delete_lines")
+
+    # -------------------------------------------------------------------------
+    # write_document (replaces document_replace_all)
+    # -------------------------------------------------------------------------
+    try:
+        write_tool = WriteDocumentTool(version_manager=version_manager)
+        _safe_register("write_document", write_tool, WRITE_DOCUMENT_SCHEMA)
+    except Exception as exc:
+        LOGGER.warning("Failed to create write_document tool: %s", exc)
+        result.failed.append("write_document")
+
+    # -------------------------------------------------------------------------
+    # find_and_replace (replaces search_replace)
+    # -------------------------------------------------------------------------
+    try:
+        find_replace_tool = FindAndReplaceTool(version_manager=version_manager)
+        _safe_register("find_and_replace", find_replace_tool, FIND_AND_REPLACE_SCHEMA)
+    except Exception as exc:
+        LOGGER.warning("Failed to create find_and_replace tool: %s", exc)
+        result.failed.append("find_and_replace")
+
+    # =========================================================================
+    # WS5: Subagent Tools
+    # =========================================================================
+
+    # -------------------------------------------------------------------------
+    # analyze_document (replaces document_plot_state, character_map)
+    # -------------------------------------------------------------------------
+    try:
+        analyze_tool = AnalyzeDocumentTool()
+        _safe_register("analyze_document", analyze_tool, ANALYZE_DOCUMENT_SCHEMA)
+    except Exception as exc:
+        LOGGER.warning("Failed to create analyze_document tool: %s", exc)
+        result.failed.append("analyze_document")
+
+    # -------------------------------------------------------------------------
+    # transform_document (replaces plot_state_update, character_edit_planner)
+    # -------------------------------------------------------------------------
+    try:
+        transform_tool = TransformDocumentTool()
+        _safe_register("transform_document", transform_tool, TRANSFORM_DOCUMENT_SCHEMA)
+    except Exception as exc:
+        LOGGER.warning("Failed to create transform_document tool: %s", exc)
+        result.failed.append("transform_document")
 
     LOGGER.info("New tool registration complete: %s", result)
     return result

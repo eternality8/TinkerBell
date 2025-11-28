@@ -93,8 +93,10 @@ class WriteDocumentTool(WriteTool):
         previous_size = len(doc_content)
         current_size = len(new_content)
 
-        # Apply edit if editor available
-        if self.document_editor:
+        # Apply the edit via document provider
+        if hasattr(context.document_provider, 'set_document_content'):
+            context.document_provider.set_document_content(tab_id, new_content)
+        elif self.document_editor:
             self.document_editor.set_document_text(tab_id, new_content)
 
         return {

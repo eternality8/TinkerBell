@@ -254,8 +254,10 @@ class InsertLinesTool(WriteTool):
         # Build new document text
         new_text = "\n".join(result_lines)
 
-        # Apply edit if not dry-run and editor available
-        if self.document_editor:
+        # Apply edit via document provider
+        if hasattr(context.document_provider, 'set_document_content'):
+            context.document_provider.set_document_content(tab_id, new_text)
+        elif self.document_editor:
             self.document_editor.set_document_text(tab_id, new_text)
 
         # Calculate new line range

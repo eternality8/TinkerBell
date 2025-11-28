@@ -36,6 +36,10 @@ class DocumentProvider(Protocol):
         """Get the content of a specific tab, or None if not found."""
         ...
 
+    def set_document_content(self, tab_id: str, content: str) -> None:
+        """Set the content of a specific tab."""
+        ...
+
     def get_document_metadata(self, tab_id: str) -> dict[str, Any] | None:
         """Get metadata for a specific tab (path, language, etc.)."""
         ...
@@ -374,12 +378,12 @@ class WriteTool(BaseTool):
         2. If dry_run=True, returns preview without applying changes
         3. Otherwise, applies changes and increments version
         """
-        # Extract and validate version token
-        version_str = params.get("version")
+        # Extract and validate version token (accept both 'version' and 'version_token')
+        version_str = params.get("version") or params.get("version_token")
         if not version_str:
             from .errors import ContentRequiredError
             raise ContentRequiredError(
-                message="Write operations require a 'version' token from a previous read",
+                message="Write operations require a 'version' or 'version_token' from a previous read",
                 field_name="version",
             )
 

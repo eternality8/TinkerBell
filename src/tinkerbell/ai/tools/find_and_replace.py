@@ -413,8 +413,10 @@ class FindAndReplaceTool(WriteTool):
             max_replacements=max_replacements,
         )
 
-        # Apply edit if editor available
-        if self.document_editor:
+        # Apply edit via document provider
+        if hasattr(context.document_provider, 'set_document_content'):
+            context.document_provider.set_document_content(tab_id, new_text)
+        elif self.document_editor:
             self.document_editor.set_document_text(tab_id, new_text)
 
         # Build result

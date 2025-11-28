@@ -316,7 +316,7 @@ class ToolDispatcher:
         # Extract tab_id for transaction
         tab_id = self._extract_tab_id(arguments)
         if not tab_id and self._context_provider:
-            tab_id = self._context_provider.get_active_tab_id()
+            tab_id = self._get_active_tab_from_provider()
 
         if not tab_id:
             error = TabNotFoundError(
@@ -324,14 +324,11 @@ class ToolDispatcher:
             )
             return self._create_error_result(tool_name, error, start_time)
 
-        # Create transaction
-        transaction = self._transaction_manager.create_transaction()
+        # Create transaction (this also begins it with the tab_ids)
+        transaction = self._transaction_manager.create_transaction(tab_ids=[tab_id])
         transaction_id = transaction.transaction_id
 
         try:
-            # Begin transaction
-            transaction.begin([tab_id])
-
             # Build context
             if context is None:
                 context = self._build_context(arguments)
@@ -389,8 +386,8 @@ class ToolDispatcher:
                 message=validation_error,
             )
 
-        # Execute
-        result = tool.execute(dict(arguments), context)
+        # Execute - context first, then params (matches BaseTool.execute signature)
+        result = tool.execute(context, dict(arguments))
 
         # Handle async result
         if hasattr(result, "__await__"):
@@ -439,7 +436,7 @@ class ToolDispatcher:
         """
         tab_id = self._extract_tab_id(arguments)
         if not tab_id and self._context_provider:
-            tab_id = self._context_provider.get_active_tab_id()
+            tab_id = self._get_active_tab_from_provider()
 
         # Need a document provider for ToolContext
         doc_provider = self._create_document_provider()
@@ -467,6 +464,26 @@ class ToolDispatcher:
         
         # Create an adapter that wraps ToolContextProvider
         return _DocumentProviderAdapter(self._context_provider)
+
+    def _get_active_tab_from_provider(self) -> str | None:
+        """Get active tab ID from context provider.
+        
+        Handles different provider types:
+        - ToolContextProvider with get_active_tab_id() method
+        - DocumentBridge with _tab_id attribute
+        """
+        if self._context_provider is None:
+            return None
+        
+        # Standard ToolContextProvider interface
+        if hasattr(self._context_provider, 'get_active_tab_id'):
+            return self._context_provider.get_active_tab_id()
+        
+        # DocumentBridge stores tab_id as _tab_id
+        if hasattr(self._context_provider, '_tab_id'):
+            return getattr(self._context_provider, '_tab_id', None)
+        
+        return None
 
     def _extract_tab_id(self, arguments: Mapping[str, Any]) -> str | None:
         """Extract tab_id from arguments or version_token."""
@@ -610,7 +627,11 @@ class ToolDispatcher:
 
 
 class _DocumentProviderAdapter:
-    """Adapter that wraps ToolContextProvider for DocumentProvider compatibility."""
+    """Adapter that wraps ToolContextProvider for DocumentProvider compatibility.
+    
+    Provides both `get_document_text` and `get_document_content` as aliases
+    to support different tool interface expectations.
+    """
     
     def __init__(self, provider: ToolContextProvider) -> None:
         self._provider = provider
@@ -618,10 +639,25 @@ class _DocumentProviderAdapter:
     def get_active_tab_id(self) -> str | None:
         return self._provider.get_active_tab_id()
     
-    def get_document_text(self, tab_id: str) -> str | None:
+    def get_document_text(self, tab_id: str | None = None) -> str | None:
+        """Get document text for a tab."""
+        if tab_id is None:
+            tab_id = self.get_active_tab_id()
+        if tab_id is None:
+            return None
         return self._provider.get_document_content(tab_id)
     
+    def get_document_content(self, tab_id: str) -> str | None:
+        """Alias for get_document_text for tools that expect this method name."""
+        return self._provider.get_document_content(tab_id)
+    
+    def get_document_metadata(self, tab_id: str) -> dict[str, Any] | None:
+        """Get metadata for a tab (path, language, etc.)."""
+        # Return minimal metadata - real implementation would query the provider
+        return {"tab_id": tab_id}
+    
     def set_document_text(self, tab_id: str, content: str) -> None:
+        """Set document text for a tab."""
         self._provider.set_document_content(tab_id, content)
 
 

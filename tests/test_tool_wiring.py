@@ -251,10 +251,20 @@ class TestRegisterNewTools:
         
         result = register_new_tools(ctx)
         
-        # Should attempt to register read_document, search_document, get_outline
-        new_tools = {"read_document", "search_document", "get_outline"}
+        # Should attempt to register all WS2-5 tools
+        expected_tools = {
+            # WS2: Navigation & Reading
+            "list_tabs", "read_document", "search_document", "get_outline",
+            # WS3: Writing
+            "create_document", "insert_lines", "replace_lines", "delete_lines",
+            "write_document", "find_and_replace",
+            # WS5: Subagent
+            "analyze_document", "transform_document",
+        }
         registered_or_failed = set(result.registered) | set(result.failed)
-        assert new_tools & registered_or_failed, "Should attempt new tool registration"
+        assert expected_tools <= registered_or_failed, (
+            f"Missing tools: {expected_tools - registered_or_failed}"
+        )
 
 
 # =============================================================================

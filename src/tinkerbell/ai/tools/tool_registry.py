@@ -490,7 +490,7 @@ def reset_tool_registry() -> None:
 VERSION_TOKEN_PARAM = ParameterSchema(
     name="version_token",
     type="string",
-    description="Version token from read_document (format: 'tab_id:version_id:hash'). Required for write operations.",
+    description="Version token from read_document (format: 'tab_id:document_id:version_id:content_hash'). Required for write operations.",
     required=True,
 )
 
