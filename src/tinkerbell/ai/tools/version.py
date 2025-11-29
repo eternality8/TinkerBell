@@ -2,6 +2,10 @@
 
 This module provides per-tab version tracking to ensure write operations
 reference the latest document state and prevent stale edits.
+
+Version tokens use a compact external format (e.g., "t1:a1b2:5") to minimize
+token usage in LLM conversations, while maintaining full integrity checking
+internally via content hashes.
 """
 
 from __future__ import annotations
@@ -10,6 +14,14 @@ import hashlib
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Mapping, MutableMapping, Protocol
+
+# Length of short hash prefix used in external token format
+_SHORT_HASH_LENGTH = 4
+
+
+def _short_hash(full_hash: str) -> str:
+    """Extract a short prefix from a content hash for external token format."""
+    return full_hash[:_SHORT_HASH_LENGTH].lower()
 
 
 class VersionProvider(Protocol):
@@ -38,6 +50,13 @@ class VersionToken:
     The version token encapsulates document identity and current version,
     used to validate write operations against stale state.
 
+    External format (for AI): A compact string like "t1:a1b2:5" using the
+    short tab_id directly and a 4-char hash prefix plus the version number.
+    This minimizes token usage while remaining unambiguous.
+
+    Internal format: Full tab_id, document_id, version_id, and content_hash
+    are stored for complete integrity validation.
+
     Attributes:
         tab_id: Identifier for the editor tab containing the document.
         document_id: Unique identifier for the document.
@@ -51,18 +70,23 @@ class VersionToken:
     content_hash: str
 
     def to_string(self) -> str:
-        """Serialize the token to a compact string format.
+        """Serialize the token to a compact external format for AI consumption.
 
-        Format: `{tab_id}:{document_id}:{version_id}:{content_hash}`
+        Format: `{tab_id}:{short_hash}:{version_id}`
+        Example: "t1:a1b2:5"
+
+        This compact format minimizes token usage in LLM conversations while
+        remaining unambiguous (not mistakable for a tab_id or other identifier).
         """
-        return f"{self.tab_id}:{self.document_id}:{self.version_id}:{self.content_hash}"
+        short_hash = _short_hash(self.content_hash)
+        return f"{self.tab_id}:{short_hash}:{self.version_id}"
 
     def __str__(self) -> str:
         """Return the compact string representation."""
         return self.to_string()
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize the token to a dictionary."""
+        """Serialize the token to a dictionary (internal use only)."""
         return {
             "tab_id": self.tab_id,
             "document_id": self.document_id,
@@ -94,8 +118,15 @@ class VersionToken:
     def from_string(cls, token_str: str) -> "VersionToken":
         """Parse a version token from its string representation.
 
+        Supports two formats:
+        1. Short format (preferred): "t1:a1b2:5" - tab_id + short hash + version
+        2. Legacy long format: "tab_id:document_id:version_id:content_hash"
+
+        For the short format, the tab_id is used directly (no lookup needed
+        since tab IDs are already short). The hash prefix is stored for validation.
+
         Args:
-            token_str: Token string in format `tab_id:document_id:version_id:content_hash`
+            token_str: Token string to parse.
 
         Returns:
             Parsed VersionToken instance.
@@ -107,34 +138,58 @@ class VersionToken:
             raise ValueError("Version token must be a non-empty string")
 
         parts = token_str.strip().split(":")
-        if len(parts) < 4:
-            raise ValueError(
-                f"Invalid version token format: expected 'tab_id:document_id:version_id:content_hash', "
-                f"got '{token_str}'"
+        
+        # Short format: "t1:a1b2:5" (3 parts)
+        if len(parts) == 3:
+            tab_id, short_hash, version_str = parts
+            try:
+                version_id = int(version_str)
+            except ValueError as exc:
+                raise ValueError(f"Invalid version_id in token: '{version_str}' is not an integer") from exc
+            
+            if version_id < 1:
+                raise ValueError(f"Version token version_id must be >= 1, got {version_id}")
+            
+            if not tab_id:
+                raise ValueError("Version token tab_id cannot be empty")
+            
+            # Return a token with the full tab_id (already short) and hash prefix
+            return cls(
+                tab_id=tab_id,
+                document_id="",    # Unknown from short format, populated during validation
+                version_id=version_id,
+                content_hash=short_hash,  # Short hash prefix
             )
 
-        tab_id = parts[0]
-        document_id = parts[1]
-        try:
-            version_id = int(parts[2])
-        except ValueError as exc:
-            raise ValueError(f"Invalid version_id in token: '{parts[2]}' is not an integer") from exc
-        content_hash = ":".join(parts[3:])  # Content hash may contain colons (unlikely but safe)
+        # Legacy long format: "tab_id:document_id:version_id:content_hash" (4+ parts)
+        if len(parts) >= 4:
+            tab_id = parts[0]
+            document_id = parts[1]
+            try:
+                version_id = int(parts[2])
+            except ValueError as exc:
+                raise ValueError(f"Invalid version_id in token: '{parts[2]}' is not an integer") from exc
+            content_hash = ":".join(parts[3:])  # Content hash may contain colons (unlikely but safe)
 
-        if not tab_id:
-            raise ValueError("Version token tab_id cannot be empty")
-        if not document_id:
-            raise ValueError("Version token document_id cannot be empty")
-        if version_id < 1:
-            raise ValueError(f"Version token version_id must be >= 1, got {version_id}")
-        if not content_hash:
-            raise ValueError("Version token content_hash cannot be empty")
+            if not tab_id:
+                raise ValueError("Version token tab_id cannot be empty")
+            if not document_id:
+                raise ValueError("Version token document_id cannot be empty")
+            if version_id < 1:
+                raise ValueError(f"Version token version_id must be >= 1, got {version_id}")
+            if not content_hash:
+                raise ValueError("Version token content_hash cannot be empty")
 
-        return cls(
-            tab_id=tab_id,
-            document_id=document_id,
-            version_id=version_id,
-            content_hash=content_hash,
+            return cls(
+                tab_id=tab_id,
+                document_id=document_id,
+                version_id=version_id,
+                content_hash=content_hash,
+            )
+
+        raise ValueError(
+            f"Invalid version token format: expected 'tab_id:hash:version' or "
+            f"'tab_id:document_id:version_id:content_hash', got '{token_str}'"
         )
 
     @classmethod
@@ -229,9 +284,10 @@ class VersionManager:
 
     Example usage:
         >>> manager = VersionManager()
-        >>> token = manager.register_tab("tab-1", "doc-abc", "a1b2c3...")
+        >>> token = manager.register_tab("t1", "doc-abc", "a1b2c3...")
+        >>> print(token.to_string())  # "t1:a1b2:1"
         >>> manager.validate_token(token)  # Returns True
-        >>> manager.increment_version("tab-1", "new-hash")
+        >>> manager.increment_version("t1", "new-hash")
         >>> manager.validate_token(token)  # Raises VersionMismatchError
     """
 
@@ -322,8 +378,46 @@ class VersionManager:
             state.increment(content_hash)
             return state.to_token()
 
+    def resolve_token(self, token: VersionToken | str) -> VersionToken:
+        """Resolve a token to a full VersionToken with current state.
+
+        Populates the document_id from current state (since short tokens
+        don't include it) while preserving the version_id from the input
+        token for validation purposes.
+
+        Args:
+            token: VersionToken instance or token string to resolve.
+
+        Returns:
+            Full VersionToken with all fields populated.
+
+        Raises:
+            KeyError: If the tab is not registered.
+        """
+        if isinstance(token, str):
+            token = VersionToken.from_string(token)
+
+        with self._lock:
+            state = self._tabs.get(token.tab_id)
+            if state is None:
+                raise KeyError(f"Tab '{token.tab_id}' is not registered")
+
+            # Return full token from current state, but with the version_id
+            # from the input token (for validation purposes)
+            # Keep the short hash if that's what was provided
+            is_short_hash = len(token.content_hash) <= _SHORT_HASH_LENGTH
+            return VersionToken(
+                tab_id=token.tab_id,
+                document_id=state.document_id,
+                version_id=token.version_id,
+                content_hash=token.content_hash if is_short_hash else state.content_hash,
+            )
+
     def validate_token(self, token: VersionToken | str) -> bool:
         """Validate that a version token matches the current document state.
+
+        Supports both compact tokens (e.g., "t1:a1b2:5") and full VersionToken
+        objects. Validates version number and content hash against current state.
 
         Args:
             token: VersionToken instance or token string to validate.
@@ -345,7 +439,10 @@ class VersionManager:
 
             current = state.to_token()
 
-            if token.document_id != current.document_id:
+            # Check if this is a short token (no document_id, short hash)
+            is_short_token = not token.document_id
+
+            if not is_short_token and token.document_id != current.document_id:
                 raise VersionMismatchError(
                     message="Document has been replaced since the token was issued",
                     your_version=token,
@@ -361,13 +458,26 @@ class VersionManager:
                     suggestion="Fetch a new snapshot with read_document and rebase your changes.",
                 )
 
-            if token.content_hash != current.content_hash:
-                raise VersionMismatchError(
-                    message="Document content has changed (hash mismatch)",
-                    your_version=token,
-                    current_version=current,
-                    suggestion="Fetch a new snapshot with read_document to see the current content.",
-                )
+            # Validate the hash - for short tokens, compare prefixes
+            is_short_hash = len(token.content_hash) <= _SHORT_HASH_LENGTH
+            if is_short_hash:
+                current_short_hash = _short_hash(current.content_hash)
+                if token.content_hash != current_short_hash:
+                    raise VersionMismatchError(
+                        message="Document content has changed (hash mismatch)",
+                        your_version=token,
+                        current_version=current,
+                        suggestion="Fetch a new snapshot with read_document to see the current content.",
+                    )
+            else:
+                # Full token - exact hash match required
+                if token.content_hash != current.content_hash:
+                    raise VersionMismatchError(
+                        message="Document content has changed (hash mismatch)",
+                        your_version=token,
+                        current_version=current,
+                        suggestion="Fetch a new snapshot with read_document to see the current content.",
+                    )
 
             return True
 

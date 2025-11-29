@@ -199,3 +199,26 @@ def test_undo_redo_preserves_text_range_history():
     widget.redo()
     selection = widget.selection_range()
     assert selection.start == selection.end == len("alpha beta!")
+
+
+def test_editor_widget_readonly_state():
+    """Test that readonly state can be set and queried."""
+    widget = EditorWidget()
+    widget.load_document(DocumentState(text="hello"))
+    
+    # Initially not readonly
+    assert not widget.is_readonly()
+    
+    # Set readonly
+    widget.set_readonly(True)
+    assert widget.is_readonly()
+    
+    # Unset readonly
+    widget.set_readonly(False)
+    assert not widget.is_readonly()
+    
+    # Programmatic edits still work when readonly (headless mode)
+    widget.set_readonly(True)
+    widget.set_text("world")
+    assert widget.to_document().text == "world"
+    assert widget.is_readonly()  # Still readonly

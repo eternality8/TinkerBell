@@ -134,8 +134,29 @@ class EditorWidget(QWidgetBase):
         self._overlay_brush: Any | None = None
         self._overlay_text_brush: Any | None = None
         self._last_change_source: str = "init"
+        self._readonly: bool = False
 
         self._build_ui()
+
+    # ------------------------------------------------------------------
+    # Read-only mode
+    # ------------------------------------------------------------------
+    def set_readonly(self, readonly: bool) -> None:
+        """Set the editor's read-only state.
+        
+        When readonly is True, user input is blocked but programmatic
+        edits (e.g., from AI tools) can still modify the document.
+        """
+        self._readonly = bool(readonly)
+        if self._qt_editor is not None:
+            try:
+                self._qt_editor.setReadOnly(self._readonly)
+            except Exception:  # pragma: no cover - defensive guard
+                pass
+
+    def is_readonly(self) -> bool:
+        """Check if the editor is in read-only mode."""
+        return self._readonly
 
     # ------------------------------------------------------------------
     # UI construction & helpers

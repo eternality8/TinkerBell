@@ -611,17 +611,21 @@ class TestVersionManagerIntegration:
         manager = get_version_manager()
 
         token = manager.register_tab(
-            tab_id="serial_tab",
+            tab_id="t1",
             document_id="doc2",
-            content_hash="def456",
+            content_hash="def456789",
         )
 
         token_str = token.to_string()
-        assert "serial_tab" in token_str
+        # New short format uses full tab_id directly (tab IDs are now short)
+        assert token_str.startswith("t1:")  # Full tab_id
+        assert ":" in token_str
 
         # Use VersionToken.from_string() for parsing
         parsed = VersionToken.from_string(token_str)
-        assert parsed.tab_id == "serial_tab"
+        # Full tab_id is preserved
+        assert parsed.tab_id == "t1"
+        assert parsed.version_id == 1
 
 
 if __name__ == "__main__":

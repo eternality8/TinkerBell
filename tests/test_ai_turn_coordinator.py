@@ -7,6 +7,7 @@ from typing import Any, Callable, cast
 
 import pytest
 
+from tinkerbell.ai.orchestration.editor_lock import EditorLockManager, LockReason, LockState
 from tinkerbell.chat.message_model import ChatMessage
 from tinkerbell.ui.ai_turn_coordinator import AITurnCoordinator
 from tinkerbell.ui.tool_trace_presenter import ToolTracePresenter
@@ -211,3 +212,95 @@ def test_process_stream_event_routes_tool_and_content_events() -> None:
     result_event = SimpleNamespace(type="tool_calls.result", tool_call_id="t-1")
     coordinator._process_stream_event(result_event)
     assert tracker.presenter.result_events == [result_event]
+
+
+# =============================================================================
+# Editor Lock Integration Tests
+# =============================================================================
+
+
+def _build_coordinator_with_lock(controller: Any | None) -> tuple[AITurnCoordinator, SimpleNamespace, EditorLockManager]:
+    """Build coordinator with an editor lock manager."""
+    tracker = SimpleNamespace(statuses=[], responses=[], failures=[], stream_states=[])
+    chat_panel = _FakeChatPanel()
+    presenter = _FakePresenter()
+    telemetry = _FakeTelemetry()
+    review = _FakeReviewController()
+    lock_manager = EditorLockManager()
+
+    coordinator = AITurnCoordinator(
+        controller_resolver=lambda: controller,
+        chat_panel=chat_panel,
+        review_controller=review,
+        telemetry_controller=telemetry,
+        status_updater=lambda message: tracker.statuses.append(message),
+        failure_handler=lambda exc: tracker.failures.append(exc),
+        response_finalizer=lambda text: tracker.responses.append(text),
+        tool_trace_presenter=cast(ToolTracePresenter, presenter),
+        stream_state_setter=lambda active: tracker.stream_states.append(active),
+        stream_text_coercer=lambda payload: str(payload or "").strip(),
+        lock_manager=lock_manager,
+    )
+
+    tracker.chat_panel = chat_panel
+    tracker.presenter = presenter
+    tracker.telemetry = telemetry
+    tracker.review = review
+    return coordinator, tracker, lock_manager
+
+
+@pytest.mark.asyncio
+async def test_run_ai_turn_acquires_and_releases_lock() -> None:
+    """Editor lock is acquired at start and released after successful completion."""
+    controller = _RecordingController()
+    coordinator, tracker, lock_manager = _build_coordinator_with_lock(controller)
+
+    # Lock starts unlocked
+    assert lock_manager.state == LockState.UNLOCKED
+    assert not lock_manager.is_locked
+
+    await coordinator.run_ai_turn(prompt="Test", snapshot={}, metadata={}, history=None)
+
+    # Lock should be released after turn completes
+    assert lock_manager.state == LockState.UNLOCKED
+    assert not lock_manager.is_locked
+    assert coordinator._active_lock_session is None
+
+
+@pytest.mark.asyncio
+async def test_run_ai_turn_releases_lock_on_failure() -> None:
+    """Editor lock is released even when the controller fails."""
+    coordinator, tracker, lock_manager = _build_coordinator_with_lock(_FailingController())
+
+    await coordinator.run_ai_turn(prompt="Test", snapshot={}, metadata={}, history=None)
+
+    # Lock should be released despite the failure
+    assert lock_manager.state == LockState.UNLOCKED
+    assert not lock_manager.is_locked
+    assert len(tracker.failures) == 1
+
+
+def test_force_release_lock_unlocks_editor() -> None:
+    """force_release_lock releases the lock immediately."""
+    coordinator, tracker, lock_manager = _build_coordinator_with_lock(None)
+
+    # Manually acquire a lock
+    session = lock_manager.acquire(LockReason.AI_TURN)
+    assert lock_manager.is_locked
+    coordinator._active_lock_session = session
+
+    # Force release
+    coordinator.force_release_lock()
+
+    assert not lock_manager.is_locked
+    assert coordinator._active_lock_session is None
+
+
+def test_coordinator_without_lock_manager_works() -> None:
+    """Coordinator works fine without a lock manager (lock_manager=None)."""
+    coordinator, tracker = _build_coordinator(controller=None)
+
+    # Should not raise even without lock manager
+    coordinator._acquire_editor_lock()
+    coordinator._release_editor_lock()
+    coordinator.force_release_lock()

@@ -5,13 +5,18 @@ concerns from the main window UI logic. It provides a clean interface
 for registering both legacy and new tools.
 
 WS7.1: Tool Wiring Extraction
+WS9.2: Orchestrator Wiring for Subagent Tools
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, Sequence, Mapping, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence, Mapping, runtime_checkable
+
+if TYPE_CHECKING:
+    from ..client import AIClient
+    from ..orchestration.subagent_executor import SubagentExecutorConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,6 +66,48 @@ class AIControllerProvider(Protocol):
     def unregister_tool(self, name: str) -> None: ...
 
 
+@runtime_checkable
+class AIClientProvider(Protocol):
+    """Protocol for providing AI client access."""
+
+    def get_ai_client(self) -> "AIClient | None": ...
+
+
+@runtime_checkable
+class DocumentCreatorProvider(Protocol):
+    """Protocol for creating new document tabs.
+    
+    This provider allows tools to create new documents in the editor.
+    It bridges the gap between the CreateDocumentTool and the workspace.
+    """
+
+    def create_document(
+        self,
+        title: str,
+        content: str = "",
+        file_type: str | None = None,
+    ) -> str:
+        """Create a new document tab.
+
+        Args:
+            title: The title/filename for the new document.
+            content: Optional initial content.
+            file_type: Optional file type hint.
+
+        Returns:
+            The tab_id of the newly created document.
+        """
+        ...
+
+    def document_exists(self, title: str) -> tuple[bool, str | None]:
+        """Check if a document with the given title exists.
+
+        Returns:
+            Tuple of (exists, tab_id or None).
+        """
+        ...
+
+
 # =============================================================================
 # Tool Wiring Context - Dependencies passed to tool registration
 # =============================================================================
@@ -80,6 +127,12 @@ class ToolWiringContext:
     bridge: DocumentBridge
     workspace: WorkspaceProvider
     selection_gateway: SelectionProvider | None = None
+
+    # AI client provider for subagent execution (WS9)
+    ai_client_provider: AIClientProvider | None = None
+
+    # Document creator for create_document tool
+    document_creator: DocumentCreatorProvider | None = None
 
     # Resolvers (lazy initialization callbacks)
     embedding_index_resolver: Callable[[], Any] | None = None
@@ -116,36 +169,7 @@ class ToolRegistrationResult:
 
 
 # =============================================================================
-# Legacy Tool Registration (DEPRECATED - NO-OP)
-# =============================================================================
-
-
-def register_legacy_tools(ctx: ToolWiringContext) -> ToolRegistrationResult:
-    """Register legacy tools with the AI controller.
-    
-    .. deprecated:: WS8.1
-        Use :func:`register_new_tools` instead. Legacy tools have been
-        removed in WS8.1. This function now returns an empty result
-        and emits a deprecation warning.
-    
-    Args:
-        ctx: Tool wiring context (unused).
-        
-    Returns:
-        Empty ToolRegistrationResult.
-    """
-    import warnings
-    warnings.warn(
-        "register_legacy_tools is deprecated and is now a no-op. "
-        "Use register_new_tools instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return ToolRegistrationResult()
-
-
-# =============================================================================
-# New Tool Registration (WS1-6 Tools)
+# Tool Registration (WS1-6 Tools)
 # =============================================================================
 
 
@@ -283,7 +307,10 @@ def register_new_tools(ctx: ToolWiringContext) -> ToolRegistrationResult:
     # create_document
     # -------------------------------------------------------------------------
     try:
-        create_doc_tool = CreateDocumentTool(version_manager=version_manager)
+        create_doc_tool = CreateDocumentTool(
+            version_manager=version_manager,
+            document_creator=ctx.document_creator,
+        )
         _safe_register("create_document", create_doc_tool, CREATE_DOCUMENT_SCHEMA)
     except Exception as exc:
         LOGGER.warning("Failed to create create_document tool: %s", exc)
@@ -340,14 +367,29 @@ def register_new_tools(ctx: ToolWiringContext) -> ToolRegistrationResult:
         result.failed.append("find_and_replace")
 
     # =========================================================================
-    # WS5: Subagent Tools
+    # WS5 + WS9: Subagent Tools with LLM Integration
     # =========================================================================
+
+    # Try to create orchestrator if AI client is available (WS9.2)
+    orchestrator = None
+    if ctx.ai_client_provider is not None:
+        try:
+            ai_client = ctx.ai_client_provider.get_ai_client()
+            if ai_client is not None:
+                from ..orchestration.subagent_executor import create_subagent_orchestrator
+                orchestrator = create_subagent_orchestrator(ai_client)
+                LOGGER.debug("Created subagent orchestrator with LLM integration")
+        except Exception as exc:
+            LOGGER.warning("Failed to create subagent orchestrator: %s", exc)
 
     # -------------------------------------------------------------------------
     # analyze_document (replaces document_plot_state, character_map)
     # -------------------------------------------------------------------------
     try:
         analyze_tool = AnalyzeDocumentTool()
+        if orchestrator is not None:
+            analyze_tool.orchestrator = orchestrator
+            LOGGER.debug("Configured analyze_document with LLM orchestrator")
         _safe_register("analyze_document", analyze_tool, ANALYZE_DOCUMENT_SCHEMA)
     except Exception as exc:
         LOGGER.warning("Failed to create analyze_document tool: %s", exc)
@@ -358,6 +400,9 @@ def register_new_tools(ctx: ToolWiringContext) -> ToolRegistrationResult:
     # -------------------------------------------------------------------------
     try:
         transform_tool = TransformDocumentTool()
+        if orchestrator is not None:
+            transform_tool.orchestrator = orchestrator
+            LOGGER.debug("Configured transform_document with LLM orchestrator")
         _safe_register("transform_document", transform_tool, TRANSFORM_DOCUMENT_SCHEMA)
     except Exception as exc:
         LOGGER.warning("Failed to create transform_document tool: %s", exc)
@@ -365,6 +410,46 @@ def register_new_tools(ctx: ToolWiringContext) -> ToolRegistrationResult:
 
     LOGGER.info("New tool registration complete: %s", result)
     return result
+
+
+# =============================================================================
+# WS9.2: Subagent Orchestrator Configuration
+# =============================================================================
+
+
+def configure_subagent_orchestrator(
+    ai_client: "AIClient",
+    analyze_tool: Any | None = None,
+    transform_tool: Any | None = None,
+    config: "SubagentExecutorConfig | None" = None,
+) -> Any:
+    """Configure subagent tools with LLM orchestrator.
+    
+    This function can be called after initial tool registration to
+    add LLM integration to subagent tools.
+    
+    Args:
+        ai_client: AIClient for LLM calls
+        analyze_tool: Optional AnalyzeDocumentTool to configure
+        transform_tool: Optional TransformDocumentTool to configure
+        config: Optional executor configuration
+        
+    Returns:
+        The created SubagentOrchestrator
+    """
+    from ..orchestration.subagent_executor import create_subagent_orchestrator
+    
+    orchestrator = create_subagent_orchestrator(ai_client, config)
+    
+    if analyze_tool is not None:
+        analyze_tool.orchestrator = orchestrator
+        LOGGER.debug("Configured analyze_document with orchestrator")
+        
+    if transform_tool is not None:
+        transform_tool.orchestrator = orchestrator
+        LOGGER.debug("Configured transform_document with orchestrator")
+    
+    return orchestrator
 
 
 # =============================================================================
@@ -409,11 +494,13 @@ __all__ = [
     "WorkspaceProvider",
     "SelectionProvider",
     "AIControllerProvider",
+    "AIClientProvider",
     # Context
     "ToolWiringContext",
     "ToolRegistrationResult",
     # Registration functions
-    "register_legacy_tools",
     "register_new_tools",
     "unregister_tools",
+    # WS9: Orchestrator configuration
+    "configure_subagent_orchestrator",
 ]

@@ -89,3 +89,109 @@ def test_router_propagates_failure_metadata_with_tab_id() -> None:
     assert cached is not None
     assert cached["tab_id"] == "tab-1"
     assert cached["status"] == metadata["status"]
+
+
+class TestRouterToolContextProviderProtocol:
+    """Tests verifying WorkspaceBridgeRouter implements ToolContextProvider protocol.
+    
+    These tests ensure the router can be used as a context_provider for ToolDispatcher,
+    which requires get_document_content, set_document_content, get_active_tab_id, etc.
+    """
+
+    def test_get_document_content_returns_tab_text(self) -> None:
+        """Router should return document text for a valid tab_id."""
+        editor = RecordingEditor()
+        # RecordingEditor uses DocumentState, update via load_document
+        from tinkerbell.editor.document_model import DocumentState
+        editor.load_document(DocumentState(text="Hello, World!"))
+        bridge = DocumentBridge(editor=editor)
+        tab = _StubTab(id="tab-1", bridge=bridge, title="Test Doc")
+        workspace = _StubWorkspace([tab])
+        router = WorkspaceBridgeRouter(workspace)
+
+        content = router.get_document_content("tab-1")
+        assert content == "Hello, World!"
+
+    def test_get_document_content_returns_none_for_missing_tab(self) -> None:
+        """Router should return None for non-existent tab_id."""
+        editor = RecordingEditor()
+        bridge = DocumentBridge(editor=editor)
+        tab = _StubTab(id="tab-1", bridge=bridge)
+        workspace = _StubWorkspace([tab])
+        router = WorkspaceBridgeRouter(workspace)
+
+        content = router.get_document_content("nonexistent-tab")
+        assert content is None
+
+    def test_get_tab_content_alias(self) -> None:
+        """get_tab_content should work the same as get_document_content."""
+        editor = RecordingEditor()
+        from tinkerbell.editor.document_model import DocumentState
+        editor.load_document(DocumentState(text="Tab content here"))
+        bridge = DocumentBridge(editor=editor)
+        tab = _StubTab(id="tab-1", bridge=bridge)
+        workspace = _StubWorkspace([tab])
+        router = WorkspaceBridgeRouter(workspace)
+
+        content = router.get_tab_content("tab-1")
+        assert content == "Tab content here"
+
+    def test_get_active_tab_id(self) -> None:
+        """Router should expose get_active_tab_id for ToolContextProvider."""
+        editor = RecordingEditor()
+        bridge = DocumentBridge(editor=editor)
+        tab = _StubTab(id="tab-1", bridge=bridge)
+        workspace = _StubWorkspace([tab])
+        router = WorkspaceBridgeRouter(workspace)
+
+        # _StubWorkspace sets first tab as active
+        assert router.get_active_tab_id() == "tab-1"
+
+    def test_set_document_content_updates_tab(self) -> None:
+        """Router should update document text for a valid tab_id."""
+        editor = RecordingEditor()
+        from tinkerbell.editor.document_model import DocumentState
+        editor.load_document(DocumentState(text="Original content"))
+        bridge = DocumentBridge(editor=editor)
+        bridge.set_tab_context(tab_id="tab-1")
+        tab = _StubTab(id="tab-1", bridge=bridge)
+        workspace = _StubWorkspace([tab])
+        router = WorkspaceBridgeRouter(workspace)
+
+        router.set_document_content("tab-1", "Updated content")
+
+        assert router.get_document_content("tab-1") == "Updated content"
+
+    def test_router_implements_tool_context_provider_protocol(self) -> None:
+        """Router should have all methods required by ToolContextProvider."""
+        editor = RecordingEditor()
+        bridge = DocumentBridge(editor=editor)
+        tab = _StubTab(id="tab-1", bridge=bridge)
+        workspace = _StubWorkspace([tab])
+        router = WorkspaceBridgeRouter(workspace)
+
+        # These methods are required by ToolContextProvider protocol
+        assert hasattr(router, "get_active_tab_id")
+        assert callable(router.get_active_tab_id)
+        assert hasattr(router, "get_document_content")
+        assert callable(router.get_document_content)
+        assert hasattr(router, "set_document_content")
+        assert callable(router.set_document_content)
+        assert hasattr(router, "get_version_token")
+        assert callable(router.get_version_token)
+
+    def test_router_implements_tab_listing_provider_protocol(self) -> None:
+        """Router should have all methods required by TabListingProvider."""
+        editor = RecordingEditor()
+        bridge = DocumentBridge(editor=editor)
+        tab = _StubTab(id="tab-1", bridge=bridge)
+        workspace = _StubWorkspace([tab])
+        router = WorkspaceBridgeRouter(workspace)
+
+        # These methods are required by TabListingProvider protocol
+        assert hasattr(router, "list_tabs")
+        assert callable(router.list_tabs)
+        assert hasattr(router, "active_tab_id")
+        assert callable(router.active_tab_id)
+        assert hasattr(router, "get_tab_content")
+        assert callable(router.get_tab_content)

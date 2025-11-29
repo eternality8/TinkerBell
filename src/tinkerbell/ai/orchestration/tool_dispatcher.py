@@ -174,6 +174,14 @@ class ToolDispatcher:
         self._lock_manager = lock_manager
         self._listener = listener
 
+    def set_listener(self, listener: DispatchListener | None) -> None:
+        """Set or replace the dispatch event listener.
+        
+        Args:
+            listener: Dispatch event listener to receive tool start/complete/error events.
+        """
+        self._listener = listener
+
     # ------------------------------------------------------------------
     # Dispatch
     # ------------------------------------------------------------------

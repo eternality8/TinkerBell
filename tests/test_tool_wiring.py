@@ -17,7 +17,6 @@ from tinkerbell.ai.tools.tool_wiring import (
     AIControllerProvider,
     ToolWiringContext,
     ToolRegistrationResult,
-    register_legacy_tools,
     register_new_tools,
     unregister_tools,
 )
@@ -163,52 +162,8 @@ class TestToolRegistrationResult:
 # =============================================================================
 
 
-class TestRegisterLegacyTools:
-    """Test legacy tool registration (deprecated - now returns empty)."""
-
-    def test_returns_empty_if_no_controller(self) -> None:
-        """Returns empty result (deprecated function is now a no-op)."""
-        ctx = ToolWiringContext(
-            controller=None,
-            bridge=MockBridge(),
-            workspace=MockWorkspace(),
-        )
-        
-        result = register_legacy_tools(ctx)
-        
-        assert result.registered == []
-        assert result.failed == []
-
-    def test_returns_empty_if_no_register_method(self) -> None:
-        """Returns empty result (deprecated function is now a no-op)."""
-        controller = object()  # No register_tool method
-        ctx = ToolWiringContext(
-            controller=controller,
-            bridge=MockBridge(),
-            workspace=MockWorkspace(),
-        )
-        
-        result = register_legacy_tools(ctx)
-        
-        assert result.registered == []
-
-    def test_is_noop(self) -> None:
-        """Legacy registration is now a no-op and returns empty result."""
-        controller = MockController()
-        ctx = ToolWiringContext(
-            controller=controller,
-            bridge=MockBridge(),
-            workspace=MockWorkspace(),
-        )
-        
-        result = register_legacy_tools(ctx)
-        
-        # Deprecated function is now a no-op
-        assert result.registered == []
-        assert result.failed == []
-
 # =============================================================================
-# New Tool Registration Tests
+# Tool Registration Tests
 # =============================================================================
 
 
@@ -351,18 +306,204 @@ class TestToolWiringIntegration:
             workspace=MockWorkspace(),
         )
         
-        # Legacy tools is now a deprecated no-op
-        legacy_result = register_legacy_tools(ctx)
-        assert legacy_result.registered == [], "Legacy registration should be no-op"
-        
-        # Register new tools
-        new_result = register_new_tools(ctx)
+        # Register tools
+        result = register_new_tools(ctx)
         # New tools may fail due to missing dependencies, that's ok
         
         # Unregister all
-        all_tools = new_result.registered
+        all_tools = result.registered
         unregistered = unregister_tools(controller, all_tools)
         
         # Should have unregistered at least some tools if any were registered
-        if new_result.registered:
+        if result.registered:
             assert len(unregistered) > 0
+
+
+# =============================================================================
+# DocumentCreatorAdapter Integration Tests
+# =============================================================================
+
+
+class TestDocumentCreatorAdapterIntegration:
+    """Integration tests for DocumentCreatorAdapter with real DocumentWorkspace.
+    
+    These tests ensure the adapter correctly interfaces with the actual
+    workspace implementation, catching API mismatches like using .tabs
+    instead of .iter_tabs().
+    """
+
+    @pytest.fixture
+    def workspace(self):
+        """Create a real DocumentWorkspace for testing."""
+        from tinkerbell.editor.workspace import DocumentWorkspace
+        from tinkerbell.editor.editor_widget import EditorWidget
+        from tinkerbell.services.bridge import DocumentBridge
+        
+        # Create workspace with mock factories that don't require Qt
+        def mock_editor_factory():
+            editor = MagicMock(spec=EditorWidget)
+            editor.to_document.return_value = MagicMock(
+                text="",
+                dirty=False,
+                metadata=MagicMock(path=None, language="markdown")
+            )
+            return editor
+        
+        def mock_bridge_factory(editor):
+            return MagicMock(spec=DocumentBridge)
+        
+        return DocumentWorkspace(
+            editor_factory=mock_editor_factory,
+            bridge_factory=mock_bridge_factory,
+        )
+
+    def test_adapter_from_ui_tools_provider(self, workspace):
+        """Test _DocumentCreatorAdapter from ui.tools.provider module."""
+        from tinkerbell.ui.tools.provider import _DocumentCreatorAdapter
+        
+        adapter = _DocumentCreatorAdapter(workspace)
+        
+        # Test document_exists on empty workspace
+        exists, tab_id = adapter.document_exists("NonExistent")
+        assert exists is False
+        assert tab_id is None
+
+    def test_adapter_document_exists_finds_tab(self, workspace):
+        """Test that document_exists correctly finds existing tabs."""
+        from tinkerbell.ui.tools.provider import _DocumentCreatorAdapter
+        
+        # Create a tab in the workspace
+        tab = workspace.create_tab(title="My Document")
+        
+        adapter = _DocumentCreatorAdapter(workspace)
+        
+        # Should find the document by its actual title (workspace may modify it)
+        # The title includes untitled_index suffix for untitled docs
+        exists, found_id = adapter.document_exists(tab.title)
+        assert exists is True
+        assert found_id == tab.id
+
+    def test_adapter_document_exists_no_match(self, workspace):
+        """Test that document_exists returns False for non-matching titles."""
+        from tinkerbell.ui.tools.provider import _DocumentCreatorAdapter
+        
+        # Create a tab with a different title
+        workspace.create_tab(title="Other Document")
+        
+        adapter = _DocumentCreatorAdapter(workspace)
+        
+        # Should not find a different title
+        exists, found_id = adapter.document_exists("My Document")
+        assert exists is False
+        assert found_id is None
+
+    def test_adapter_create_document(self, workspace):
+        """Test that create_document creates a real tab."""
+        from tinkerbell.ui.tools.provider import _DocumentCreatorAdapter
+        
+        adapter = _DocumentCreatorAdapter(workspace)
+        
+        # Create a document
+        tab_id = adapter.create_document(
+            title="New Doc",
+            content="Hello World",
+            file_type="markdown",
+        )
+        
+        # Verify the tab was created
+        assert tab_id is not None
+        assert workspace.tab_count() == 1
+        
+        # Verify we can find it by the actual tab title
+        tab = workspace.get_tab(tab_id)
+        exists, found_id = adapter.document_exists(tab.title)
+        assert exists is True
+        assert found_id == tab_id
+
+    def test_adapter_iterates_multiple_tabs(self, workspace):
+        """Test that document_exists correctly iterates over multiple tabs."""
+        from tinkerbell.ui.tools.provider import _DocumentCreatorAdapter
+        
+        # Create multiple tabs
+        workspace.create_tab(title="Doc A")
+        workspace.create_tab(title="Doc B")
+        tab_c = workspace.create_tab(title="Doc C")
+        
+        adapter = _DocumentCreatorAdapter(workspace)
+        
+        # Should find the last one by its actual title
+        exists, found_id = adapter.document_exists(tab_c.title)
+        assert exists is True
+        assert found_id == tab_c.id
+        
+        # Should not find non-existent
+        exists, found_id = adapter.document_exists("Completely Different Name")
+        assert exists is False
+
+
+# =============================================================================
+# AIClientProviderAdapter Tests
+# =============================================================================
+
+
+class TestAIClientProviderAdapter:
+    """Tests for _AIClientProviderAdapter."""
+
+    def test_get_ai_client_returns_client_from_controller(self):
+        """Test that get_ai_client returns the client attribute from controller."""
+        from tinkerbell.ui.tools.provider import _AIClientProviderAdapter
+        
+        # Create a mock controller with a client attribute
+        mock_client = MagicMock()
+        mock_controller = MagicMock()
+        mock_controller.client = mock_client
+        
+        adapter = _AIClientProviderAdapter(lambda: mock_controller)
+        
+        result = adapter.get_ai_client()
+        assert result is mock_client
+
+    def test_get_ai_client_returns_none_when_controller_is_none(self):
+        """Test that get_ai_client returns None when controller is None."""
+        from tinkerbell.ui.tools.provider import _AIClientProviderAdapter
+        
+        adapter = _AIClientProviderAdapter(lambda: None)
+        
+        result = adapter.get_ai_client()
+        assert result is None
+
+    def test_get_ai_client_returns_none_when_no_client_attribute(self):
+        """Test that get_ai_client returns None when controller has no client."""
+        from tinkerbell.ui.tools.provider import _AIClientProviderAdapter
+        
+        # Create a controller without a client attribute
+        mock_controller = MagicMock(spec=[])  # No attributes
+        
+        adapter = _AIClientProviderAdapter(lambda: mock_controller)
+        
+        result = adapter.get_ai_client()
+        assert result is None
+
+    def test_adapter_is_used_in_tool_wiring_context(self):
+        """Test that ToolProvider includes ai_client_provider in context."""
+        from tinkerbell.ui.tools.provider import ToolProvider
+        from tinkerbell.editor.selection_gateway import SelectionSnapshotProvider
+        
+        mock_controller = MagicMock()
+        mock_controller.client = MagicMock()
+        
+        provider = ToolProvider(
+            controller_resolver=lambda: mock_controller,
+            bridge=MockBridge(),
+            workspace=MockWorkspace(),
+            selection_gateway=MagicMock(spec=SelectionSnapshotProvider),
+        )
+        
+        ctx = provider.build_tool_wiring_context()
+        
+        # Verify ai_client_provider is set
+        assert ctx.ai_client_provider is not None
+        
+        # Verify it can get the client
+        client = ctx.ai_client_provider.get_ai_client()
+        assert client is mock_controller.client

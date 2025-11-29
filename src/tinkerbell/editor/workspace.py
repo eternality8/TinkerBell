@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import uuid
+import itertools
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,8 +26,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# Global counter for short tab IDs (session-scoped, no persistence needed)
+_tab_id_counter = itertools.count(1)
+
+
 def _generate_tab_id() -> str:
-    return uuid.uuid4().hex
+    """Generate a short sequential tab ID like 't1', 't2', etc."""
+    return f"t{next(_tab_id_counter)}"
 
 
 def _normalize_path(path: Path | str | None) -> Path | None:

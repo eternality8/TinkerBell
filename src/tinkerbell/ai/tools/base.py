@@ -396,6 +396,16 @@ class WriteTool(BaseTool):
                 token=version_str,
             ) from exc
 
+        # Resolve short token to full token (gets full tab_id, document_id, etc.)
+        try:
+            token = context.version_manager.resolve_token(token)
+        except KeyError as exc:
+            from .errors import TabNotFoundError
+            raise TabNotFoundError(
+                message=str(exc),
+                tab_id=token.tab_id,
+            ) from exc
+
         # Validate token is current
         try:
             context.version_manager.validate_token(token)

@@ -97,6 +97,10 @@ class DiffReviewControls:
         if self._container is not None:
             return
         try:
+            from PySide6.QtWidgets import QSizePolicy
+        except Exception:  # pragma: no cover - optional during tests
+            QSizePolicy = None
+        try:
             container = QWidget(status_bar)
             layout = QHBoxLayout(container)
             layout.setContentsMargins(0, 0, 0, 0)
@@ -116,6 +120,11 @@ class DiffReviewControls:
                 reject_button.clicked.connect(self.trigger_reject)  # type: ignore[attr-defined]
             except Exception:
                 pass
+            # Prevent the container from affecting the window's minimum width
+            if QSizePolicy is not None:
+                policy = container.sizePolicy()
+                policy.setHorizontalPolicy(QSizePolicy.Ignored)
+                container.setSizePolicy(policy)
             status_bar.addPermanentWidget(container)
             container.setVisible(False)
         except Exception:
@@ -197,10 +206,19 @@ class DocumentStatusIndicator:
         if self._button is not None:
             return
         try:
+            from PySide6.QtWidgets import QSizePolicy
+        except Exception:  # pragma: no cover - optional during tests
+            QSizePolicy = None
+        try:
             button = QPushButton("Doc Status")
             button.setObjectName("tb-status-doc")
             button.setVisible(False)
             button.clicked.connect(self._handle_clicked)  # type: ignore[attr-defined]
+            # Prevent the button from affecting the window's minimum width
+            if QSizePolicy is not None:
+                policy = button.sizePolicy()
+                policy.setHorizontalPolicy(QSizePolicy.Ignored)
+                button.setSizePolicy(policy)
             status_bar.addPermanentWidget(button)
         except Exception:
             return
@@ -244,6 +262,76 @@ class DocumentStatusIndicator:
         except Exception:
             pass
 
+
+class EditorLockIndicator:
+    """Visual indicator showing editor lock state with padlock symbol."""
+
+    # Padlock symbols
+    LOCKED_SYMBOL = "🔒 Locked"
+    UNLOCKED_SYMBOL = "🔓"
+
+    def __init__(self) -> None:
+        self._label: Any | None = None
+        self._is_locked: bool = False
+        self._message: str = ""
+
+    def install(self, status_bar: Any | None) -> None:
+        """Install the lock indicator into the status bar."""
+        import logging
+        _logger = logging.getLogger(__name__)
+        _logger.info("EditorLockIndicator.install called, status_bar=%s, QLabel=%s", status_bar, QLabel)
+        if status_bar is None or QLabel is None:
+            _logger.warning("EditorLockIndicator.install: early return (status_bar=%s, QLabel=%s)", status_bar, QLabel)
+            return
+        if self._label is not None:
+            _logger.info("EditorLockIndicator.install: already installed")
+            return
+        try:
+            from PySide6.QtWidgets import QSizePolicy
+        except Exception:  # pragma: no cover - optional during tests
+            QSizePolicy = None
+        try:
+            label = QLabel(self.UNLOCKED_SYMBOL)
+            label.setObjectName("tb-status-lock")
+            label.setContentsMargins(8, 0, 8, 0)
+            # Always visible - shows lock state at all times
+            label.setVisible(True)
+            # Prevent the label from affecting window minimum width
+            if QSizePolicy is not None:
+                policy = label.sizePolicy()
+                policy.setHorizontalPolicy(QSizePolicy.Ignored)
+                label.setSizePolicy(policy)
+            status_bar.addPermanentWidget(label)
+            _logger.info("EditorLockIndicator.install: label added successfully, text=%r", label.text())
+        except Exception as e:
+            _logger.exception("EditorLockIndicator.install: failed to create/add label: %s", e)
+            return
+        self._label = label
+        self._refresh()
+
+    def set_locked(self, locked: bool, message: str = "") -> None:
+        """Update the lock state and optional message."""
+        self._is_locked = bool(locked)
+        self._message = message.strip()
+        self._refresh()
+
+    @property
+    def is_locked(self) -> bool:
+        """Return current lock state."""
+        return self._is_locked
+
+    def _refresh(self) -> None:
+        """Update the label display based on current state."""
+        if self._label is None:
+            return
+        try:
+            symbol = self.LOCKED_SYMBOL if self._is_locked else self.UNLOCKED_SYMBOL
+            self._label.setText(symbol)
+            tooltip = self._message or ("Editor locked" if self._is_locked else "Editor unlocked")
+            self._label.setToolTip(tooltip)
+        except Exception:
+            pass
+
 class StatusBar:
     """Status bar that mirrors the plan.md contract yet stays test friendly."""
 
@@ -276,6 +364,7 @@ class StatusBar:
         self._document_status_detail: str = ""
         self._document_status_severity: str = ""
         self._document_status_indicator = DocumentStatusIndicator()
+        self._lock_indicator = EditorLockIndicator()
 
         self._qt_bar = self._build_qt_status_bar(parent)
         self._cursor_label: Any = None
@@ -288,6 +377,7 @@ class StatusBar:
         self._chunk_flow_label: Any = None
         self._guardrail_label: Any = None
         self._analysis_label: Any = None
+        self._lock_label: Any = None
 
         if self._qt_bar is not None:
             self._init_widgets()
@@ -439,6 +529,20 @@ class StatusBar:
         except Exception:
             pass
 
+    def set_editor_lock_state(self, locked: bool, message: str = "") -> None:
+        """Update the editor lock indicator (padlock symbol).
+        
+        Args:
+            locked: Whether the editor is currently locked.
+            message: Optional tooltip/message explaining why.
+        """
+        self._lock_indicator.set_locked(locked, message)
+
+    @property
+    def editor_lock_state(self) -> tuple[bool, str]:
+        """Return the current editor lock state as (is_locked, message)."""
+        return (self._lock_indicator.is_locked, self._lock_indicator._message)
+
     def set_document_status_badge(
         self,
         status: str | None,
@@ -563,6 +667,11 @@ class StatusBar:
         if self._qt_bar is None or QLabel is None:
             return
 
+        try:
+            from PySide6.QtWidgets import QSizePolicy
+        except Exception:  # pragma: no cover - optional during tests
+            QSizePolicy = None
+
         self._cursor_label = QLabel(self._format_cursor_text())
         self._cursor_label.setObjectName("tb-status-cursor")
         self._format_label = QLabel(self._document_format.upper())
@@ -586,6 +695,24 @@ class StatusBar:
         self._analysis_label = QLabel(self._format_analysis_text())
         self._analysis_label.setObjectName("tb-status-analysis")
         self._analysis_label.setVisible(False)
+        
+        # Create lock indicator label directly
+        self._lock_label = QLabel(EditorLockIndicator.UNLOCKED_SYMBOL)
+        self._lock_label.setObjectName("tb-status-lock")
+        self._lock_indicator._label = self._lock_label  # Wire up to indicator
+
+        # Apply Ignored horizontal policy to labels that start hidden
+        # to prevent them from affecting window minimum width when shown
+        hidden_labels = (
+            self._chunk_flow_label,
+            self._guardrail_label,
+            self._analysis_label,
+        )
+        if QSizePolicy is not None:
+            for label in hidden_labels:
+                policy = label.sizePolicy()
+                policy.setHorizontalPolicy(QSizePolicy.Ignored)
+                label.setSizePolicy(policy)
 
         for label in (
             self._cursor_label,
@@ -598,6 +725,7 @@ class StatusBar:
             self._chunk_flow_label,
             self._guardrail_label,
             self._analysis_label,
+            self._lock_label,  # Add lock label with other labels
         ):
             label.setContentsMargins(8, 0, 8, 0)
             try:
@@ -712,5 +840,5 @@ class StatusBar:
         return bar
 
 
-__all__ = ["StatusBar", "ContextUsageWidget", "DiffReviewControls", "DocumentStatusIndicator"]
+__all__ = ["StatusBar", "ContextUsageWidget", "DiffReviewControls", "DocumentStatusIndicator", "EditorLockIndicator"]
 

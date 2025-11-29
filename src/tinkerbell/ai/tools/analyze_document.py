@@ -7,11 +7,12 @@ Uses subagents for parallel chunk processing of large documents.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar, Coroutine, Protocol
 
 from .base import SubagentTool, ToolContext
 from .errors import (
@@ -230,6 +231,117 @@ class AnalyzeDocumentTool(SubagentTool):
                 expected="non-empty string",
             )
 
+    def execute(
+        self,
+        context: ToolContext,
+        params: dict[str, Any],
+    ) -> dict[str, Any] | Coroutine[Any, Any, dict[str, Any]]:
+        """Execute document analysis.
+
+        Overrides the base SubagentTool.execute to use async orchestrator
+        when available. Returns a coroutine that will be awaited by the
+        tool dispatcher.
+        """
+        # Plan the work
+        tasks = self.plan(context, params)
+        if not tasks:
+            return {"status": "no_tasks", "results": []}
+
+        # If we have an orchestrator with an executor, use async execution
+        if self.orchestrator and self.orchestrator._executor is not None:
+            return self._execute_async(context, params, tasks)
+
+        # Fall back to sync execution (which will return errors without executor)
+        return self._execute_sync(context, tasks)
+
+    async def _execute_async(
+        self,
+        context: ToolContext,
+        params: dict[str, Any],
+        tasks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Execute analysis asynchronously using the orchestrator."""
+        analysis_type_str = params.get("analysis_type", "summary")
+        custom_prompt = params.get("custom_prompt")
+
+        # Convert task dicts to SubagentTask objects
+        subagent_tasks = []
+        for task in tasks:
+            chunk: ChunkSpec = task["chunk"]
+            subagent_task = SubagentTask(
+                task_id=f"analyze-{uuid.uuid4().hex[:8]}",
+                subagent_type=SubagentType.CHUNK_ANALYZER,
+                chunk=chunk,
+                instructions=task["instructions"],
+                priority=TaskPriority.NORMAL,
+                metadata={
+                    "analysis_type": analysis_type_str,
+                    "custom_prompt": custom_prompt,
+                },
+            )
+            subagent_tasks.append(subagent_task)
+
+        # Run all tasks through orchestrator
+        results = await self.orchestrator.run_tasks(subagent_tasks, parallel=True)
+
+        # Aggregate results
+        aggregated = self._aggregate_results(results, analysis_type_str)
+
+        return aggregated
+
+    def _execute_sync(
+        self,
+        context: ToolContext,
+        tasks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Execute analysis synchronously (fallback when no async executor)."""
+        results = []
+        errors = []
+        for task in tasks:
+            try:
+                result = self.execute_subagent(context, task)
+                results.append(result)
+            except Exception as exc:
+                LOGGER.warning("Subagent task failed: %s", exc)
+                errors.append({"task": task, "error": str(exc)})
+
+        # Aggregate results
+        aggregated = self.aggregate(results)
+
+        # Include error info if any
+        if errors:
+            aggregated["partial_errors"] = errors
+            aggregated["completed"] = len(results)
+            aggregated["total"] = len(tasks)
+
+        return aggregated
+
+    def _aggregate_results(
+        self,
+        results: list[SubagentResult],
+        analysis_type: str,
+    ) -> dict[str, Any]:
+        """Aggregate SubagentResult objects into final output."""
+        aggregator = AnalysisAggregator()
+        aggregated = aggregator.aggregate(results)
+
+        # Add analysis-specific summary
+        successful = [r for r in results if r.success]
+        failed = [r for r in results if not r.success]
+
+        aggregated["status"] = "complete" if not failed else "partial"
+        aggregated["chunks_processed"] = len(successful)
+        aggregated["chunks_failed"] = len(failed)
+
+        # Include errors if any
+        if failed:
+            aggregated["errors"] = [
+                {"chunk_id": r.chunk_id, "error": r.error}
+                for r in failed
+            ]
+
+        return aggregated
+
     def plan(
         self,
         context: ToolContext,
@@ -340,20 +452,26 @@ class AnalyzeDocumentTool(SubagentTool):
             priority=TaskPriority.NORMAL,
         )
 
-        # If we have an orchestrator, use it
+        # If we have an orchestrator, queue the task
+        # Note: The orchestrator handles async execution; this tool returns
+        # a task reference that can be checked later for results
         if self.orchestrator:
-            # Note: In async context, this would be awaited
-            # For sync execution, we return a mock result
+            # TODO: When async execution is implemented, this should queue the task
+            # For now, we return an error indicating the limitation
+            LOGGER.warning(
+                "analyze_document: orchestrator is configured but sync execution is not yet supported. "
+                "Task %s for chunk %s cannot be executed.",
+                subagent_task.task_id,
+                chunk.chunk_id,
+            )
             return {
                 "task_id": subagent_task.task_id,
-                "success": True,
+                "success": False,
                 "chunk_id": chunk.chunk_id,
-                "output": {
-                    "analysis_type": analysis_type.value,
-                    "chunk_preview": chunk.preview(50),
-                    "line_range": [chunk.start_line, chunk.end_line],
-                },
-                "tokens_used": chunk.token_estimate,
+                "error": "Document analysis is queued but sync execution is not yet implemented. "
+                         "This feature will be available when async subagent execution is complete.",
+                "output": {},
+                "tokens_used": 0,
             }
 
         # No orchestrator - return error indicating the feature isn't ready

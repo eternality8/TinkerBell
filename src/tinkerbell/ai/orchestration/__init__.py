@@ -51,6 +51,26 @@ from .tool_dispatcher import (
     create_tool_dispatcher,
 )
 
+# WS9: Subagent Executor
+from .subagent_executor import (
+    SubagentExecutor,
+    SubagentExecutorConfig,
+    ResponseParseError,
+    extract_json_from_response,
+    validate_response_schema,
+    normalize_analysis_result,
+    validate_transformation_output,
+    create_subagent_orchestrator,
+    configure_analyze_tool_executor,
+    configure_transform_tool_executor,
+)
+from .subagent_prompts import (
+    get_analysis_prompt,
+    get_transform_prompt,
+    ANALYSIS_SCHEMAS,
+    TRANSFORM_SCHEMAS,
+)
+
 __all__ = [
     "AIController",
     "ContextBudgetExceeded",
@@ -95,4 +115,19 @@ __all__ = [
     "ToolContextProvider",
     "DispatchListener",
     "create_tool_dispatcher",
+    # WS9: Subagent Executor
+    "SubagentExecutor",
+    "SubagentExecutorConfig",
+    "ResponseParseError",
+    "extract_json_from_response",
+    "validate_response_schema",
+    "normalize_analysis_result",
+    "validate_transformation_output",
+    "create_subagent_orchestrator",
+    "configure_analyze_tool_executor",
+    "configure_transform_tool_executor",
+    "get_analysis_prompt",
+    "get_transform_prompt",
+    "ANALYSIS_SCHEMAS",
+    "TRANSFORM_SCHEMAS",
 ]

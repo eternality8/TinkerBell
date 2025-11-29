@@ -155,6 +155,80 @@ class WorkspaceBridgeRouter:
     def active_tab_id(self) -> str | None:
         return self._workspace.active_tab_id
 
+    def get_active_tab_id(self) -> str | None:
+        """Alias for active_tab_id() for ToolContextProvider compatibility."""
+        return self._workspace.active_tab_id
+
+    def get_tab_content(self, tab_id: str) -> str | None:
+        """Get the content of a specific tab by ID.
+        
+        Required by TabListingProvider protocol for ListTabsTool.
+        
+        Args:
+            tab_id: The tab identifier.
+            
+        Returns:
+            Document text content, or None if tab not found.
+        """
+        try:
+            tab = self._workspace.get_tab(tab_id)
+            return tab.document().text
+        except KeyError:
+            return None
+
+    def get_document_content(self, tab_id: str) -> str | None:
+        """Get document content for a tab.
+        
+        Required by ToolContextProvider protocol for ToolDispatcher.
+        
+        Args:
+            tab_id: The tab identifier.
+            
+        Returns:
+            Document text content, or None if tab not found.
+        """
+        return self.get_tab_content(tab_id)
+
+    def set_document_content(self, tab_id: str, content: str) -> None:
+        """Set document content for a tab.
+        
+        Required by ToolContextProvider protocol for ToolDispatcher.
+        
+        Args:
+            tab_id: The tab identifier.
+            content: The new document content.
+            
+        Raises:
+            KeyError: If the tab is not found.
+        """
+        tab = self._workspace.get_tab(tab_id)
+        bridge = tab.bridge
+        from ..editor.document_model import DocumentState
+        current_doc = bridge.editor.to_document()
+        new_doc = DocumentState(
+            document_id=current_doc.document_id,
+            text=content,
+        )
+        bridge.editor.load_document(new_doc)
+
+    def get_version_token(self, tab_id: str) -> str | None:
+        """Get current version token for a tab.
+        
+        Required by ToolContextProvider protocol for ToolDispatcher.
+        
+        Args:
+            tab_id: The tab identifier.
+            
+        Returns:
+            Version token string, or None if not available.
+        """
+        from ..ai.tools.version import get_version_manager
+        try:
+            token = get_version_manager().get_current_token(tab_id)
+            return token.to_string() if token else None
+        except Exception:
+            return None
+
     def __getattr__(self, name: str):  # pragma: no cover - fallback forwarding
         return getattr(self._bridge_for_tab(None), name)
 

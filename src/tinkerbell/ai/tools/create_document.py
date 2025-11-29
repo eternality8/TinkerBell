@@ -258,9 +258,18 @@ class CreateDocumentTool(BaseTool):
                     reason=str(exc),
                 ) from exc
         else:
-            # Mock creation for testing - generate a fake tab_id
-            import hashlib
-            tab_id = f"tab-{hashlib.md5(title.encode()).hexdigest()[:8]}"
+            # No document creator configured - this is a configuration error
+            # that should be caught early, not silently worked around
+            LOGGER.error(
+                "CreateDocumentTool.document_creator is None - tool was not properly wired. "
+                "Cannot create document '%s'. This indicates a configuration bug.",
+                title,
+            )
+            raise DocumentCreationError(
+                message=f"Cannot create document '{title}': document creator not configured",
+                reason="The create_document tool was not properly initialized with a document_creator. "
+                       "This is an internal configuration error.",
+            )
 
         # Initialize version tracking
         from .version import compute_content_hash

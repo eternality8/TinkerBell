@@ -398,6 +398,7 @@ class ChatPanel(QWidgetBase):
             if message.tool_traces:
                 target.tool_traces.extend(message.tool_traces)
             self._trim_history()
+            # Always rebuild the widget to ensure proper text wrapping and sizing
             self._refresh_history_widget()
             if should_autoscroll:
                 self._scroll_history_to_bottom(force=True)
@@ -852,30 +853,62 @@ class ChatPanel(QWidgetBase):
                     widget.addItem(self._render_message_text(message))
                     continue
                 item = QListWidgetItem(widget)
-                # Set fixed width first so heightForWidth can calculate properly
+                # Calculate the available width for the row
                 target_width = viewport_width - 8 if viewport_width > 8 else 400
-                bubble_widget.setFixedWidth(target_width)
-                # Force layout computation before getting size hint
-                layout = bubble_widget.layout()
-                if layout is not None:
-                    layout.activate()
-                bubble_widget.adjustSize()
                 
-                # Calculate height based on text label's heightForWidth
+                # Get the bubble's maximum allowed width from _create_message_bubble
+                bubble_frame = None
+                for child in bubble_widget.children():
+                    if hasattr(child, 'objectName') and 'tb-chat-bubble-' in str(child.objectName()):
+                        bubble_frame = child
+                        break
+                
+                # Calculate height based on text label
                 text_label = getattr(bubble_widget, '_text_label', None)
-                if text_label is not None:
-                    # Account for margins: container has 4+4=8 horizontal, bubble has 12+12=24
-                    label_width = target_width - 32
-                    label_height = text_label.heightForWidth(label_width)
-                    if label_height > 0:
-                        # Add vertical margins: bubble layout has 6+6=12, plus extra buffer for text rendering
-                        total_height = label_height + 24
-                        if QSize is not None:
-                            item.setSizeHint(QSize(target_width, total_height))
-                        else:
-                            item.setSizeHint(bubble_widget.sizeHint())
-                    else:
-                        item.setSizeHint(bubble_widget.sizeHint())
+                if text_label is not None and QSize is not None:
+                    # Get the bubble's max width (set in _create_message_bubble)
+                    bubble_max = 520
+                    if bubble_frame is not None:
+                        try:
+                            bubble_max = bubble_frame.maximumWidth()
+                        except Exception:  # pragma: no cover
+                            pass
+                    
+                    # Label width is bubble max minus bubble padding (12+12=24)
+                    label_width = max(100, bubble_max - 24)
+                    
+                    # Calculate height using font metrics
+                    label_height = 20  # default
+                    font_metrics = text_label.fontMetrics()
+                    text_content = text_label.text()
+                    if font_metrics is not None and Qt is not None and text_content:
+                        try:
+                            # Check if label has fixed width (needs wrapping)
+                            actual_label_width = text_label.width()
+                            if actual_label_width > 0:
+                                label_width = actual_label_width
+                            
+                            # Use boundingRect with proper flags for word wrapping
+                            text_rect = font_metrics.boundingRect(
+                                0, 0, label_width, 100000,
+                                Qt.TextWordWrap | Qt.AlignLeft,
+                                text_content
+                            )
+                            if text_rect:
+                                label_height = text_rect.height()
+                                # Add extra line height as safety margin for rendering differences
+                                line_height = font_metrics.lineSpacing()
+                                label_height += line_height
+                        except Exception:  # pragma: no cover
+                            pass
+                    
+                    # Vertical margins:
+                    # - bubble_layout: 6 top + 6 bottom = 12
+                    # - container row_layout: minimal
+                    # - extra buffer for rendering differences = 8
+                    vertical_margins = 20
+                    total_height = max(36, label_height + vertical_margins)
+                    item.setSizeHint(QSize(target_width, total_height))
                 else:
                     item.setSizeHint(bubble_widget.sizeHint())
                 item.setToolTip(self._tooltip_label_for_message(message))
@@ -1057,6 +1090,11 @@ class ChatPanel(QWidgetBase):
             return "pending"
 
         metadata = trace.metadata if isinstance(trace.metadata, Mapping) else {}
+
+        # Check for partial failures first (e.g., chunks_failed > 0, errors array, etc.)
+        if self._has_partial_failure(metadata):
+            return "failure"
+
         structured = self._extract_structured_status(metadata)
         if structured:
             normalized = structured.lower()
@@ -1073,9 +1111,53 @@ class ChatPanel(QWidgetBase):
 
         if self._looks_like_failure(summary_lower):
             return "failure"
+
+        # A completed tool call (not pending, not failure) should be treated as success.
+        # Tools that have output and are no longer running have completed successfully.
+        if summary and not summary_lower.startswith("("):
+            return "success"
+
         if self._looks_like_success(summary_lower):
             return "success"
         return "neutral"
+
+    def _has_partial_failure(self, metadata: Mapping[str, Any]) -> bool:
+        """Detect partial failures from structured output (e.g., chunks_failed, errors array)."""
+
+        def _check_payload(payload: Any) -> bool:
+            if not isinstance(payload, Mapping):
+                return False
+            # Check for failed chunk counts
+            chunks_failed = payload.get("chunks_failed")
+            if isinstance(chunks_failed, (int, float)) and chunks_failed > 0:
+                return True
+            # Check for non-empty errors array
+            errors = payload.get("errors")
+            if isinstance(errors, Sequence) and not isinstance(errors, (str, bytes)) and len(errors) > 0:
+                return True
+            # Check for failure_count or error_count
+            for key in ("failure_count", "error_count", "failed_count"):
+                count = payload.get(key)
+                if isinstance(count, (int, float)) and count > 0:
+                    return True
+            return False
+
+        # Check parsed_output first
+        parsed = metadata.get("parsed_output")
+        if _check_payload(parsed):
+            return True
+
+        # Check raw_output if it's a dict or parseable JSON
+        raw_output = metadata.get("raw_output")
+        if isinstance(raw_output, Mapping):
+            if _check_payload(raw_output):
+                return True
+        elif isinstance(raw_output, str):
+            parsed_raw = self._parse_jsonish(raw_output)
+            if _check_payload(parsed_raw):
+                return True
+
+        return False
 
     def _extract_structured_status(self, metadata: Mapping[str, Any]) -> Optional[str]:
         status_value = metadata.get("status")
@@ -1409,11 +1491,6 @@ class ChatPanel(QWidgetBase):
         row_layout = QHBoxLayout(container)
         row_layout.setContentsMargins(4, 0, 4, 0)
         row_layout.setSpacing(4)
-        if QSizePolicy is not None:
-            try:
-                container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-            except Exception:  # pragma: no cover - Qt defensive guard
-                pass
 
         bubble = QFrame(container)
         bubble.setObjectName(f"tb-chat-bubble-{message.role}")
@@ -1426,20 +1503,44 @@ class ChatPanel(QWidgetBase):
         bubble_layout.setContentsMargins(12, 6, 12, 6)
         bubble_layout.setSpacing(2)
 
-        if QSizePolicy is not None:
-            try:
-                bubble.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-            except Exception:  # pragma: no cover - Qt defensive guard
-                pass
-
         text_label = QLabel(message.content.strip() or "\u200b", bubble)
         text_label.setWordWrap(True)
         text_label.setContentsMargins(0, 0, 0, 0)
-        if QSizePolicy is not None:
+        # Set text interaction flags for proper text rendering
+        if Qt is not None:
             try:
-                text_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+                text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
             except Exception:  # pragma: no cover - Qt defensive guard
                 pass
+        
+        # Calculate max width for bubble and label
+        bubble_max_width = 520
+        if viewport_width:
+            available = max(120, viewport_width - 24)
+            bubble_max_width = max(180, int(available * 0.92))
+        label_max_width = bubble_max_width - 24
+        
+        # Check if text needs wrapping by measuring single-line width
+        needs_fixed_width = False
+        font_metrics = text_label.fontMetrics()
+        if font_metrics is not None:
+            try:
+                # Get width needed for single line (no wrapping)
+                single_line_width = font_metrics.horizontalAdvance(text_label.text())
+                # If text is wider than max, we need to fix the width to force wrapping
+                if single_line_width > label_max_width:
+                    needs_fixed_width = True
+            except Exception:  # pragma: no cover
+                # Fallback: if text has newlines or is long, assume it needs fixed width
+                text_content = text_label.text()
+                if '\n' in text_content or len(text_content) > 50:
+                    needs_fixed_width = True
+        
+        if needs_fixed_width:
+            text_label.setFixedWidth(label_max_width)
+        else:
+            text_label.setMaximumWidth(label_max_width)
+        
         bubble_layout.addWidget(text_label)
 
         if message.metadata:
@@ -1452,18 +1553,15 @@ class ChatPanel(QWidgetBase):
                 pass
             bubble_layout.addWidget(meta_label)
 
-        bubble_max_width = 520
-        if viewport_width:
-            available = max(120, viewport_width - 24)
-            bubble_max_width = max(180, int(available * 0.92))
+        # bubble_max_width already calculated above for label
         bubble.setMaximumWidth(bubble_max_width)
         if message.role == "user":
             bubble.setStyleSheet("background-color: #2d7dff; color: white; border-radius: 12px; padding: 0px;")
             row_layout.addStretch(1)
-            row_layout.addWidget(bubble, 1)
+            row_layout.addWidget(bubble, 0)  # stretch=0 so bubble doesn't expand
         else:
             bubble.setStyleSheet("background-color: #2f333a; color: #f5f5f5; border-radius: 12px; padding: 0px;")
-            row_layout.addWidget(bubble, 1)
+            row_layout.addWidget(bubble, 0)  # stretch=0 so bubble doesn't expand
             row_layout.addStretch(1)
 
         self._attach_bubble_context_menu(bubble, message)
@@ -1613,17 +1711,6 @@ class ChatPanel(QWidgetBase):
             except Exception:  # pragma: no cover - Qt defensive guard
                 pass
         return default
-
-    def resizeEvent(self, event: Any) -> None:  # type: ignore[override]
-        """Ensure chat bubbles adapt to the latest viewport width on resize."""
-
-        parent_resize = getattr(super(), "resizeEvent", None)
-        if callable(parent_resize):
-            try:
-                parent_resize(event)
-            except Exception:  # pragma: no cover - Qt defensive guard
-                pass
-        self._refresh_history_widget()
 
     # Qt callbacks ----------------------------------------------------
     def _handle_action_button_clicked(self) -> None:

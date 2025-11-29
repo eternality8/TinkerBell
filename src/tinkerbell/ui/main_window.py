@@ -42,7 +42,16 @@ from ..ai.tools.tool_wiring import (
     ToolWiringContext,
     register_new_tools,
 )
+from ..ai.tools.tool_registry import get_tool_registry
+from ..ai.orchestration.tool_dispatcher import DispatchListener, DispatchResult
 from .settings_runtime import SettingsRuntime
+from ..ai.orchestration.editor_lock import (
+    EditorLockManager,
+    LockableTab,
+    LockState,
+    LockStatusUpdater,
+    TabProvider,
+)
 from .ai_review_controller import AIReviewController, EditSummary, PendingReviewSession, PendingTurnReview
 from .ai_turn_coordinator import AITurnCoordinator
 from .document_session_service import DocumentSessionService
@@ -92,6 +101,87 @@ WINDOW_APP_NAME = "TinkerBell"
 UNTITLED_DOCUMENT_NAME = "Untitled"
 SUGGESTION_LOADING_LABEL = "Generating personalized suggestions…"
 OPENAI_API_BASE_URL = "https://api.openai.com/v1"
+
+
+class _WriteToolDispatchListener:
+    """Listens for tool dispatch events to track document write operations.
+    
+    When a tool with writes_document=True completes successfully, this listener
+    records the edit in the pending turn review so that changes are not dropped
+    as "no-edits".
+    """
+    
+    def __init__(self, main_window: "MainWindow") -> None:
+        self._window = main_window
+        self._registry = get_tool_registry()
+    
+    def on_tool_start(self, tool_name: str, arguments: Mapping[str, Any]) -> None:
+        """Called when a tool starts execution."""
+        # We only care about completion, not start
+        pass
+    
+    def on_tool_complete(self, result: DispatchResult) -> None:
+        """Called when a tool completes - increment edit count if it was a write tool."""
+        if not result.success:
+            return
+        if not self._registry.is_write_tool(result.tool_name):
+            return
+        # Track this as an edit in the pending turn review
+        self._window._record_write_tool_edit(result)
+    
+    def on_tool_error(self, tool_name: str, error: Any) -> None:
+        """Called when a tool fails."""
+        # Errors don't count as edits
+        pass
+
+
+class _EditorTabWrapper:
+    """Wraps a DocumentTab to implement LockableTab protocol."""
+    
+    __slots__ = ("_tab",)
+    
+    def __init__(self, tab: DocumentTab) -> None:
+        self._tab = tab
+    
+    @property
+    def id(self) -> str:
+        return self._tab.id
+    
+    def set_readonly(self, readonly: bool) -> None:
+        """Set the tab's read-only state via its editor widget."""
+        editor = self._tab.editor
+        set_ro = getattr(editor, "set_readonly", None)
+        if callable(set_ro):
+            set_ro(readonly)
+    
+    def is_readonly(self) -> bool:
+        """Check if the tab is read-only."""
+        editor = self._tab.editor
+        is_ro = getattr(editor, "is_readonly", None)
+        if callable(is_ro):
+            return is_ro()
+        return False
+
+
+class _WorkspaceTabProvider:
+    """Implements TabProvider protocol for the workspace."""
+    
+    __slots__ = ("_workspace",)
+    
+    def __init__(self, workspace: Any) -> None:
+        self._workspace = workspace
+    
+    def get_all_tabs(self) -> Sequence[LockableTab]:
+        """Get all open tabs as lockable wrappers."""
+        tabs = list(self._workspace.iter_tabs())
+        return [_EditorTabWrapper(tab) for tab in tabs]
+    
+    def get_active_tab(self) -> LockableTab | None:
+        """Get the currently active tab."""
+        active = self._workspace.active_tab
+        if active is None:
+            return None
+        return _EditorTabWrapper(active)
 
 
 class MainWindow(QMainWindow):
@@ -245,6 +335,11 @@ class MainWindow(QMainWindow):
             workspace=self._workspace,
             selection_gateway=self._selection_gateway,
         )
+        # Initialize editor lock manager for AI turn coordination
+        self._editor_lock_manager = EditorLockManager(
+            tab_provider=_WorkspaceTabProvider(self._workspace),
+            status_updater=self._update_lock_status,
+        )
         self._ai_turn_coordinator = AITurnCoordinator(
             controller_resolver=lambda: self._context.ai_controller,
             chat_panel=self._chat_panel,
@@ -256,6 +351,7 @@ class MainWindow(QMainWindow):
             tool_trace_presenter=self._tool_trace_presenter,
             stream_state_setter=self._set_ai_stream_active,
             stream_text_coercer=self._coerce_stream_text,
+            lock_manager=self._editor_lock_manager,
         )
         self._settings_runtime = SettingsRuntime(
             context=self._context,
@@ -555,6 +651,10 @@ class MainWindow(QMainWindow):
         controller = context.controller
         if controller is not None and hasattr(controller, "configure_tool_dispatcher"):
             controller.configure_tool_dispatcher(context_provider=context.bridge)
+            # Wire up dispatch listener to track write tool completions for edit counting
+            dispatcher = getattr(controller, "tool_dispatcher", None)
+            if dispatcher is not None and hasattr(dispatcher, "set_listener"):
+                dispatcher.set_listener(_WriteToolDispatchListener(self))
 
     def _register_phase3_ai_tools(self, *, register_fn: Callable[..., Any] | None = None) -> None:
         # Phase3 tools have been deprecated; this is now a no-op
@@ -1372,6 +1472,10 @@ class MainWindow(QMainWindow):
         self._ai_task = None
         self._ai_stream_active = False
         self._chat_panel.set_ai_running(False)
+        
+        # Force release the editor lock when canceling
+        self._ai_turn_coordinator.force_release_lock()
+        
         if self._suppress_cancel_abort:
             return
         self._review_controller.abort_pending_review(
@@ -1603,6 +1707,73 @@ class MainWindow(QMainWindow):
             label_override=overlay_label,
         )
         self._document_monitor.update_autosave_indicator(document=current_document or _state)
+
+    def _record_write_tool_edit(self, result: DispatchResult) -> None:
+        """Record a write tool completion as an edit in the pending turn review.
+        
+        Called by _WriteToolDispatchListener when a tool with writes_document=True
+        completes successfully. This ensures that write_document and similar tools
+        increment the edit count so changes aren't dropped as "no-edits".
+        
+        Args:
+            result: The dispatch result from the completed tool.
+        """
+        turn = self._review_controller.pending_turn_review
+        if turn is None:
+            _LOGGER.debug(
+                "write tool %s completed but no pending turn review",
+                result.tool_name,
+            )
+            return
+        
+        # Extract tab_id from the result metadata or tool arguments
+        tab_id: str | None = None
+        if result.metadata:
+            tab_id = result.metadata.get("tab_id")
+        if tab_id is None and isinstance(result.result, dict):
+            tab_id = result.result.get("tab_id")
+        
+        # If we still don't have a tab_id, try to get the active tab
+        if tab_id is None:
+            tab_id = self._workspace.active_tab_id
+        
+        if tab_id is None:
+            _LOGGER.debug(
+                "write tool %s completed but could not determine tab_id",
+                result.tool_name,
+            )
+            # Still increment edit count even if we can't track the tab
+            turn.total_edit_count += 1
+            return
+        
+        # Get the document state for the session snapshot
+        try:
+            tab = self._workspace.get_tab(tab_id)
+            doc_state = tab.editor.to_document()
+        except KeyError:
+            _LOGGER.debug(
+                "write tool %s completed but tab %s not found",
+                result.tool_name,
+                tab_id,
+            )
+            turn.total_edit_count += 1
+            return
+        
+        # Ensure we have a review session for this tab
+        session = self._review_controller.ensure_pending_review_session(
+            tab_id=tab_id,
+            document_snapshot=doc_state,
+            tab=tab,
+        )
+        
+        # Increment edit count
+        turn.total_edit_count += 1
+        _LOGGER.debug(
+            "Recorded write tool %s edit for tab %s (total_edit_count=%d)",
+            result.tool_name,
+            tab_id,
+            turn.total_edit_count,
+        )
 
     def _handle_edit_failure(
         self,
@@ -2095,6 +2266,15 @@ class MainWindow(QMainWindow):
             pass
 
         _LOGGER.debug("Status: %s", message)
+
+    def _update_lock_status(self, message: str, is_locked: bool) -> None:
+        """Update status bar with editor lock state.
+        
+        This is called by the EditorLockManager when lock state changes.
+        """
+        _LOGGER.debug("Editor lock status: %s (locked=%s)", message, is_locked)
+        if self._status_bar is not None:
+            self._status_bar.set_editor_lock_state(is_locked, message)
 
     # ------------------------------------------------------------------
     # Utilities

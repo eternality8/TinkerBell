@@ -354,6 +354,18 @@ class ToolRegistry:
         reg = self._tools.get(name)
         return reg is not None and reg.enabled
 
+    def is_write_tool(self, name: str) -> bool:
+        """Check if a tool modifies documents.
+        
+        Args:
+            name: Tool name to check.
+            
+        Returns:
+            True if the tool has writes_document=True in its schema.
+        """
+        schema = self.get_schema(name)
+        return schema is not None and schema.writes_document
+
     def list_tools(
         self,
         *,
@@ -497,7 +509,12 @@ VERSION_TOKEN_PARAM = ParameterSchema(
 TAB_ID_PARAM = ParameterSchema(
     name="tab_id",
     type="string",
-    description="Target tab identifier. Optional if using version_token.",
+    description=(
+        "The tab_id from list_tabs (e.g., '38b454b7b3274ffa90660bb5bc1b6017'). "
+        "Tab IDs are opaque strings, NOT document titles. "
+        "Call list_tabs first to get valid tab_ids. "
+        "If omitted, uses the currently active tab."
+    ),
     required=False,
 )
 
@@ -528,7 +545,12 @@ MAX_LINES_PARAM = ParameterSchema(
 
 LIST_TABS_SCHEMA = ToolSchema(
     name="list_tabs",
-    description="List all open document tabs with their IDs, titles, and status.",
+    description=(
+        "List all open document tabs. Returns tab_id (opaque identifier like '38b454b7b3274ffa90660bb5bc1b6017'), "
+        "title (human-readable name), and status for each tab. "
+        "CALL THIS FIRST to get valid tab_ids for use with read_document and other tools. "
+        "Do NOT use document titles as tab_ids."
+    ),
     parameters=[],
     category=ToolCategory.NAVIGATION,
     requires_version=False,
@@ -540,7 +562,8 @@ READ_DOCUMENT_SCHEMA = ToolSchema(
     description=(
         "Read document content and get a version_token. "
         "CALL THIS FIRST before any edit. Returns version_token (required for edits) "
-        "and content. Use offset/max_lines for large documents."
+        "and content. Use offset/max_lines for large documents. "
+        "Omit tab_id to read the active document, or call list_tabs first to get a valid tab_id."
     ),
     parameters=[
         TAB_ID_PARAM,

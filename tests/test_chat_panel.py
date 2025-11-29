@@ -341,6 +341,31 @@ def test_tool_trace_entry_marks_failure_from_summary():
     assert text.startswith("✕ Step 2")
 
 
+def test_tool_trace_entry_marks_failure_from_partial_failure():
+    """Tool calls with chunks_failed > 0 or errors array should be failures."""
+    panel = _make_panel()
+
+    # Case 1: chunks_failed > 0 with status "complete"
+    trace = ToolTrace(
+        name="analyze_document",
+        input_summary="characters",
+        output_summary='{"status": "complete", "chunks_processed": 0, "chunks_failed": 1}',
+        metadata={"parsed_output": {"status": "complete", "chunks_processed": 0, "chunks_failed": 1, "errors": [{"error": "failed"}]}},
+    )
+    _, status = panel._format_tool_trace_entry(trace, 1)
+    assert status == "failure", "chunks_failed > 0 should be failure"
+
+    # Case 2: non-empty errors array
+    trace2 = ToolTrace(
+        name="analyze_document",
+        input_summary="plot",
+        output_summary="complete",
+        metadata={"parsed_output": {"status": "complete", "errors": [{"chunk_id": "x", "error": "timeout"}]}},
+    )
+    _, status2 = panel._format_tool_trace_entry(trace2, 2)
+    assert status2 == "failure", "non-empty errors array should be failure"
+
+
 def test_tool_trace_entry_marks_success_from_structured_status():
     panel = _make_panel()
     trace = ToolTrace(
@@ -364,6 +389,26 @@ def test_tool_trace_entry_marks_pending_for_running_summary():
 
     assert status == "pending"
     assert text.startswith("… Step 1")
+
+
+def test_tool_trace_entry_marks_success_for_completed_output():
+    """Completed tool calls with non-keyword output are treated as success."""
+    panel = _make_panel()
+
+    # Various output summaries that don't match explicit success keywords
+    test_cases = [
+        ("42", "success"),  # numeric output
+        ("diff", "success"),  # simple word
+        ("Δ-2 chars", "success"),  # delta notation
+        ("patched", "success"),  # past tense verb
+        ("Outline updated", "success"),  # action description
+        ("result=42", "success"),  # key-value style
+        ("Line 1\nLine 2", "success"),  # multi-line
+    ]
+    for output_summary, expected_status in test_cases:
+        trace = ToolTrace(name="tool", input_summary="", output_summary=output_summary)
+        _, status = panel._format_tool_trace_entry(trace, 1)
+        assert status == expected_status, f"Expected '{expected_status}' for output '{output_summary}', got '{status}'"
 
 
 def test_chat_panel_suggestions_update_composer():
@@ -601,20 +646,6 @@ def test_copy_text_to_clipboard_records_text_when_qt_missing(monkeypatch):
 
     assert copied is False
     assert panel.last_copied_text == "Example message"
-
-
-def test_chat_panel_resize_event_refreshes_history(monkeypatch):
-    panel = ChatPanel()
-    calls: list[bool] = []
-
-    def _fake_refresh() -> None:
-        calls.append(True)
-
-    monkeypatch.setattr(panel, "_refresh_history_widget", _fake_refresh)
-
-    panel.resizeEvent(object())
-
-    assert calls == [True]
 
 
 def test_copy_text_to_clipboard_uses_qt_clipboard(monkeypatch):

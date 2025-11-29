@@ -210,7 +210,6 @@ from .tool_wiring import (
     AIControllerProvider,
     ToolWiringContext,
     ToolRegistrationResult,
-    register_legacy_tools,
     register_new_tools as wiring_register_new_tools,
     unregister_tools,
 )
@@ -377,7 +376,6 @@ __all__ = [
     "AIControllerProvider",
     "ToolWiringContext",
     "ToolRegistrationResult",
-    "register_legacy_tools",
     "wiring_register_new_tools",
     "unregister_tools",
 ]

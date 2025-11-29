@@ -32,13 +32,13 @@ def system_prompt_v2(*, model_name: str | None = None) -> str:
 ## Available Tools
 
 ### Navigation Tools
-- **list_tabs** - List all open documents
-- **read_document** - Read document content, get version_token
+- **list_tabs** - List all open documents and their tab_ids (CALL FIRST to get valid tab_ids)
+- **read_document** - Read document content, get version_token (omit tab_id for active document)
 - **search_document** - Search with exact, regex, or semantic matching
 - **get_outline** - Get document structure (headings, sections)
 
 ### Writing Tools
-- **create_document** - Create a new document tab
+- **create_document** - Create a new document tab (returns the new tab_id)
 - **insert_lines** - Insert lines WITHOUT overwriting (use after_line)
 - **replace_lines** - Replace a range of lines
 - **delete_lines** - Delete a range of lines
@@ -48,6 +48,13 @@ def system_prompt_v2(*, model_name: str | None = None) -> str:
 ### Analysis Tools
 - **analyze_document** - Analyze characters, plot, style, or custom
 - **transform_document** - Rename characters, change settings, rewrite style
+
+## IMPORTANT: Tab IDs
+
+Tab IDs are opaque identifiers (like "38b454b7b3274ffa90660bb5bc1b6017"), NOT document titles.
+- To work with the active document: omit tab_id (read_document will use the active tab)
+- To work with a specific document: call list_tabs first to get valid tab_ids
+- NEVER use document titles or names as tab_ids
 
 ## Core Workflow
 
@@ -77,12 +84,18 @@ def _workflow_section() -> str:
     """Core workflow instructions."""
     return """### Read → Edit → Verify
 
-1. **Read First**
+1. **Read First** (omit tab_id to use active document)
    ```
-   read_document(tab_id="optional") → version_token, content
+   read_document() → version_token, content  # Reads active document
    ```
    - Always read before editing
    - Save the version_token - you'll need it
+
+   **To read a specific document:**
+   ```
+   list_tabs() → tabs with tab_id for each
+   read_document(tab_id="38b454b7b3274ffa90660bb5bc1b6017") → version_token, content
+   ```
 
 2. **Choose Edit Tool**
    - **insert_lines**: Add NEW content between lines
@@ -118,7 +131,7 @@ search_document(query="concept to find", mode="semantic")
 
 Use **get_outline** for document structure:
 ```
-get_outline(tab_id="optional") → headings with line numbers
+get_outline() → headings with line numbers  # Uses active document
 ```
 
 ### Large Documents

@@ -380,7 +380,11 @@ class TestReadOnlyTool:
 
         assert result.success is True
         assert "version" in result.data
-        assert result.data["version"].startswith("tab-1:")
+        # New short format: "tab1:hash:1" (4 chars from tab, 4 from hash, version)
+        version = result.data["version"]
+        assert ":" in version  # Should be colon-separated
+        parts = version.split(":")
+        assert len(parts) == 3  # short_tab:short_hash:version_id
 
     def test_preserves_explicit_version(self, context: ToolContext) -> None:
         """Test that explicit version is not overwritten."""

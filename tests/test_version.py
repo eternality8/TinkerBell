@@ -32,14 +32,29 @@ class TestVersionToken:
         assert token.content_hash == "abc123"
 
     def test_to_string(self) -> None:
-        """Test token serialization to string."""
+        """Test token serialization to compact external format."""
         token = VersionToken(
-            tab_id="tab-1",
+            tab_id="t1",
             document_id="doc-abc",
             version_id=5,
-            content_hash="deadbeef",
+            content_hash="deadbeef1234",
         )
-        assert token.to_string() == "tab-1:doc-abc:5:deadbeef"
+        # New compact format: tab_id:short_hash:version
+        assert token.to_string() == "t1:dead:5"
+
+    def test_to_string_format(self) -> None:
+        """Test that to_string produces the expected short format."""
+        token = VersionToken(
+            tab_id="t42",
+            document_id="doc-xyz",
+            version_id=42,
+            content_hash="fedcba9876543210",
+        )
+        result = token.to_string()
+        # Format: {tab_id}:{4 chars from hash}:{version}
+        assert result == "t42:fedc:42"
+        # Should be compact (under 15 chars typically)
+        assert len(result) < 20
 
     def test_to_dict(self) -> None:
         """Test token serialization to dictionary."""

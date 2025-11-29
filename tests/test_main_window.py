@@ -1755,3 +1755,156 @@ def test_close_event_cancels_background_tasks(monkeypatch: pytest.MonkeyPatch) -
 
     assert calls == ["ai", "suggestions", "cache"]
     assert accepted["value"] is True
+
+
+class TestWriteToolEditTracking:
+    """Tests for write tool edit tracking via DispatchListener."""
+
+    @staticmethod
+    def _make_chat_snapshot() -> ChatTurnSnapshot:
+        """Create a minimal ChatTurnSnapshot for testing."""
+        from tinkerbell.chat.chat_panel import ComposerContext
+        return ChatTurnSnapshot(
+            messages=[],
+            tool_traces=[],
+            composer_text="",
+            composer_context=ComposerContext(),
+            suggestions=(),
+            suggestion_panel_open=False,
+            ai_running=False,
+        )
+
+    def test_record_write_tool_edit_increments_count(self):
+        """Write tool completion should increment total_edit_count."""
+        from tinkerbell.ai.orchestration.tool_dispatcher import DispatchResult
+        from tinkerbell.ui.main_window import _WriteToolDispatchListener
+        
+        window = _make_window()
+        # Set up a pending turn review
+        chat_snapshot = self._make_chat_snapshot()
+        window._review_controller.begin_pending_turn_review(
+            prompt="test prompt",
+            prompt_metadata={},
+            chat_snapshot=chat_snapshot,
+        )
+        
+        assert window._review_controller.pending_turn_review is not None
+        assert window._review_controller.pending_turn_review.total_edit_count == 0
+        
+        # Simulate a write tool completion
+        result = DispatchResult(
+            success=True,
+            result={"lines_affected": {"previous": 10, "current": 15}},
+            tool_name="write_document",
+        )
+        
+        window._record_write_tool_edit(result)
+        
+        assert window._review_controller.pending_turn_review.total_edit_count == 1
+
+    def test_record_write_tool_edit_no_turn_review(self):
+        """Write tool completion without pending turn should not crash."""
+        from tinkerbell.ai.orchestration.tool_dispatcher import DispatchResult
+        
+        window = _make_window()
+        assert window._review_controller.pending_turn_review is None
+        
+        result = DispatchResult(
+            success=True,
+            result={},
+            tool_name="write_document",
+        )
+        
+        # Should not raise
+        window._record_write_tool_edit(result)
+
+    def test_write_tool_listener_ignores_non_write_tools(self):
+        """Listener should not increment count for non-write tools."""
+        from tinkerbell.ai.orchestration.tool_dispatcher import DispatchResult
+        from tinkerbell.ui.main_window import _WriteToolDispatchListener
+        
+        window = _make_window()
+        listener = _WriteToolDispatchListener(window)
+        
+        # Set up a pending turn review
+        chat_snapshot = self._make_chat_snapshot()
+        window._review_controller.begin_pending_turn_review(
+            prompt="test prompt",
+            prompt_metadata={},
+            chat_snapshot=chat_snapshot,
+        )
+        
+        # Simulate a non-write tool completion (read_document)
+        result = DispatchResult(
+            success=True,
+            result={"content": "hello"},
+            tool_name="read_document",
+        )
+        
+        listener.on_tool_complete(result)
+        
+        # Edit count should still be 0 since read_document is not a write tool
+        assert window._review_controller.pending_turn_review.total_edit_count == 0
+
+    def test_write_tool_listener_ignores_failed_tools(self):
+        """Listener should not increment count for failed write tools."""
+        from tinkerbell.ai.orchestration.tool_dispatcher import DispatchResult
+        from tinkerbell.ui.main_window import _WriteToolDispatchListener
+        
+        window = _make_window()
+        listener = _WriteToolDispatchListener(window)
+        
+        # Set up a pending turn review
+        chat_snapshot = self._make_chat_snapshot()
+        window._review_controller.begin_pending_turn_review(
+            prompt="test prompt",
+            prompt_metadata={},
+            chat_snapshot=chat_snapshot,
+        )
+        
+        # Simulate a failed write tool
+        result = DispatchResult(
+            success=False,
+            result=None,
+            tool_name="write_document",
+        )
+        
+        listener.on_tool_complete(result)
+        
+        # Edit count should still be 0 since tool failed
+        assert window._review_controller.pending_turn_review.total_edit_count == 0
+
+    def test_write_tool_listener_increments_for_write_tools(self):
+        """Listener should increment count for successful write tools."""
+        from tinkerbell.ai.orchestration.tool_dispatcher import DispatchResult
+        from tinkerbell.ui.main_window import _WriteToolDispatchListener
+        from tinkerbell.ai.tools.tool_registry import get_tool_registry, WRITE_DOCUMENT_SCHEMA
+        
+        # Ensure write_document is registered in the registry with correct schema
+        registry = get_tool_registry()
+        if not registry.has_tool("write_document"):
+            # Register with schema= parameter, not as the tool implementation
+            registry.register(tool=None, schema=WRITE_DOCUMENT_SCHEMA)
+        
+        window = _make_window()
+        listener = _WriteToolDispatchListener(window)
+        
+        # Set up a pending turn review
+        chat_snapshot = self._make_chat_snapshot()
+        window._review_controller.begin_pending_turn_review(
+            prompt="test prompt",
+            prompt_metadata={},
+            chat_snapshot=chat_snapshot,
+        )
+        
+        # Simulate a successful write_document call
+        result = DispatchResult(
+            success=True,
+            result={"lines_affected": {"previous": 10, "current": 15}},
+            tool_name="write_document",
+        )
+        
+        listener.on_tool_complete(result)
+        
+        # Edit count should be 1
+        assert window._review_controller.pending_turn_review.total_edit_count == 1

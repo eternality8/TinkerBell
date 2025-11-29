@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
+from ..ai.orchestration.editor_lock import (
+    EditorLockManager,
+    LockReason,
+    LockSession,
+)
 from ..chat.message_model import ChatMessage
 from .tool_trace_presenter import ToolTracePresenter
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -23,8 +31,10 @@ class AITurnCoordinator:
     tool_trace_presenter: ToolTracePresenter
     stream_state_setter: Callable[[bool], None]
     stream_text_coercer: Callable[[Any], str]
+    lock_manager: EditorLockManager | None = None
 
     _ai_stream_active: bool = False
+    _active_lock_session: LockSession | None = field(default=None, repr=False)
 
     async def run_ai_turn(
         self,
@@ -44,6 +54,10 @@ class AITurnCoordinator:
         self.stream_state_setter(False)
         self.tool_trace_presenter.reset()
         normalized_metadata = self._normalize_metadata(metadata)
+        
+        # Acquire editor lock to prevent user edits during AI turn
+        self._acquire_editor_lock()
+        
         self.status_updater("AI thinking…")
         try:
             result = await controller.run_chat(
@@ -54,6 +68,7 @@ class AITurnCoordinator:
                 on_event=self._handle_stream_event,
             )
         except Exception as exc:  # pragma: no cover - runtime path
+            self._release_editor_lock()
             self.review_controller.finalize_pending_turn_review(success=False)
             self.failure_handler(exc)
             return
@@ -77,6 +92,10 @@ class AITurnCoordinator:
                 document_id=str(document_id) if document_id else None,
                 document_label=document_label,
             )
+        
+        # Release editor lock after AI turn completes
+        self._release_editor_lock()
+        
         self.status_updater("AI response ready")
         self.review_controller.finalize_pending_turn_review(success=True)
 
@@ -126,6 +145,54 @@ class AITurnCoordinator:
             return dict(metadata)
         except Exception:
             return metadata
+
+    # ------------------------------------------------------------------
+    # Editor Lock Management
+    # ------------------------------------------------------------------
+    def _acquire_editor_lock(self) -> None:
+        """Acquire the editor lock to prevent user edits during AI turn."""
+        if self.lock_manager is None:
+            return
+        try:
+            session = self.lock_manager.acquire(LockReason.AI_TURN)
+            if session is not None:
+                self._active_lock_session = session
+                _LOGGER.debug("Editor lock acquired: session=%s", session.session_id)
+            else:
+                _LOGGER.debug("Failed to acquire editor lock (already locked)")
+        except Exception:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Error acquiring editor lock", exc_info=True)
+
+    def _release_editor_lock(self) -> None:
+        """Release the editor lock after AI turn completes."""
+        if self.lock_manager is None:
+            return
+        session = self._active_lock_session
+        if session is None:
+            return
+        try:
+            session_id = session.session_id
+            released = self.lock_manager.release(session_id)
+            if released:
+                _LOGGER.debug("Editor lock released: session=%s", session_id)
+            else:
+                _LOGGER.debug("Failed to release editor lock: session=%s", session_id)
+        except Exception:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Error releasing editor lock", exc_info=True)
+        finally:
+            self._active_lock_session = None
+
+    def force_release_lock(self) -> None:
+        """Force release the editor lock (for cancellation)."""
+        if self.lock_manager is None:
+            return
+        try:
+            self.lock_manager.force_release()
+            _LOGGER.debug("Editor lock force-released")
+        except Exception:  # pragma: no cover - defensive guard
+            _LOGGER.debug("Error force-releasing editor lock", exc_info=True)
+        finally:
+            self._active_lock_session = None
 
 
 __all__ = ["AITurnCoordinator"]
