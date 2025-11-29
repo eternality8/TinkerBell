@@ -78,7 +78,7 @@ from .window_shell import WindowChrome
 from .widgets import CommandPaletteDialog, DocumentStatusWindow, PaletteCommand, build_palette_commands
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type hints
-    from ..ai.orchestration import AIController
+    from ..ai.orchestration import AIOrchestrator
     from ..ai.memory import DocumentEmbeddingIndex
     from ..ai.memory.plot_state import DocumentPlotStateStore
     from ..ai.memory.character_map import CharacterMapStore
@@ -255,7 +255,7 @@ class MainWindow(QMainWindow):
             index_propagator=lambda: self._embedding_controller.propagate_index_to_worker(),
         )
         self._tool_provider = ToolProvider(
-            controller_resolver=lambda: self._context.ai_controller,
+            controller_resolver=lambda: self._context.ai_orchestrator,
             bridge=self._bridge,
             workspace=self._workspace,
             selection_gateway=self._selection_gateway,
@@ -267,7 +267,7 @@ class MainWindow(QMainWindow):
             status_updater=self._update_lock_status,
         )
         self._ai_turn_coordinator = AITurnCoordinator(
-            controller_resolver=lambda: self._context.ai_controller,
+            controller_resolver=lambda: self._context.ai_orchestrator,
             chat_panel=self._chat_panel,
             review_controller=self._review_controller,
             telemetry_controller=self._telemetry_controller,
@@ -587,16 +587,16 @@ class MainWindow(QMainWindow):
                 dispatcher.set_listener(_WriteToolDispatchListener(self))
 
     def _resolve_plot_state_store(self) -> DocumentPlotStateStore | None:
-        controller = self._context.ai_controller
-        if controller is None:
+        orchestrator = self._context.ai_orchestrator
+        if orchestrator is None:
             return None
-        return getattr(controller, "plot_state_store", None)
+        return getattr(orchestrator, "plot_state_store", None)
 
     def _resolve_character_map_store(self) -> CharacterMapStore | None:
-        controller = self._context.ai_controller
-        if controller is None:
+        orchestrator = self._context.ai_orchestrator
+        if orchestrator is None:
             return None
-        return getattr(controller, "character_map_store", None)
+        return getattr(orchestrator, "character_map_store", None)
 
     def _handle_chat_request(self, prompt: str, metadata: dict[str, Any]) -> None:
         try:
@@ -614,8 +614,8 @@ class MainWindow(QMainWindow):
             snapshot = self._chat_panel.capture_state()
         self._pending_turn_snapshot = snapshot
 
-        controller = self._context.ai_controller
-        if controller is None:
+        orchestrator = self._context.ai_orchestrator
+        if orchestrator is None:
             self._post_assistant_notice(
                 "AI assistant is unavailable. Open Settings to configure your API key and model."
             )
@@ -677,12 +677,12 @@ class MainWindow(QMainWindow):
         self.update_status("Manual command unsupported")
 
     def _handle_manual_analyze_command(self, request: ManualCommandRequest) -> None:
-        controller = self._context.ai_controller
-        if controller is None:
+        orchestrator = self._context.ai_orchestrator
+        if orchestrator is None:
             self._post_assistant_notice("AI assistant is unavailable.")
             self.update_status("Analysis unavailable")
             return
-        enabled_probe = getattr(controller, "analysis_enabled", None)
+        enabled_probe = getattr(orchestrator, "analysis_enabled", None)
         if callable(enabled_probe) and not enabled_probe():
             self._post_assistant_notice("Preflight analysis is disabled. Enable it in Settings > AI to use /analyze.")
             self.update_status("Analysis disabled")
@@ -1097,7 +1097,7 @@ class MainWindow(QMainWindow):
             workspace=self._workspace,
             bridge=self._bridge,
             telemetry=self._telemetry_controller,
-            controller_resolver=lambda: self._context.ai_controller,
+            controller_resolver=lambda: self._context.ai_orchestrator,
             outline_memory_resolver=outline_resolver,
             plot_state_resolver=self._resolve_plot_state_store,
             character_map_resolver=self._resolve_character_map_store,
@@ -1334,13 +1334,13 @@ class MainWindow(QMainWindow):
         return task
 
     def _cancel_active_ai_turn(self) -> None:
-        controller = self._context.ai_controller
-        cancel = getattr(controller, "cancel", None)
+        orchestrator = self._context.ai_orchestrator
+        cancel = getattr(orchestrator, "cancel", None)
         if callable(cancel):
             try:
                 cancel()
             except Exception:  # pragma: no cover - defensive logging
-                _LOGGER.debug("AI controller cancel raised", exc_info=True)
+                _LOGGER.debug("AI orchestrator cancel raised", exc_info=True)
 
         task = self._ai_task
         if task is not None and not task.done():
@@ -1396,8 +1396,8 @@ class MainWindow(QMainWindow):
             self.update_status("Loaded cached suggestions")
             return
 
-        controller = self._context.ai_controller
-        if controller is None:
+        orchestrator = self._context.ai_orchestrator
+        if orchestrator is None:
             self._document_monitor.refresh_chat_suggestions()
             self.update_status("AI suggestions unavailable")
             return
@@ -1445,8 +1445,8 @@ class MainWindow(QMainWindow):
         history: Sequence[ChatMessage],
         request_id: int,
     ) -> None:
-        controller = self._context.ai_controller
-        if controller is None:
+        orchestrator = self._context.ai_orchestrator
+        if orchestrator is None:
             return
 
         payload = serialize_chat_history(history)
@@ -1455,7 +1455,7 @@ class MainWindow(QMainWindow):
 
         suggestions: list[str] = []
         try:
-            suggestions = await controller.suggest_followups(payload, max_suggestions=4)
+            suggestions = await orchestrator.suggest_followups(payload, max_suggestions=4)
         except asyncio.CancelledError:  # pragma: no cover - propagated cancellation
             raise
         except Exception as exc:  # pragma: no cover - defensive logging
@@ -2182,8 +2182,8 @@ class MainWindow(QMainWindow):
     def _build_ai_client_from_settings(self, settings: Settings):
         return self._settings_runtime.build_ai_client_from_settings(settings)
 
-    def _build_ai_controller_from_settings(self, settings: Settings):
-        return self._settings_runtime.build_ai_controller_from_settings(settings)
+    def _build_ai_orchestrator_from_settings(self, settings: Settings):
+        return self._settings_runtime.build_ai_orchestrator_from_settings(settings)
 
     @property
     def _ai_client_signature(self) -> tuple[Any, ...] | None:

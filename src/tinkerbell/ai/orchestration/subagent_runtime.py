@@ -15,7 +15,7 @@ from ..services.context_policy import ContextBudgetPolicy
 from ..agents.subagents import SubagentManager
 
 if TYPE_CHECKING:  # pragma: no cover - typing helpers
-    from .controller import OpenAIToolSpec
+    from .model_types import OpenAIToolSpec
 
 LOGGER = logging.getLogger(__name__)
 

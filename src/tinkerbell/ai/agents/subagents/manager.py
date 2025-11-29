@@ -1,4 +1,4 @@
-"""Subagent sandbox controller used by :class:`AIController`."""
+"""Subagent sandbox controller used by :class:`AIOrchestrator`."""
 
 from __future__ import annotations
 
@@ -284,7 +284,7 @@ class SubagentExecutor:
 
 
 class SubagentManager:
-    """Coordinates job queues and executor wiring for AIController."""
+    """Coordinates job queues and executor wiring for AIOrchestrator."""
 
     def __init__(
         self,

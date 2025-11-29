@@ -1,41 +1,107 @@
 """High-level AI orchestration utilities for the desktop app."""
 
-from .budget_manager import ContextBudgetExceeded
-from .chunk_flow import ChunkContext, ChunkFlowTracker
-from .controller import AIController, OpenAIToolSpec, ToolRegistration
-from .model_types import MessagePlan, ModelTurnResult, ToolCallRequest
-from .runtime_config import AnalysisRuntimeConfig, ChunkingRuntimeConfig
+from .model_types import (
+    MessagePlan,
+    ModelTurnResult,
+    OpenAIToolSpec,
+    ToolCallRequest,
+    ToolRegistration,
+)
 from .subagent_state import SubagentDocumentState
-from .turn_tracking import PlotLoopTracker, SnapshotRefreshTracker
 
-# Phase 2 extractions: static utilities and helpers
-from .controller_utils import (
-    normalize_iterations,
-    normalize_scope_origin,
-    normalize_context_tokens,
-    normalize_response_reserve,
-    normalize_temperature,
-    coerce_optional_int,
-    coerce_optional_float,
-    coerce_optional_str,
-    sanitize_suggestions,
+# New orchestrator facade
+from .orchestrator import (
+    AIOrchestrator,
+    OrchestratorConfig,
+    ChatResult,
+    StreamCallback,
 )
-from .scope_helpers import (
-    scope_summary_from_arguments,
-    scope_fields_from_summary,
-    extract_chunk_id,
-    parse_chunk_bounds,
-)
+
+# Tool call parsing (used by pipeline)
 from .tool_call_parser import (
     parse_embedded_tool_calls,
     normalize_tool_marker_text,
     try_parse_json_block,
 )
-from .guardrail_hints import (
-    format_guardrail_hint,
-    outline_guardrail_hints,
-    retrieval_guardrail_hints,
+
+# =============================================================================
+# New Orchestration Pipeline (Phase 1 Cleanup)
+# =============================================================================
+
+# Core types
+from .types import (
+    TurnInput,
+    TurnOutput,
+    TurnConfig,
+    TurnMetrics,
+    Message,
+    ModelResponse,
+    ParsedToolCall,
+    PreparedTurn,
+    AnalyzedTurn,
+    BudgetEstimate,
+    ToolCallRecord,
 )
+
+# Turn runner
+from .runner import (
+    TurnRunner,
+    RunnerConfig,
+    ContentCallback,
+    ToolCallback,
+    create_runner,
+)
+
+# Tool system
+from .tools import (
+    ToolRegistry,
+    ToolSpec,
+    Tool,
+    SimpleTool,
+    ToolCategory,
+    ToolRegistration as NewToolRegistration,
+    DuplicateToolError,
+    ToolNotFoundError,
+)
+from .tools.executor import (
+    ToolExecutor as NewToolExecutor,
+    ExecutorConfig,
+    ToolExecutionError,
+)
+
+# Pipeline stages (for advanced usage)
+from .pipeline.prepare import (
+    prepare_turn,
+    build_messages,
+    estimate_budget,
+    TokenCounter,
+)
+from .pipeline.analyze import (
+    analyze_turn,
+    generate_hints,
+    AnalysisProvider,
+)
+from .pipeline.execute import (
+    execute_model,
+    parse_response,
+    ModelClient,
+)
+from .pipeline.tools import (
+    execute_tools,
+    append_tool_results,
+    ToolResults,
+    ToolExecutionResult,
+)
+from .pipeline.finish import (
+    finish_turn,
+    finish_turn_with_error,
+    collect_metrics,
+    TurnTimer,
+)
+
+# =============================================================================
+# End New Orchestration Pipeline
+# =============================================================================
 
 # WS4: Editor Lock & Diff Review
 from .editor_lock import (
@@ -106,48 +172,79 @@ from .subagent_prompts import (
 )
 
 __all__ = [
-    "AIController",
-    "ContextBudgetExceeded",
+    # New orchestrator (replaces AIController)
+    "AIOrchestrator",
+    "OrchestratorConfig",
+    "ChatResult",
+    "StreamCallback",
+    # Tool specifications
     "OpenAIToolSpec",
     "ToolRegistration",  # Backwards compatibility alias for OpenAIToolSpec
     # Extracted model types
     "ToolCallRequest",
     "ModelTurnResult",
     "MessagePlan",
-    # Chunk flow tracking
-    "ChunkContext",
-    "ChunkFlowTracker",
-    # Turn tracking
-    "SnapshotRefreshTracker",
-    "PlotLoopTracker",
-    # Runtime configs
-    "ChunkingRuntimeConfig",
-    "AnalysisRuntimeConfig",
     # Subagent state
     "SubagentDocumentState",
-    # Phase 2: Controller utilities
-    "normalize_iterations",
-    "normalize_scope_origin",
-    "normalize_context_tokens",
-    "normalize_response_reserve",
-    "normalize_temperature",
-    "coerce_optional_int",
-    "coerce_optional_float",
-    "coerce_optional_str",
-    "sanitize_suggestions",
-    # Phase 2: Scope helpers
-    "scope_summary_from_arguments",
-    "scope_fields_from_summary",
-    "extract_chunk_id",
-    "parse_chunk_bounds",
-    # Phase 2: Tool call parsing
+    # Tool call parsing
     "parse_embedded_tool_calls",
     "normalize_tool_marker_text",
     "try_parse_json_block",
-    # Phase 2: Guardrail hints
-    "format_guardrail_hint",
-    "outline_guardrail_hints",
-    "retrieval_guardrail_hints",
+    # ==========================================================================
+    # New Orchestration Pipeline (Phase 1 Cleanup)
+    # ==========================================================================
+    # Core types
+    "TurnInput",
+    "TurnOutput",
+    "TurnConfig",
+    "TurnMetrics",
+    "Message",
+    "ModelResponse",
+    "ParsedToolCall",
+    "PreparedTurn",
+    "AnalyzedTurn",
+    "BudgetEstimate",
+    "ToolCallRecord",
+    # Turn runner
+    "TurnRunner",
+    "RunnerConfig",
+    "ContentCallback",
+    "ToolCallback",
+    "create_runner",
+    # Tool system
+    "ToolRegistry",
+    "ToolSpec",
+    "Tool",
+    "SimpleTool",
+    "ToolCategory",
+    "NewToolRegistration",
+    "DuplicateToolError",
+    "ToolNotFoundError",
+    "NewToolExecutor",
+    "ExecutorConfig",
+    "ToolExecutionError",
+    # Pipeline stages
+    "prepare_turn",
+    "build_messages",
+    "estimate_budget",
+    "TokenCounter",
+    "analyze_turn",
+    "generate_hints",
+    "AnalysisProvider",
+    "execute_model",
+    "parse_response",
+    "ModelClient",
+    "execute_tools",
+    "append_tool_results",
+    "ToolResults",
+    "ToolExecutionResult",
+    "finish_turn",
+    "finish_turn_with_error",
+    "collect_metrics",
+    "TurnTimer",
+    # ==========================================================================
+    # End New Orchestration Pipeline
+    # ==========================================================================
     # WS4.1: Editor Lock
     "EditorLockManager",
     "LockSession",

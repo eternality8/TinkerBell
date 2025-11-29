@@ -51,8 +51,8 @@ class SelectionProvider(Protocol):
 
 
 @runtime_checkable
-class AIControllerProvider(Protocol):
-    """Protocol for AI controller access."""
+class AIToolRegistrar(Protocol):
+    """Protocol for tool registration with AI orchestrator."""
 
     def register_tool(
         self,
@@ -123,7 +123,7 @@ class ToolWiringContext:
     """
 
     # Core providers
-    controller: AIControllerProvider | None
+    controller: AIToolRegistrar | None
     bridge: DocumentBridge
     workspace: WorkspaceProvider
     selection_gateway: SelectionProvider | None = None
@@ -493,7 +493,7 @@ __all__ = [
     "DocumentBridge",
     "WorkspaceProvider",
     "SelectionProvider",
-    "AIControllerProvider",
+    "AIToolRegistrar",
     "AIClientProvider",
     # Context
     "ToolWiringContext",

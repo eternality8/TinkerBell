@@ -73,7 +73,7 @@ def _make_window(
     return MainWindow(
         WindowContext(
             settings=resolved_settings,
-            ai_controller=controller,
+            ai_orchestrator=controller,
             unsaved_cache=cache,
             unsaved_cache_store=store,
         )
@@ -1138,6 +1138,7 @@ def test_theme_change_applies_immediately(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_ai_client_reconfigured_on_connection_change(monkeypatch: pytest.MonkeyPatch) -> None:
     controller = _StubAIController()
+    controller.set_config = lambda cfg: None  # Add stub method
     window = _make_window(controller, Settings(api_key="old-key"))
     updated = Settings(api_key="new-key", model="gpt-4.1-mini", base_url="https://example.com/v1")
     new_client = SimpleNamespace(settings=SimpleNamespace(debug_logging=False))
@@ -1155,8 +1156,8 @@ def test_ai_client_reconfigured_on_connection_change(monkeypatch: pytest.MonkeyP
 
 def test_ai_controller_created_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     window = _make_window(controller=None, settings=Settings(api_key="", base_url="https://api", model="gpt-4o-mini"))
-    sentinel_controller = SimpleNamespace(client=SimpleNamespace(settings=SimpleNamespace(debug_logging=False)))
-    monkeypatch.setattr(window._settings_runtime, "build_ai_controller_from_settings", lambda cfg: sentinel_controller)
+    sentinel_orchestrator = SimpleNamespace(client=SimpleNamespace(settings=SimpleNamespace(debug_logging=False)))
+    monkeypatch.setattr(window._settings_runtime, "build_ai_orchestrator_from_settings", lambda cfg: sentinel_orchestrator)
     called: dict[str, bool] = {}
     monkeypatch.setattr(window._settings_runtime, "_register_default_ai_tools", lambda: called.setdefault("wired", True))
     updated = Settings(api_key="live-key", base_url="https://api", model="gpt-4o-mini")
@@ -1168,7 +1169,7 @@ def test_ai_controller_created_when_missing(monkeypatch: pytest.MonkeyPatch) -> 
 
     window._handle_settings_requested()
 
-    assert window._context.ai_controller is sentinel_controller
+    assert window._context.ai_orchestrator is sentinel_orchestrator
     assert called["wired"] is True
 
 
@@ -1185,7 +1186,7 @@ def test_ai_controller_disabled_when_credentials_missing(monkeypatch: pytest.Mon
 
     window._handle_settings_requested()
 
-    assert window._context.ai_controller is None
+    assert window._context.ai_orchestrator is None
     assert window._ai_client_signature is None
 
 

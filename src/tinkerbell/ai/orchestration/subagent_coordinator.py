@@ -22,7 +22,7 @@ from .subagent_state import SubagentDocumentState
 
 if TYPE_CHECKING:
     from .subagent_runtime import SubagentRuntimeManager
-    from .controller import OpenAIToolSpec
+    from .model_types import OpenAIToolSpec
 
 LOGGER = logging.getLogger(__name__)
 

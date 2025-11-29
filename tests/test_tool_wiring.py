@@ -14,7 +14,7 @@ from tinkerbell.ai.tools.tool_wiring import (
     DocumentBridge,
     WorkspaceProvider,
     SelectionProvider,
-    AIControllerProvider,
+    AIToolRegistrar,
     ToolWiringContext,
     ToolRegistrationResult,
     register_new_tools,
@@ -283,10 +283,10 @@ class TestProtocolCompliance:
         workspace = MockWorkspace()
         assert isinstance(workspace, WorkspaceProvider)
 
-    def test_mock_controller_is_ai_controller_provider(self) -> None:
-        """MockController implements AIControllerProvider protocol."""
+    def test_mock_controller_is_ai_tool_registrar(self) -> None:
+        """MockController implements AIToolRegistrar protocol."""
         controller = MockController()
-        assert isinstance(controller, AIControllerProvider)
+        assert isinstance(controller, AIToolRegistrar)
 
 
 # =============================================================================

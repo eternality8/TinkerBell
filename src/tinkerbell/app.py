@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, TextIO, cast, get_args, get_origin, get_type_hints
 
 from .ai.ai_types import SubagentRuntimeConfig
-from .ai.orchestration import AIController
+from .ai.orchestration import AIOrchestrator, OrchestratorConfig
 from .ai.client import AIClient, ClientSettings
 from .ui.main_window import MainWindow, WindowContext
 from .services.settings import (
@@ -172,13 +172,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     _warmup_vector_store()
 
-    ai_controller = _build_ai_controller(settings, debug_logging=debug)
+    ai_orchestrator = _build_ai_orchestrator(settings, debug_logging=debug)
 
     runtime = create_qapp(settings)
     window = MainWindow(
         WindowContext(
             settings=settings,
-            ai_controller=ai_controller,
+            ai_orchestrator=ai_orchestrator,
             settings_store=settings_store,
             unsaved_cache=unsaved_cache,
             unsaved_cache_store=unsaved_cache_store,
@@ -193,7 +193,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         _LOGGER.info("Shutdown requested by user.")
     finally:
         with contextlib.suppress(RuntimeError):
-            loop.run_until_complete(_shutdown_ai_controller(ai_controller))
+            loop.run_until_complete(_shutdown_ai_orchestrator(ai_orchestrator))
         _drain_event_loop(loop)
         loop.close()
 
@@ -311,20 +311,20 @@ def _drain_event_loop(loop: asyncio.AbstractEventLoop) -> None:
         _LOGGER.debug("Unable to drain asyncio loop: %s", exc)
 
 
-async def _shutdown_ai_controller(controller: AIController | None) -> None:
-    """Close the AI controller to release background network resources."""
+async def _shutdown_ai_orchestrator(orchestrator: AIOrchestrator | None) -> None:
+    """Close the AI orchestrator to release background network resources."""
 
-    if controller is None:
+    if orchestrator is None:
         return
 
-    close = getattr(controller, "aclose", None)
+    close = getattr(orchestrator, "aclose", None)
     if close is None:
         return
 
     try:
         await close()
     except Exception as exc:  # pragma: no cover - defensive logging
-        _LOGGER.debug("AI controller shutdown failed: %s", exc)
+        _LOGGER.debug("AI orchestrator shutdown failed: %s", exc)
 
 
 def _install_qt_message_handler() -> None:
@@ -370,8 +370,8 @@ def _warmup_vector_store() -> None:
         _LOGGER.debug("FAISS import succeeded.")
 
 
-def _build_ai_controller(settings: Settings, *, debug_logging: bool = False) -> AIController | None:
-    """Construct the AI controller using the current settings, if possible."""
+def _build_ai_orchestrator(settings: Settings, *, debug_logging: bool = False) -> AIOrchestrator | None:
+    """Construct the AI orchestrator using the current settings, if possible."""
 
     try:
         client_settings = ClientSettings(
@@ -389,34 +389,22 @@ def _build_ai_controller(settings: Settings, *, debug_logging: bool = False) -> 
         )
         client = AIClient(client_settings)
     except Exception as exc:  # pragma: no cover - dependency/config errors
-        _LOGGER.warning("AI controller unavailable: %s", exc)
+        _LOGGER.warning("AI orchestrator unavailable: %s", exc)
         return None
 
     limit = _resolve_max_tool_iterations(settings)
     context_tokens = getattr(settings, "max_context_tokens", 128_000)
     response_reserve = getattr(settings, "response_token_reserve", 16_000)
-    debug_settings = getattr(settings, "debug", None)
-    telemetry_enabled = bool(getattr(debug_settings, "token_logging_enabled", False))
-    telemetry_limit = getattr(debug_settings, "token_log_limit", 200)
-    try:
-        telemetry_limit = int(telemetry_limit)
-    except (TypeError, ValueError):
-        telemetry_limit = 200
-    subagent_config = SubagentRuntimeConfig(
-        enabled=bool(getattr(settings, "enable_subagents", False)),
-        plot_scaffolding_enabled=bool(getattr(settings, "enable_plot_scaffolding", False)),
-    )
-    return AIController(
-        client=client,
-        max_tool_iterations=limit,
+    
+    config = OrchestratorConfig(
+        max_iterations=limit,
         max_context_tokens=context_tokens,
         response_token_reserve=response_reserve,
         temperature=getattr(settings, "temperature", 0.2),
-        telemetry_enabled=telemetry_enabled,
-        telemetry_limit=telemetry_limit,
-        subagent_config=subagent_config,
-        debug_event_logging=bool(getattr(settings, "debug_event_logging", False)),
+        streaming_enabled=True,
     )
+    
+    return AIOrchestrator(client=client, config=config)
 
 
 def _resolve_max_tool_iterations(settings: Settings | None) -> int:

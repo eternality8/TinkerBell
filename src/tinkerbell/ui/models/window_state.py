@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - imports for type checking only
-    from ...ai.orchestration import AIController
+    from ...ai.orchestration import AIOrchestrator
     from ...services.settings import Settings, SettingsStore
     from ...services.unsaved_cache import UnsavedCache, UnsavedCacheStore
 
@@ -16,7 +16,7 @@ class WindowContext:
     """Shared context passed to the main window when constructing the UI."""
 
     settings: Optional[Settings] = None
-    ai_controller: Optional[AIController] = None
+    ai_orchestrator: Optional[AIOrchestrator] = None
     settings_store: Optional[SettingsStore] = None
     unsaved_cache: Optional[UnsavedCache] = None
     unsaved_cache_store: Optional[UnsavedCacheStore] = None

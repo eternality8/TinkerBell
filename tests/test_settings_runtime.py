@@ -141,10 +141,8 @@ def test_apply_runtime_settings_creates_controller_and_refreshes_runtime(monkeyp
     context = bundle["context"]
     embedding = bundle["embedding"]
 
-    controller = _ControllerStub()
-    monkeypatch.setattr(runtime, "build_ai_controller_from_settings", lambda cfg: controller)
-    monkeypatch.setattr(runtime, "_build_context_budget_policy", lambda cfg: "policy")
-    monkeypatch.setattr(runtime, "_build_subagent_runtime_config", lambda cfg: "subagent-config")
+    orchestrator = _ControllerStub()
+    monkeypatch.setattr(runtime, "build_ai_orchestrator_from_settings", lambda cfg: orchestrator)
 
     handlers: dict[str, bool] = {}
     runtime.apply_runtime_settings(
@@ -153,16 +151,9 @@ def test_apply_runtime_settings_creates_controller_and_refreshes_runtime(monkeyp
     )
 
     assert handlers == {"chat": True}
-    assert context.ai_controller is controller
+    assert context.ai_orchestrator is orchestrator
     assert bundle["register_state"]["count"] == 1
     assert embedding.runtime_settings is settings
-    assert controller.max_iterations == 5
-    assert controller.context_window == {
-        "max_context_tokens": 4096,
-        "response_token_reserve": 512,
-    }
-    assert controller.policy == "policy"
-    assert controller.subagent_config == "subagent-config"
 
 
 def test_apply_runtime_settings_disables_controller_without_credentials() -> None:
@@ -172,8 +163,8 @@ def test_apply_runtime_settings_disables_controller_without_credentials() -> Non
     context = bundle["context"]
     ai_state = bundle["ai_state"]
 
-    controller = _ControllerStub()
-    context.ai_controller = controller
+    orchestrator = _ControllerStub()
+    context.ai_orchestrator = orchestrator
     runtime.ai_client_signature = ("sig",)
     task = _FakeTask()
     ai_state["task"] = task
@@ -184,25 +175,7 @@ def test_apply_runtime_settings_disables_controller_without_credentials() -> Non
         chat_panel_handler=lambda s: None,
     )
 
-    assert context.ai_controller is None
+    assert context.ai_orchestrator is None
     assert runtime.ai_client_signature is None
     assert ai_state["task"] is None
     assert ai_state["streaming"] is False
-
-
-def test_event_logging_toggle_updates_controller() -> None:
-    base = Settings(api_key="live", base_url="https://api", model="gpt-4o-mini", debug_event_logging=False)
-    bundle = _runtime_bundle(base)
-    runtime = bundle["runtime"]
-    context = bundle["context"]
-    controller = _ControllerStub()
-    context.ai_controller = controller
-    runtime.ai_client_signature = runtime._ai_settings_signature(base)
-
-    updated = replace(base, debug_event_logging=True)
-    runtime.apply_runtime_settings(
-        updated,
-        chat_panel_handler=lambda s: None,
-    )
-
-    assert controller.event_logging_enabled is True

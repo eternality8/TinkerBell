@@ -24,7 +24,7 @@ def _stub_ai_client(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(app, "AIClient", _StubAIClient)
 
 
-def test_build_ai_controller_uses_settings_iteration_limit() -> None:
+def test_build_ai_orchestrator_uses_settings_iteration_limit() -> None:
     settings = Settings(
         base_url="https://api.example.com/v1",
         api_key="test-key",
@@ -32,14 +32,13 @@ def test_build_ai_controller_uses_settings_iteration_limit() -> None:
         max_tool_iterations=25,
     )
 
-    controller = app._build_ai_controller(settings)
+    orchestrator = app._build_ai_orchestrator(settings)
 
-    assert controller is not None
-    assert controller.max_tool_iterations == 25
-    assert controller.graph["metadata"]["max_iterations"] == 25
+    assert orchestrator is not None
+    assert orchestrator.config.max_iterations == 25
 
 
-def test_build_ai_controller_clamps_iteration_limit() -> None:
+def test_build_ai_orchestrator_clamps_iteration_limit() -> None:
     settings = Settings(
         base_url="https://api.example.com/v1",
         api_key="test-key",
@@ -47,10 +46,10 @@ def test_build_ai_controller_clamps_iteration_limit() -> None:
         max_tool_iterations=0,
     )
 
-    controller = app._build_ai_controller(settings)
+    orchestrator = app._build_ai_orchestrator(settings)
 
-    assert controller is not None
-    assert controller.max_tool_iterations == 1
+    assert orchestrator is not None
+    assert orchestrator.config.max_iterations == 1
 
     high_settings = Settings(
         base_url="https://api.example.com/v1",
@@ -59,10 +58,10 @@ def test_build_ai_controller_clamps_iteration_limit() -> None:
         max_tool_iterations=500,
     )
 
-    high_controller = app._build_ai_controller(high_settings)
+    high_orchestrator = app._build_ai_orchestrator(high_settings)
 
-    assert high_controller is not None
-    assert high_controller.max_tool_iterations == 200
+    assert high_orchestrator is not None
+    assert high_orchestrator.config.max_iterations == 200
 
 
 def test_drain_event_loop_cancels_pending_tasks() -> None:
@@ -122,29 +121,29 @@ def test_drain_event_loop_skips_current_task(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.asyncio
-async def test_shutdown_ai_controller_closes_controller() -> None:
-    class _StubController:
+async def test_shutdown_ai_orchestrator_closes_orchestrator() -> None:
+    class _StubOrchestrator:
         def __init__(self) -> None:
             self.closed = False
 
         async def aclose(self) -> None:
             self.closed = True
 
-    controller = _StubController()
+    orchestrator = _StubOrchestrator()
 
-    await app._shutdown_ai_controller(cast(app.AIController, controller))
+    await app._shutdown_ai_orchestrator(cast(app.AIOrchestrator, orchestrator))
 
-    assert controller.closed is True
+    assert orchestrator.closed is True
 
 
 @pytest.mark.asyncio
-async def test_shutdown_ai_controller_ignores_missing_method() -> None:
-    class _StubController:
+async def test_shutdown_ai_orchestrator_ignores_missing_method() -> None:
+    class _StubOrchestrator:
         pass
 
-    controller = _StubController()
+    orchestrator = _StubOrchestrator()
 
-    await app._shutdown_ai_controller(cast(app.AIController, controller))
+    await app._shutdown_ai_orchestrator(cast(app.AIOrchestrator, orchestrator))
 
 
 def test_coerce_cli_overrides_casts_types() -> None:

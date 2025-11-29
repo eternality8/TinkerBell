@@ -47,10 +47,10 @@ class TelemetryController:
         self._last_compaction_stats = dict(stats) if isinstance(stats, Mapping) else None
 
     def refresh_context_usage_status(self) -> None:
-        controller = getattr(self._context, "ai_controller", None)
+        orchestrator = getattr(self._context, "ai_orchestrator", None)
         settings = getattr(self._context, "settings", None)
         status_bar = self._status_bar
-        if controller is None or settings is None or status_bar is None:
+        if orchestrator is None or settings is None or status_bar is None:
             return
         debug_settings = getattr(settings, "debug", None)
         if not getattr(debug_settings, "token_logging_enabled", False):
@@ -60,7 +60,7 @@ class TelemetryController:
             limit_value = max(1, int(limit))
         except (TypeError, ValueError):
             limit_value = 1
-        events = controller.get_recent_context_events(limit=limit_value)
+        events = orchestrator.get_recent_context_events(limit=limit_value)
         dashboard = telemetry_service.build_usage_dashboard(events)
         if dashboard is None:
             return
@@ -75,7 +75,7 @@ class TelemetryController:
                     stats_bits = f"{stats_bits} (saved {tokens_saved:,})"
                 summary_text = f"{summary_text} · {stats_bits}" if summary_text else stats_bits
         budget_snapshot = None
-        getter = getattr(controller, "get_budget_status", None)
+        getter = getattr(orchestrator, "get_budget_status", None)
         if callable(getter):
             budget_snapshot = getter()
         if isinstance(budget_snapshot, Mapping):
@@ -159,11 +159,11 @@ class TelemetryController:
         self._set_chunk_flow_indicator(None)
 
     def refresh_analysis_state(self, document_id: str | None, *, document_label: str | None = None) -> None:
-        controller = getattr(self._context, "ai_controller", None)
-        if controller is None or not document_id:
+        orchestrator = getattr(self._context, "ai_orchestrator", None)
+        if orchestrator is None or not document_id:
             self._set_analysis_indicator(None)
             return
-        getter = getattr(controller, "get_latest_analysis_advice", None)
+        getter = getattr(orchestrator, "get_latest_analysis_advice", None)
         if not callable(getter):
             self._set_analysis_indicator(None)
             return
