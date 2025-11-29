@@ -14,9 +14,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence, TYPE_CHECKING
 
 from ..tools.base import BaseTool, ReadOnlyTool, WriteTool, ToolContext, ToolResult
+
+if TYPE_CHECKING:
+    from .turn_context import TurnContext
 from ..tools.errors import (
     ErrorCode,
     ToolError,
@@ -173,6 +176,46 @@ class ToolDispatcher:
         self._transaction_manager = transaction_manager
         self._lock_manager = lock_manager
         self._listener = listener
+        self._turn_context: TurnContext | None = None
+
+    # ------------------------------------------------------------------
+    # Turn Context Management
+    # ------------------------------------------------------------------
+
+    def set_turn_context(self, turn_context: "TurnContext | None") -> None:
+        """Set the turn context for subsequent dispatches.
+        
+        The turn context captures state (like the active tab ID) at the
+        start of an AI turn. This pinned state is used as the default for
+        tools that don't explicitly specify a tab_id, preventing race
+        conditions if the user switches tabs during the turn.
+        
+        Args:
+            turn_context: The turn context to use, or None to clear.
+        """
+        self._turn_context = turn_context
+        if turn_context:
+            LOGGER.debug(
+                "Turn context set: turn_id=%s, pinned_tab_id=%s",
+                turn_context.turn_id,
+                turn_context.pinned_tab_id,
+            )
+        else:
+            LOGGER.debug("Turn context cleared")
+
+    def clear_turn_context(self) -> None:
+        """Clear the current turn context.
+        
+        Should be called at the end of an AI turn to prevent stale context
+        from affecting subsequent operations.
+        """
+        self._turn_context = None
+        LOGGER.debug("Turn context cleared")
+
+    @property
+    def turn_context(self) -> "TurnContext | None":
+        """Return the current turn context, if any."""
+        return self._turn_context
 
     def set_listener(self, listener: DispatchListener | None) -> None:
         """Set or replace the dispatch event listener.
@@ -440,11 +483,34 @@ class ToolDispatcher:
     def _build_context(self, arguments: Mapping[str, Any]) -> ToolContext | None:
         """Build tool context from arguments and provider.
         
+        Tab ID resolution priority:
+        1. Explicit tab_id in arguments (tool explicitly targets a tab)
+        2. Pinned tab_id from turn context (captured at turn start)
+        3. Current active tab from provider (fallback, may race)
+        
         Returns None if no document provider is available.
         """
+        # Priority 1: explicit tab_id in arguments
         tab_id = self._extract_tab_id(arguments)
+        
+        # Priority 2: pinned tab_id from turn context
+        if not tab_id and self._turn_context:
+            tab_id = self._turn_context.pinned_tab_id
+            if tab_id:
+                LOGGER.debug(
+                    "Using pinned tab_id from turn context: %s (turn_id=%s)",
+                    tab_id,
+                    self._turn_context.turn_id,
+                )
+        
+        # Priority 3: current active tab (fallback)
         if not tab_id and self._context_provider:
             tab_id = self._get_active_tab_from_provider()
+            if tab_id and self._turn_context:
+                LOGGER.warning(
+                    "Falling back to active tab %s (turn context has no pinned tab)",
+                    tab_id,
+                )
 
         # Need a document provider for ToolContext
         doc_provider = self._create_document_provider()

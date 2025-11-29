@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import itertools
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Protocol
 
 from .document_model import DocumentMetadata, DocumentState
+
+LOGGER = logging.getLogger(__name__)
 from .editor_widget import EditorWidget
 from ..services.bridge import DocumentBridge
 
@@ -113,6 +116,7 @@ class DocumentWorkspace:
         untitled_index: int | None = None,
     ) -> DocumentTab:
         """Create a new tab wrapping its own editor + bridge."""
+        import traceback
 
         editor = self._editor_factory()
         resolved_path = _normalize_path(path)
@@ -121,7 +125,7 @@ class DocumentWorkspace:
             doc.metadata.path = resolved_path
         editor.load_document(doc)
         bridge = self._bridge_factory(editor)
-        tab_id = tab_id or _generate_tab_id()
+        resolved_tab_id = tab_id or _generate_tab_id()
         untitled_idx: int | None = None
         if doc.metadata.path is None:
             if untitled_index is not None:
@@ -129,8 +133,15 @@ class DocumentWorkspace:
                 self._observe_untitled_index(untitled_idx)
             else:
                 untitled_idx = self._reserve_untitled_index()
+        LOGGER.debug(
+            "create_tab: id=%s, path=%s, title=%s, untitled_index=%s",
+            resolved_tab_id,
+            resolved_path,
+            title,
+            untitled_idx,
+        )
         tab = DocumentTab(
-            id=tab_id,
+            id=resolved_tab_id,
             editor=editor,
             bridge=bridge,
             untitled_index=untitled_idx,
@@ -138,14 +149,14 @@ class DocumentWorkspace:
         set_tab_context = getattr(bridge, "set_tab_context", None)
         if callable(set_tab_context):
             try:
-                set_tab_context(tab_id=tab_id)
+                set_tab_context(tab_id=resolved_tab_id)
             except Exception:  # pragma: no cover - best-effort telemetry metadata
                 pass
         tab.update_title(title or "Untitled")
-        self._tabs[tab_id] = tab
-        self._order.append(tab_id)
+        self._tabs[resolved_tab_id] = tab
+        self._order.append(resolved_tab_id)
         if make_active or self._active_tab_id is None:
-            self.set_active_tab(tab_id)
+            self.set_active_tab(resolved_tab_id)
         return tab
 
     def close_tab(self, tab_id: str) -> DocumentTab:
@@ -154,6 +165,12 @@ class DocumentWorkspace:
         if tab_id not in self._tabs:
             raise KeyError(f"Unknown tab_id: {tab_id}")
         tab = self._tabs.pop(tab_id)
+        LOGGER.debug(
+            "close_tab: removed %s (title=%s), remaining tabs: %s",
+            tab_id,
+            tab.title,
+            list(self._tabs.keys()),
+        )
         try:
             index = self._order.index(tab_id)
         except ValueError:  # pragma: no cover - defensive, should not happen
@@ -225,8 +242,10 @@ class DocumentWorkspace:
         return tab
 
     def iter_tabs(self) -> Iterator[DocumentTab]:
-        for tab_id in self._order:
-            yield self._tabs[tab_id]
+        for tab_id in list(self._order):
+            tab = self._tabs.get(tab_id)
+            if tab is not None:
+                yield tab
 
     def tab_ids(self) -> Iterable[str]:
         return tuple(self._order)

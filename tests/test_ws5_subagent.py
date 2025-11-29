@@ -856,22 +856,40 @@ class TestTransformDocumentTool:
             tool.validate({"transformation_type": "style_rewrite"})
 
     def test_validate_tense_change(self):
-        """tense_change requires from and to tense."""
+        """tense_change requires target_tense or from/to tense."""
         tool = TransformDocumentTool()
+        # Missing all tense params should fail
         with pytest.raises(ContentRequiredError):
-            tool.validate({
-                "transformation_type": "tense_change",
-                "from_tense": "past",
-            })
+            tool.validate({"transformation_type": "tense_change"})
+        # target_tense alone is valid (simpler API)
+        tool.validate({
+            "transformation_type": "tense_change",
+            "target_tense": "present",
+        })
+        # from_tense + to_tense is also valid (explicit API)
+        tool.validate({
+            "transformation_type": "tense_change",
+            "from_tense": "past",
+            "to_tense": "present",
+        })
 
     def test_validate_pov_change(self):
-        """pov_change requires from and to POV."""
+        """pov_change requires target_pov or from/to POV."""
         tool = TransformDocumentTool()
+        # Missing all POV params should fail
         with pytest.raises(ContentRequiredError):
-            tool.validate({
-                "transformation_type": "pov_change",
-                "from_pov": "first",
-            })
+            tool.validate({"transformation_type": "pov_change"})
+        # target_pov alone is valid (simpler API)
+        tool.validate({
+            "transformation_type": "pov_change",
+            "target_pov": "first",
+        })
+        # from_pov + to_pov is also valid (explicit API)
+        tool.validate({
+            "transformation_type": "pov_change",
+            "from_pov": "third",
+            "to_pov": "first",
+        })
 
     def test_validate_custom_requires_prompt(self):
         """custom requires custom_prompt."""

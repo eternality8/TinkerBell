@@ -401,17 +401,23 @@ class TransformDocumentTool(SubagentTool):
                 )
 
         elif transform_type == "tense_change":
-            if not params.get("from_tense") or not params.get("to_tense"):
+            # Accept either target_tense (simpler) or from_tense/to_tense (explicit)
+            has_target = bool(params.get("target_tense"))
+            has_from_to = bool(params.get("from_tense") and params.get("to_tense"))
+            if not has_target and not has_from_to:
                 raise ContentRequiredError(
-                    message="from_tense and to_tense are required for tense_change",
-                    field_name="from_tense/to_tense",
+                    message="target_tense (or from_tense and to_tense) is required for tense_change",
+                    field_name="target_tense",
                 )
 
         elif transform_type == "pov_change":
-            if not params.get("from_pov") or not params.get("to_pov"):
+            # Accept either target_pov (simpler) or from_pov/to_pov (explicit)
+            has_target = bool(params.get("target_pov"))
+            has_from_to = bool(params.get("from_pov") and params.get("to_pov"))
+            if not has_target and not has_from_to:
                 raise ContentRequiredError(
-                    message="from_pov and to_pov are required for pov_change",
-                    field_name="from_pov/to_pov",
+                    message="target_pov (or from_pov and to_pov) is required for pov_change",
+                    field_name="target_pov",
                 )
 
         elif transform_type == "custom":
@@ -760,15 +766,27 @@ class TransformDocumentTool(SubagentTool):
             }
 
         elif transform_type == TransformationType.TENSE_CHANGE:
+            # Support both target_tense (infer from) and explicit from_tense/to_tense
+            to_tense = params.get("to_tense") or params.get("target_tense", "")
+            from_tense = params.get("from_tense", "")
+            # If only target_tense provided, infer the opposite as from_tense
+            if not from_tense and to_tense:
+                from_tense = "present" if to_tense == "past" else "past"
             format_args = {
-                "from_tense": params.get("from_tense", ""),
-                "to_tense": params.get("to_tense", ""),
+                "from_tense": from_tense,
+                "to_tense": to_tense,
             }
 
         elif transform_type == TransformationType.POV_CHANGE:
+            # Support both target_pov (infer from) and explicit from_pov/to_pov
+            to_pov = params.get("to_pov") or params.get("target_pov", "")
+            from_pov = params.get("from_pov", "")
+            # If only target_pov provided, use "unknown" as from_pov (AI will detect)
+            if not from_pov and to_pov:
+                from_pov = "current"
             format_args = {
-                "from_pov": params.get("from_pov", ""),
-                "to_pov": params.get("to_pov", ""),
+                "from_pov": from_pov,
+                "to_pov": to_pov,
                 "focal_character": params.get("focal_character", "the protagonist"),
             }
 

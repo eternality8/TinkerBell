@@ -466,6 +466,22 @@ class TestTransformationPrompts:
         assert "first" in prompt
         assert "Alice" in prompt
     
+    def test_tense_change_prompt_with_target(self):
+        """Tense change prompt works with target_tense only."""
+        params = {"target_tense": "present"}
+        prompt = get_transform_prompt("tense_change", params)
+        # Should infer from_tense as "past" when target is "present"
+        assert "past" in prompt
+        assert "present" in prompt
+    
+    def test_pov_change_prompt_with_target(self):
+        """POV change prompt works with target_pov only."""
+        params = {"target_pov": "first"}
+        prompt = get_transform_prompt("pov_change", params)
+        # Should use "current" as placeholder for from_pov
+        assert "current" in prompt
+        assert "first" in prompt
+
     def test_character_rename_prompt(self):
         """Character rename prompt includes parameters."""
         params = {"old_name": "Alice", "new_name": "Dorothy", "aliases": ["girl"]}

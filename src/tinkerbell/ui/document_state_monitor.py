@@ -200,6 +200,8 @@ class DocumentStateMonitor:
         *,
         state: DocumentState | None = None,
     ) -> None:
+        if state is None and self.workspace.active_tab is None:
+            return
         document = state or self.editor.to_document()
         suggestions = self._build_chat_suggestions(document)
         self.chat_panel.set_suggestions(suggestions)

@@ -57,6 +57,7 @@ from .event_log import ChatEventLogger
 from .subagent_runtime import SubagentRuntimeManager
 from .telemetry_manager import TelemetryManager
 from .tool_dispatcher import ToolDispatcher, DispatchResult, ToolContextProvider
+from .turn_context import TurnContext
 
 # Normalizes stylized glyphs inside <|tool ...|> markers emitted by some models.
 _TOOL_MARKER_TRANSLATION = str.maketrans(
@@ -1464,6 +1465,17 @@ class AIController:
         async def _runner() -> dict:
             if self._trace_compactor is not None:
                 self._trace_compactor.reset()
+            
+            # Create and set turn context to pin tab_id for this turn
+            turn_context = TurnContext.from_snapshot(snapshot)
+            if self._tool_dispatcher is not None:
+                self._tool_dispatcher.set_turn_context(turn_context)
+                LOGGER.debug(
+                    "Turn context created: turn_id=%s, pinned_tab_id=%s",
+                    turn_context.turn_id,
+                    turn_context.pinned_tab_id,
+                )
+            
             chunk_tracker = _ChunkFlowTracker(document_id=self._resolve_document_id(snapshot))
             self._chunk_flow_tracker = chunk_tracker
             refresh_tracker: _SnapshotRefreshTracker | None = None
@@ -1762,6 +1774,9 @@ class AIController:
                 log_context.__exit__(exc.__class__, exc, exc.__traceback__)
                 raise
             finally:
+                # Clear turn context to prevent stale pinned tab_id
+                if self._tool_dispatcher is not None:
+                    self._tool_dispatcher.clear_turn_context()
                 if self._chunk_flow_tracker is chunk_tracker:
                     self._chunk_flow_tracker = None
                 if self._snapshot_refresh_tracker is refresh_tracker:

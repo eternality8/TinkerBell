@@ -318,12 +318,24 @@ def get_transform_prompt(
         format_args["cultural_details"] = params.get("cultural_details", "Adapt as appropriate")
         
     elif transform_type == "tense_change":
-        format_args["from_tense"] = params.get("from_tense", "")
-        format_args["to_tense"] = params.get("to_tense", "")
+        # Support both target_tense (simpler) and explicit from_tense/to_tense
+        to_tense = params.get("to_tense") or params.get("target_tense", "")
+        from_tense = params.get("from_tense", "")
+        # If only target_tense provided, infer the opposite as from_tense
+        if not from_tense and to_tense:
+            from_tense = "present" if to_tense == "past" else "past"
+        format_args["from_tense"] = from_tense
+        format_args["to_tense"] = to_tense
         
     elif transform_type == "pov_change":
-        format_args["from_pov"] = params.get("from_pov", "")
-        format_args["to_pov"] = params.get("to_pov", "")
+        # Support both target_pov (simpler) and explicit from_pov/to_pov
+        to_pov = params.get("to_pov") or params.get("target_pov", "")
+        from_pov = params.get("from_pov", "")
+        # If only target_pov provided, use "current" as placeholder
+        if not from_pov and to_pov:
+            from_pov = "current"
+        format_args["from_pov"] = from_pov
+        format_args["to_pov"] = to_pov
         format_args["focal_character"] = params.get("focal_character", "the protagonist")
         
     elif transform_type == "character_rename":

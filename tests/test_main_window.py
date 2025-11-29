@@ -56,6 +56,19 @@ def _make_window(
     if controller is not None and not (resolved_settings.api_key or "").strip():
         resolved_settings.api_key = "test-key"
     cache = unsaved_cache or UnsavedCache()
+    # Add a default tab for tests unless they're explicitly testing fallback behavior.
+    # Fallback behavior is triggered by last_open_file, unsaved_snapshot, or
+    # untitled_snapshots, so only add default tabs when none of these are set.
+    if (
+        resolved_settings.open_tabs is None
+        and not resolved_settings.last_open_file
+        and cache.unsaved_snapshot is None
+        and not cache.untitled_snapshots
+    ):
+        resolved_settings.open_tabs = [
+            {"tab_id": "t1", "title": "Untitled", "dirty": False, "language": "markdown"}
+        ]
+        resolved_settings.active_tab_id = "t1"
     store = unsaved_cache_store or _StubUnsavedCacheStore()
     return MainWindow(
         WindowContext(

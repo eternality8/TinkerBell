@@ -199,7 +199,7 @@ class MainWindow(QMainWindow):
         self._outline_generation_enabled = bool(getattr(initial_settings, "enable_outline_generation", False))
         self._plot_scaffolding_enabled = bool(getattr(initial_settings, "enable_plot_scaffolding", False))
         show_tool_panel = bool(getattr(initial_settings, "show_tool_activity_panel", False))
-        self._editor = TabbedEditorWidget()
+        self._editor = TabbedEditorWidget(skip_default_tab=True)
         self._editor.set_tab_close_handler(self._handle_tab_close_request)
         self._workspace = self._editor.workspace
         self._chat_panel = ChatPanel(show_tool_activity_panel=show_tool_panel)
@@ -334,6 +334,7 @@ class MainWindow(QMainWindow):
             bridge=self._bridge,
             workspace=self._workspace,
             selection_gateway=self._selection_gateway,
+            editor=self._editor,  # For Qt-aware tab creation
         )
         # Initialize editor lock manager for AI turn coordination
         self._editor_lock_manager = EditorLockManager(
@@ -482,7 +483,8 @@ class MainWindow(QMainWindow):
 
         self.update_status("Ready")
         self._document_session.restore_last_session_document()
-        self._document_monitor.update_autosave_indicator(document=self._editor.to_document())
+        if self._workspace.active_tab is not None:
+            self._document_monitor.update_autosave_indicator(document=self._editor.to_document())
         self._refresh_document_status_badge()
 
     def _action_callbacks(self) -> Dict[str, Callable[[], Any]]:
@@ -2056,6 +2058,14 @@ class MainWindow(QMainWindow):
             closed = self._editor.close_tab(tab_id)
         except KeyError:
             return False
+
+        # Handle orphaned tabs (existed in Qt widget but not in workspace)
+        if closed is None:
+            # Still sync workspace state to persist the current tabs
+            self._document_session.sync_workspace_state()
+            self.update_status(f"Closed orphaned tab {tab_id}")
+            return True
+
         self._review_controller.mark_pending_session_orphaned(closed.id, reason="tab-closed")
         document = closed.document()
         self._document_monitor.clear_unsaved_snapshot(path=document.metadata.path, tab_id=closed.id)
@@ -2149,7 +2159,9 @@ class MainWindow(QMainWindow):
             plot_scaffolding_handler=self._apply_plot_scaffolding_setting,
             safe_edit_handler=self._apply_safe_edit_settings,
         )
-        self._document_session.persist_settings(result.settings)
+        # Sync workspace state to ensure open_tabs reflects current tabs
+        # (the dialog may have been open while tabs were closed)
+        self._document_session.sync_workspace_state()
         self.update_status("Settings updated")
 
     # ------------------------------------------------------------------
@@ -2464,6 +2476,10 @@ class MainWindow(QMainWindow):
 
     def _refresh_window_title(self, state: Optional[DocumentState] = None) -> None:
         """Construct a descriptive window title for the active document."""
+
+        if state is None and self._workspace.active_tab is None:
+            self.setWindowTitle(self._WINDOW_BASE_TITLE)
+            return
 
         document = state or self._editor.to_document()
         candidate_path: Optional[Path]

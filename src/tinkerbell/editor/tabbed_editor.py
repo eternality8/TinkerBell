@@ -39,7 +39,12 @@ SelectionChangeListener = Callable[[str, SelectionRange, int, int], None]
 class TabbedEditorWidget(QWidgetBase):
     """Container widget that wraps a :class:`DocumentWorkspace` with UI tabs."""
 
-    def __init__(self, *, workspace: DocumentWorkspace | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        workspace: DocumentWorkspace | None = None,
+        skip_default_tab: bool = False,
+    ) -> None:
         super().__init__()
         self._snapshot_listeners: list[SnapshotListener] = []
         self._text_listeners: list[TextChangeListener] = []
@@ -60,7 +65,7 @@ class TabbedEditorWidget(QWidgetBase):
 
         self._build_ui()
         existing_tabs = list(self._workspace.iter_tabs())
-        if not existing_tabs:
+        if not existing_tabs and not skip_default_tab:
             tab = self._workspace.create_tab()
             existing_tabs = [tab]
         for tab in existing_tabs:
@@ -184,12 +189,38 @@ class TabbedEditorWidget(QWidgetBase):
         self._register_tab(tab)
         return tab
 
-    def close_tab(self, tab_id: str) -> DocumentTab:
-        tab = self._workspace.get_tab(tab_id)
+    def close_tab(self, tab_id: str) -> DocumentTab | None:
+        # Try to get tab from workspace - it may not exist if there's state inconsistency
+        try:
+            tab = self._workspace.get_tab(tab_id)
+        except KeyError:
+            # Tab not in workspace but may exist in Qt widget - clean up orphaned Qt tab
+            self._remove_orphaned_qt_tab(tab_id)
+            return None
+
         self._remove_tab_widget(tab)
         closed = self._workspace.close_tab(tab_id)
         self._editor_lookup.pop(id(tab.editor), None)
         return closed
+
+    def _remove_orphaned_qt_tab(self, tab_id: str) -> None:
+        """Remove a Qt tab that has no corresponding workspace entry."""
+        if self._tab_widget is None:
+            return
+        # Find the editor by tab_id in our lookup (reverse lookup)
+        editor_id = None
+        for eid, tid in list(self._editor_lookup.items()):
+            if tid == tab_id:
+                editor_id = eid
+                break
+        if editor_id is not None:
+            self._editor_lookup.pop(editor_id, None)
+        # Try to find and remove the tab from Qt widget
+        for i in range(self._tab_widget.count()):
+            widget = self._tab_widget.widget(i)
+            if widget is not None and self._tab_id_for_editor(widget) == tab_id:
+                self._tab_widget.removeTab(i)
+                break
 
     def close_active_tab(self) -> DocumentTab:
         return self.close_tab(self._workspace.require_active_tab().id)

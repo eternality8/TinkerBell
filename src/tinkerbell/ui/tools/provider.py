@@ -31,10 +31,14 @@ class _AIClientProviderAdapter:
 
 
 class _DocumentCreatorAdapter:
-    """Adapter that implements DocumentCreator protocol using workspace."""
+    """Adapter that implements DocumentCreator protocol using editor/workspace.
     
-    def __init__(self, workspace: Any) -> None:
-        self._workspace = workspace
+    This adapter can work with either a TabbedEditorWidget (preferred, for full
+    Qt UI integration) or a DocumentWorkspace (for tests without Qt).
+    """
+    
+    def __init__(self, editor_or_workspace: Any) -> None:
+        self._editor_or_workspace = editor_or_workspace
     
     def create_document(
         self,
@@ -51,13 +55,16 @@ class _DocumentCreatorAdapter:
             metadata=DocumentMetadata(path=None, language=file_type or "markdown"),
         )
         
-        # Create the tab in the workspace
-        tab = self._workspace.create_tab(document=doc, title=title, make_active=True)
+        # Create the tab using create_tab() - works for both
+        # TabbedEditorWidget and DocumentWorkspace
+        tab = self._editor_or_workspace.create_tab(document=doc, title=title, make_active=True)
         return tab.id
     
     def document_exists(self, title: str) -> tuple[bool, str | None]:
         """Check if a document with the given title already exists."""
-        for tab in self._workspace.iter_tabs():
+        # Get workspace for iteration - either directly or via .workspace property
+        workspace = getattr(self._editor_or_workspace, 'workspace', self._editor_or_workspace)
+        for tab in workspace.iter_tabs():
             if tab.title == title:
                 return (True, tab.id)
         return (False, None)
@@ -71,18 +78,22 @@ class ToolProvider:
     bridge: Any
     workspace: Any
     selection_gateway: SelectionSnapshotProvider
+    editor: Any = None  # TabbedEditorWidget for Qt-aware tab creation
 
     def build_tool_wiring_context(
         self,
     ) -> ToolWiringContext:
         """Return a tool wiring context reflecting the current runtime state."""
+        # Use editor (TabbedEditorWidget) for document creation if available,
+        # otherwise fall back to workspace (for tests without Qt)
+        doc_creator_target = self.editor if self.editor is not None else self.workspace
 
         return ToolWiringContext(
             controller=self.controller_resolver(),
             bridge=self.bridge,
             workspace=self.workspace,
             selection_gateway=self.selection_gateway,
-            document_creator=_DocumentCreatorAdapter(self.workspace),
+            document_creator=_DocumentCreatorAdapter(doc_creator_target),
             ai_client_provider=_AIClientProviderAdapter(self.controller_resolver),
         )
 

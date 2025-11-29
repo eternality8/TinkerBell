@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -9,6 +10,8 @@ from ..editor.document_model import DocumentMetadata, DocumentState
 from ..editor.workspace import DocumentTab, DocumentWorkspace
 from ..services.settings import Settings
 from ..services.unsaved_cache import UnsavedCache
+
+LOGGER = logging.getLogger(__name__)
 from ..utils import file_io
 from .ai_review_controller import AIReviewController
 from .review_overlay_manager import ReviewOverlayManager
@@ -167,14 +170,17 @@ class DocumentSessionService:
 
     def persist_settings(self, settings: Settings | None) -> None:
         if settings is None:
+            LOGGER.debug("persist_settings: skipping - no settings")
             return
         store = self._context.settings_store
         if store is None:
+            LOGGER.debug("persist_settings: skipping - no store")
             return
         try:
             store.save(settings)
-        except Exception:
-            pass
+            LOGGER.debug("persist_settings: saved successfully")
+        except Exception as exc:
+            LOGGER.warning("persist_settings: failed to save: %s", exc)
 
     def persist_unsaved_cache(self, cache: UnsavedCache | None) -> None:
         if cache is None:
@@ -189,17 +195,27 @@ class DocumentSessionService:
 
     def sync_workspace_state(self, *, persist: bool = True) -> None:
         if self._restoring_workspace:
+            LOGGER.debug("sync_workspace_state: skipping - restoring workspace")
             return
         settings = self._context.settings
         if settings is None:
+            LOGGER.debug("sync_workspace_state: skipping - no settings")
             return
         state = self._workspace.serialize_state()
+        tab_ids = [t.get("tab_id", "?") for t in state.get("open_tabs", [])]
+        LOGGER.debug(
+            "sync_workspace_state: serialized %d tabs (ids=%s), active=%s",
+            len(state.get("open_tabs", [])),
+            tab_ids,
+            state.get("active_tab_id"),
+        )
         settings.open_tabs = state.get("open_tabs", [])
         settings.active_tab_id = state.get("active_tab_id")
         untitled_counter = state.get("untitled_counter")
         if isinstance(untitled_counter, int):
             settings.next_untitled_index = untitled_counter
         if persist:
+            LOGGER.debug("sync_workspace_state: persisting settings with %d tabs (ids=%s)", len(settings.open_tabs), tab_ids)
             self.persist_settings(settings)
 
     def _unsaved_cache(self) -> UnsavedCache | None:
@@ -299,7 +315,28 @@ class DocumentSessionService:
         return True
 
     def _restore_workspace_tabs(self, settings: Settings) -> bool:
+        # Distinguish between None (never saved) and empty list (explicitly saved as empty)
+        open_tabs_was_set = settings.open_tabs is not None
         entries = [entry for entry in (settings.open_tabs or []) if isinstance(entry, dict)]
+        tab_ids_to_restore = [e.get("tab_id", "?") for e in entries]
+        LOGGER.debug(
+            "_restore_workspace_tabs: will restore %d tabs (ids=%s), open_tabs_was_set=%s",
+            len(entries),
+            tab_ids_to_restore,
+            open_tabs_was_set,
+        )
+
+        # If open_tabs was explicitly saved (even as empty), clear existing tabs
+        if open_tabs_was_set and not entries:
+            # User closed all tabs - clear any default tabs that were created during init
+            for tab_id in list(self._workspace.tab_ids()):
+                try:
+                    self._editor.close_tab(tab_id)
+                except KeyError:
+                    continue
+            LOGGER.debug("_restore_workspace_tabs: cleared default tabs (open_tabs was empty)")
+            return True  # Signal that we handled the restore (with 0 tabs)
+
         if not entries:
             return False
         review_controller = self._require_review_controller()

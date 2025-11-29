@@ -112,7 +112,7 @@ class Settings:
     unsaved_snapshot: dict[str, Any] | None = None
     unsaved_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     untitled_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
-    open_tabs: list[dict[str, Any]] = field(default_factory=list)
+    open_tabs: list[dict[str, Any]] | None = None  # None = never saved, [] = explicitly empty
     active_tab_id: str | None = None
     next_untitled_index: int = 1
     font_family: str = "JetBrains Mono"
@@ -225,6 +225,18 @@ class SettingsStore:
         """Load settings from disk, applying CLI/environment overrides when present."""
 
         payload = self._read_payload()
+        tab_payload = payload.get("open_tabs") if payload else None
+        # Handle both None (never saved) and null (explicitly saved as null in JSON)
+        if tab_payload is None:
+            tab_payload = []
+        tab_ids_from_disk = [t.get("tab_id", "?") for t in tab_payload if isinstance(t, dict)]
+        LOGGER.debug(
+            "Settings loaded from %s: %d tabs (ids=%s), active_tab_id=%s",
+            self._path,
+            len(tab_payload),
+            tab_ids_from_disk,
+            payload.get("active_tab_id") if payload else None,
+        )
         settings = Settings()
         needs_migration = False
 
@@ -295,6 +307,15 @@ class SettingsStore:
         tmp_path = self._path.with_suffix(".tmp")
         tmp_path.write_text(body, encoding="utf-8")
         tmp_path.replace(self._path)
+        open_tabs = settings.open_tabs or []
+        tab_ids = [t.get("tab_id", "?") for t in open_tabs]
+        LOGGER.debug(
+            "Settings saved to %s: %d tabs (ids=%s), active_tab_id=%s",
+            self._path,
+            len(open_tabs),
+            tab_ids,
+            settings.active_tab_id,
+        )
         return self._path
 
     def _serialize(self, settings: Settings) -> Dict[str, Any]:
