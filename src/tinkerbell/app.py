@@ -16,7 +16,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence, TextIO, cast, get_arg
 from .ai.ai_types import SubagentRuntimeConfig
 from .ai.orchestration import AIOrchestrator, OrchestratorConfig
 from .ai.client import AIClient, ClientSettings
-from .ui.main_window import MainWindow, WindowContext
+from .ui.bootstrap import create_application
+from .ui.models.window_state import WindowContext
 from .services.settings import (
     Settings,
     SettingsStore,
@@ -175,15 +176,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     ai_orchestrator = _build_ai_orchestrator(settings, debug_logging=debug)
 
     runtime = create_qapp(settings)
-    window = MainWindow(
-        WindowContext(
-            settings=settings,
-            ai_orchestrator=ai_orchestrator,
-            settings_store=settings_store,
-            unsaved_cache=unsaved_cache,
-            unsaved_cache_store=unsaved_cache_store,
-        )
+
+    # Create the application using the bootstrap factory
+    context = WindowContext(
+        settings=settings,
+        ai_orchestrator=ai_orchestrator,
+        settings_store=settings_store,
+        unsaved_cache=unsaved_cache,
+        unsaved_cache_store=unsaved_cache_store,
     )
+    event_bus, coordinator, window = create_application(context)
     window.show()
 
     loop = runtime.loop

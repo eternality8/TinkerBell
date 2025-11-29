@@ -358,8 +358,8 @@ class TestDocumentCreatorAdapterIntegration:
         )
 
     def test_adapter_from_ui_tools_provider(self, workspace):
-        """Test _DocumentCreatorAdapter from ui.tools.provider module."""
-        from tinkerbell.ui.tools.provider import _DocumentCreatorAdapter
+        """Test _DocumentCreatorAdapter from ui.infrastructure.tool_adapter module."""
+        from tinkerbell.ui.infrastructure.tool_adapter import _DocumentCreatorAdapter
         
         adapter = _DocumentCreatorAdapter(workspace)
         
@@ -370,7 +370,7 @@ class TestDocumentCreatorAdapterIntegration:
 
     def test_adapter_document_exists_finds_tab(self, workspace):
         """Test that document_exists correctly finds existing tabs."""
-        from tinkerbell.ui.tools.provider import _DocumentCreatorAdapter
+        from tinkerbell.ui.infrastructure.tool_adapter import _DocumentCreatorAdapter
         
         # Create a tab in the workspace
         tab = workspace.create_tab(title="My Document")
@@ -385,7 +385,7 @@ class TestDocumentCreatorAdapterIntegration:
 
     def test_adapter_document_exists_no_match(self, workspace):
         """Test that document_exists returns False for non-matching titles."""
-        from tinkerbell.ui.tools.provider import _DocumentCreatorAdapter
+        from tinkerbell.ui.infrastructure.tool_adapter import _DocumentCreatorAdapter
         
         # Create a tab with a different title
         workspace.create_tab(title="Other Document")
@@ -399,7 +399,7 @@ class TestDocumentCreatorAdapterIntegration:
 
     def test_adapter_create_document(self, workspace):
         """Test that create_document creates a real tab."""
-        from tinkerbell.ui.tools.provider import _DocumentCreatorAdapter
+        from tinkerbell.ui.infrastructure.tool_adapter import _DocumentCreatorAdapter
         
         adapter = _DocumentCreatorAdapter(workspace)
         
@@ -422,7 +422,7 @@ class TestDocumentCreatorAdapterIntegration:
 
     def test_adapter_iterates_multiple_tabs(self, workspace):
         """Test that document_exists correctly iterates over multiple tabs."""
-        from tinkerbell.ui.tools.provider import _DocumentCreatorAdapter
+        from tinkerbell.ui.infrastructure.tool_adapter import _DocumentCreatorAdapter
         
         # Create multiple tabs
         workspace.create_tab(title="Doc A")
@@ -451,7 +451,7 @@ class TestAIClientProviderAdapter:
 
     def test_get_ai_client_returns_client_from_controller(self):
         """Test that get_ai_client returns the client attribute from controller."""
-        from tinkerbell.ui.tools.provider import _AIClientProviderAdapter
+        from tinkerbell.ui.infrastructure.tool_adapter import _AIClientProviderAdapter
         
         # Create a mock controller with a client attribute
         mock_client = MagicMock()
@@ -465,7 +465,7 @@ class TestAIClientProviderAdapter:
 
     def test_get_ai_client_returns_none_when_controller_is_none(self):
         """Test that get_ai_client returns None when controller is None."""
-        from tinkerbell.ui.tools.provider import _AIClientProviderAdapter
+        from tinkerbell.ui.infrastructure.tool_adapter import _AIClientProviderAdapter
         
         adapter = _AIClientProviderAdapter(lambda: None)
         
@@ -474,7 +474,7 @@ class TestAIClientProviderAdapter:
 
     def test_get_ai_client_returns_none_when_no_client_attribute(self):
         """Test that get_ai_client returns None when controller has no client."""
-        from tinkerbell.ui.tools.provider import _AIClientProviderAdapter
+        from tinkerbell.ui.infrastructure.tool_adapter import _AIClientProviderAdapter
         
         # Create a controller without a client attribute
         mock_controller = MagicMock(spec=[])  # No attributes
@@ -485,21 +485,21 @@ class TestAIClientProviderAdapter:
         assert result is None
 
     def test_adapter_is_used_in_tool_wiring_context(self):
-        """Test that ToolProvider includes ai_client_provider in context."""
-        from tinkerbell.ui.tools.provider import ToolProvider
+        """Test that ToolAdapter includes ai_client_provider in context."""
+        from tinkerbell.ui.infrastructure.tool_adapter import ToolAdapter
         from tinkerbell.editor.selection_gateway import SelectionSnapshotProvider
         
         mock_controller = MagicMock()
         mock_controller.client = MagicMock()
         
-        provider = ToolProvider(
+        adapter = ToolAdapter(
             controller_resolver=lambda: mock_controller,
             bridge=MockBridge(),
             workspace=MockWorkspace(),
             selection_gateway=MagicMock(spec=SelectionSnapshotProvider),
         )
         
-        ctx = provider.build_tool_wiring_context()
+        ctx = adapter.build_wiring_context()
         
         # Verify ai_client_provider is set
         assert ctx.ai_client_provider is not None

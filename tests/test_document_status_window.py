@@ -9,9 +9,9 @@ from typing import Any
 
 import pytest
 
-import tinkerbell.ui.widgets.document_status_window as document_status_window_module
+import tinkerbell.ui.presentation.dialogs.document_status_window as document_status_window_module
 from tinkerbell.ui.document_status import DocumentDescriptor
-from tinkerbell.ui.widgets.document_status_window import DocumentStatusWindow
+from tinkerbell.ui.presentation.dialogs.document_status_window import DocumentStatusWindow
 
 
 def _ensure_qapp() -> None:

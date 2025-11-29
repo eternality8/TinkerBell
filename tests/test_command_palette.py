@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from tinkerbell.ui.models.actions import WindowAction
-from tinkerbell.ui.widgets.command_palette import PaletteCommand, build_palette_commands
+from tinkerbell.ui.presentation.dialogs.command_palette import PaletteCommand, build_palette_commands
 
 
 def test_build_palette_commands_excludes_actions() -> None:
