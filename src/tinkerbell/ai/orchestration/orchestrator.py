@@ -55,6 +55,7 @@ __all__ = [
     "OrchestratorConfig",
     "ChatResult",
     "StreamCallback",
+    "AnalysisAgentAdapter",
 ]
 
 LOGGER = logging.getLogger(__name__)
@@ -136,21 +137,83 @@ class _DispatcherToolExecutor:
     This allows the TurnRunner to use ToolDispatcher for executing tools.
     """
 
-    def __init__(self, dispatcher: ToolDispatcher) -> None:
+    def __init__(
+        self,
+        dispatcher: ToolDispatcher,
+        event_callback: StreamCallback | None = None,
+    ) -> None:
         self._dispatcher = dispatcher
+        self._event_callback = event_callback
+        self._tool_index = 0  # Track tool index for events
 
     async def execute(
         self,
         name: str,
         arguments: Mapping[str, Any],
+        *,
+        call_id: str = "",
     ) -> str:
-        """Execute a tool and return the result as a string."""
+        """Execute a tool and return the result as a string.
+        
+        Args:
+            name: Name of the tool to execute.
+            arguments: Tool arguments as a mapping.
+            call_id: Optional call ID for tracing.
+            
+        Returns:
+            String result from the tool, or an error message.
+        """
+        import json
+        
+        LOGGER.debug(
+            "Executing tool %s (call_id=%s), dispatcher has listener: %s",
+            name,
+            call_id,
+            getattr(self._dispatcher, "_listener", None) is not None,
+        )
+        
+        # Emit arguments.done event before execution (so UI shows the tool call)
+        if self._event_callback:
+            try:
+                args_str = json.dumps(arguments) if arguments else "{}"
+                args_event = _ToolCallArgumentsDoneEvent(
+                    tool_call_id=call_id,
+                    tool_name=name,
+                    tool_arguments=args_str,
+                    tool_index=self._tool_index,
+                )
+                self._event_callback(args_event)
+            except Exception:
+                LOGGER.debug("Failed to emit tool arguments event", exc_info=True)
+        
         result = await self._dispatcher.dispatch(name, dict(arguments))
+        
+        # Emit tool result event after execution
+        result_str: str
         if result.success:
-            return str(result.result) if result.result is not None else ""
+            LOGGER.debug("Tool %s succeeded: %s", name, result.result)
+            result_str = str(result.result) if result.result is not None else ""
         else:
             error_msg = result.error.message if result.error else "Unknown error"
-            return f"Error: {error_msg}"
+            LOGGER.warning("Tool %s failed: %s", name, error_msg)
+            result_str = f"Error: {error_msg}"
+        
+        # Emit result event for UI
+        if self._event_callback:
+            try:
+                result_event = _ToolResultEvent(
+                    tool_call_id=call_id,
+                    tool_name=name,
+                    content=result_str,
+                    tool_index=self._tool_index,
+                    parsed=result.result if result.success else None,
+                )
+                self._event_callback(result_event)
+            except Exception:
+                LOGGER.debug("Failed to emit tool result event", exc_info=True)
+        
+        self._tool_index += 1
+        return result_str
 
 
 # -----------------------------------------------------------------------------
@@ -166,20 +229,180 @@ class _AIClientAdapter:
 
     async def stream_chat(
         self,
-        *,
         messages: Sequence[Mapping[str, Any]],
+        *,
         tools: Sequence[Mapping[str, Any]] | None = None,
+        tool_choice: str | Mapping[str, Any] | None = None,
         temperature: float = 0.2,
-        max_tokens: int | None = None,
+        max_completion_tokens: int | None = None,
+        **kwargs: Any,
     ):
         """Stream chat completion."""
         async for event in self._client.stream_chat(
             messages=messages,
             tools=tools,
+            tool_choice=tool_choice,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_completion_tokens=max_completion_tokens,
         ):
             yield event
+
+
+# -----------------------------------------------------------------------------
+# Analysis Provider Adapter
+# -----------------------------------------------------------------------------
+
+# Minimum document size thresholds for analysis
+_MIN_CHARS_FOR_ANALYSIS = 500  # Skip analysis for very short documents
+_MIN_SPAN_FOR_ANALYSIS = 200   # Skip if selected span is too small
+
+
+class AnalysisAgentAdapter:
+    """Adapts AnalysisAgent to the AnalysisProvider protocol.
+    
+    This adapter wraps the rule-based AnalysisAgent to provide preflight
+    analysis hints to the turn pipeline.
+    
+    Analysis is skipped for:
+    - Very short documents (< 500 chars)
+    - Very small selection spans (< 200 chars)
+    - Documents with no content
+    """
+
+    def __init__(
+        self,
+        agent: Any,
+        *,
+        min_chars: int = _MIN_CHARS_FOR_ANALYSIS,
+        min_span: int = _MIN_SPAN_FOR_ANALYSIS,
+    ) -> None:
+        """Initialize with an AnalysisAgent instance.
+        
+        Args:
+            agent: An AnalysisAgent instance from tinkerbell.ai.analysis.
+            min_chars: Minimum document chars to run analysis.
+            min_span: Minimum span length to run analysis.
+        """
+        self._agent = agent
+        self._min_chars = min_chars
+        self._min_span = min_span
+
+    def run_analysis(
+        self,
+        snapshot: Mapping[str, Any],
+        *,
+        source: str = "pipeline",
+        force_refresh: bool = False,
+    ) -> Any | None:
+        """Run analysis on a document snapshot.
+        
+        Converts the snapshot mapping to AnalysisInput and delegates
+        to the underlying AnalysisAgent.
+        
+        Args:
+            snapshot: Document snapshot as a mapping.
+            source: Source identifier for telemetry.
+            force_refresh: Force refresh even if cached.
+            
+        Returns:
+            AnalysisAdvice or None if analysis unavailable or skipped.
+        """
+        # Check if document is worth analyzing
+        if not self._should_analyze(snapshot):
+            return None
+        
+        try:
+            from ..analysis.models import AnalysisInput
+        except ImportError:
+            LOGGER.debug("Analysis models not available")
+            return None
+        
+        # Build AnalysisInput from snapshot
+        analysis_input = AnalysisInput(
+            document_id=str(snapshot.get("document_id", "")),
+            document_version=snapshot.get("version_id") or snapshot.get("document_version"),
+            document_path=snapshot.get("path"),
+            span_start=int(snapshot.get("span_start", 0)),
+            span_end=int(snapshot.get("span_end", 0)),
+            document_chars=snapshot.get("document_chars"),
+            chunk_profile_hint=snapshot.get("chunk_profile_hint"),
+            chunk_index_ready=bool(snapshot.get("chunk_index_ready", False)),
+            chunk_manifest_profile=snapshot.get("chunk_manifest_profile"),
+            chunk_manifest_cache_key=snapshot.get("chunk_manifest_cache_key"),
+            outline_digest=snapshot.get("outline_digest"),
+            outline_age_seconds=snapshot.get("outline_age_seconds"),
+            outline_version_id=snapshot.get("outline_version_id"),
+            plot_state_status=snapshot.get("plot_state_status"),
+            plot_override_version=snapshot.get("plot_override_version"),
+            concordance_status=snapshot.get("concordance_status"),
+            concordance_age_seconds=snapshot.get("concordance_age_seconds"),
+            retrieval_enabled=bool(snapshot.get("retrieval_enabled", True)),
+            extra_metadata=snapshot.get("extra_metadata"),
+            chunk_flow_warnings=snapshot.get("chunk_flow_warnings"),
+            plot_loop_flags=snapshot.get("plot_loop_flags"),
+        )
+        
+        try:
+            return self._agent.analyze(
+                analysis_input,
+                force_refresh=force_refresh,
+                source=source,
+            )
+        except Exception:
+            LOGGER.warning("Analysis agent failed", exc_info=True)
+            return None
+
+    def _should_analyze(self, snapshot: Mapping[str, Any]) -> bool:
+        """Determine if the document is worth analyzing.
+        
+        Skips analysis for:
+        - Empty or missing documents
+        - Very short documents (< min_chars)
+        - Very small selection spans (< min_span)
+        
+        Args:
+            snapshot: Document snapshot mapping.
+            
+        Returns:
+            True if analysis should proceed, False to skip.
+        """
+        # No document ID means nothing to analyze
+        doc_id = snapshot.get("document_id") or snapshot.get("tab_id")
+        if not doc_id:
+            LOGGER.debug("Skipping analysis: no document ID")
+            return False
+        
+        # Check document size
+        doc_chars = snapshot.get("document_chars")
+        content = snapshot.get("content") or snapshot.get("text") or ""
+        
+        # Use explicit char count if available, otherwise measure content
+        char_count = doc_chars if doc_chars is not None else len(content)
+        
+        if char_count < self._min_chars:
+            LOGGER.debug(
+                "Skipping analysis: document too short (%d < %d chars)",
+                char_count,
+                self._min_chars,
+            )
+            return False
+        
+        # Check span size if a span is specified
+        span_start = int(snapshot.get("span_start", 0))
+        span_end = int(snapshot.get("span_end", 0))
+        
+        if span_end > span_start:
+            # A specific span is selected
+            span_length = span_end - span_start
+            if span_length < self._min_span:
+                LOGGER.debug(
+                    "Skipping analysis: span too short (%d < %d chars)",
+                    span_length,
+                    self._min_span,
+                )
+                return False
+        
+        return True
 
 
 # -----------------------------------------------------------------------------
@@ -238,6 +461,9 @@ class AIOrchestrator:
         # Active task for cancellation
         self._active_task: asyncio.Task[Any] | None = None
         self._task_lock = asyncio.Lock()
+        
+        # Cache for latest analysis advice per document
+        self._analysis_advice_cache: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -267,6 +493,44 @@ class AIOrchestrator:
     def services(self) -> Services | None:
         """The services container."""
         return self._services
+
+    def get_latest_analysis_advice(self, document_id: str) -> Any | None:
+        """Get the latest analysis advice for a document.
+        
+        Returns cached analysis advice from the most recent preflight
+        analysis run for the given document.
+        
+        Args:
+            document_id: The document identifier.
+            
+        Returns:
+            The latest AnalysisAdvice or None if not available.
+        """
+        return self._analysis_advice_cache.get(document_id)
+
+    def set_analysis_advice(self, document_id: str, advice: Any) -> None:
+        """Store analysis advice for a document.
+        
+        Called by the analysis provider after running preflight analysis.
+        
+        Args:
+            document_id: The document identifier.
+            advice: The AnalysisAdvice to cache.
+        """
+        if document_id and advice is not None:
+            self._analysis_advice_cache[document_id] = advice
+
+    def clear_analysis_advice(self, document_id: str | None = None) -> None:
+        """Clear cached analysis advice.
+        
+        Args:
+            document_id: If provided, clear only this document's advice.
+                         If None, clear all cached advice.
+        """
+        if document_id is None:
+            self._analysis_advice_cache.clear()
+        else:
+            self._analysis_advice_cache.pop(document_id, None)
 
     # ------------------------------------------------------------------
     # Configuration
@@ -398,10 +662,10 @@ class AIOrchestrator:
             document_id=doc_snapshot.tab_id or "",
         )
 
-        # Create runner
-        runner = self._create_runner()
+        # Create runner with event callback for tool result streaming
+        runner = self._create_runner(on_event=on_event)
 
-        # Content callback adapter
+        # Content callback adapter for streaming content deltas
         content_callback = None
         if on_event:
             def content_callback(text: str) -> None:
@@ -418,6 +682,8 @@ class AIOrchestrator:
 
         try:
             output = await task
+            # Cache analysis advice from the turn output
+            self._cache_analysis_advice(turn_input.document_id, output)
             return ChatResult.from_turn_output(output)
         except asyncio.CancelledError:
             return ChatResult(
@@ -435,6 +701,14 @@ class AIOrchestrator:
         finally:
             if self._active_task is task:
                 self._active_task = None
+
+    def _cache_analysis_advice(self, document_id: str, output: TurnOutput) -> None:
+        """Cache analysis advice from turn output if available."""
+        if not document_id:
+            return
+        advice = output.metadata.get("analysis_advice") if output.metadata else None
+        if advice is not None:
+            self._analysis_advice_cache[document_id] = advice
 
     def cancel(self) -> None:
         """Cancel the active chat turn."""
@@ -495,15 +769,26 @@ class AIOrchestrator:
     # Private Helpers
     # ------------------------------------------------------------------
 
-    def _create_runner(self) -> TurnRunner:
-        """Create a TurnRunner for chat execution."""
+    def _create_runner(
+        self,
+        *,
+        on_event: StreamCallback | None = None,
+    ) -> TurnRunner:
+        """Create a TurnRunner for chat execution.
+        
+        Args:
+            on_event: Optional callback for streaming events (content + tool results).
+        """
         # Get tool definitions for the model
         tool_definitions = self._get_tool_definitions()
 
-        # Create tool executor
+        # Create tool executor with event callback for tool result streaming
         tool_executor: Any = None
         if self._tool_dispatcher:
-            tool_executor = _DispatcherToolExecutor(self._tool_dispatcher)
+            tool_executor = _DispatcherToolExecutor(
+                self._tool_dispatcher,
+                event_callback=on_event,
+            )
 
         # Create client adapter
         client_adapter = _AIClientAdapter(self._client)
@@ -536,6 +821,7 @@ class AIOrchestrator:
                         "name": registration.schema.name,
                         "description": registration.schema.description,
                         "parameters": registration.schema.to_json_schema(),
+                        "strict": True,
                     },
                 })
         return definitions
@@ -668,3 +954,26 @@ class _ContentDeltaEvent:
 
     content: str
     type: str = "content.delta"
+
+
+@dataclass(slots=True)
+class _ToolCallArgumentsDoneEvent:
+    """Event emitted when tool call arguments are finalized."""
+
+    tool_call_id: str
+    tool_name: str
+    tool_arguments: str
+    tool_index: int = 0
+    type: str = "tool_calls.function.arguments.done"
+
+
+@dataclass(slots=True)
+class _ToolResultEvent:
+    """Event emitted when a tool execution completes."""
+
+    tool_call_id: str
+    tool_name: str | None = None
+    content: str = ""
+    tool_index: int = 0
+    type: str = "tool_calls.result"
+    parsed: Any = None  # Parsed result object for status detection

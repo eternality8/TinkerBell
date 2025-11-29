@@ -1383,7 +1383,7 @@ class _StubAIController:
                 SimpleNamespace(type="content.done", content="Hello world!"),
             ]
             for payload in events:
-                await on_event(payload)
+                on_event(payload)  # Callback is synchronous, not awaited
         response_text = self.response_texts.pop(0) if self.response_texts else "Hello world!"
         return {"response": response_text}
 

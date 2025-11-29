@@ -125,10 +125,13 @@ class SettingsRuntime:
         if client is None:
             return None
         try:
-            from ..ai.orchestration import AIOrchestrator, OrchestratorConfig
+            from ..ai.orchestration import AIOrchestrator, OrchestratorConfig, AnalysisAgentAdapter
         except Exception as exc:  # pragma: no cover - dependency guard
             _LOGGER.warning("AI orchestrator unavailable: %s", exc)
             return None
+
+        # Build analysis provider
+        analysis_provider = self._build_analysis_provider()
 
         try:
             config = OrchestratorConfig(
@@ -138,9 +141,29 @@ class SettingsRuntime:
                 temperature=getattr(settings, "temperature", 0.2),
                 streaming_enabled=True,
             )
-            return AIOrchestrator(client=client, config=config)
+            return AIOrchestrator(
+                client=client,
+                config=config,
+                analysis_provider=analysis_provider,
+            )
         except Exception as exc:
             _LOGGER.warning("Failed to initialize AI orchestrator: %s", exc)
+            return None
+
+    def _build_analysis_provider(self):
+        """Build an analysis provider for preflight analysis."""
+        try:
+            from ..ai.analysis import AnalysisAgent
+            from ..ai.orchestration import AnalysisAgentAdapter
+        except ImportError:
+            _LOGGER.debug("Analysis components not available")
+            return None
+        
+        try:
+            agent = AnalysisAgent()
+            return AnalysisAgentAdapter(agent)
+        except Exception as exc:
+            _LOGGER.debug("Failed to create analysis provider: %s", exc)
             return None
 
     # ------------------------------------------------------------------

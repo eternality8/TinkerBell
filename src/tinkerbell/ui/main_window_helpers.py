@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Sequence
@@ -21,6 +22,8 @@ from ..chat.commands import DIRECTIVE_SCHEMA
 if TYPE_CHECKING:
     from ..chat.message_model import ChatMessage
     from ..editor.workspace import DocumentTab
+
+LOGGER = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -179,25 +182,37 @@ class WriteToolDispatchListener:
     def __init__(self, main_window: Any) -> None:
         self._window = main_window
         self._registry = get_tool_registry()
+        LOGGER.debug("WriteToolDispatchListener initialized")
     
     def on_tool_start(self, tool_name: str, arguments: Mapping[str, Any]) -> None:
         """Called when a tool starts execution."""
-        # We only care about completion, not start
-        pass
+        LOGGER.debug("WriteToolDispatchListener: tool_start %s", tool_name)
     
     def on_tool_complete(self, result: DispatchResult) -> None:
         """Called when a tool completes - increment edit count if it was a write tool."""
+        LOGGER.debug(
+            "WriteToolDispatchListener: tool_complete %s success=%s",
+            result.tool_name,
+            result.success,
+        )
         if not result.success:
+            LOGGER.debug("WriteToolDispatchListener: skipping failed tool")
             return
-        if not self._registry.is_write_tool(result.tool_name):
+        is_write = self._registry.is_write_tool(result.tool_name)
+        LOGGER.debug(
+            "WriteToolDispatchListener: is_write_tool(%s) = %s",
+            result.tool_name,
+            is_write,
+        )
+        if not is_write:
             return
         # Track this as an edit in the pending turn review
+        LOGGER.debug("WriteToolDispatchListener: recording edit for %s", result.tool_name)
         self._window._record_write_tool_edit(result)
     
     def on_tool_error(self, tool_name: str, error: Any) -> None:
         """Called when a tool fails."""
-        # Errors don't count as edits
-        pass
+        LOGGER.debug("WriteToolDispatchListener: tool_error %s: %s", tool_name, error)
 
 
 class EditorTabWrapper:

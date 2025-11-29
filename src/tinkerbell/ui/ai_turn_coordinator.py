@@ -73,11 +73,20 @@ class AITurnCoordinator:
             self.failure_handler(exc)
             return
 
-        payload = result or {}
-        tool_records = payload.get("tool_calls")
+        # Handle both ChatResult objects and legacy dict responses
+        if hasattr(result, 'response'):
+            # ChatResult object
+            tool_records = getattr(result, 'tool_calls', None)
+            trace_compaction = None  # ChatResult doesn't have trace_compaction
+            response_text = (getattr(result, 'response', '') or '').strip() or "The AI did not return any content."
+        else:
+            # Legacy dict response
+            payload = result or {}
+            tool_records = payload.get("tool_calls")
+            trace_compaction = payload.get("trace_compaction")
+            response_text = payload.get("response", "").strip() or "The AI did not return any content."
         self.tool_trace_presenter.annotate_compaction(tool_records)
-        self.telemetry_controller.set_compaction_stats(payload.get("trace_compaction"))
-        response_text = payload.get("response", "").strip() or "The AI did not return any content."
+        self.telemetry_controller.set_compaction_stats(trace_compaction)
         self.response_finalizer(response_text)
         self.telemetry_controller.refresh_context_usage_status()
         document_id = snapshot.get("document_id") if isinstance(snapshot, Mapping) else None
@@ -96,10 +105,11 @@ class AITurnCoordinator:
         # Release editor lock after AI turn completes
         self._release_editor_lock()
         
+        _LOGGER.debug("AI turn completed, calling finalize_pending_turn_review")
         self.status_updater("AI response ready")
         self.review_controller.finalize_pending_turn_review(success=True)
 
-    async def _handle_stream_event(self, event: Any) -> None:
+    def _handle_stream_event(self, event: Any) -> None:
         self._process_stream_event(event)
 
     def _process_stream_event(self, event: Any) -> None:

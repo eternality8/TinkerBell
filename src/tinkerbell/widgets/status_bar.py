@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from typing import Any, Callable, Optional
 
@@ -15,6 +16,8 @@ except Exception:  # pragma: no cover - PySide6 not available
     QPushButton = None  # type: ignore[assignment]
     QHBoxLayout = None  # type: ignore[assignment]
     QStatusBar = None  # type: ignore[assignment]
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ContextUsageWidget:
@@ -85,6 +88,7 @@ class DiffReviewControls:
         self._visible = False
 
     def install(self, status_bar: Any | None) -> None:
+        LOGGER.debug("DiffReviewControls.install: status_bar=%s", status_bar is not None)
         self._status_bar = status_bar
         if (
             status_bar is None
@@ -93,8 +97,10 @@ class DiffReviewControls:
             or QPushButton is None
             or QHBoxLayout is None
         ):
+            LOGGER.debug("DiffReviewControls.install: missing Qt widgets, skipping")
             return
         if self._container is not None:
+            LOGGER.debug("DiffReviewControls.install: already installed")
             return
         try:
             from PySide6.QtWidgets import QSizePolicy
@@ -103,15 +109,18 @@ class DiffReviewControls:
         try:
             container = QWidget(status_bar)
             layout = QHBoxLayout(container)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(4)
+            layout.setContentsMargins(4, 0, 4, 0)
+            layout.setSpacing(6)
             summary_label = QLabel(self.summary_text or "")
             summary_label.setObjectName("tb-status-review-summary")
-            summary_label.setContentsMargins(8, 0, 4, 0)
-            accept_button = QPushButton("Accept")
+            summary_label.setContentsMargins(4, 0, 4, 0)
+            accept_button = QPushButton("✓ Accept")
             accept_button.setObjectName("tb-status-review-accept")
-            reject_button = QPushButton("Reject")
+            reject_button = QPushButton("✗ Reject")
             reject_button.setObjectName("tb-status-review-reject")
+            # Set minimum sizes to ensure buttons are visible
+            accept_button.setMinimumWidth(70)
+            reject_button.setMinimumWidth(70)
             layout.addWidget(summary_label)
             layout.addWidget(accept_button)
             layout.addWidget(reject_button)
@@ -120,14 +129,13 @@ class DiffReviewControls:
                 reject_button.clicked.connect(self.trigger_reject)  # type: ignore[attr-defined]
             except Exception:
                 pass
-            # Prevent the container from affecting the window's minimum width
-            if QSizePolicy is not None:
-                policy = container.sizePolicy()
-                policy.setHorizontalPolicy(QSizePolicy.Ignored)
-                container.setSizePolicy(policy)
+            # Do NOT apply Ignored policy - we want the controls to be visible
+            # The container should take its natural size from the buttons
             status_bar.addPermanentWidget(container)
             container.setVisible(False)
+            LOGGER.debug("DiffReviewControls.install: container created successfully")
         except Exception:
+            LOGGER.debug("DiffReviewControls.install: failed to create container", exc_info=True)
             return
 
         self._container = container
@@ -145,6 +153,11 @@ class DiffReviewControls:
         reject_callback: Callable[[], None] | None = None,
     ) -> None:
         normalized = (summary or "").strip()
+        LOGGER.debug(
+            "DiffReviewControls.set_state: summary=%r container=%s",
+            normalized,
+            self._container is not None,
+        )
         self.summary_text = normalized
         self.accept_callback = accept_callback
         self.reject_callback = reject_callback
@@ -177,13 +190,20 @@ class DiffReviewControls:
             pass
 
     def _set_visible(self, visible: bool) -> None:
+        LOGGER.debug(
+            "DiffReviewControls._set_visible: visible=%s container=%s",
+            visible,
+            self._container is not None,
+        )
         self._visible = visible
         if self._container is None:
+            LOGGER.debug("DiffReviewControls._set_visible: no container, skipping")
             return
         try:
             self._container.setVisible(visible)
+            LOGGER.debug("DiffReviewControls._set_visible: setVisible(%s) called", visible)
         except Exception:
-            pass
+            LOGGER.debug("DiffReviewControls._set_visible: setVisible failed", exc_info=True)
 
     @property
     def visible(self) -> bool:
@@ -714,6 +734,10 @@ class StatusBar:
                 policy.setHorizontalPolicy(QSizePolicy.Ignored)
                 label.setSizePolicy(policy)
 
+        # Install review controls FIRST so they appear prominently on the left
+        # of the permanent widget area (before all the status labels)
+        self._review_controls.install(self._qt_bar)
+
         for label in (
             self._cursor_label,
             self._format_label,
@@ -733,7 +757,6 @@ class StatusBar:
             except Exception:
                 break
 
-        self._review_controls.install(self._qt_bar)
         self._context_widget.install(self._qt_bar)
         self._document_status_indicator.install(self._qt_bar)
 

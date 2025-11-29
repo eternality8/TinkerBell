@@ -15,6 +15,7 @@ from tinkerbell.ai.orchestration.orchestrator import (
     _ContentDeltaEvent,
     _AIClientAdapter,
     _DispatcherToolExecutor,
+    AnalysisAgentAdapter,
 )
 from tinkerbell.ai.orchestration.types import (
     TurnOutput,
@@ -39,17 +40,20 @@ class MockAIClient:
 
     async def stream_chat(
         self,
-        *,
         messages: Sequence[Mapping[str, Any]],
+        *,
         tools: Sequence[Mapping[str, Any]] | None = None,
+        tool_choice: str | Mapping[str, Any] | None = None,
         temperature: float = 0.2,
-        max_tokens: int | None = None,
+        max_completion_tokens: int | None = None,
+        **kwargs: Any,
     ):
         self._stream_calls.append({
             "messages": list(messages),
             "tools": tools,
+            "tool_choice": tool_choice,
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            "max_completion_tokens": max_completion_tokens,
         })
         response = self.responses[min(self._call_count, len(self.responses) - 1)]
         self._call_count += 1
@@ -391,7 +395,7 @@ class TestAIClientAdapter:
             messages=messages,
             tools=None,
             temperature=0.5,
-            max_tokens=100,
+            max_completion_tokens=100,
         ):
             events.append(event)
         
@@ -440,6 +444,247 @@ class TestDispatcherToolExecutor:
         
         assert "Error:" in result
         assert "Tool failed" in result
+
+
+class TestAnalysisAgentAdapter:
+    """Tests for AnalysisAgentAdapter."""
+
+    def test_run_analysis_success(self):
+        """Adapter delegates to agent and returns advice."""
+        @dataclass
+        class MockAdvice:
+            document_id: str
+            chunk_profile: str = "auto"
+            required_tools: tuple = ()
+            optional_tools: tuple = ()
+            must_refresh_outline: bool = False
+            plot_state_status: str | None = None
+            concordance_status: str | None = None
+            warnings: tuple = ()
+
+        class MockAgent:
+            def __init__(self):
+                self.calls: list[tuple] = []
+
+            def analyze(self, analysis_input, *, force_refresh=False, source="pipeline"):
+                self.calls.append((analysis_input, force_refresh, source))
+                return MockAdvice(document_id=analysis_input.document_id)
+
+        agent = MockAgent()
+        adapter = AnalysisAgentAdapter(agent)
+        
+        snapshot = {
+            "document_id": "doc-1",
+            "version_id": "v1",
+            "path": "/test/doc.txt",
+            "span_start": 0,
+            "span_end": 1000,
+            "document_chars": 5000,  # Above threshold
+        }
+        
+        result = adapter.run_analysis(snapshot, source="test", force_refresh=True)
+        
+        assert result is not None
+        assert result.document_id == "doc-1"
+        assert len(agent.calls) == 1
+        assert agent.calls[0][1] is True  # force_refresh
+        assert agent.calls[0][2] == "test"  # source
+
+    def test_run_analysis_agent_failure(self):
+        """Adapter returns None when agent raises."""
+        class FailingAgent:
+            def analyze(self, *args, **kwargs):
+                raise RuntimeError("Analysis failed")
+
+        adapter = AnalysisAgentAdapter(FailingAgent())
+        
+        result = adapter.run_analysis({
+            "document_id": "doc-1",
+            "document_chars": 1000,
+        })
+        
+        assert result is None
+
+    def test_run_analysis_skips_empty_snapshot(self):
+        """Adapter skips analysis for empty snapshot (no document ID)."""
+        class MockAgent:
+            def __init__(self):
+                self.called = False
+
+            def analyze(self, analysis_input, **kwargs):
+                self.called = True
+                return None
+
+        agent = MockAgent()
+        adapter = AnalysisAgentAdapter(agent)
+        
+        result = adapter.run_analysis({})
+        
+        assert result is None
+        assert agent.called is False  # Agent should not be called
+
+    def test_run_analysis_skips_short_document(self):
+        """Adapter skips analysis for documents below char threshold."""
+        class MockAgent:
+            def __init__(self):
+                self.called = False
+
+            def analyze(self, analysis_input, **kwargs):
+                self.called = True
+                return None
+
+        agent = MockAgent()
+        adapter = AnalysisAgentAdapter(agent, min_chars=500)
+        
+        result = adapter.run_analysis({
+            "document_id": "doc-1",
+            "document_chars": 100,  # Below threshold
+        })
+        
+        assert result is None
+        assert agent.called is False
+
+    def test_run_analysis_skips_short_span(self):
+        """Adapter skips analysis for spans below threshold."""
+        class MockAgent:
+            def __init__(self):
+                self.called = False
+
+            def analyze(self, analysis_input, **kwargs):
+                self.called = True
+                return None
+
+        agent = MockAgent()
+        adapter = AnalysisAgentAdapter(agent, min_span=200)
+        
+        result = adapter.run_analysis({
+            "document_id": "doc-1",
+            "document_chars": 5000,  # Document is large enough
+            "span_start": 100,
+            "span_end": 150,  # Span is only 50 chars
+        })
+        
+        assert result is None
+        assert agent.called is False
+
+    def test_run_analysis_uses_content_length_fallback(self):
+        """Adapter uses content length when document_chars not provided."""
+        class MockAgent:
+            def __init__(self):
+                self.called = False
+
+            def analyze(self, analysis_input, **kwargs):
+                self.called = True
+                return None
+
+        agent = MockAgent()
+        adapter = AnalysisAgentAdapter(agent, min_chars=500)
+        
+        # Short content, no document_chars
+        result = adapter.run_analysis({
+            "document_id": "doc-1",
+            "content": "Short",
+        })
+        
+        assert result is None
+        assert agent.called is False
+        
+        # Long content
+        agent.called = False
+        result = adapter.run_analysis({
+            "document_id": "doc-1",
+            "content": "x" * 1000,
+        })
+        
+        assert agent.called is True
+
+    def test_run_analysis_allows_full_document_span(self):
+        """Adapter allows analysis when no span is specified (full document)."""
+        @dataclass
+        class MockAdvice:
+            document_id: str
+
+        class MockAgent:
+            def analyze(self, analysis_input, **kwargs):
+                return MockAdvice(document_id=analysis_input.document_id)
+
+        adapter = AnalysisAgentAdapter(MockAgent())
+        
+        # No span specified (span_start=0, span_end=0 means full document)
+        result = adapter.run_analysis({
+            "document_id": "doc-1",
+            "document_chars": 1000,
+        })
+        
+        assert result is not None
+
+    def test_run_analysis_custom_thresholds(self):
+        """Adapter respects custom min_chars and min_span thresholds."""
+        class MockAgent:
+            def __init__(self):
+                self.called = False
+
+            def analyze(self, analysis_input, **kwargs):
+                self.called = True
+                return None
+
+        # Very low thresholds
+        agent = MockAgent()
+        adapter = AnalysisAgentAdapter(agent, min_chars=10, min_span=5)
+        
+        result = adapter.run_analysis({
+            "document_id": "doc-1",
+            "document_chars": 50,
+            "span_start": 0,
+            "span_end": 10,
+        })
+        
+        assert agent.called is True
+
+    def test_run_analysis_maps_all_fields(self):
+        """Adapter correctly maps all snapshot fields to AnalysisInput."""
+        class RecordingAgent:
+            def __init__(self):
+                self.received_input = None
+
+            def analyze(self, analysis_input, **kwargs):
+                self.received_input = analysis_input
+                return None
+
+        agent = RecordingAgent()
+        adapter = AnalysisAgentAdapter(agent)
+        
+        snapshot = {
+            "document_id": "doc-1",
+            "version_id": "v1",
+            "document_version": "v2",  # Should prefer version_id
+            "path": "/test/doc.txt",
+            "span_start": 100,
+            "span_end": 500,
+            "document_chars": 10000,
+            "chunk_profile_hint": "large",
+            "chunk_index_ready": True,
+            "outline_digest": "abc123",
+            "plot_state_status": "stale",
+            "concordance_status": "fresh",
+            "retrieval_enabled": False,
+        }
+        
+        adapter.run_analysis(snapshot)
+        
+        inp = agent.received_input
+        assert inp.document_id == "doc-1"
+        assert inp.document_version == "v1"  # version_id takes precedence
+        assert inp.document_path == "/test/doc.txt"
+        assert inp.span_start == 100
+        assert inp.span_end == 500
+        assert inp.document_chars == 10000
+        assert inp.chunk_profile_hint == "large"
+        assert inp.chunk_index_ready is True
+        assert inp.outline_digest == "abc123"
+        assert inp.plot_state_status == "stale"
+        assert inp.concordance_status == "fresh"
+        assert inp.retrieval_enabled is False
 
 
 # =============================================================================
@@ -605,3 +850,69 @@ class TestToolDefinitions:
         assert definitions[0]["type"] == "function"
         assert definitions[0]["function"]["name"] == "test_tool"
         assert definitions[0]["function"]["description"] == "A test tool"
+        assert definitions[0]["function"]["strict"] is True
+
+
+# =============================================================================
+# Analysis Advice Cache Tests
+# =============================================================================
+
+
+class TestAnalysisAdviceCache:
+    """Tests for analysis advice caching."""
+
+    def test_get_latest_analysis_advice_empty(self, mock_client):
+        """Returns None when no advice cached."""
+        orchestrator = AIOrchestrator(client=mock_client)
+        assert orchestrator.get_latest_analysis_advice("doc-1") is None
+
+    def test_set_and_get_analysis_advice(self, mock_client):
+        """Can set and retrieve analysis advice."""
+        @dataclass
+        class MockAdvice:
+            document_id: str
+            chunk_profile: str = "auto"
+
+        orchestrator = AIOrchestrator(client=mock_client)
+        advice = MockAdvice(document_id="doc-1")
+        
+        orchestrator.set_analysis_advice("doc-1", advice)
+        
+        result = orchestrator.get_latest_analysis_advice("doc-1")
+        assert result is advice
+
+    def test_clear_analysis_advice_single(self, mock_client):
+        """Can clear advice for a single document."""
+        orchestrator = AIOrchestrator(client=mock_client)
+        orchestrator.set_analysis_advice("doc-1", {"id": "doc-1"})
+        orchestrator.set_analysis_advice("doc-2", {"id": "doc-2"})
+        
+        orchestrator.clear_analysis_advice("doc-1")
+        
+        assert orchestrator.get_latest_analysis_advice("doc-1") is None
+        assert orchestrator.get_latest_analysis_advice("doc-2") is not None
+
+    def test_clear_analysis_advice_all(self, mock_client):
+        """Can clear all cached advice."""
+        orchestrator = AIOrchestrator(client=mock_client)
+        orchestrator.set_analysis_advice("doc-1", {"id": "doc-1"})
+        orchestrator.set_analysis_advice("doc-2", {"id": "doc-2"})
+        
+        orchestrator.clear_analysis_advice()
+        
+        assert orchestrator.get_latest_analysis_advice("doc-1") is None
+        assert orchestrator.get_latest_analysis_advice("doc-2") is None
+
+    def test_set_analysis_advice_ignores_none(self, mock_client):
+        """Setting None advice is a no-op."""
+        orchestrator = AIOrchestrator(client=mock_client)
+        orchestrator.set_analysis_advice("doc-1", None)
+        
+        assert orchestrator.get_latest_analysis_advice("doc-1") is None
+
+    def test_set_analysis_advice_ignores_empty_doc_id(self, mock_client):
+        """Setting advice with empty doc ID is a no-op."""
+        orchestrator = AIOrchestrator(client=mock_client)
+        orchestrator.set_analysis_advice("", {"id": "test"})
+        
+        assert orchestrator.get_latest_analysis_advice("") is None

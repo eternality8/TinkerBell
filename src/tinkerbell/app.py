@@ -392,6 +392,9 @@ def _build_ai_orchestrator(settings: Settings, *, debug_logging: bool = False) -
         _LOGGER.warning("AI orchestrator unavailable: %s", exc)
         return None
 
+    # Build analysis provider for preflight analysis
+    analysis_provider = _build_analysis_provider()
+
     limit = _resolve_max_tool_iterations(settings)
     context_tokens = getattr(settings, "max_context_tokens", 128_000)
     response_reserve = getattr(settings, "response_token_reserve", 16_000)
@@ -404,7 +407,28 @@ def _build_ai_orchestrator(settings: Settings, *, debug_logging: bool = False) -
         streaming_enabled=True,
     )
     
-    return AIOrchestrator(client=client, config=config)
+    return AIOrchestrator(
+        client=client,
+        config=config,
+        analysis_provider=analysis_provider,
+    )
+
+
+def _build_analysis_provider():
+    """Build an analysis provider for preflight analysis."""
+    try:
+        from .ai.analysis import AnalysisAgent
+        from .ai.orchestration import AnalysisAgentAdapter
+    except ImportError:
+        _LOGGER.debug("Analysis components not available")
+        return None
+    
+    try:
+        agent = AnalysisAgent()
+        return AnalysisAgentAdapter(agent)
+    except Exception as exc:
+        _LOGGER.debug("Failed to create analysis provider: %s", exc)
+        return None
 
 
 def _resolve_max_tool_iterations(settings: Settings | None) -> int:

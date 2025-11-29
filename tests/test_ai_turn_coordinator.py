@@ -34,7 +34,8 @@ class _RecordingController:
                 "history": history,
             }
         )
-        await on_event(SimpleNamespace(type="content.delta", content="partial"))
+        # on_event is a sync callback, don't await it
+        on_event(SimpleNamespace(type="content.delta", content="partial"))
         return {
             "response": " done ",
             "tool_calls": [{"id": "call-123"}],

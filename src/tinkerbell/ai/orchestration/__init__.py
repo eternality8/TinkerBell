@@ -15,6 +15,7 @@ from .orchestrator import (
     OrchestratorConfig,
     ChatResult,
     StreamCallback,
+    AnalysisAgentAdapter,
 )
 
 # Tool call parsing (used by pipeline)
@@ -177,6 +178,7 @@ __all__ = [
     "OrchestratorConfig",
     "ChatResult",
     "StreamCallback",
+    "AnalysisAgentAdapter",
     # Tool specifications
     "OpenAIToolSpec",
     "ToolRegistration",  # Backwards compatibility alias for OpenAIToolSpec

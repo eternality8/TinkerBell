@@ -208,6 +208,7 @@ class WorkspaceBridgeRouter:
         new_doc = DocumentState(
             document_id=current_doc.document_id,
             text=content,
+            dirty=True,  # Mark as dirty so autosave persists the content
         )
         bridge.editor.load_document(new_doc)
 

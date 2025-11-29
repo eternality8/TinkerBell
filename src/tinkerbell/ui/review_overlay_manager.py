@@ -161,6 +161,10 @@ class ReviewOverlayManager:
             suffix = "tab" if len(skipped_tabs) == 1 else "tabs"
             notice = f"{notice} (skipped {len(skipped_tabs)} closed {suffix})"
         self._review_controller.drop_pending_turn_review(reason="accepted")
+        
+        # Persist the accepted changes to disk
+        self._sync_workspace_state()
+        
         self._status_updater(notice)
         self._notice_poster(notice)
 

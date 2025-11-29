@@ -402,11 +402,15 @@ class TurnRunner:
             started_at=timer.started_at,
             finished_at=timer.finished_at,
         )
+        # Include analysis advice in metadata if available
+        metadata: dict[str, Any] = {"max_iterations_reached": True}
+        if analyzed.advice is not None:
+            metadata["analysis_advice"] = analyzed.advice
         return finish_turn(
             response=response,
             metrics=metrics,
             tool_records=tuple(all_tool_records),
-            metadata={"max_iterations_reached": True},
+            metadata=metadata,
         )
 
     def _resolve_config(self, turn_config: TurnConfig) -> TurnConfig:
@@ -580,10 +584,15 @@ class TurnRunner:
             started_at=timer.started_at,
             finished_at=timer.finished_at,
         )
+        # Include analysis advice in metadata if available
+        metadata: dict[str, Any] = {}
+        if analyzed.advice is not None:
+            metadata["analysis_advice"] = analyzed.advice
         return finish_turn(
             response=response,
             metrics=metrics,
             tool_records=tool_records,
+            metadata=metadata if metadata else None,
         )
 
 

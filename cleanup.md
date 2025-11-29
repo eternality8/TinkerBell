@@ -72,53 +72,13 @@ After reviewing the codebase, several categories of issues have been identified:
 
 ## Priority 1: Critical Refactoring
 
-### 1.1 Split `controller.py` (Partial ✅)
+### 1.1 Split `controller.py` ✅
 
 **Location:** `src/tinkerbell/ai/orchestration/controller.py`
 
-**Phase 1 Complete:** The controller.py file has been split from 4,636 lines to ~4,250 lines (~395 lines extracted).
+**Status:** Complete. Total rewrite performed.
 
-**Extracted Files (Phase 1):**
-- `model_types.py` - `ToolCallRequest`, `ModelTurnResult`, `MessagePlan`
-- `chunk_flow.py` - `ChunkContext`, `ChunkFlowTracker`
-- `turn_tracking.py` - `SnapshotRefreshTracker`, `PlotLoopTracker`
-- `runtime_config.py` - `ChunkingRuntimeConfig`, `AnalysisRuntimeConfig`
-- `subagent_state.py` - `SubagentDocumentState`
-
-**Phase 2 Partial Complete:** Additional extractions brought the file down to ~3,925 lines (~720 total lines extracted).
-
-**Extracted Files (Phase 2):**
-- ✅ `tool_call_parser.py` - Tool call parsing constants and functions (`TOOL_MARKER_TRANSLATION`, regex patterns, `parse_embedded_tool_calls`, `normalize_tool_marker_text`, `try_parse_json_block`)
-- ✅ `controller_utils.py` - Static utility functions (`normalize_iterations`, `normalize_scope_origin`, `normalize_context_tokens`, `normalize_response_reserve`, `normalize_temperature`, `coerce_optional_int`, `coerce_optional_float`, `coerce_optional_str`, `sanitize_suggestions`)
-- ✅ `scope_helpers.py` - Scope/range handling (~250 lines: `scope_summary_from_arguments`, `scope_summary_from_metadata`, `scope_summary_from_ranges`, `scope_summary_from_target_range`, `scope_summary_from_chunk_arguments`, `scope_fields_from_summary`, `range_bounds_from_entry`, `range_bounds_from_mapping`, `extract_chunk_id`, `parse_chunk_bounds`)
-- ✅ `guardrail_hints.py` - Guardrail hint generation (~120 lines: `format_guardrail_hint`, `outline_guardrail_hints`, `retrieval_guardrail_hints`)
-
-**Phase 2 Remaining:**
-
-| Extraction Target | Est. Lines | Risk | Priority | Status |
-|-------------------|------------|------|----------|--------|
-| `tool_call_parser.py` | ~150 | Low | 1 | ✅ Done |
-| `controller_utils.py` | ~100 | Low | 2 | ✅ Done |
-| `scope_helpers.py` | ~300 | Low | 3 | ✅ Done |
-| `guardrail_hints.py` | ~200 | Low | 4 | ✅ Done |
-| `suggestions.py` | ~100 | Low | 5 | ⏳ Pending |
-| `tool_execution.py` | ~350 | Medium | 6 | ⏳ Pending |
-| `version_retry.py` | ~150 | Medium | 7 | ⏳ Pending |
-| `metrics_recorder.py` | ~200 | Low | 8 | ⏳ Pending |
-| `analysis_pipeline.py` | ~200 | Medium | 9 | ⏳ Pending |
-| `subagent_pipeline.py` | ~400 | Medium | 10 | ⏳ Pending |
-
-**Action Items:**
-- [x] Extract `tool_call_parser.py` (standalone, no controller state dependency)
-- [x] Extract `controller_utils.py` (pure functions)
-- [x] Extract `scope_helpers.py` (mostly stateless helpers)
-- [x] Extract `guardrail_hints.py` (self-contained logic)
-- [ ] Extract `suggestions.py` (isolated feature)
-- [ ] Extract `tool_execution.py` (core tool handling)
-- [ ] Extract `version_retry.py` (retry logic)
-- [ ] Extract `metrics_recorder.py` (telemetry helpers)
-- [ ] Extract `analysis_pipeline.py` (preflight analysis)
-- [ ] Extract `subagent_pipeline.py` (subagent orchestration)
+**Summary:** The controller was completely rewritten with a clean architecture, eliminating the need for incremental extraction. The new implementation is properly modularized from the start.
 
 ---
 

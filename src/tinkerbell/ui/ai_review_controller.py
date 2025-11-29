@@ -148,6 +148,12 @@ class AIReviewController:
 
     def finalize_pending_turn_review(self, *, success: bool) -> None:
         turn = self._pending_turn_review
+        LOGGER.debug(
+            "finalize_pending_turn_review: success=%s turn=%s edit_count=%s",
+            success,
+            turn.turn_id if turn else None,
+            turn.total_edit_count if turn else None,
+        )
         if turn is None:
             return
         turn.completed = True
@@ -158,6 +164,7 @@ class AIReviewController:
             self.drop_pending_turn_review(reason="no-edits")
             return
         turn.ready_for_review = True
+        LOGGER.debug("finalize_pending_turn_review: showing review controls")
         self.show_review_controls()
 
     def abort_pending_review(
