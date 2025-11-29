@@ -1,7 +1,41 @@
 """High-level AI orchestration utilities for the desktop app."""
 
 from .budget_manager import ContextBudgetExceeded
-from .controller import AIController, ToolRegistration
+from .chunk_flow import ChunkContext, ChunkFlowTracker
+from .controller import AIController, OpenAIToolSpec, ToolRegistration
+from .model_types import MessagePlan, ModelTurnResult, ToolCallRequest
+from .runtime_config import AnalysisRuntimeConfig, ChunkingRuntimeConfig
+from .subagent_state import SubagentDocumentState
+from .turn_tracking import PlotLoopTracker, SnapshotRefreshTracker
+
+# Phase 2 extractions: static utilities and helpers
+from .controller_utils import (
+    normalize_iterations,
+    normalize_scope_origin,
+    normalize_context_tokens,
+    normalize_response_reserve,
+    normalize_temperature,
+    coerce_optional_int,
+    coerce_optional_float,
+    coerce_optional_str,
+    sanitize_suggestions,
+)
+from .scope_helpers import (
+    scope_summary_from_arguments,
+    scope_fields_from_summary,
+    extract_chunk_id,
+    parse_chunk_bounds,
+)
+from .tool_call_parser import (
+    parse_embedded_tool_calls,
+    normalize_tool_marker_text,
+    try_parse_json_block,
+)
+from .guardrail_hints import (
+    format_guardrail_hint,
+    outline_guardrail_hints,
+    retrieval_guardrail_hints,
+)
 
 # WS4: Editor Lock & Diff Review
 from .editor_lock import (
@@ -74,7 +108,46 @@ from .subagent_prompts import (
 __all__ = [
     "AIController",
     "ContextBudgetExceeded",
-    "ToolRegistration",
+    "OpenAIToolSpec",
+    "ToolRegistration",  # Backwards compatibility alias for OpenAIToolSpec
+    # Extracted model types
+    "ToolCallRequest",
+    "ModelTurnResult",
+    "MessagePlan",
+    # Chunk flow tracking
+    "ChunkContext",
+    "ChunkFlowTracker",
+    # Turn tracking
+    "SnapshotRefreshTracker",
+    "PlotLoopTracker",
+    # Runtime configs
+    "ChunkingRuntimeConfig",
+    "AnalysisRuntimeConfig",
+    # Subagent state
+    "SubagentDocumentState",
+    # Phase 2: Controller utilities
+    "normalize_iterations",
+    "normalize_scope_origin",
+    "normalize_context_tokens",
+    "normalize_response_reserve",
+    "normalize_temperature",
+    "coerce_optional_int",
+    "coerce_optional_float",
+    "coerce_optional_str",
+    "sanitize_suggestions",
+    # Phase 2: Scope helpers
+    "scope_summary_from_arguments",
+    "scope_fields_from_summary",
+    "extract_chunk_id",
+    "parse_chunk_bounds",
+    # Phase 2: Tool call parsing
+    "parse_embedded_tool_calls",
+    "normalize_tool_marker_text",
+    "try_parse_json_block",
+    # Phase 2: Guardrail hints
+    "format_guardrail_hint",
+    "outline_guardrail_hints",
+    "retrieval_guardrail_hints",
     # WS4.1: Editor Lock
     "EditorLockManager",
     "LockSession",

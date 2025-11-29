@@ -72,44 +72,80 @@ After reviewing the codebase, several categories of issues have been identified:
 
 ## Priority 1: Critical Refactoring
 
-### 1.1 Split `controller.py` (4,636 lines)
+### 1.1 Split `controller.py` (Partial ✅)
 
 **Location:** `src/tinkerbell/ai/orchestration/controller.py`
 
-This is the largest file in the codebase and contains multiple distinct responsibilities:
+**Phase 1 Complete:** The controller.py file has been split from 4,636 lines to ~4,250 lines (~395 lines extracted).
 
-**Current Classes:**
-- `_ToolCallRequest`, `_ModelTurnResult`, `_MessagePlan` (data classes)
-- `_ChunkContext`, `_ChunkFlowTracker` (chunk tracking)
-- `_SnapshotRefreshTracker`, `_PlotLoopTracker` (turn tracking)
-- `_SubagentDocumentState` (subagent state)
-- `ChunkingRuntimeConfig`, `AnalysisRuntimeConfig` (config)
-- `ToolRegistration` (duplicate of registry class!)
-- `AIController` (main class, likely 3,500+ lines)
+**Extracted Files (Phase 1):**
+- `model_types.py` - `ToolCallRequest`, `ModelTurnResult`, `MessagePlan`
+- `chunk_flow.py` - `ChunkContext`, `ChunkFlowTracker`
+- `turn_tracking.py` - `SnapshotRefreshTracker`, `PlotLoopTracker`
+- `runtime_config.py` - `ChunkingRuntimeConfig`, `AnalysisRuntimeConfig`
+- `subagent_state.py` - `SubagentDocumentState`
 
-**Recommended Split:**
-```
-ai/orchestration/
-├── controller.py        # AIController only (~1,000 lines)
-├── turn_tracking.py     # _SnapshotRefreshTracker, _PlotLoopTracker
-├── chunk_flow.py        # _ChunkContext, _ChunkFlowTracker
-├── model_types.py       # _ToolCallRequest, _ModelTurnResult, _MessagePlan
-├── runtime_config.py    # ChunkingRuntimeConfig, AnalysisRuntimeConfig
-└── subagent_state.py    # _SubagentDocumentState
-```
+**Phase 2 Partial Complete:** Additional extractions brought the file down to ~3,925 lines (~720 total lines extracted).
+
+**Extracted Files (Phase 2):**
+- ✅ `tool_call_parser.py` - Tool call parsing constants and functions (`TOOL_MARKER_TRANSLATION`, regex patterns, `parse_embedded_tool_calls`, `normalize_tool_marker_text`, `try_parse_json_block`)
+- ✅ `controller_utils.py` - Static utility functions (`normalize_iterations`, `normalize_scope_origin`, `normalize_context_tokens`, `normalize_response_reserve`, `normalize_temperature`, `coerce_optional_int`, `coerce_optional_float`, `coerce_optional_str`, `sanitize_suggestions`)
+- ✅ `scope_helpers.py` - Scope/range handling (~250 lines: `scope_summary_from_arguments`, `scope_summary_from_metadata`, `scope_summary_from_ranges`, `scope_summary_from_target_range`, `scope_summary_from_chunk_arguments`, `scope_fields_from_summary`, `range_bounds_from_entry`, `range_bounds_from_mapping`, `extract_chunk_id`, `parse_chunk_bounds`)
+- ✅ `guardrail_hints.py` - Guardrail hint generation (~120 lines: `format_guardrail_hint`, `outline_guardrail_hints`, `retrieval_guardrail_hints`)
+
+**Phase 2 Remaining:**
+
+| Extraction Target | Est. Lines | Risk | Priority | Status |
+|-------------------|------------|------|----------|--------|
+| `tool_call_parser.py` | ~150 | Low | 1 | ✅ Done |
+| `controller_utils.py` | ~100 | Low | 2 | ✅ Done |
+| `scope_helpers.py` | ~300 | Low | 3 | ✅ Done |
+| `guardrail_hints.py` | ~200 | Low | 4 | ✅ Done |
+| `suggestions.py` | ~100 | Low | 5 | ⏳ Pending |
+| `tool_execution.py` | ~350 | Medium | 6 | ⏳ Pending |
+| `version_retry.py` | ~150 | Medium | 7 | ⏳ Pending |
+| `metrics_recorder.py` | ~200 | Low | 8 | ⏳ Pending |
+| `analysis_pipeline.py` | ~200 | Medium | 9 | ⏳ Pending |
+| `subagent_pipeline.py` | ~400 | Medium | 10 | ⏳ Pending |
 
 **Action Items:**
-- [ ] Extract internal data classes to `model_types.py`
-- [ ] Extract tracking classes to `turn_tracking.py`
-- [ ] Extract chunk flow logic to `chunk_flow.py`
-- [ ] Remove duplicate `ToolRegistration` class (use `tool_registry.ToolRegistration`)
-- [ ] Extract prompt generation methods to `prompts_v2.py`
+- [x] Extract `tool_call_parser.py` (standalone, no controller state dependency)
+- [x] Extract `controller_utils.py` (pure functions)
+- [x] Extract `scope_helpers.py` (mostly stateless helpers)
+- [x] Extract `guardrail_hints.py` (self-contained logic)
+- [ ] Extract `suggestions.py` (isolated feature)
+- [ ] Extract `tool_execution.py` (core tool handling)
+- [ ] Extract `version_retry.py` (retry logic)
+- [ ] Extract `metrics_recorder.py` (telemetry helpers)
+- [ ] Extract `analysis_pipeline.py` (preflight analysis)
+- [ ] Extract `subagent_pipeline.py` (subagent orchestration)
 
 ---
 
-### 1.2 Split `main_window.py` (2,519 lines)
+### 1.2 Split `main_window.py` (Partial ✅)
 
 **Location:** `src/tinkerbell/ui/main_window.py`
+
+**Current Status:** 2,519 → 2,233 lines (~11% reduction, 286 lines extracted)
+
+**Extracted to `main_window_helpers.py` (220 lines):**
+- Protocol implementations: `WriteToolDispatchListener`, `EditorTabWrapper`, `WorkspaceTabProvider`
+- Pure utility functions:
+  - `condense_whitespace` - Collapse whitespace to single spaces
+  - `line_column_from_offset` - Convert offset to line/column
+  - `coerce_stream_text` - Extract text from streaming payloads
+  - `infer_language` - Infer language from file extension
+  - `directive_parameters_schema` - Build directive schema copy
+  - `serialize_chat_history` - Serialize chat history to dicts
+  - `history_signature` - Compute SHA-256 of chat history
+
+**Also Cleaned:**
+- Removed duplicate `file_io` import
+- Removed `hashlib` import (no longer needed)
+- Removed 4 no-op methods (`_register_phase3_ai_tools`, etc.)
+- Removed unused `DIRECTIVE_SCHEMA` import
+
+**Remaining Work:** The remaining ~2,233 lines are tightly coupled to instance state. Further extraction requires creating coordinator classes that receive dependencies via constructor injection, similar to `AITurnCoordinator` and `AIReviewController`.
 
 Contains UI, business logic, and coordination all mixed together.
 
@@ -145,32 +181,38 @@ class MainWindow:
 
 ---
 
-### 1.3 Split `dialogs.py` (1,948 lines)
+### 1.3 Split `dialogs.py` (Partial ✅)
 
-**Location:** `src/tinkerbell/widgets/dialogs.py`
+**Location:** `src/tinkerbell/widgets/dialogs.py` → `src/tinkerbell/widgets/_dialogs_legacy.py`
 
-Contains 7 different dialog classes that should be separate files.
+**Status:** Partial extraction complete. Simpler dialog classes extracted to package, SettingsDialog remains in legacy file due to complexity.
 
-**Current Classes:**
-- `SampleDocument` (dataclass)
-- `DocumentLoadDialog`
-- `DocumentExportDialog`
-- `ValidationResult`
-- `SettingsDialogResult`
-- `ValidationErrorsDialog`
-- `SettingsDialog`
-
-**Recommended Split:**
+**Extracted Files:**
 ```
 widgets/dialogs/
-├── __init__.py              # Re-exports
+├── __init__.py              # Re-exports + open_file_dialog, save_file_dialog
+├── common.py                # DEFAULT_FILE_FILTER, PREVIEW_CHAR_LIMIT, ValidationResult types
 ├── sample_document.py       # SampleDocument, discover_sample_documents
 ├── document_load.py         # DocumentLoadDialog
 ├── document_export.py       # DocumentExportDialog
-├── settings_dialog.py       # SettingsDialog, SettingsDialogResult
-├── validation_errors.py     # ValidationErrorsDialog, ValidationResult
-└── common.py                # Shared utilities, file_dialog helpers
+├── validation_errors.py     # ValidationErrorsDialog, show_validation_errors
 ```
+
+**Line Counts:**
+- `_dialogs_legacy.py`: 1,948 lines (original renamed, contains SettingsDialog)
+- `common.py`: 106 lines
+- `document_export.py`: 159 lines  
+- `document_load.py`: 252 lines
+- `sample_document.py`: 63 lines
+- `validation_errors.py`: 58 lines
+- `__init__.py`: 133 lines (includes `open_file_dialog`, `save_file_dialog`)
+- **Total extracted**: ~771 lines in new package
+
+**Remaining Work:**
+- Extract `SettingsDialog` (~1,100 lines) to `settings_dialog.py` - Complex due to extensive widget setup and test dependencies
+- Original `_dialogs_legacy.py` still needed for `SettingsDialog`, `SettingsDialogResult`, `show_settings_dialog`, `test_ai_api_settings`, `test_embedding_settings`
+
+**Import Path:** `from tinkerbell.widgets.dialogs import ...` still works for all existing code.
 
 ---
 
@@ -250,15 +292,16 @@ These should be consolidated into a single utility function.
 
 ---
 
-### 2.3 Duplicate `ToolRegistration` Class
+### 2.3 Duplicate `ToolRegistration` Class ✅
 
-**Locations:**
-- `src/tinkerbell/ai/tools/tool_registry.py:178` - `ToolRegistration`
-- `src/tinkerbell/ai/orchestration/controller.py:530` - `ToolRegistration`
+**Date:** Completed
 
-**Action:**
-- [ ] Remove duplicate class from `controller.py`
-- [ ] Import from `tool_registry.py`
+**Resolution:** The two classes serve different purposes and should remain separate. To avoid confusion, they have been renamed:
+
+- `src/tinkerbell/ai/tools/tool_registry.py` - `ToolRegistration` (tool lifecycle management, categories, feature flags)
+- `src/tinkerbell/ai/orchestration/controller.py` - **Renamed to `OpenAIToolSpec`** (runtime API formatting for OpenAI function calling)
+
+A backwards compatibility alias `ToolRegistration = OpenAIToolSpec` is maintained in `controller.py` for existing code.
 
 ---
 
@@ -710,7 +753,7 @@ tests/
 
 | Metric | Current | Target |
 |--------|---------|--------|
-| Largest file (lines) | 4,636 | < 1,000 |
+| Largest file (lines) | 4,241 (controller.py) | < 1,000 |
 | Files > 1,000 lines | 7 | 0 |
 | `# type: ignore` in src | ~5 | 0 |
 | Bare `except Exception:` | 100+ | < 10 |

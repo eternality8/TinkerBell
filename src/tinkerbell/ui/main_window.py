@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import importlib
 import json
 import logging
 import os
-from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING, cast
@@ -17,7 +15,6 @@ from ..ai.analysis import AnalysisAdvice
 from ..chat.chat_panel import ChatPanel, ChatTurnSnapshot
 from ..chat.commands import (
     ActionType,
-    DIRECTIVE_SCHEMA,
     ManualCommandRequest,
     ManualCommandType,
     parse_manual_command,
@@ -34,7 +31,6 @@ from ..services.bridge import DocumentBridge
 from ..services.bridge_router import WorkspaceBridgeRouter
 from ..services.importers import FileImporter
 from ..services.settings import Settings, SettingsStore
-from ..utils import file_io
 from ..utils import file_io
 from ..services import telemetry as telemetry_service
 from ..widgets.status_bar import StatusBar
@@ -59,6 +55,18 @@ from .document_state_monitor import DocumentStateMonitor
 from .document_status_service import DocumentStatusService
 from .embedding_controller import EmbeddingController, EmbeddingRuntimeState
 from .import_controller import ImportController
+from .main_window_helpers import (
+    WriteToolDispatchListener,
+    WorkspaceTabProvider,
+    # Pure utility functions
+    condense_whitespace,
+    line_column_from_offset,
+    coerce_stream_text,
+    infer_language,
+    directive_parameters_schema,
+    serialize_chat_history,
+    history_signature,
+)
 from .models.actions import MenuSpec, ToolbarSpec, WindowAction
 from .models.window_state import OutlineStatusInfo, WindowContext
 from .review_overlay_manager import ReviewOverlayManager
@@ -102,86 +110,12 @@ UNTITLED_DOCUMENT_NAME = "Untitled"
 SUGGESTION_LOADING_LABEL = "Generating personalized suggestions…"
 OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 
-
-class _WriteToolDispatchListener:
-    """Listens for tool dispatch events to track document write operations.
-    
-    When a tool with writes_document=True completes successfully, this listener
-    records the edit in the pending turn review so that changes are not dropped
-    as "no-edits".
-    """
-    
-    def __init__(self, main_window: "MainWindow") -> None:
-        self._window = main_window
-        self._registry = get_tool_registry()
-    
-    def on_tool_start(self, tool_name: str, arguments: Mapping[str, Any]) -> None:
-        """Called when a tool starts execution."""
-        # We only care about completion, not start
-        pass
-    
-    def on_tool_complete(self, result: DispatchResult) -> None:
-        """Called when a tool completes - increment edit count if it was a write tool."""
-        if not result.success:
-            return
-        if not self._registry.is_write_tool(result.tool_name):
-            return
-        # Track this as an edit in the pending turn review
-        self._window._record_write_tool_edit(result)
-    
-    def on_tool_error(self, tool_name: str, error: Any) -> None:
-        """Called when a tool fails."""
-        # Errors don't count as edits
-        pass
-
-
-class _EditorTabWrapper:
-    """Wraps a DocumentTab to implement LockableTab protocol."""
-    
-    __slots__ = ("_tab",)
-    
-    def __init__(self, tab: DocumentTab) -> None:
-        self._tab = tab
-    
-    @property
-    def id(self) -> str:
-        return self._tab.id
-    
-    def set_readonly(self, readonly: bool) -> None:
-        """Set the tab's read-only state via its editor widget."""
-        editor = self._tab.editor
-        set_ro = getattr(editor, "set_readonly", None)
-        if callable(set_ro):
-            set_ro(readonly)
-    
-    def is_readonly(self) -> bool:
-        """Check if the tab is read-only."""
-        editor = self._tab.editor
-        is_ro = getattr(editor, "is_readonly", None)
-        if callable(is_ro):
-            return is_ro()
-        return False
-
-
-class _WorkspaceTabProvider:
-    """Implements TabProvider protocol for the workspace."""
-    
-    __slots__ = ("_workspace",)
-    
-    def __init__(self, workspace: Any) -> None:
-        self._workspace = workspace
-    
-    def get_all_tabs(self) -> Sequence[LockableTab]:
-        """Get all open tabs as lockable wrappers."""
-        tabs = list(self._workspace.iter_tabs())
-        return [_EditorTabWrapper(tab) for tab in tabs]
-    
-    def get_active_tab(self) -> LockableTab | None:
-        """Get the currently active tab."""
-        active = self._workspace.active_tab
-        if active is None:
-            return None
-        return _EditorTabWrapper(active)
+# Import helper classes from extracted module
+from .main_window_helpers import (
+    WriteToolDispatchListener as _WriteToolDispatchListener,
+    EditorTabWrapper as _EditorTabWrapper,
+    WorkspaceTabProvider as _WorkspaceTabProvider,
+)
 
 
 class MainWindow(QMainWindow):
@@ -342,7 +276,7 @@ class MainWindow(QMainWindow):
             response_finalizer=self._finalize_ai_response,
             tool_trace_presenter=self._tool_trace_presenter,
             stream_state_setter=self._set_ai_stream_active,
-            stream_text_coercer=self._coerce_stream_text,
+            stream_text_coercer=coerce_stream_text,
             lock_manager=self._editor_lock_manager,
         )
         self._settings_runtime = SettingsRuntime(
@@ -652,22 +586,6 @@ class MainWindow(QMainWindow):
             if dispatcher is not None and hasattr(dispatcher, "set_listener"):
                 dispatcher.set_listener(_WriteToolDispatchListener(self))
 
-    def _register_phase3_ai_tools(self, *, register_fn: Callable[..., Any] | None = None) -> None:
-        # Phase3 tools have been deprecated; this is now a no-op
-        pass
-
-    def _unregister_phase3_ai_tools(self) -> None:
-        # Phase3 tools have been deprecated; this is now a no-op
-        pass
-
-    def _register_plot_state_tool(self, *, register_fn: Callable[..., Any] | None = None) -> None:
-        # Plot state tools have been deprecated; this is now a no-op
-        pass
-
-    def _unregister_plot_state_tool(self) -> None:
-        # Plot state tools have been deprecated; this is now a no-op
-        pass
-
     def _resolve_plot_state_store(self) -> DocumentPlotStateStore | None:
         controller = self._context.ai_controller
         if controller is None:
@@ -679,17 +597,6 @@ class MainWindow(QMainWindow):
         if controller is None:
             return None
         return getattr(controller, "character_map_store", None)
-
-    @staticmethod
-    def _directive_parameters_schema() -> Dict[str, Any]:
-        """Return a copy of the directive schema used by the document edit tool."""
-
-        schema = deepcopy(DIRECTIVE_SCHEMA)
-        schema.setdefault(
-            "description",
-            "Structured edit directive containing action, content, optional rationale, and target range. Prefer action='patch' with a unified diff and document_version when modifying existing text.",
-        )
-        return schema
 
     def _handle_chat_request(self, prompt: str, metadata: dict[str, Any]) -> None:
         try:
@@ -733,7 +640,7 @@ class MainWindow(QMainWindow):
 
         snapshot = self._bridge.generate_snapshot()
         self._apply_embedding_metadata(snapshot)
-        history_payload = self._serialize_chat_history(
+        history_payload = serialize_chat_history(
             self._chat_panel.history(),
             limit=0,
             exclude_latest=True,
@@ -1147,7 +1054,7 @@ class MainWindow(QMainWindow):
             text = document.text or ""
         except Exception:
             text = ""
-        line, column = self._line_column_from_offset(text, caret)
+        line, column = line_column_from_offset(text, caret)
         self._status_bar.update_cursor(line, column)
 
     def _handle_document_status_signal(self, payload: Mapping[str, Any] | None) -> None:
@@ -1330,7 +1237,7 @@ class MainWindow(QMainWindow):
             score_text = f"{float(score):.2f}" if isinstance(score, (int, float)) else "n/a"
             lines.append(f"{index}. {' · '.join(label_parts)} (score {score_text})")
             preview = pointer.get("preview")
-            snippet = self._condense_whitespace(str(preview)) if isinstance(preview, str) else ""
+            snippet = condense_whitespace(str(preview)) if isinstance(preview, str) else ""
             if snippet:
                 if len(snippet) > 180:
                     snippet = f"{snippet[:177]}…"
@@ -1389,30 +1296,6 @@ class MainWindow(QMainWindow):
 
     def _set_ai_stream_active(self, active: bool) -> None:
         self._ai_stream_active = active
-
-    def _coerce_stream_text(self, payload: Any) -> str:
-        if payload is None:
-            return ""
-        if isinstance(payload, str):
-            return payload
-        if isinstance(payload, Mapping):
-            for key in ("text", "content", "value"):
-                if key in payload:
-                    text = self._coerce_stream_text(payload[key])
-                    if text:
-                        return text
-        if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
-            parts = [self._coerce_stream_text(item) for item in payload]
-            return "".join(part for part in parts if part)
-        text_attr = getattr(payload, "text", None)
-        if text_attr:
-            return self._coerce_stream_text(text_attr)
-        content_attr = getattr(payload, "content", None)
-        if content_attr is not None and content_attr is not payload:
-            text = self._coerce_stream_text(content_attr)
-            if text:
-                return text
-        return str(payload)
 
     def _finalize_ai_response(self, content: str) -> None:
         if self._ai_stream_active:
@@ -1500,13 +1383,13 @@ class MainWindow(QMainWindow):
             self._document_monitor.refresh_chat_suggestions()
             return
 
-        history_signature = self._history_signature(history)
-        if history_signature is None:
+        hist_sig = history_signature(history)
+        if hist_sig is None:
             self._document_monitor.refresh_chat_suggestions()
             return
 
         if (
-            history_signature == self._suggestion_cache_key
+            hist_sig == self._suggestion_cache_key
             and self._suggestion_cache_values
         ):
             self._chat_panel.set_suggestions(list(self._suggestion_cache_values))
@@ -1550,39 +1433,12 @@ class MainWindow(QMainWindow):
         self._suggestion_cache_values = None
 
     def _store_suggestion_cache(self, history: Sequence[ChatMessage], suggestions: Sequence[str]) -> None:
-        signature = self._history_signature(history)
+        signature = history_signature(history)
         if signature is None:
             self._clear_suggestion_cache()
             return
         self._suggestion_cache_key = signature
         self._suggestion_cache_values = tuple(suggestions)
-
-    def _history_signature(self, history: Sequence[ChatMessage]) -> str | None:
-        payload = self._serialize_chat_history(history)
-        if not payload:
-            return None
-        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-        return digest
-
-    def _serialize_chat_history(
-        self,
-        history: Sequence[ChatMessage],
-        limit: int = 10,
-        *,
-        exclude_latest: bool = False,
-    ) -> list[dict[str, str]]:
-        messages = list(history)
-        if exclude_latest and messages:
-            messages = messages[:-1]
-        windowed = messages[-limit:] if limit else messages
-        serialized: list[dict[str, str]] = []
-        for message in windowed:
-            text = (message.content or "").strip()
-            if not text:
-                continue
-            serialized.append({"role": message.role, "content": text})
-        return serialized
 
     async def _generate_dynamic_suggestions(
         self,
@@ -1593,7 +1449,7 @@ class MainWindow(QMainWindow):
         if controller is None:
             return
 
-        payload = self._serialize_chat_history(history)
+        payload = serialize_chat_history(history)
         if not payload:
             return
 
@@ -1833,7 +1689,7 @@ class MainWindow(QMainWindow):
         if not metadata:
             return None
         cause = str(metadata.get("cause") or "").strip()
-        reason_text = self._condense_whitespace(str(metadata.get("reason") or reason or ""))
+        reason_text = condense_whitespace(str(metadata.get("reason") or reason or ""))
         if cause == DocumentBridge.CAUSE_HASH_MISMATCH:
             return self._build_snapshot_guardrail_notice(reason_text)
         if cause == DocumentBridge.CAUSE_CHUNK_HASH_MISMATCH:
@@ -1855,7 +1711,7 @@ class MainWindow(QMainWindow):
             return None
         diagnostics = metadata.get("diagnostics")
         diag_map = diagnostics if isinstance(diagnostics, Mapping) else {}
-        reason_text = self._condense_whitespace(str(metadata.get("reason") or reason or ""))
+        reason_text = condense_whitespace(str(metadata.get("reason") or reason or ""))
         detail_bits: list[str] = []
         if reason_text:
             detail_bits.append(reason_text)
@@ -1913,8 +1769,8 @@ class MainWindow(QMainWindow):
         detail: str,
         guidance: str,
     ) -> tuple[str, str, str]:
-        detail_text = self._condense_whitespace(detail) or prefix
-        guidance_text = self._condense_whitespace(guidance)
+        detail_text = condense_whitespace(detail) or prefix
+        guidance_text = condense_whitespace(guidance)
         reason_label = self._summarize_guardrail_reason(detail_text)
         suffix = ""
         if reason_label:
@@ -1934,7 +1790,7 @@ class MainWindow(QMainWindow):
             setter(status, detail=detail, category="safe_edit")
 
     def _summarize_guardrail_reason(self, reason: str, *, limit: int = 60) -> str:
-        text = self._condense_whitespace(reason)
+        text = condense_whitespace(reason)
         if not text:
             return ""
         if len(text) <= limit:
@@ -1944,7 +1800,7 @@ class MainWindow(QMainWindow):
     def _summarize_inspector_snippet(self, value: Any, *, limit: int = 80) -> str:
         if value is None:
             return ""
-        text = self._condense_whitespace(str(value))
+        text = condense_whitespace(str(value))
         if not text:
             return ""
         if len(text) <= limit:
@@ -1964,23 +1820,6 @@ class MainWindow(QMainWindow):
         if pending_turn and pending_turn.ready_for_review:
             self._review_controller.show_review_controls()
 
-    @staticmethod
-    def _condense_whitespace(text: str) -> str:
-        return " ".join(text.split())
-
-    @staticmethod
-    def _line_column_from_offset(text: str, caret: int) -> tuple[int, int]:
-        if not text:
-            return (1, 1)
-        length = len(text)
-        caret = max(0, min(int(caret), length))
-        line = text.count("\n", 0, caret) + 1
-        last_newline = text.rfind("\n", 0, caret)
-        column = caret + 1 if last_newline == -1 else caret - last_newline
-        if column <= 0:
-            column = 1
-        return (line, column)
-
     def _handle_snapshot_requested(self) -> None:
         """Force a snapshot refresh and log the event."""
 
@@ -1988,7 +1827,6 @@ class MainWindow(QMainWindow):
         self._last_snapshot = snapshot
         _LOGGER.debug("Snapshot refreshed: chars=%s", len(snapshot.get("text", "")))
         self.update_status("Snapshot refreshed")
-
     def _handle_accept_ai_changes(self) -> None:
         if self._review_overlay_manager is not None:
             self._review_overlay_manager.handle_accept_ai_changes()
@@ -2113,7 +1951,7 @@ class MainWindow(QMainWindow):
             self.update_status(f"File not found: {path}")
             return
 
-        metadata = DocumentMetadata(path=path, language=self._infer_language(path))
+        metadata = DocumentMetadata(path=path, language=infer_language(path))
         document = DocumentState(text=text, metadata=metadata)
         document.dirty = False
 
@@ -2205,7 +2043,7 @@ class MainWindow(QMainWindow):
             return
 
         text = file_io.read_text(target)
-        metadata = DocumentMetadata(path=target, language=self._infer_language(target))
+        metadata = DocumentMetadata(path=target, language=infer_language(target))
         document = DocumentState(text=text, metadata=metadata)
         document.dirty = False
 
@@ -2281,20 +2119,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
-    def _infer_language(self, path: Path) -> str:
-        """Infer a simple language identifier from the file suffix."""
-
-        suffix = path.suffix.lower()
-        if suffix in {".md", ".markdown"}:
-            return "markdown"
-        if suffix in {".yaml", ".yml"}:
-            return "yaml"
-        if suffix == ".json":
-            return "json"
-        if suffix in {".txt", ""}:
-            return "text"
-        return "plain"
-
     def _prompt_for_import_path(self) -> Path | None:
         """Delegate import dialog handling to the session service."""
 

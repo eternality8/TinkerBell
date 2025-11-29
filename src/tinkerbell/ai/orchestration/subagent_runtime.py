@@ -15,7 +15,7 @@ from ..services.context_policy import ContextBudgetPolicy
 from ..agents.subagents import SubagentManager
 
 if TYPE_CHECKING:  # pragma: no cover - typing helpers
-    from .controller import ToolRegistration
+    from .controller import OpenAIToolSpec
 
 LOGGER = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ LOGGER = logging.getLogger(__name__)
 class SubagentRuntimeManager:
     """Stores shared subagent state and wiring dependencies."""
 
-    tool_resolver: Callable[[], Mapping[str, "ToolRegistration"]]
+    tool_resolver: Callable[[], Mapping[str, "OpenAIToolSpec"]]
     manager: SubagentManager | None = None
     cache: SubagentResultCache | None = None
     plot_state_store: PlotStateMemory | None = None

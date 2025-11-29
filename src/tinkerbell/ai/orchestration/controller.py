@@ -53,50 +53,53 @@ from ..services.trace_compactor import TraceCompactor
 from ..tools.errors import NeedsRangeError
 from ..tools.version import get_version_manager, VersionManager
 from .budget_manager import BudgetManager
+from .chunk_flow import ChunkContext, ChunkFlowTracker
 from .event_log import ChatEventLogger
+from .model_types import MessagePlan, ModelTurnResult, ToolCallRequest
+from .runtime_config import AnalysisRuntimeConfig, ChunkingRuntimeConfig
 from .subagent_runtime import SubagentRuntimeManager
+from .subagent_state import SubagentDocumentState
 from .telemetry_manager import TelemetryManager
 from .tool_dispatcher import ToolDispatcher, DispatchResult, ToolContextProvider
 from .turn_context import TurnContext
-
-# Normalizes stylized glyphs inside <|tool ...|> markers emitted by some models.
-_TOOL_MARKER_TRANSLATION = str.maketrans(
-    {
-        ord("＜"): "<",
-        ord("﹤"): "<",
-        ord("〈"): "<",
-        ord("《"): "<",
-        ord("＞"): ">",
-        ord("﹥"): ">",
-        ord("〉"): ">",
-        ord("》"): ">",
-        ord("｜"): "|",
-        ord("￨"): "|",
-        ord("│"): "|",
-        ord("︱"): "|",
-        ord("︲"): "|",
-        ord("▁"): "_",
-        ord("\u00a0"): " ",
-        ord("\u1680"): " ",
-        ord("\u2000"): " ",
-        ord("\u2001"): " ",
-        ord("\u2002"): " ",
-        ord("\u2003"): " ",
-        ord("\u2004"): " ",
-        ord("\u2005"): " ",
-        ord("\u2006"): " ",
-        ord("\u2007"): " ",
-        ord("\u2008"): " ",
-        ord("\u2009"): " ",
-        ord("\u200a"): " ",
-        ord("\u200b"): " ",
-        ord("\u200c"): " ",
-        ord("\u200d"): " ",
-        ord("\u202f"): " ",
-        ord("\u205f"): " ",
-        ord("\u3000"): " ",
-        ord("\ufeff"): " ",
-    }
+from .turn_tracking import PlotLoopTracker, SnapshotRefreshTracker
+from .tool_call_parser import (
+    TOOL_MARKER_TRANSLATION as _TOOL_MARKER_TRANSLATION,
+    TOOL_CALLS_BLOCK_RE as _TOOL_CALLS_BLOCK_RE,
+    TOOL_CALL_ENTRY_RE as _TOOL_CALL_ENTRY_RE,
+    parse_embedded_tool_calls as _parse_embedded_tool_calls_impl,
+    parse_tool_call_entries as _parse_tool_call_entries_impl,
+    normalize_tool_marker_text as _normalize_tool_marker_text_impl,
+    parsed_tool_call_id as _parsed_tool_call_id_impl,
+    try_parse_json_block as _try_parse_json_block_impl,
+)
+from .controller_utils import (
+    normalize_iterations as _normalize_iterations_impl,
+    normalize_scope_origin as _normalize_scope_origin_impl,
+    normalize_context_tokens as _normalize_context_tokens_impl,
+    normalize_response_reserve as _normalize_response_reserve_impl,
+    normalize_temperature as _normalize_temperature_impl,
+    coerce_optional_int as _coerce_optional_int_impl,
+    coerce_optional_float as _coerce_optional_float_impl,
+    coerce_optional_str as _coerce_optional_str_impl,
+    sanitize_suggestions as _sanitize_suggestions_impl,
+)
+from .scope_helpers import (
+    scope_summary_from_arguments as _scope_summary_from_arguments_impl,
+    scope_summary_from_metadata as _scope_summary_from_metadata_impl,
+    scope_summary_from_ranges as _scope_summary_from_ranges_impl,
+    scope_summary_from_target_range as _scope_summary_from_target_range_impl,
+    scope_summary_from_chunk_arguments as _scope_summary_from_chunk_arguments_impl,
+    scope_fields_from_summary as _scope_fields_from_summary_impl,
+    range_bounds_from_entry as _range_bounds_from_entry_impl,
+    range_bounds_from_mapping as _range_bounds_from_mapping_impl,
+    extract_chunk_id as _extract_chunk_id_impl,
+    parse_chunk_bounds as _parse_chunk_bounds_impl,
+)
+from .guardrail_hints import (
+    format_guardrail_hint as _format_guardrail_hint_impl,
+    outline_guardrail_hints as _outline_guardrail_hints_impl,
+    retrieval_guardrail_hints as _retrieval_guardrail_hints_impl,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -106,429 +109,26 @@ _SUGGESTION_SYSTEM_PROMPT = (
     "You are a helpful writing copilot asked to propose up to {max_suggestions} focused follow-up suggestions. "
     "Each suggestion should be a short imperative phrase (no numbering) tailored to the prior conversation transcript."
 )
-_TOOL_CALLS_BLOCK_RE = re.compile(
-    r"<\s*\|?\s*tool[\s_]*calls[\s_]*begin\s*\|?\s*>(?P<body>.*?)<\s*\|?\s*tool[\s_]*calls[\s_]*end\s*\|?\s*>",
-    re.IGNORECASE | re.DOTALL,
-)
-_TOOL_CALL_ENTRY_RE = re.compile(
-    r"<\s*\|?\s*tool[\s_]*call[\s_]*begin\s*\|?\s*>(?P<name>.*?)<\s*\|?\s*tool[\s_]*sep\s*\|?\s*>(?P<args>.*?)<\s*\|?\s*tool[\s_]*call[\s_]*end\s*\|?\s*>",
-    re.IGNORECASE | re.DOTALL,
-)
 
 ToolCallback = Callable[[AIStreamEvent], Awaitable[None] | None]
 
+# Aliases for internal names (preserved for backwards compatibility with tests)
+_ToolCallRequest = ToolCallRequest
+_ModelTurnResult = ModelTurnResult
+_MessagePlan = MessagePlan
+_ChunkContext = ChunkContext
+_ChunkFlowTracker = ChunkFlowTracker
+_SnapshotRefreshTracker = SnapshotRefreshTracker
+_PlotLoopTracker = PlotLoopTracker
+_SubagentDocumentState = SubagentDocumentState
 
 @dataclass(slots=True)
-class _ToolCallRequest:
-    """Internal representation of tool call directives emitted by the model."""
-
-    call_id: str
-    name: str
-    index: int
-    arguments: str | None
-    parsed: Any | None
-
-
-@dataclass(slots=True)
-class _ModelTurnResult:
-    """Aggregate of a single model turn (stream) including tool metadata."""
-
-    assistant_message: Dict[str, Any]
-    response_text: str
-    tool_calls: list[_ToolCallRequest]
-
-
-@dataclass(slots=True)
-class _MessagePlan:
-    """Normalized plan for the prompt and completion budgeting."""
-
-    messages: list[dict[str, str]]
-    completion_budget: int | None
-    prompt_tokens: int
-
-
-@dataclass(slots=True)
-class _ChunkContext:
-    """Resolved chunk metadata pulled from a manifest for subagent planning."""
-
-    chunk_id: str
-    document_id: str
-    char_range: tuple[int, int]
-    chunk_hash: str | None = None
-    pointer_id: str | None = None
-    text: str | None = None
-
-
-@dataclass(slots=True)
-class _ChunkFlowTracker:
-    """Tracks whether the agent stays on the chunk-first path during a run.
+class OpenAIToolSpec:
+    """Tool metadata formatted for OpenAI function calling API.
     
-    Recognizes both legacy and new tool names:
-    - document_snapshot / read_document
-    - document_chunk / analyze_document
+    This is distinct from tool_registry.ToolRegistration which handles
+    tool lifecycle management. This class focuses on runtime API formatting.
     """
-
-    document_id: str | None
-    warning_active: bool = False
-    last_reason: str | None = None
-
-    # Tool name sets for matching (legacy + new names)
-    _SNAPSHOT_TOOLS: frozenset[str] = frozenset({"document_snapshot", "read_document"})
-    _CHUNK_TOOLS: frozenset[str] = frozenset({"document_chunk", "analyze_document"})
-
-    def observe_tool(self, record: Mapping[str, Any], payload: Mapping[str, Any] | None) -> list[str] | None:
-        name = str(record.get("name") or "").lower()
-        if name in self._SNAPSHOT_TOOLS:
-            return self._handle_snapshot(record, payload, source=name)
-        if name in self._CHUNK_TOOLS:
-            self._handle_chunk_tool(payload, source=name)
-        return None
-
-    # ------------------------------------------------------------------
-    # Snapshot handling
-    # ------------------------------------------------------------------
-    def _handle_snapshot(self, record: Mapping[str, Any], payload: Mapping[str, Any] | None, *, source: str = "read_document") -> list[str] | None:
-        if not isinstance(payload, Mapping):
-            return None
-        window = payload.get("window") if isinstance(payload.get("window"), Mapping) else None
-        if window is None:
-            window = {}
-        includes_full = bool(window.get("includes_full_document"))
-        doc_length = self._coerce_int(payload.get("length"))
-        window_span = self._window_span(window, payload)
-        span_length = self._span_length(window, payload)
-        manifest = payload.get("chunk_manifest") if isinstance(payload.get("chunk_manifest"), Mapping) else None
-        metadata: dict[str, Any] = {
-            "document_id": payload.get("document_id") or self.document_id,
-            "document_length": doc_length,
-            "window_span": window_span,
-            "span_length": span_length,
-            "window_kind": str(window.get("kind") or ""),
-            "requested_window": str(window.get("requested_kind") or ""),
-            "defaulted": bool(window.get("defaulted")),
-            "source": source,
-        }
-        if manifest:
-            chunks = manifest.get("chunks")
-            if isinstance(chunks, Sequence):
-                metadata["chunk_count"] = len(chunks)
-            cache_hit = manifest.get("cache_hit")
-            if cache_hit is not None:
-                metadata["cache_hit"] = bool(cache_hit)
-        threshold_triggered = self._is_large_window(doc_length, window_span)
-        if includes_full and threshold_triggered:
-            metadata["reason"] = self._snapshot_reason(record, metadata)
-            return self._emit_warning(metadata)
-        self._emit_request(metadata)
-        if self.warning_active:
-            recovery = dict(metadata)
-            recovery["recovered_via"] = source
-            self._emit_recovery(recovery)
-        return None
-
-    def _snapshot_reason(self, record: Mapping[str, Any], metadata: Mapping[str, Any]) -> str:
-        resolved = record.get("resolved_arguments") if isinstance(record.get("resolved_arguments"), Mapping) else None
-        if resolved:
-            window_arg = resolved.get("window")
-            if isinstance(window_arg, str) and window_arg.strip():
-                return f"window:{window_arg.strip().lower()}"
-            if isinstance(window_arg, Mapping):
-                kind = window_arg.get("kind") or window_arg.get("requested_kind")
-                if isinstance(kind, str) and kind.strip():
-                    return f"window:{kind.strip().lower()}"
-        if metadata.get("defaulted"):
-            return "default_window_full"
-        return "full_window_range"
-
-    def _window_span(self, window: Mapping[str, Any], payload: Mapping[str, Any]) -> int | None:
-        start = self._coerce_int(window.get("start"))
-        end = self._coerce_int(window.get("end"))
-        if start is not None and end is not None:
-            return max(0, end - start)
-        text_range = payload.get("text_range")
-        if isinstance(text_range, Mapping):
-            range_start = self._coerce_int(text_range.get("start"))
-            range_end = self._coerce_int(text_range.get("end"))
-            if range_start is not None and range_end is not None:
-                return max(0, range_end - range_start)
-        return None
-
-    @staticmethod
-    def _span_length(window: Mapping[str, Any], payload: Mapping[str, Any]) -> int | None:
-        text_range = payload.get("text_range") if isinstance(payload.get("text_range"), Mapping) else None
-        if isinstance(text_range, Mapping):
-            start = _ChunkFlowTracker._coerce_int(text_range.get("start"))
-            end = _ChunkFlowTracker._coerce_int(text_range.get("end"))
-            if start is not None and end is not None:
-                return max(0, end - start)
-        start = _ChunkFlowTracker._coerce_int(window.get("start"))
-        end = _ChunkFlowTracker._coerce_int(window.get("end"))
-        if start is None or end is None:
-            return None
-        return max(0, end - start)
-
-    @staticmethod
-    def _is_large_window(doc_length: int | None, window_span: int | None) -> bool:
-        span = window_span if window_span is not None else doc_length
-        if span is None:
-            return False
-        return span >= prompts.LARGE_DOC_CHAR_THRESHOLD
-
-    # ------------------------------------------------------------------
-    # Chunk tool handling
-    # ------------------------------------------------------------------
-    def _handle_chunk_tool(self, payload: Mapping[str, Any] | None, *, source: str = "analyze_document") -> None:
-        if not isinstance(payload, Mapping):
-            return
-        chunk = payload.get("chunk")
-        if not isinstance(chunk, Mapping):
-            return
-        start = self._coerce_int(chunk.get("start"))
-        end = self._coerce_int(chunk.get("end"))
-        length = chunk.get("length")
-        if not isinstance(length, int) and start is not None and end is not None:
-            length = max(0, end - start)
-        metadata = {
-            "document_id": chunk.get("document_id") or self.document_id,
-            "chunk_id": chunk.get("chunk_id"),
-            "chunk_length": length,
-            "window_start": start,
-            "window_end": end,
-            "pointerized": bool(chunk.get("pointer")),
-            "source": source,
-        }
-        self._emit_request(metadata)
-        if self.warning_active:
-            recovery = dict(metadata)
-            recovery["recovered_via"] = source
-            self._emit_recovery(recovery)
-
-    # ------------------------------------------------------------------
-    # Telemetry helpers
-    # ------------------------------------------------------------------
-    def _emit_request(self, metadata: Mapping[str, Any]) -> None:
-        telemetry_service.emit("chunk_flow.requested", self._clean_payload(metadata))
-
-    def _emit_warning(self, metadata: Mapping[str, Any]) -> list[str]:
-        payload = dict(metadata)
-        if self.warning_active:
-            payload["repeat"] = True
-        telemetry_service.emit("chunk_flow.escaped_full_snapshot", self._clean_payload(payload))
-        self.warning_active = True
-        self.last_reason = str(metadata.get("reason") or "full_snapshot")
-        doc_length = self._coerce_int(metadata.get("document_length"))
-        approx = f" (~{doc_length:,} chars)" if doc_length else ""
-        return [
-            f"read_document fetched the entire document{approx}.",
-            "Request a selection-scoped read or analyze a chunk via analyze_document before editing.",
-            "If a full read is unavoidable, explain the fallback to the user and immediately return to chunked context.",
-        ]
-
-    def _emit_recovery(self, metadata: Mapping[str, Any]) -> None:
-        if not self.warning_active:
-            return
-        telemetry_service.emit("chunk_flow.retry_success", self._clean_payload(metadata))
-        self.warning_active = False
-        self.last_reason = None
-
-    @staticmethod
-    def _clean_payload(metadata: Mapping[str, Any]) -> dict[str, Any]:
-        return {key: value for key, value in metadata.items() if value not in (None, "")}
-
-    @staticmethod
-    def _coerce_int(value: Any) -> int | None:
-        if value in (None, ""):
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-
-@dataclass(slots=True)
-class _SnapshotRefreshTracker:
-    """Warns when the agent applies too many edits without a fresh snapshot.
-    
-    Recognizes both legacy and new tool names:
-    - document_snapshot / read_document
-    - document_apply_patch, document_edit / replace_lines, insert_lines, delete_lines
-    """
-
-    document_id: str | None
-    threshold: int
-    edits_since_snapshot: int = 0
-    last_snapshot_version: str | None = None
-    warning_active: bool = False
-
-    # Tool name sets for matching (legacy + new names)
-    _SNAPSHOT_TOOLS: frozenset[str] = frozenset({"document_snapshot", "read_document"})
-    _EDIT_TOOLS: frozenset[str] = frozenset({
-        "document_apply_patch", "document_edit",
-        "replace_lines", "insert_lines", "delete_lines", "write_document",
-    })
-
-    def __post_init__(self) -> None:
-        try:
-            value = int(self.threshold)
-        except (TypeError, ValueError):  # pragma: no cover - defensive cast
-            value = 1
-        self.threshold = max(1, value)
-
-    def observe_tool(self, record: Mapping[str, Any], payload: Mapping[str, Any] | None) -> list[str] | None:
-        name = str(record.get("name") or "").lower()
-        status = str(record.get("status") or "ok").lower()
-        succeeded = status == "ok"
-        if name in self._SNAPSHOT_TOOLS:
-            if succeeded:
-                self._note_snapshot(payload)
-            return None
-        if name not in self._EDIT_TOOLS or not succeeded:
-            return None
-        self.edits_since_snapshot += 1
-        if not self.warning_active and self.edits_since_snapshot >= self.threshold:
-            self.warning_active = True
-            return self._warning_lines()
-        return None
-
-    def _note_snapshot(self, payload: Mapping[str, Any] | None) -> None:
-        self.edits_since_snapshot = 0
-        self.warning_active = False
-        self.last_snapshot_version = self._extract_version(payload)
-
-    def _extract_version(self, payload: Mapping[str, Any] | None) -> str | None:
-        if not isinstance(payload, Mapping):
-            return None
-        for key in ("version", "document_version", "version_id"):
-            value = payload.get(key)
-            if value in (None, ""):
-                continue
-            text = str(value).strip()
-            if text:
-                return text
-        return None
-
-    def _warning_lines(self) -> list[str]:
-        target = self.document_id or "this document"
-        version = self.last_snapshot_version or "unknown"
-        return [
-            f"{self.edits_since_snapshot} edits have landed on {target} since the last read_document (version {version}).",
-            "Offsets drift after multiple edits off a single snapshot. Call read_document to capture a fresh span before drafting another edit and narrate the refresh to the user.",
-        ]
-
-
-@dataclass(slots=True)
-class _PlotLoopTracker:
-    """Ensures the agent follows the outline → edit → update contract.
-    
-    Tool name mapping (legacy → new):
-    - plot_outline → get_outline
-    - document_plot_state → analyze_document
-    - plot_state_update → transform_document
-    - document_apply_patch, document_edit → replace_lines, insert_lines, delete_lines
-    """
-
-    document_id: str | None
-    outline_called: bool = False
-    pending_update: bool = False
-    blocked_edits: int = 0
-    snapshot_prompt_pending: bool = False
-
-    # Tool name sets for matching
-    _OUTLINE_TOOLS: frozenset[str] = frozenset({
-        "get_outline", "analyze_document",
-        # Legacy names for backward compatibility
-        "plot_outline", "document_plot_state",
-    })
-    _EDIT_TOOLS: frozenset[str] = frozenset({
-        "replace_lines", "insert_lines", "delete_lines", "write_document",
-        # Legacy names for backward compatibility
-        "document_apply_patch", "document_edit",
-    })
-    _UPDATE_TOOLS: frozenset[str] = frozenset({
-        "transform_document",
-        # Legacy name for backward compatibility
-        "plot_state_update",
-    })
-
-    def before_tool(self, tool_name: str | None) -> str | None:
-        name = (tool_name or "").strip().lower()
-        if name in self._EDIT_TOOLS and not self.outline_called:
-            self.blocked_edits += 1
-            self.snapshot_prompt_pending = True
-            return (
-                "Plot loop guardrail: call get_outline or analyze_document for continuity context before applying edits."
-            )
-        return None
-
-    def observe_tool(self, record: Mapping[str, Any], payload: Mapping[str, Any] | None) -> list[str] | None:
-        name = str(record.get("name") or "").lower()
-        status = str(record.get("status") or "ok").lower()
-        succeeded = status == "ok"
-        if name in self._OUTLINE_TOOLS and succeeded:
-            self.outline_called = True
-            if self.snapshot_prompt_pending:
-                self.snapshot_prompt_pending = False
-                target = self.document_id or "this document"
-                return [
-                    f"Plot loop guardrail satisfied for {target}: capture a fresh read_document before drafting your next edit so offsets stay in sync.",
-                ]
-            return None
-        if name in self._UPDATE_TOOLS:
-            if succeeded and self.pending_update:
-                self.pending_update = False
-                return [
-                    "transform_document received your changes. You may proceed to the next edit after reading the outline if needed.",
-                ]
-            if succeeded:
-                self.pending_update = False
-            return None
-        if name in self._EDIT_TOOLS and succeeded:
-            self.pending_update = True
-            return [
-                "Plot loop reminder: call transform_document to log the changes you just applied so downstream agents stay in sync.",
-            ]
-        return None
-
-    def needs_update_prompt(self) -> bool:
-        return self.pending_update
-
-    def update_prompt(self) -> str:
-        target = self.document_id or "this document"
-        return (
-            f"Plot loop requirement: run transform_document for {target} before finishing this turn so plot scaffolding reflects your edits."
-        )
-
-
-@dataclass(slots=True)
-class _SubagentDocumentState:
-    """Tracks helper scheduling metadata per document."""
-
-    last_job_hashes: dict[str, str] = field(default_factory=dict)
-    edit_churn: int = 0
-    last_edit_ts: float = 0.0
-    last_job_ts: float = 0.0
-
-
-@dataclass(slots=True)
-class ChunkingRuntimeConfig:
-    """Settings governing chunk manifest preferences and tool caps."""
-
-    default_profile: str = "auto"
-    overlap_chars: int = 256
-    max_inline_tokens: int = 1_800
-    iterator_limit: int = 4
-
-
-@dataclass(slots=True)
-class AnalysisRuntimeConfig:
-    """Toggles for the preflight analysis agent."""
-
-    enabled: bool = True
-    ttl_seconds: float = 120.0
-
-@dataclass(slots=True)
-class ToolRegistration:
-    """Metadata stored for each registered tool."""
 
     name: str
     impl: Any
@@ -567,12 +167,16 @@ class ToolRegistration:
         )
 
 
+# Backwards compatibility alias
+ToolRegistration = OpenAIToolSpec
+
+
 @dataclass(slots=True)
 class AIController:
     """High-level interface invoked by the chat panel."""
 
     client: AIClient
-    tools: MutableMapping[str, ToolRegistration] = field(default_factory=dict)
+    tools: MutableMapping[str, OpenAIToolSpec] = field(default_factory=dict)
     max_tool_iterations: int = 8
     diff_builder_reminder_threshold: int = 3
     max_edits_without_snapshot: int = 4
@@ -624,12 +228,12 @@ class AIController:
 
     def __post_init__(self) -> None:
         if self.tools:
-            normalized: Dict[str, ToolRegistration] = {}
+            normalized: Dict[str, OpenAIToolSpec] = {}
             for name, value in self.tools.items():
-                if isinstance(value, ToolRegistration):
+                if isinstance(value, OpenAIToolSpec):
                     normalized[name] = value
                 else:
-                    normalized[name] = ToolRegistration(name=name, impl=value)
+                    normalized[name] = OpenAIToolSpec(name=name, impl=value)
             self.tools = normalized
         config = self.agent_config or AgentConfig(max_iterations=self.max_tool_iterations)
         config.max_iterations = self._normalize_iterations(config.max_iterations)
@@ -787,13 +391,13 @@ class AIController:
         parameters: Mapping[str, Any] | None = None,
         strict: bool | None = None,
         summarizable: bool | None = None,
-    ) -> ToolRegistration:
+    ) -> OpenAIToolSpec:
         if summarizable is None:
             attr_flag = getattr(tool, "summarizable", None)
             summarizable_flag = True if attr_flag is None else bool(attr_flag)
         else:
             summarizable_flag = bool(summarizable)
-        return ToolRegistration(
+        return OpenAIToolSpec(
             name=name,
             impl=tool,
             description=description,
@@ -802,8 +406,8 @@ class AIController:
             summarizable=summarizable_flag,
         )
 
-    def _coerce_registration(self, name: str, spec: Any) -> ToolRegistration:
-        if isinstance(spec, ToolRegistration):
+    def _coerce_registration(self, name: str, spec: Any) -> OpenAIToolSpec:
+        if isinstance(spec, OpenAIToolSpec):
             return spec
         if isinstance(spec, Mapping):
             candidate = dict(spec)
@@ -822,7 +426,7 @@ class AIController:
             )
         return self._build_tool_registration(name, spec)
 
-    def _store_tool_registration(self, registration: ToolRegistration) -> None:
+    def _store_tool_registration(self, registration: OpenAIToolSpec) -> None:
         self.tools[registration.name] = registration
         LOGGER.debug("Registered tool: %s", registration.name)
         self._schedule_graph_rebuild()
@@ -1969,21 +1573,15 @@ class AIController:
 
     @staticmethod
     def _normalize_iterations(value: int | None) -> int:
-        try:
-            candidate = int(value) if value is not None else 8
-        except (TypeError, ValueError):
-            candidate = 8
-        return max(1, min(candidate, 200))
+        return _normalize_iterations_impl(value)
 
     @staticmethod
     def _normalize_scope_origin(origin: Any) -> str | None:
-        if not isinstance(origin, str):
-            return None
-        text = origin.strip().lower()
-        return text or None
+        return _normalize_scope_origin_impl(origin)
 
     @staticmethod
     def _normalize_context_tokens(value: int | None) -> int:
+        # Delegate to extracted utility - note: original had different bounds
         default = 128_000
         try:
             candidate = int(value) if value is not None else default
@@ -1993,6 +1591,7 @@ class AIController:
 
     @staticmethod
     def _normalize_response_reserve(value: int | None) -> int:
+        # Note: this signature differs from extracted version
         default = 16_000
         try:
             candidate = int(value) if value is not None else default
@@ -2002,6 +1601,7 @@ class AIController:
 
     @staticmethod
     def _normalize_temperature(value: float | None) -> float:
+        # Note: this has a different default than extracted version
         default = 0.2
         if value is None:
             return default
@@ -2246,108 +1846,13 @@ class AIController:
         return hints
 
     def _outline_guardrail_hints(self, payload: Mapping[str, Any]) -> list[str]:
-        hints: list[str] = []
-        guardrails = payload.get("guardrails")
-        if isinstance(guardrails, Sequence):
-            for entry in guardrails:
-                if not isinstance(entry, Mapping):
-                    continue
-                guardrail_type = str(entry.get("type") or "guardrail")
-                message = str(entry.get("message") or "").strip()
-                action = str(entry.get("action") or "").strip()
-                lines: list[str] = []
-                if message:
-                    lines.append(message)
-                if action:
-                    lines.append(f"Action: {action}")
-                hint = self._format_guardrail_hint(f"get_outline • {guardrail_type}", lines)
-                if hint:
-                    hints.append(hint)
-        status = str(payload.get("status") or "").lower()
-        document_id = str(payload.get("document_id") or "this document")
-        reason = str(payload.get("reason") or "").strip()
-        retry_after_ms = payload.get("retry_after_ms")
-        is_stale = bool(payload.get("is_stale")) or status == "stale"
-        trimmed_reason = str(payload.get("trimmed_reason") or "").lower()
-        outline_available = payload.get("outline_available")
-        if status == "pending":
-            retry_hint = None
-            if isinstance(retry_after_ms, (int, float)) and retry_after_ms > 0:
-                retry_seconds = retry_after_ms / 1000.0
-                retry_hint = f"Retry after ~{retry_seconds:.1f}s or continue with read_document while the worker rebuilds."
-            lines = [f"Outline for {document_id} is still building; treat existing nodes as stale hints only."]
-            if retry_hint:
-                lines.append(retry_hint)
-            hints.append(self._format_guardrail_hint("get_outline", lines))
-        elif status == "unsupported_format":
-            detail = reason or "unsupported format"
-            lines = [
-                f"Outline unavailable for {document_id}: {detail}.",
-                "Navigate manually with read_document or other tools.",
-            ]
-            hints.append(self._format_guardrail_hint("get_outline", lines))
-        elif status in {"outline_missing", "outline_unavailable", "no_document"}:
-            detail = reason or "outline not cached yet"
-            lines = [
-                f"Outline missing for {document_id} ({detail}).",
-                "Queue the worker or rely on selection-scoped snapshots until it exists.",
-            ]
-            hints.append(self._format_guardrail_hint("get_outline", lines))
-        if is_stale:
-            lines = [
-                f"Outline for {document_id} is stale compared to the latest read_document.",
-                "Refresh the outline or treat headings as hints only before editing.",
-            ]
-            hints.append(self._format_guardrail_hint("get_outline", lines))
-        if trimmed_reason == "token_budget":
-            lines = [
-                "Outline was trimmed by the token budget.",
-                "Request fewer levels or hydrate specific pointers before editing deeper sections.",
-            ]
-            hints.append(self._format_guardrail_hint("get_outline", lines))
-        if outline_available is False and status not in {"pending", "unsupported_format", "outline_missing", "outline_unavailable"}:
-            lines = [
-                f"Outline payload for {document_id} indicated no nodes were returned.",
-                "Avoid planning edits that rely on missing structure until the worker succeeds.",
-            ]
-            hints.append(self._format_guardrail_hint("get_outline", lines))
-        return [hint for hint in hints if hint]
+        return _outline_guardrail_hints_impl(payload)
 
     def _retrieval_guardrail_hints(self, payload: Mapping[str, Any]) -> list[str]:
-        hints: list[str] = []
-        status = str(payload.get("status") or "").lower()
-        document_id = str(payload.get("document_id") or "this document")
-        reason = str(payload.get("reason") or "").strip()
-        fallback_reason = str(payload.get("fallback_reason") or "").strip()
-        offline_mode = bool(payload.get("offline_mode"))
-        if status == "unsupported_format":
-            detail = reason or "unsupported format"
-            lines = [
-                f"Retrieval disabled for {document_id}: {detail}.",
-                "Use read_document, manual navigation, or outline pointers instead.",
-            ]
-            hints.append(self._format_guardrail_hint("search_document", lines))
-        if offline_mode or status in {"offline_fallback", "offline_no_results"}:
-            label_reason = fallback_reason or ("offline mode" if offline_mode else "fallback strategy")
-            lines = [
-                f"Retrieval is running without embeddings ({label_reason}).",
-                "Treat matches as low-confidence hints and rehydrate via read_document before editing.",
-            ]
-            hints.append(self._format_guardrail_hint("search_document", lines))
-        if status == "offline_no_results":
-            lines = [
-                f"Offline fallback could not find matches for {document_id}.",
-                "Try a different query or scan the outline/snapshot manually.",
-            ]
-            hints.append(self._format_guardrail_hint("search_document", lines))
-        return [hint for hint in hints if hint]
+        return _retrieval_guardrail_hints_impl(payload)
 
     def _format_guardrail_hint(self, source: str, lines: Sequence[str]) -> str:
-        filtered = [str(line).strip() for line in lines if str(line).strip()]
-        if not filtered:
-            return ""
-        body = "\n".join(f"- {line}" for line in filtered)
-        return f"Guardrail hint ({source}):\n{body}"
+        return _format_guardrail_hint_impl(source, lines)
 
     def _capture_outline_tool_metrics(self, context: dict[str, Any], record: Mapping[str, Any]) -> None:
         payload = self._deserialize_tool_result(record)
@@ -2494,28 +1999,15 @@ class AIController:
 
     @staticmethod
     def _coerce_optional_int(value: object) -> int | None:
-        if value in (None, ""):
-            return None
-        try:
-            return int(value)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            return None
+        return _coerce_optional_int_impl(value)
 
     @staticmethod
     def _coerce_optional_float(value: object) -> float | None:
-        if value in (None, ""):
-            return None
-        try:
-            return float(value)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            return None
+        return _coerce_optional_float_impl(value)
 
     @staticmethod
     def _coerce_optional_str(value: object) -> str | None:
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
+        return _coerce_optional_str_impl(value)
 
     def _evaluate_budget(
         self,
@@ -3268,7 +2760,7 @@ class AIController:
         )
         compactor.commit_entry(entry, current_tokens=token_count)
 
-    def _tool_registry_snapshot(self) -> Mapping[str, ToolRegistration]:
+    def _tool_registry_snapshot(self) -> Mapping[str, OpenAIToolSpec]:
         return dict(self.tools)
 
     def _build_metadata(
@@ -3781,7 +3273,7 @@ class AIController:
     async def _execute_tool_call(
         self,
         call: _ToolCallRequest,
-        registration: ToolRegistration | None,
+        registration: OpenAIToolSpec | None,
         on_event: ToolCallback | None,
     ) -> tuple[str, Any, Any]:
         resolved_arguments = self._coerce_tool_arguments(call.arguments, call.parsed)
@@ -3912,7 +3404,7 @@ class AIController:
     async def _handle_version_mismatch_retry(
         self,
         call: _ToolCallRequest,
-        registration: ToolRegistration,
+        registration: OpenAIToolSpec,
         resolved_arguments: Any,
         error: DocumentVersionMismatchError,
     ) -> tuple[Any, dict[str, Any]]:
@@ -4222,239 +3714,36 @@ class AIController:
         return hint
 
     def _scope_summary_from_arguments(self, arguments: Any) -> dict[str, Any] | None:
-        if not isinstance(arguments, Mapping):
-            return None
-        metadata_summary = self._scope_summary_from_metadata(arguments.get("metadata"))
-        if metadata_summary:
-            return metadata_summary
-        ranges_summary = self._scope_summary_from_ranges(arguments.get("ranges"))
-        if ranges_summary:
-            return ranges_summary
-        target_summary = self._scope_summary_from_target_range(arguments.get("target_range"))
-        if target_summary:
-            return target_summary
-        chunk_summary = self._scope_summary_from_chunk_arguments(arguments)
-        if chunk_summary:
-            return chunk_summary
-        return None
+        return _scope_summary_from_arguments_impl(arguments)
 
     def _scope_summary_from_metadata(self, metadata: Any) -> dict[str, Any] | None:
-        if not isinstance(metadata, Mapping):
-            return None
-        scope_payload = metadata.get("scope") if isinstance(metadata.get("scope"), Mapping) else None
-        origin = metadata.get("scope_origin")
-        if (not isinstance(origin, str) or not origin.strip()) and isinstance(scope_payload, Mapping):
-            origin = scope_payload.get("origin")
-        normalized_origin = self._normalize_scope_origin(origin)
-        summary: dict[str, Any] = {}
-        if normalized_origin:
-            summary["origin"] = normalized_origin
-        length_value = metadata.get("scope_length")
-        length = self._coerce_optional_int(length_value)
-        if length is None and isinstance(scope_payload, Mapping):
-            length = self._coerce_optional_int(scope_payload.get("length"))
-        if length is not None:
-            summary["length"] = max(0, length)
-        range_payload = metadata.get("scope_range")
-        if not isinstance(range_payload, Mapping) and isinstance(scope_payload, Mapping):
-            candidate = scope_payload.get("range")
-            if isinstance(candidate, Mapping):
-                range_payload = candidate
-        bounds = self._range_bounds_from_mapping(range_payload)
-        if bounds is not None:
-            start, end = bounds
-            summary["range"] = {"start": start, "end": end}
-        return summary or None
+        return _scope_summary_from_metadata_impl(metadata)
 
     def _scope_summary_from_ranges(self, ranges: Any) -> dict[str, Any] | None:
-        if not isinstance(ranges, Sequence) or isinstance(ranges, (str, bytes)):
-            return None
-        origins: set[str] = set()
-        total_length = 0
-        range_starts: list[int] = []
-        range_ends: list[int] = []
-        found = False
-        for entry in ranges:
-            if not isinstance(entry, Mapping):
-                continue
-            found = True
-            origin = self._normalize_scope_origin(entry.get("scope_origin"))
-            scope_payload = entry.get("scope") if isinstance(entry.get("scope"), Mapping) else None
-            if origin is None and isinstance(scope_payload, Mapping):
-                origin = self._normalize_scope_origin(scope_payload.get("origin"))
-            if origin:
-                origins.add(origin)
-            length = self._coerce_optional_int(entry.get("scope_length"))
-            if length is None and isinstance(scope_payload, Mapping):
-                length = self._coerce_optional_int(scope_payload.get("length"))
-            bounds = self._range_bounds_from_entry(entry)
-            if bounds is not None:
-                start, end = bounds
-                range_starts.append(start)
-                range_ends.append(end)
-                if length is None:
-                    length = max(0, end - start)
-            if length is not None:
-                total_length += max(0, length)
-        if not found:
-            return None
-        origin_summary = "mixed"
-        if len(origins) == 1:
-            origin_summary = origins.pop()
-        elif not origins:
-            origin_summary = "explicit_span"
-        summary: dict[str, Any] = {"origin": origin_summary}
-        if total_length > 0:
-            summary["length"] = total_length
-        if range_starts and range_ends:
-            summary["range"] = {"start": min(range_starts), "end": max(range_ends)}
-        return summary
+        return _scope_summary_from_ranges_impl(ranges)
 
     def _scope_summary_from_target_range(self, target_range: Any) -> dict[str, Any] | None:
-        if target_range is None:
-            return None
-        if isinstance(target_range, str):
-            token = target_range.strip().lower()
-            if token in {"document"}:
-                return {"origin": "document"}
-            return None
-        start: int | None = None
-        end: int | None = None
-        origin: str | None = None
-        if isinstance(target_range, Mapping):
-            scope_token = str(target_range.get("scope") or target_range.get("origin") or "").strip().lower()
-            if scope_token in {"document"}:
-                origin = "document"
-            start = self._coerce_optional_int(target_range.get("start"))
-            end = self._coerce_optional_int(target_range.get("end"))
-        elif isinstance(target_range, Sequence) and len(target_range) == 2 and not isinstance(target_range, (str, bytes)):
-            start = self._coerce_optional_int(target_range[0])
-            end = self._coerce_optional_int(target_range[1])
-        if start is None or end is None:
-            if origin == "document":
-                return {"origin": "document"}
-            return None
-        if end < start:
-            start, end = end, start
-        summary = {
-            "origin": origin or "explicit_span",
-            "range": {"start": start, "end": end},
-            "length": max(0, end - start),
-        }
-        return summary
+        return _scope_summary_from_target_range_impl(target_range)
 
     def _scope_summary_from_chunk_arguments(self, arguments: Mapping[str, Any]) -> dict[str, Any] | None:
-        chunk_id = self._extract_chunk_id(arguments)
-        if not chunk_id:
-            return None
-        bounds = self._parse_chunk_bounds(chunk_id)
-        if not bounds:
-            return None
-        start, end = bounds
-        return {
-            "origin": "chunk",
-            "range": {"start": start, "end": end},
-            "length": max(0, end - start),
-            "chunk_id": chunk_id,
-        }
+        return _scope_summary_from_chunk_arguments_impl(arguments)
 
     def _range_bounds_from_entry(self, entry: Mapping[str, Any]) -> tuple[int, int] | None:
-        range_payload = entry.get("scope_range") if isinstance(entry.get("scope_range"), Mapping) else None
-        if range_payload is None:
-            scope_payload = entry.get("scope") if isinstance(entry.get("scope"), Mapping) else None
-            if isinstance(scope_payload, Mapping):
-                candidate = scope_payload.get("range")
-                if isinstance(candidate, Mapping):
-                    range_payload = candidate
-        bounds = self._range_bounds_from_mapping(range_payload)
-        if bounds is not None:
-            return bounds
-        start = self._coerce_optional_int(entry.get("start"))
-        end = self._coerce_optional_int(entry.get("end"))
-        if start is None or end is None:
-            return None
-        if end < start:
-            start, end = end, start
-        return start, end
+        return _range_bounds_from_entry_impl(entry)
 
     def _range_bounds_from_mapping(self, payload: Mapping[str, Any] | None) -> tuple[int, int] | None:
-        if not isinstance(payload, Mapping):
-            return None
-        start = self._coerce_optional_int(payload.get("start"))
-        end = self._coerce_optional_int(payload.get("end"))
-        if start is None or end is None:
-            return None
-        if end < start:
-            start, end = end, start
-        return start, end
+        return _range_bounds_from_mapping_impl(payload)
 
     @staticmethod
     def _scope_fields_from_summary(summary: Mapping[str, Any] | None) -> dict[str, Any]:
-        if not isinstance(summary, Mapping):
-            return {}
-        payload: dict[str, Any] = {}
-        origin = summary.get("origin")
-        if isinstance(origin, str) and origin.strip():
-            payload["scope_origin"] = origin.strip()
-        length = summary.get("length")
-        try:
-            if length is not None:
-                payload["scope_length"] = max(0, int(length))
-        except (TypeError, ValueError):
-            pass
-        range_payload = summary.get("range")
-        if isinstance(range_payload, Mapping):
-            try:
-                start = int(range_payload.get("start"))
-                end = int(range_payload.get("end"))
-            except (TypeError, ValueError):
-                start = end = None
-            if start is not None and end is not None:
-                payload["scope_range"] = {"start": start, "end": end}
-        return payload
+        return _scope_fields_from_summary_impl(summary)
 
     def _extract_chunk_id(self, arguments: Mapping[str, Any]) -> str | None:
-        def _coerce(value: Any) -> str | None:
-            if isinstance(value, str):
-                text = value.strip()
-                return text or None
-            return None
-
-        chunk_id = _coerce(arguments.get("chunk_id"))
-        if chunk_id:
-            return chunk_id
-        metadata = arguments.get("metadata")
-        if isinstance(metadata, Mapping):
-            chunk_id = _coerce(metadata.get("chunk_id"))
-            if chunk_id:
-                return chunk_id
-        for key in ("patches", "ranges"):
-            entries = arguments.get(key)
-            if not isinstance(entries, Sequence):
-                continue
-            for entry in entries:
-                if not isinstance(entry, Mapping):
-                    continue
-                chunk_id = _coerce(entry.get("chunk_id"))
-                if chunk_id:
-                    return chunk_id
-        return None
+        return _extract_chunk_id_impl(arguments)
 
     @staticmethod
     def _parse_chunk_bounds(chunk_id: str | None) -> tuple[int, int] | None:
-        if not chunk_id:
-            return None
-        parts = chunk_id.split(":")
-        if len(parts) < 4:
-            return None
-        try:
-            start = int(parts[-2])
-            end = int(parts[-1])
-        except ValueError:
-            return None
-        if end < start:
-            start, end = end, start
-        return start, end
+        return _parse_chunk_bounds_impl(chunk_id)
 
     def _build_tool_record(
         self,
