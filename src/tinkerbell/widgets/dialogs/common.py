@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Mapping
 
 from PySide6.QtWidgets import QFileDialog, QWidget
 
@@ -16,9 +15,6 @@ __all__ = [
     "SAMPLE_LANG_MAP",
     "DEFAULT_SAMPLE_LIMIT",
     "PREVIEW_CHAR_LIMIT",
-    "ValidationResult",
-    "SettingsValidator",
-    "SettingsTester",
     "humanize_bytes",
     "language_from_suffix",
     "project_root",
@@ -51,21 +47,6 @@ DEFAULT_SAMPLE_LIMIT = 12
 PREVIEW_CHAR_LIMIT = 3200
 
 
-@dataclass(slots=True)
-class ValidationResult:
-    """Outcome of validating a set of settings."""
-
-    ok: bool
-    message: str = ""
-
-
-SettingsValidator = Callable[["Settings"], "ValidationResult | tuple[bool, str] | bool"]
-SettingsTester = Callable[["Settings"], "ValidationResult | tuple[bool, str] | bool"]
-
-# Import Settings type for annotations
-from ...services.settings import Settings  # noqa: E402
-
-
 def humanize_bytes(size: int) -> str:
     """Convert byte count to human-readable string."""
     units = ["B", "KB", "MB", "GB", "TB"]
@@ -94,13 +75,3 @@ def project_root() -> Path:
         if (parent / "pyproject.toml").exists():
             return parent
     return parents[-1] if parents else current.parent
-
-
-def coerce_validation_result(result: ValidationResult | tuple[bool, str] | bool) -> ValidationResult:
-    """Convert various result formats to ValidationResult."""
-    if isinstance(result, ValidationResult):
-        return result
-    if isinstance(result, tuple):
-        ok, message = result
-        return ValidationResult(bool(ok), str(message))
-    return ValidationResult(bool(result), "")

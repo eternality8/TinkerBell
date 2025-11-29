@@ -181,54 +181,73 @@ class MainWindow:
 
 ---
 
-### 1.3 Split `dialogs.py` (Partial ✅)
+### 1.3 Split `dialogs.py` ✅
 
-**Location:** `src/tinkerbell/widgets/dialogs.py` → `src/tinkerbell/widgets/_dialogs_legacy.py`
+**Location:** `src/tinkerbell/widgets/dialogs.py` → `src/tinkerbell/widgets/dialogs/` (package)
 
-**Status:** Partial extraction complete. Simpler dialog classes extracted to package, SettingsDialog remains in legacy file due to complexity.
+**Status:** Complete. All dialog classes extracted, legacy file deleted.
 
 **Extracted Files:**
 ```
 widgets/dialogs/
-├── __init__.py              # Re-exports + open_file_dialog, save_file_dialog
-├── common.py                # DEFAULT_FILE_FILTER, PREVIEW_CHAR_LIMIT, ValidationResult types
-├── sample_document.py       # SampleDocument, discover_sample_documents
-├── document_load.py         # DocumentLoadDialog
-├── document_export.py       # DocumentExportDialog
-├── validation_errors.py     # ValidationErrorsDialog, show_validation_errors
+├── __init__.py              # Re-exports + open_file_dialog, save_file_dialog (133 lines)
+├── common.py                # DEFAULT_FILE_FILTER, constants, utilities (72 lines)
+├── sample_document.py       # SampleDocument, discover_sample_documents (63 lines)
+├── document_load.py         # DocumentLoadDialog (252 lines)
+├── document_export.py       # DocumentExportDialog (159 lines)
+├── validation_errors.py     # ValidationErrorsDialog, show_validation_errors (58 lines)
+├── settings_dialog.py       # SettingsDialog, SettingsDialogResult, test functions (1,403 lines)
 ```
 
-**Line Counts:**
-- `_dialogs_legacy.py`: 1,948 lines (original renamed, contains SettingsDialog)
-- `common.py`: 106 lines
-- `document_export.py`: 159 lines  
-- `document_load.py`: 252 lines
-- `sample_document.py`: 63 lines
-- `validation_errors.py`: 58 lines
-- `__init__.py`: 133 lines (includes `open_file_dialog`, `save_file_dialog`)
-- **Total extracted**: ~771 lines in new package
+**Summary:**
+- Original `dialogs.py` (1,948 lines) → 7 focused modules (~2,140 total lines with better organization)
+- `SettingsDialog` (~1,100 lines of the original) extracted to `settings_dialog.py`
+- Helper functions `show_settings_dialog`, `test_ai_api_settings`, `test_embedding_settings` moved to `settings_dialog.py`
+- `ValidationResult`, `SettingsValidator`, `SettingsTester` types defined in `settings_dialog.py`
+- Legacy file `_dialogs_legacy.py` deleted
+- All 1,102 tests pass
 
-**Remaining Work:**
-- Extract `SettingsDialog` (~1,100 lines) to `settings_dialog.py` - Complex due to extensive widget setup and test dependencies
-- Original `_dialogs_legacy.py` still needed for `SettingsDialog`, `SettingsDialogResult`, `show_settings_dialog`, `test_ai_api_settings`, `test_embedding_settings`
-
-**Import Path:** `from tinkerbell.widgets.dialogs import ...` still works for all existing code.
+**Import Path:** `from tinkerbell.widgets.dialogs import ...` works for all dialog classes and utilities.
 
 ---
 
-### 1.4 Split `bridge.py` (1,856 lines)
+### 1.4 Split `bridge.py` ✅
 
 **Location:** `src/tinkerbell/services/bridge.py`
 
-**Recommended Split:**
+**Status:** Complete. Reduced from 1,856 lines to ~1,417 lines (~24% reduction, 439 lines extracted).
+
+**Extracted Files:**
 ```
 services/
-├── bridge.py                # DocumentBridge core (~500 lines)
-├── bridge_types.py          # PatchRangePayload, EditContext, PatchMetrics
-├── bridge_queue.py          # Edit queue management
-├── bridge_versioning.py     # Version tracking, hash checking
-└── bridge_inspection.py     # Post-edit inspection logic
+├── bridge.py                # DocumentBridge core (1,417 lines)
+├── bridge_types.py          # Types and dataclasses (137 lines)
+│   - PatchRangePayload, EditContext, PatchMetrics
+│   - SafeEditSettings, DocumentVersionMismatchError
+│   - QueuedEdit, EditorAdapter protocol, Executor type
+├── bridge_versioning.py     # Version token utilities (122 lines)
+│   - format_version_token, is_version_current
+│   - hash_text, extract_context_version, extract_content_hash
+│   - parse_chunk_bounds, compute_line_start_offsets
+│   - clamp_range, summarize_diff
+├── bridge_inspection.py     # Post-edit inspection helpers (111 lines)
+│   - auto_revert_remediation, format_auto_revert_message
+│   - build_failure_metadata, attach_scope_metadata
+└── bridge_queue.py          # Edit queue management (330 lines)
+    - normalize_directive, normalize_patch_ranges
+    - scope helpers: normalize_scope_origin, coerce_scope_length
+    - summarize_patch_scopes, range_hint_from_payload
+    - validate_scope_requirements, refresh_scope_span
 ```
+
+**Summary:**
+- Original `bridge.py` (1,856 lines) → 5 focused modules (~2,117 total lines with better organization)
+- All static utility methods moved to appropriate helper modules
+- `DocumentBridge` class retained in `bridge.py` with core orchestration logic
+- Types re-exported from `services/__init__.py` for backwards compatibility
+- All 1,102 tests pass
+
+**Import Path:** Original imports still work: `from tinkerbell.services.bridge import DocumentBridge, DocumentVersionMismatchError`
 
 ---
 

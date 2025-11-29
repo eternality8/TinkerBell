@@ -12,8 +12,6 @@ from PySide6.QtWidgets import QDialog, QWidget
 from .common import (
     DEFAULT_FILE_FILTER,
     PREVIEW_CHAR_LIMIT,
-    SettingsValidator,
-    SettingsTester,
 )
 from .sample_document import (
     SampleDocument,
@@ -30,13 +28,13 @@ from .validation_errors import (
     show_validation_errors,
 )
 
-# Import SettingsDialog and related from the legacy dialogs module
-# These will be extracted to their own file in a future step
-# ValidationResult is imported from legacy to maintain type identity for isinstance checks
-from .._dialogs_legacy import (
+# Import SettingsDialog and related from the new settings_dialog module
+from .settings_dialog import (
     SettingsDialog,
     SettingsDialogResult,
     ValidationResult,
+    SettingsValidator,
+    SettingsTester,
     show_settings_dialog,
     test_ai_api_settings,
     test_embedding_settings,

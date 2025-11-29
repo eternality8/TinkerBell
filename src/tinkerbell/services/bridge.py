@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import logging
 import time
 from copy import deepcopy
 from collections import OrderedDict, deque
-from dataclasses import dataclass
-from typing import Any, Callable, Deque, Mapping, Optional, Protocol, Sequence, TypeVar
+from typing import Any, Callable, Deque, Mapping, Optional, Sequence
 
 from ..ai.memory.cache_bus import (
     DocumentCacheBus,
@@ -17,7 +15,7 @@ from ..ai.memory.cache_bus import (
     DocumentClosedEvent,
     get_document_cache_bus,
 )
-from ..ai.tools.version import VersionManager, get_version_manager
+from ..ai.tools.version import get_version_manager
 from ..chat.commands import ActionType, parse_agent_payload, validate_directive
 from ..chat.message_model import EditDirective
 from ..documents.ranges import TextRange
@@ -27,126 +25,52 @@ from ..editor.patches import PatchApplyError, PatchResult, RangePatch, apply_str
 from ..editor.post_edit_inspector import InspectionResult, PostEditInspector
 from .telemetry import emit as telemetry_emit
 
+# Import types from extracted modules
+from .bridge_types import (
+    EditContext,
+    EditorAdapter,
+    Executor,
+    PatchMetrics,
+    PatchRangePayload,
+    QueuedEdit,
+    SafeEditSettings,
+    DocumentVersionMismatchError,
+)
+from .bridge_versioning import (
+    clamp_range,
+    compute_line_start_offsets,
+    extract_content_hash,
+    extract_context_version,
+    format_version_token,
+    hash_text,
+    is_version_current,
+    parse_chunk_bounds,
+)
+from .bridge_inspection import (
+    attach_scope_metadata,
+    auto_revert_remediation,
+    build_failure_metadata,
+    format_auto_revert_message,
+)
+from .bridge_queue import (
+    coerce_text_range_hint,
+    normalize_directive,
+    normalize_patch_ranges,
+    normalize_scope_origin,
+    coerce_scope_length,
+    refresh_scope_span,
+    summarize_patch_scopes,
+)
+
 
 _LOGGER = logging.getLogger(__name__)
 
 
-TResult = TypeVar("TResult")
-Executor = Callable[[Callable[[], TResult]], TResult]
+# Re-export types for backwards compatibility
 EditAppliedListener = Callable[[EditDirective, DocumentState, str], None]
 
-
-class EditorAdapter(Protocol):
-    """Minimal interface consumed by the bridge."""
-
-    def load_document(self, document: DocumentState) -> None:
-        ...
-
-    def to_document(self) -> DocumentState:
-        ...
-
-    def apply_ai_edit(self, directive: EditDirective, *, preserve_selection: bool = False) -> DocumentState:
-        ...
-
-    def apply_patch_result(
-        self,
-        result: PatchResult,
-        selection_hint: tuple[int, int] | None = None,
-        *,
-        preserve_selection: bool = False,
-    ) -> DocumentState:
-        ...
-
-    def restore_document(self, document: DocumentState) -> DocumentState:
-        ...
-
-
-@dataclass(slots=True)
-class _QueuedEdit:
-    """Internal representation of a validated directive awaiting execution."""
-
-    directive: EditDirective
-    context_version: Optional[str] = None
-    content_hash: Optional[str] = None
-    payload: Optional[Mapping[str, Any]] = None
-    diff: Optional[str] = None
-    ranges: tuple["PatchRangePayload", ...] = ()
-    scope_summary: Mapping[str, Any] | None = None
-
-
-@dataclass(slots=True)
-class PatchRangePayload:
-    """Normalized representation of a streamed patch range payload."""
-
-    start: int
-    end: int
-    replacement: str
-    match_text: str
-    chunk_id: str | None = None
-    chunk_hash: str | None = None
-    scope_origin: str | None = None
-    scope_length: int | None = None
-    scope_range: tuple[int, int] | None = None
-    scope: Mapping[str, Any] | None = None
-
-
-@dataclass(slots=True)
-class EditContext:
-    """Details about the most recently applied directive."""
-
-    action: str
-    target_range: TextRange
-    replaced_text: str
-    content: str
-    diff: Optional[str] = None
-    spans: tuple[tuple[int, int], ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "target_range", TextRange.from_value(self.target_range, fallback=(0, 0)))
-
-
-@dataclass(slots=True)
-class PatchMetrics:
-    """Lightweight telemetry captured for diff-based edits."""
-
-    total: int = 0
-    conflicts: int = 0
-    avg_latency_ms: float = 0.0
-
-    def record_success(self, duration_seconds: float) -> None:
-        self.total += 1
-        duration_ms = max(0.0, duration_seconds * 1000.0)
-        if self.avg_latency_ms == 0.0:
-            self.avg_latency_ms = duration_ms
-        else:
-            self.avg_latency_ms = (self.avg_latency_ms * 0.8) + (duration_ms * 0.2)
-
-    def record_conflict(self) -> None:
-        self.conflicts += 1
-
-
-@dataclass(slots=True)
-class SafeEditSettings:
-    """Runtime configuration for post-edit inspections."""
-
-    enabled: bool = False
-    duplicate_threshold: int = 2
-    token_drift: float = 0.05
-
-
-class DocumentVersionMismatchError(RuntimeError):
-    """Raised when an edit references a stale document version."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        cause: str | None = None,
-        details: Mapping[str, Any] | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.cause = cause
-        self.details = dict(details) if isinstance(details, Mapping) else None
+# Backwards compatibility alias for internal queued edit type
+_QueuedEdit = QueuedEdit
 
 
 class DocumentBridge:
@@ -216,7 +140,7 @@ class DocumentBridge:
         document = self.editor.to_document()
         snapshot = document.snapshot(delta_only=delta_only)
         snapshot["length"] = len(document.text)
-        snapshot["line_start_offsets"] = self._compute_line_start_offsets(document.text)
+        snapshot["line_start_offsets"] = compute_line_start_offsets(document.text)
         window_range = self._resolve_window(
             window,
             length=len(document.text),
@@ -242,7 +166,7 @@ class DocumentBridge:
         snapshot.setdefault("document_id", version.document_id)
         snapshot.setdefault("version_id", version.version_id)
         snapshot.setdefault("content_hash", version.content_hash)
-        token = self._format_version_token(version)
+        token = format_version_token(version, self._tab_id)
         snapshot["version"] = token
         self._last_snapshot_token = token
         self._last_document_version = version
@@ -521,7 +445,7 @@ class DocumentBridge:
         summary = reason or "edit rejected"
         self._last_diff = f"failed: {summary}"
         scope_summary = scope_summary or queued.scope_summary
-        failure_metadata = self._build_failure_metadata(
+        failure_metadata = build_failure_metadata(
             version=version,
             status=status,
             reason=summary,
@@ -572,14 +496,14 @@ class DocumentBridge:
                 "Patch directives must include document_version metadata",
                 cause=self.CAUSE_HASH_MISMATCH,
             )
-        if not self._is_version_current(document, queued.context_version):
+        if not is_version_current(document, queued.context_version):
             raise DocumentVersionMismatchError(
                 "Patch directive references a stale document snapshot",
                 cause=self.CAUSE_HASH_MISMATCH,
             )
         expected_hash = queued.content_hash
         if expected_hash is None and queued.payload is not None:
-            expected_hash = self._extract_content_hash(queued.payload)
+            expected_hash = extract_content_hash(queued.payload)
         if not expected_hash:
             raise DocumentVersionMismatchError(
                 "Patch directives must include content_hash metadata",
@@ -611,7 +535,7 @@ class DocumentBridge:
                 if range_hint is not None:
                     queued.directive.target_range = TextRange.from_value(range_hint)
                 self._validate_range_chunk_hashes(document_before, expanded_ranges)
-                scope_summary = self._summarize_patch_scopes(expanded_ranges)
+                scope_summary = summarize_patch_scopes(expanded_ranges)
                 queued.scope_summary = scope_summary
                 patch_result = self._apply_range_payloads(expanded_ranges, document_before)
             else:
@@ -670,7 +594,7 @@ class DocumentBridge:
                 diff_summary=diff_summary,
             )
             raise DocumentVersionMismatchError(
-                self._format_auto_revert_message(rejection_details),
+                format_auto_revert_message(rejection_details),
                 cause=self.CAUSE_INSPECTOR_FAILURE,
                 details=rejection_details,
             )
@@ -686,7 +610,7 @@ class DocumentBridge:
         )
         self._last_diff = diff_summary
         version = updated_state.version_info(edited_ranges=patch_result.spans)
-        self._last_snapshot_token = self._format_version_token(version)
+        self._last_snapshot_token = format_version_token(version, self._tab_id)
         self._last_document_version = version
         elapsed = time.perf_counter() - start_time
         self._patch_metrics.record_success(elapsed)
@@ -746,22 +670,8 @@ class DocumentBridge:
             payload["reason"] = reason
         if cause:
             payload["cause"] = cause
-        self._attach_scope_metadata(payload, scope_summary)
+        attach_scope_metadata(payload, scope_summary)
         telemetry_emit(event_name, payload)
-
-    def _format_auto_revert_message(self, details: Mapping[str, Any] | None) -> str:
-        if not isinstance(details, Mapping):
-            return (
-                "Auto-revert triggered. Document was restored to the previous snapshot; refresh "
-                "document_snapshot and retry with an updated diff."
-            )
-        reason = str(details.get("reason") or "inspection_failure")
-        detail = str(details.get("detail") or "Edit rejected")
-        remediation = details.get("remediation")
-        message = f"Auto-revert triggered ({reason}). {detail}"
-        if remediation:
-            message = f"{message} {remediation}".strip()
-        return message
 
     def _emit_auto_revert_event(
         self,
@@ -789,7 +699,7 @@ class DocumentBridge:
             payload["tab_id"] = self._tab_id
         if diagnostics:
             payload["diagnostics"] = dict(diagnostics)
-        self._attach_scope_metadata(payload, scope_summary)
+        attach_scope_metadata(payload, scope_summary)
         telemetry_emit(event_name, payload)
 
     def _emit_duplicate_detected_event(
@@ -815,19 +725,6 @@ class DocumentBridge:
         if self._tab_id:
             payload["tab_id"] = self._tab_id
         telemetry_emit(event_name, payload)
-
-    def _auto_revert_remediation(self, reason: str | None) -> str:
-        mapping = {
-            "duplicate_paragraphs": "Retry with replace_all=true or delete the original text before inserting the rewrite to avoid duplicated passages.",
-            "duplicate_windows": "Retry with replace_all=true or narrow the edit range so the rewrite replaces the previous text instead of appending it.",
-            "boundary_dropped": "Ensure the edit preserves blank lines between paragraphs or include surrounding context in the diff.",
-            "split_tokens": "Insert whitespace around the edited span so tokens are not merged across boundaries before retrying.",
-            "split_token_regex": "Add a newline or space before markdown tokens (e.g., '#') so headings are not fused with preceding words.",
-        }
-        return mapping.get(
-            reason or "",
-            "Refresh document_snapshot and rebuild the diff before retrying to ensure the edit targets the latest content.",
-        )
 
     def _run_post_edit_inspection(
         self,
@@ -864,7 +761,7 @@ class DocumentBridge:
         diagnostics = dict(inspection.diagnostics or {})
         reason_code = inspection.reason or "inspector_failure"
         detail = inspection.detail or reason_code or "Edit rejected"
-        remediation = self._auto_revert_remediation(reason_code)
+        remediation = auto_revert_remediation(reason_code)
         self._emit_auto_revert_event(
             version=version,
             diff_summary=diff_summary,
@@ -912,40 +809,8 @@ class DocumentBridge:
             restored = self._execute_on_main_thread(_load)
         version = restored.version_info()
         self._last_document_version = version
-        self._last_snapshot_token = self._format_version_token(version)
+        self._last_snapshot_token = format_version_token(version, self._tab_id)
         return restored
-
-    def _build_failure_metadata(
-        self,
-        *,
-        version: DocumentVersion | None,
-        status: str | None = None,
-        reason: str | None = None,
-        cause: str | None = None,
-        range_count: int | None = None,
-        streamed: bool | None = None,
-        diagnostics: Mapping[str, Any] | None = None,
-        scope_summary: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        metadata: dict[str, Any] = {}
-        if version is not None:
-            metadata["document_id"] = version.document_id
-            metadata["version_id"] = version.version_id
-            metadata["content_hash"] = version.content_hash
-        if status:
-            metadata["status"] = status
-        if reason:
-            metadata["reason"] = reason
-        if cause:
-            metadata["cause"] = cause
-        if range_count is not None:
-            metadata["range_count"] = range_count
-        if streamed is not None:
-            metadata["streamed"] = bool(streamed)
-        if diagnostics:
-            metadata["diagnostics"] = dict(diagnostics)
-        self._attach_scope_metadata(metadata, scope_summary)
-        return metadata
 
     @staticmethod
     def _supports_failure_metadata(listener: Callable[..., Any]) -> bool:
@@ -997,7 +862,7 @@ class DocumentBridge:
             payload["streamed"] = bool(streamed)
         if diagnostics:
             payload["diagnostics"] = dict(diagnostics)
-        self._attach_scope_metadata(payload, scope_summary)
+        attach_scope_metadata(payload, scope_summary)
         telemetry_emit(event_name, payload)
 
     def _emit_hash_mismatch_event(
@@ -1034,7 +899,7 @@ class DocumentBridge:
             payload["streamed"] = bool(streamed)
         if diagnostics:
             payload["diagnostics"] = dict(diagnostics)
-        self._attach_scope_metadata(payload, scope_summary)
+        attach_scope_metadata(payload, scope_summary)
         telemetry_emit(event_name, payload)
 
     def _apply_range_payloads(
@@ -1067,14 +932,14 @@ class DocumentBridge:
         for entry in ranges:
             if not entry.chunk_hash:
                 continue
-            bounds = self._parse_chunk_bounds(entry.chunk_id)
+            bounds = parse_chunk_bounds(entry.chunk_id)
             if bounds is None:
                 continue
             start, end = bounds
             start = max(0, min(start, length))
             end = max(start, min(end, length))
             actual_slice = text[start:end]
-            actual_hash = self._hash_text(actual_slice)
+            actual_hash = hash_text(actual_slice)
             if actual_hash != entry.chunk_hash:
                 raise DocumentVersionMismatchError(
                     "Chunk hash mismatch detected before applying streamed patch",
@@ -1086,7 +951,7 @@ class DocumentBridge:
         document = self.editor.to_document()
         version = document.version_info()
         self._last_document_version = version
-        self._last_snapshot_token = self._format_version_token(version)
+        self._last_snapshot_token = format_version_token(version, self._tab_id)
         if self._cache_bus is None:
             return
         event = DocumentClosedEvent(
@@ -1167,7 +1032,7 @@ class DocumentBridge:
         normalized = normalize_text_range(text, entry.start, entry.end, replacement=entry.replacement)
         if normalized.start == entry.start and normalized.end == entry.end:
             return entry
-        scope_mapping = self._refresh_scope_span(entry.scope, normalized.start, normalized.end)
+        scope_mapping = refresh_scope_span(entry.scope, normalized.start, normalized.end)
         scope_origin = scope_mapping.get("origin") if isinstance(scope_mapping, Mapping) else entry.scope_origin
         scope_length = scope_mapping.get("length") if isinstance(scope_mapping, Mapping) else entry.scope_length
         scope_range = (normalized.start, normalized.end) if scope_mapping is not None else entry.scope_range
@@ -1178,8 +1043,8 @@ class DocumentBridge:
             match_text=normalized.slice_text,
             chunk_id=entry.chunk_id,
             chunk_hash=entry.chunk_hash,
-            scope_origin=self._normalize_scope_origin(scope_origin) if scope_origin else entry.scope_origin,
-            scope_length=self._coerce_scope_length(scope_length) if scope_length is not None else entry.scope_length,
+            scope_origin=normalize_scope_origin(scope_origin) if scope_origin else entry.scope_origin,
+            scope_length=coerce_scope_length(scope_length) if scope_length is not None else entry.scope_length,
             scope_range=scope_range,
             scope=scope_mapping if scope_mapping is not None else entry.scope,
         )
@@ -1195,23 +1060,13 @@ class DocumentBridge:
             return (start, end)
         metadata = payload.get("metadata")
         if isinstance(metadata, Mapping):
-            hint = self._coerce_text_range_hint(metadata.get("target_range"))
+            hint = coerce_text_range_hint(metadata.get("target_range"))
             if hint is not None:
                 return hint
-        hint = self._coerce_text_range_hint(payload.get("target_range"))
+        hint = coerce_text_range_hint(payload.get("target_range"))
         if hint is not None:
             return hint
         return (0, 0)
-
-    @staticmethod
-    def _coerce_text_range_hint(value: Any) -> tuple[int, int] | None:
-        if value is None:
-            return None
-        try:
-            text_range = TextRange.from_value(value)
-        except (TypeError, ValueError):
-            return None
-        return text_range.to_tuple()
 
     def _normalize_directive(self, directive: EditDirective | Mapping[str, Any]) -> _QueuedEdit:
         if isinstance(directive, EditDirective):
@@ -1235,22 +1090,22 @@ class DocumentBridge:
         document = self.editor.to_document()
         action = str(payload.get("action", "")).lower()
         rationale = payload.get("rationale")
-        context_version = self._extract_context_version(payload)
+        context_version = extract_context_version(payload)
 
         match_text_value = payload.get("match_text")
         expected_text_value = payload.get("expected_text")
 
         if action == ActionType.PATCH.value:
             diff_text = str(payload.get("diff", ""))
-            ranges = self._normalize_patch_ranges(payload.get("ranges"))
+            ranges = normalize_patch_ranges(payload.get("ranges"))
             if not diff_text.strip() and not ranges:
                 raise ValueError("Patch directives must include a diff string or ranges payload")
             if not context_version:
                 raise ValueError("Patch directives must include the originating document version")
-            content_hash = self._extract_content_hash(payload)
+            content_hash = extract_content_hash(payload)
             if not content_hash:
                 raise ValueError("Patch directives must include the originating content_hash")
-            scope_summary = self._summarize_patch_scopes(ranges)
+            scope_summary = summarize_patch_scopes(ranges)
             range_hint = self._range_hint_from_payload(ranges, payload)
             directive = EditDirective(
                 action=action,
@@ -1293,240 +1148,7 @@ class DocumentBridge:
         except (TypeError, ValueError) as exc:
             raise ValueError("target_range must contain numeric bounds") from exc
 
-        return self._clamp_range(start, end, len(document.text))
-
-    def _normalize_patch_ranges(self, ranges: Any) -> tuple[PatchRangePayload, ...]:
-        if ranges in (None, (), []):
-            return ()
-        if not isinstance(ranges, Sequence):
-            raise ValueError("Patch ranges must be provided as an array")
-        normalized: list[PatchRangePayload] = []
-        for entry in ranges:
-            if not isinstance(entry, Mapping):
-                raise ValueError("Patch ranges must be objects")
-            if "start" not in entry or "end" not in entry:
-                raise ValueError("Patch ranges require 'start' and 'end' keys")
-            replacement = entry.get("replacement") or entry.get("content") or entry.get("text")
-            if replacement is None:
-                raise ValueError("Patch ranges must include replacement text")
-            match_text = entry.get("match_text")
-            if match_text is None:
-                raise ValueError("Patch ranges must include match_text")
-            start = int(entry.get("start", 0))
-            end = int(entry.get("end", 0))
-            if end < start:
-                start, end = end, start
-            scope_payload = entry.get("scope")
-            scope_mapping = dict(scope_payload) if isinstance(scope_payload, Mapping) else None
-            scope_origin = entry.get("scope_origin")
-            if not isinstance(scope_origin, str) and scope_mapping is not None:
-                scope_origin = scope_mapping.get("origin")
-            normalized_scope_origin = self._normalize_scope_origin(scope_origin)
-            scope_length = entry.get("scope_length")
-            if scope_length is None and scope_mapping is not None:
-                scope_length = scope_mapping.get("length")
-            scope_range_payload = entry.get("scope_range")
-            if scope_range_payload is None and scope_mapping is not None:
-                scope_range_payload = scope_mapping.get("range")
-            normalized_scope_range = self._coerce_scope_range(scope_range_payload)
-            normalized_scope_length = self._coerce_scope_length(scope_length)
-            if normalized_scope_length is None and normalized_scope_range is not None:
-                normalized_scope_length = max(0, normalized_scope_range[1] - normalized_scope_range[0])
-            chunk_id = str(entry.get("chunk_id")) if isinstance(entry.get("chunk_id"), str) else None
-            chunk_hash = str(entry.get("chunk_hash")) if isinstance(entry.get("chunk_hash"), str) else None
-            scope_mapping = self._normalize_scope_mapping(
-                scope_mapping,
-                origin=normalized_scope_origin,
-                scope_range=normalized_scope_range,
-                scope_length=normalized_scope_length,
-            )
-            self._validate_scope_requirements(
-                origin=normalized_scope_origin,
-                scope_range=normalized_scope_range,
-                scope_length=normalized_scope_length,
-                chunk_id=chunk_id,
-                chunk_hash=chunk_hash,
-            )
-            normalized.append(
-                PatchRangePayload(
-                    start=start,
-                    end=end,
-                    replacement=str(replacement),
-                    match_text=str(match_text),
-                    chunk_id=chunk_id,
-                    chunk_hash=chunk_hash,
-                    scope_origin=normalized_scope_origin,
-                    scope_length=normalized_scope_length,
-                    scope_range=normalized_scope_range,
-                    scope=scope_mapping,
-                )
-            )
-        return tuple(normalized)
-
-    @staticmethod
-    def _normalize_scope_origin(origin: Any) -> str | None:
-        if not isinstance(origin, str):
-            return None
-        token = origin.strip().lower()
-        return token or None
-
-    @staticmethod
-    def _coerce_scope_length(value: Any) -> int | None:
-        if value is None:
-            return None
-        try:
-            length = int(value)
-        except (TypeError, ValueError):
-            return None
-        return max(0, length)
-
-    @staticmethod
-    def _refresh_scope_span(
-        scope: Mapping[str, Any] | None,
-        start: int,
-        end: int,
-    ) -> Mapping[str, Any] | None:
-        if not isinstance(scope, Mapping):
-            return None
-        updated = dict(scope)
-        updated["range"] = {"start": start, "end": end}
-        updated["length"] = max(0, end - start)
-        return updated
-
-    @staticmethod
-    def _coerce_scope_range(value: Any) -> tuple[int, int] | None:
-        if value is None:
-            return None
-        try:
-            text_range = TextRange.from_value(value)
-        except (TypeError, ValueError):
-            return None
-        start, end = text_range.to_tuple()
-        if end < start:
-            start, end = end, start
-        return (start, end)
-
-    @staticmethod
-    def _normalize_scope_mapping(
-        scope: Mapping[str, Any] | None,
-        *,
-        origin: str | None,
-        scope_range: tuple[int, int] | None,
-        scope_length: int | None,
-    ) -> Mapping[str, Any] | None:
-        has_data = any(value is not None for value in (origin, scope_range, scope_length))
-        if not isinstance(scope, Mapping) and not has_data:
-            return None
-        mapping = dict(scope) if isinstance(scope, Mapping) else {}
-        if origin:
-            mapping.setdefault("origin", origin)
-        if scope_range is not None:
-            mapping.setdefault("range", {"start": scope_range[0], "end": scope_range[1]})
-        if scope_length is not None:
-            mapping.setdefault("length", scope_length)
-        return mapping or None
-
-    def _validate_scope_requirements(
-        self,
-        *,
-        origin: str | None,
-        scope_range: tuple[int, int] | None,
-        scope_length: int | None,
-        chunk_id: str | None,
-        chunk_hash: str | None,
-    ) -> None:
-        if origin is None:
-            raise ValueError("Patch ranges must include scope metadata (scope.origin)")
-        if origin != "document" and scope_range is None:
-            raise ValueError("Patch ranges must include scope_range metadata for non-document scopes")
-        if origin == "chunk" and not chunk_id and not chunk_hash:
-            raise ValueError("Chunk-scoped ranges must include chunk_id or chunk_hash metadata")
-        if scope_range is not None and scope_length is not None:
-            expected = max(0, scope_range[1] - scope_range[0])
-            if expected != scope_length:
-                raise ValueError("scope_length must match the provided scope_range span")
-
-    def _summarize_patch_scopes(self, ranges: Sequence[PatchRangePayload]) -> Mapping[str, Any] | None:
-        if not ranges:
-            return None
-        origins: set[str] = set()
-        lengths: list[int] = []
-        for entry in ranges:
-            origin = entry.scope_origin
-            if not origin and isinstance(entry.scope, Mapping):
-                origin = self._normalize_scope_origin(entry.scope.get("origin"))
-            if origin:
-                origins.add(origin)
-            length = entry.scope_length
-            if length is None and entry.scope_range is not None:
-                length = max(0, entry.scope_range[1] - entry.scope_range[0])
-            if length is None:
-                length = max(0, entry.end - entry.start)
-            lengths.append(length)
-        if not origins:
-            origins.add("unknown")
-        origin_summary = origins.pop() if len(origins) == 1 else "mixed"
-        summary: dict[str, Any] = {"origin": origin_summary}
-        if lengths:
-            summary["length"] = sum(lengths)
-        range_starts = [entry.scope_range[0] if entry.scope_range else entry.start for entry in ranges]
-        range_ends = [entry.scope_range[1] if entry.scope_range else entry.end for entry in ranges]
-        if range_starts and range_ends:
-            summary["range"] = {
-                "start": min(range_starts),
-                "end": max(range_ends),
-            }
-        return summary
-
-    @staticmethod
-    def _attach_scope_metadata(target: dict[str, Any], scope_summary: Mapping[str, Any] | None) -> None:
-        if not isinstance(scope_summary, Mapping):
-            return
-        origin = scope_summary.get("origin")
-        if isinstance(origin, str) and origin.strip():
-            target["scope_origin"] = origin.strip()
-        length = scope_summary.get("length")
-        try:
-            if length is not None:
-                target["scope_length"] = max(0, int(length))
-        except (TypeError, ValueError):
-            pass
-        range_payload = scope_summary.get("range")
-        if isinstance(range_payload, Mapping):
-            start = range_payload.get("start")
-            end = range_payload.get("end")
-            try:
-                if start is not None and end is not None:
-                    target["scope_range"] = {"start": int(start), "end": int(end)}
-            except (TypeError, ValueError):
-                pass
-
-    def _extract_context_version(self, payload: Mapping[str, Any]) -> Optional[str]:
-        for key in ("document_version", "snapshot_version", "version", "document_digest"):
-            token = payload.get(key)
-            if token is None:
-                continue
-            token_str = str(token).strip()
-            if token_str:
-                return token_str
-        return None
-
-    @staticmethod
-    def _extract_content_hash(payload: Mapping[str, Any]) -> Optional[str]:
-        token = payload.get("content_hash")
-        if token is None:
-            return None
-        token_str = str(token).strip()
-        return token_str or None
-
-    def _format_version_token(self, version: DocumentVersion) -> str:
-        """Format version token with tab_id prefix.
-        
-        Format: 'tab_id:document_id:version_id:content_hash'
-        If no tab_id is set, uses 'default' as placeholder.
-        """
-        tab_id = self._tab_id or "default"
-        return f"{tab_id}:{version.document_id}:{version.version_id}:{version.content_hash}"
+        return clamp_range(start, end, len(document.text))
 
     def _register_with_version_manager(self, version: DocumentVersion) -> None:
         """Register the current tab/document with the global version manager.
@@ -1541,66 +1163,6 @@ class DocumentBridge:
         except Exception:
             # Don't fail snapshot generation if version manager has issues
             _LOGGER.debug("Failed to register tab with version manager", exc_info=True)
-
-    @staticmethod
-    def _hash_text(text: str) -> str:
-        return hashlib.sha1(text.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _is_version_current(document: DocumentState, expected: str) -> bool:
-        """Check if document version matches expected token.
-        
-        Handles both 3-part (document_id:version_id:hash) and 
-        4-part (tab_id:document_id:version_id:hash) tokens.
-        """
-        signature = document.version_signature()
-        # If expected has 4 parts (with tab_id prefix), strip the prefix
-        parts = expected.split(":")
-        if len(parts) >= 4:
-            # 4-part format: tab_id:document_id:version_id:hash
-            expected = ":".join(parts[1:])  # Remove tab_id prefix
-        return signature == expected
-
-    @staticmethod
-    def _clamp_range(start: int, end: int, length: int) -> tuple[int, int]:
-        start = max(0, min(start, length))
-        end = max(0, min(end, length))
-        if end < start:
-            start, end = end, start
-        return start, end
-
-    @staticmethod
-    def _summarize_diff(before: str, after: str) -> str:
-        delta = len(after) - len(before)
-        if delta == 0:
-            return "Δ0"
-        sign = "+" if delta > 0 else "-"
-        return f"{sign}{abs(delta)} chars"
-
-    @staticmethod
-    def _parse_chunk_bounds(chunk_id: str | None) -> tuple[int, int] | None:
-        if not chunk_id:
-            return None
-        parts = chunk_id.split(":")
-        if len(parts) < 4:
-            return None
-        try:
-            start = int(parts[-2])
-            end = int(parts[-1])
-        except ValueError:
-            return None
-        return (start, end)
-
-    @staticmethod
-    def _compute_line_start_offsets(text: str) -> list[int]:
-        offsets = [0]
-        if not text:
-            return offsets
-        cursor = 0
-        for segment in text.splitlines(keepends=True):
-            cursor += len(segment)
-            offsets.append(cursor)
-        return offsets
 
     def _publish_document_changed(
         self,
@@ -1686,7 +1248,7 @@ class DocumentBridge:
             chunks.append(
                 {
                     "id": f"chunk:{document.document_id}:{cursor}:{chunk_end}",
-                    "hash": self._hash_text(segment),
+                    "hash": hash_text(segment),
                     "start": cursor,
                     "end": chunk_end,
                     "length": chunk_end - cursor,
@@ -1713,7 +1275,7 @@ class DocumentBridge:
             },
             "chunks": chunks,
             "content_hash": document.content_hash,
-            "version": self._format_version_token(version),
+            "version": format_version_token(version, self._tab_id),
             "cache_key": self._manifest_cache_key(window, chunk_profile, document.content_hash),
             "generated_at": time.time(),
         }
@@ -1792,7 +1354,7 @@ class DocumentBridge:
             if span_cap is not None and span_cap < (end - start):
                 end = min(length, start + span_cap)
         elif start_override is not None or end_override is not None:
-            start, end = self._clamp_range(start_override or 0, end_override or length, length)
+            start, end = clamp_range(start_override or 0, end_override or length, length)
             kind = "range"
         else:
             span = focus_hint.length if focus_hint.length > 0 else padding * 2 or 1024

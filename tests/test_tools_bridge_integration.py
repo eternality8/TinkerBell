@@ -33,6 +33,7 @@ from tinkerbell.ai.tools.errors import (
     VersionMismatchToolError,
 )
 from tinkerbell.services.bridge import DocumentBridge
+from tinkerbell.services.bridge_versioning import is_version_current
 from tinkerbell.editor.document_model import DocumentState
 
 
@@ -700,7 +701,7 @@ class TestBridgeVersionCompatibility:
 
         # The version should be "current" when compared
         doc = mock_editor.to_document()
-        assert bridge._is_version_current(doc, version_token) is True
+        assert is_version_current(doc, version_token) is True
 
     def test_bridge_accepts_3_part_token_legacy(self, bridge: DocumentBridge, mock_editor: MockEditorAdapter):
         """Bridge should still accept 3-part version tokens for backwards compatibility."""
@@ -712,7 +713,7 @@ class TestBridgeVersionCompatibility:
 
         # Should work with 3-part format
         assert len(signature.split(":")) == 3
-        assert bridge._is_version_current(doc, signature) is True
+        assert is_version_current(doc, signature) is True
 
     def test_bridge_rejects_stale_4_part_token(self, bridge: DocumentBridge, mock_editor: MockEditorAdapter):
         """Bridge should reject stale 4-part tokens."""
@@ -726,7 +727,7 @@ class TestBridgeVersionCompatibility:
         mock_editor.set_text("Changed content")
 
         doc = mock_editor.to_document()
-        assert bridge._is_version_current(doc, old_token) is False
+        assert is_version_current(doc, old_token) is False
 
 
 # =============================================================================
