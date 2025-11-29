@@ -43,20 +43,12 @@ _BOOL_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_DEBUG_LOGGING": "debug_logging",
     "TINKERBELL_DEBUG_EVENT_LOGGING": "debug_event_logging",
     "TINKERBELL_TOOL_ACTIVITY_PANEL": "show_tool_activity_panel",
-    "TINKERBELL_PHASE3_OUTLINE_TOOLS": "phase3_outline_tools",
-    "TINKERBELL_ENABLE_OUTLINE_GENERATION": "enable_outline_generation",
-    "TINKERBELL_ENABLE_SUBAGENTS": "enable_subagents",
-    "TINKERBELL_ENABLE_PLOT_SCAFFOLDING": "enable_plot_scaffolding",
-    "TINKERBELL_SAFE_AI_EDITS": "safe_ai_edits",
 }
 _FLOAT_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_REQUEST_TIMEOUT": "request_timeout",
     "TINKERBELL_TEMPERATURE": "temperature",
-    "TINKERBELL_TOKEN_DRIFT": "safe_ai_token_drift",
 }
-_INT_ENV_OVERRIDES: Mapping[str, str] = {
-    "TINKERBELL_DUPLICATE_THRESHOLD": "safe_ai_duplicate_threshold",
-}
+_INT_ENV_OVERRIDES: Mapping[str, str] = {}
 _TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
 _API_KEY_FIELD = "api_key_ciphertext"
 _SECRET_BACKEND_ENV = "TINKERBELL_SECRET_BACKEND"
@@ -121,13 +113,6 @@ class Settings:
     debug_logging: bool = False
     debug_event_logging: bool = False
     show_tool_activity_panel: bool = False
-    phase3_outline_tools: bool = False
-    enable_outline_generation: bool = False
-    enable_subagents: bool = False
-    enable_plot_scaffolding: bool = False
-    safe_ai_edits: bool = False
-    safe_ai_duplicate_threshold: int = 2
-    safe_ai_token_drift: float = 0.05
     chunk_profile: str = "auto"
     chunk_overlap_chars: int = 256
     chunk_max_inline_tokens: int = 1_800

@@ -68,17 +68,8 @@ class SettingsRuntime:
         settings: Settings,
         *,
         chat_panel_handler: Callable[[Settings], None],
-        outline_handler: Callable[[Settings], None],
-        phase3_handler: Callable[[Settings], None],
-        plot_scaffolding_handler: Callable[[Settings], None],
-        safe_edit_handler: Callable[[Settings], None] | None = None,
     ) -> None:
         chat_panel_handler(settings)
-        outline_handler(settings)
-        phase3_handler(settings)
-        plot_scaffolding_handler(settings)
-        if safe_edit_handler is not None:
-            safe_edit_handler(settings)
         self._apply_debug_logging_setting(settings)
         self._apply_event_logging_setting(settings)
         self.apply_theme_setting(settings)
@@ -218,10 +209,6 @@ class SettingsRuntime:
                 _LOGGER.debug("Unable to set event logging attribute: %s", exc)
 
     def _refresh_ai_runtime(self, settings: Settings) -> None:
-        new_subagent_flag = bool(getattr(settings, "enable_subagents", False))
-        telemetry_setter = getattr(self._telemetry_controller, "set_subagent_enabled", None)
-        if callable(telemetry_setter):
-            telemetry_setter(new_subagent_flag)
         if not self._ai_settings_ready(settings):
             self._disable_ai_controller()
             return
@@ -325,10 +312,9 @@ class SettingsRuntime:
         )
 
     def _build_subagent_runtime_config(self, settings: Settings) -> SubagentRuntimeConfig:
-        enabled = bool(getattr(settings, "enable_subagents", False))
         return SubagentRuntimeConfig(
-            enabled=enabled,
-            plot_scaffolding_enabled=bool(getattr(settings, "enable_plot_scaffolding", False)),
+            enabled=True,
+            plot_scaffolding_enabled=True,
         )
 
     def _resolve_max_tool_iterations(self, settings: Settings | None) -> int:

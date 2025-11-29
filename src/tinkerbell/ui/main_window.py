@@ -195,9 +195,6 @@ class MainWindow(QMainWindow):
         self._context = context
         self._async_loop: asyncio.AbstractEventLoop | None = None
         initial_settings = context.settings
-        self._phase3_outline_enabled = bool(getattr(initial_settings, "phase3_outline_tools", False))
-        self._outline_generation_enabled = bool(getattr(initial_settings, "enable_outline_generation", False))
-        self._plot_scaffolding_enabled = bool(getattr(initial_settings, "enable_plot_scaffolding", False))
         show_tool_panel = bool(getattr(initial_settings, "show_tool_activity_panel", False))
         self._editor = TabbedEditorWidget(skip_default_tab=True)
         self._editor.set_tab_close_handler(self._handle_tab_close_request)
@@ -206,9 +203,6 @@ class MainWindow(QMainWindow):
         self._selection_gateway = SelectionGateway(workspace=self._workspace)
         self._bridge = WorkspaceBridgeRouter(self._workspace)
         self._editor.add_tab_created_listener(self._bridge.track_tab)
-        self._safe_ai_config: tuple[bool, int, float] = (False, 2, 0.05)
-        self._editor.add_tab_created_listener(self._handle_tab_created_for_safe_editing)
-        self._apply_safe_edit_settings(initial_settings)
         self._status_bar = StatusBar()
         self._status_bar.set_document_status_callback(self._handle_document_status_clicked)
         self._document_monitor: DocumentStateMonitor | None = None
@@ -246,11 +240,9 @@ class MainWindow(QMainWindow):
         self._workspace.add_active_listener(self._handle_active_tab_for_review)
         self._workspace.add_active_listener(self._handle_active_tab_for_document_status)
         self._workspace.add_active_listener(self._handle_active_tab_for_cursor)
-        initial_subagent_enabled = bool(getattr(initial_settings, "enable_subagents", False))
         self._telemetry_controller = TelemetryController(
             status_bar=self._status_bar,
             context=self._context,
-            initial_subagent_enabled=initial_subagent_enabled,
             chat_panel=self._chat_panel,
         )
         self._review_controller = AIReviewController(
@@ -321,7 +313,6 @@ class MainWindow(QMainWindow):
             outline_worker_resolver=lambda: self._outline_runtime.worker() if self._outline_runtime else None,
             async_loop_resolver=self._resolve_async_loop,
             background_task_runner=self._run_background_task,
-            phase3_outline_enabled=self._phase3_outline_enabled,
         )
         self._outline_runtime = OutlineRuntime(
             document_provider=self._workspace.find_document_by_id,
@@ -376,7 +367,10 @@ class MainWindow(QMainWindow):
         if initial_settings is not None:
             self._settings_runtime.apply_theme_setting(initial_settings)
         self._embedding_controller.refresh_runtime(initial_settings)
-        self._update_outline_runtime_state()
+        # Start outline runtime by default (Phase 3 tools are always enabled now)
+        if self._outline_runtime is not None:
+            self._outline_runtime.ensure_started()
+            self._embedding_controller.propagate_index_to_worker()
 
     # ------------------------------------------------------------------
     # Qt lifecycle hooks
@@ -2154,10 +2148,6 @@ class MainWindow(QMainWindow):
         self._settings_runtime.apply_runtime_settings(
             result.settings,
             chat_panel_handler=self._apply_chat_panel_settings,
-            outline_handler=self._apply_outline_generation_setting,
-            phase3_handler=self._apply_phase3_outline_setting,
-            plot_scaffolding_handler=self._apply_plot_scaffolding_setting,
-            safe_edit_handler=self._apply_safe_edit_settings,
         )
         # Sync workspace state to ensure open_tabs reflects current tabs
         # (the dialog may have been open while tabs were closed)
@@ -2358,105 +2348,6 @@ class MainWindow(QMainWindow):
         else:
             base_dir = Path.home() / ".tinkerbell"
         return base_dir / "cache" / "outline_builder"
-
-    def _apply_outline_generation_setting(self, settings: Settings) -> None:
-        enabled = bool(getattr(settings, "enable_outline_generation", False))
-        if enabled == self._outline_generation_enabled:
-            return
-        self._outline_generation_enabled = enabled
-        self._update_outline_runtime_state()
-
-    def _update_outline_runtime_state(self) -> None:
-        runtime = self._outline_runtime
-        if runtime is None:
-            return
-        should_run = self._phase3_outline_enabled or self._outline_generation_enabled
-        if should_run:
-            runtime.ensure_started()
-            self._embedding_controller.propagate_index_to_worker()
-            return
-        runtime.shutdown()
-        if self._document_monitor is not None:
-            self._document_monitor.reset_outline_digest_cache()
-        if self._status_bar is not None:
-            self._status_bar.set_outline_status("")
-
-    def _apply_phase3_outline_setting(self, settings: Settings) -> None:
-        enabled = bool(getattr(settings, "phase3_outline_tools", False))
-        if enabled == self._phase3_outline_enabled:
-            return
-
-        self._phase3_outline_enabled = enabled
-        self._embedding_controller.set_phase3_outline_enabled(enabled)
-        if self._tool_provider is not None:
-            self._tool_provider.set_phase3_outline_enabled(enabled)
-        if enabled:
-            self._register_phase3_ai_tools()
-        else:
-            if self._tool_provider is not None:
-                self._tool_provider.reset_outline_tools()
-            if self._document_monitor is not None:
-                self._document_monitor.reset_outline_digest_cache()
-            self._unregister_phase3_ai_tools()
-        if self._status_bar is not None:
-            self._status_bar.set_outline_status("")
-        self._update_outline_runtime_state()
-
-    def _apply_plot_scaffolding_setting(self, settings: Settings) -> None:
-        enabled = bool(getattr(settings, "enable_plot_scaffolding", False))
-        if enabled == self._plot_scaffolding_enabled:
-            return
-        self._plot_scaffolding_enabled = enabled
-        if self._tool_provider is not None:
-            self._tool_provider.set_plot_scaffolding_enabled(enabled)
-        if enabled:
-            self._register_plot_state_tool()
-            return
-        self._unregister_plot_state_tool()
-        if self._tool_provider is not None:
-            self._tool_provider.reset_plot_state_tool()
-
-    def _handle_tab_created_for_safe_editing(self, tab: DocumentTab) -> None:
-        self._configure_bridge_safe_edits(tab.bridge, self._safe_ai_config)
-
-    def _apply_safe_edit_settings(self, settings: Settings | None) -> None:
-        config = self._coerce_safe_ai_config(settings)
-        if getattr(self, "_safe_ai_config", None) == config:
-            return
-        self._safe_ai_config = config
-        for tab in self._workspace.iter_tabs():
-            self._configure_bridge_safe_edits(tab.bridge, config)
-
-    def _configure_bridge_safe_edits(self, bridge: Any, config: tuple[bool, int, float]) -> None:
-        configure = getattr(bridge, "configure_safe_editing", None)
-        if not callable(configure):  # pragma: no cover - legacy bridge fallback
-            return
-        enabled, duplicate_threshold, token_drift = config
-        try:
-            configure(
-                enabled=enabled,
-                duplicate_threshold=duplicate_threshold,
-                token_drift=token_drift,
-            )
-        except Exception:  # pragma: no cover - defensive guard
-            _LOGGER.debug("Unable to configure safe AI edits", exc_info=True)
-
-    @staticmethod
-    def _coerce_safe_ai_config(settings: Settings | None) -> tuple[bool, int, float]:
-        if settings is None:
-            return (False, 2, 0.05)
-        enabled = bool(getattr(settings, "safe_ai_edits", False))
-        duplicate_raw = getattr(settings, "safe_ai_duplicate_threshold", 2)
-        token_raw = getattr(settings, "safe_ai_token_drift", 0.05)
-        try:
-            duplicate_threshold = max(2, int(duplicate_raw))
-        except (TypeError, ValueError):
-            duplicate_threshold = 2
-        try:
-            token_drift = max(0.0, float(token_raw))
-        except (TypeError, ValueError):
-            token_drift = 0.05
-        return (enabled, duplicate_threshold, token_drift)
 
     def _apply_chat_panel_settings(self, settings: Settings) -> None:
         visible = bool(getattr(settings, "show_tool_activity_panel", False))

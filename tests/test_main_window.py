@@ -235,20 +235,6 @@ def test_active_tab_cursor_refresh_updates_status_bar():
 
     assert window._status_bar.cursor_position == (3, 3)
 
-def test_safe_ai_settings_apply_to_existing_bridges():
-    settings = Settings(
-        safe_ai_edits=True,
-        safe_ai_duplicate_threshold=4,
-        safe_ai_token_drift=0.15,
-    )
-
-    window = _make_window(settings=settings)
-
-    bridge = window._workspace.require_active_tab().bridge  # type: ignore[attr-defined]
-    assert getattr(bridge, "_safe_edit_settings").enabled is True
-    assert getattr(bridge, "_safe_edit_settings").duplicate_threshold == 4
-    assert getattr(bridge, "_safe_edit_settings").token_drift == pytest.approx(0.15)
-
 
 def test_new_ai_tools_registered():
     """Verify new WS1-6 tools are registered instead of legacy tools."""
@@ -304,29 +290,6 @@ def test_settings_dialog_toggle_updates_tool_panel(monkeypatch: pytest.MonkeyPat
 
     assert window.chat_panel.tool_activity_visible is True
     assert window._context.settings is updated
-
-
-def test_settings_dialog_updates_safe_ai_edits(monkeypatch: pytest.MonkeyPatch):
-    initial = Settings(safe_ai_edits=False)
-    window = _make_window(settings=initial)
-    updated = Settings(
-        safe_ai_edits=True,
-        safe_ai_duplicate_threshold=6,
-        safe_ai_token_drift=0.2,
-    )
-
-    monkeypatch.setattr(
-        window,
-        "_show_settings_dialog",
-        lambda current: SimpleNamespace(accepted=True, settings=updated),
-    )
-
-    window._handle_settings_requested()
-
-    bridge = window._workspace.require_active_tab().bridge  # type: ignore[attr-defined]
-    assert getattr(bridge, "_safe_edit_settings").enabled is True
-    assert getattr(bridge, "_safe_edit_settings").duplicate_threshold == 6
-    assert getattr(bridge, "_safe_edit_settings").token_drift == pytest.approx(0.2)
 
 
 def test_safe_edit_failure_surfaces_guardrail_notice():
@@ -563,16 +526,8 @@ def test_context_usage_status_includes_compaction_stats():
     assert "Compactions 2" in window._status_bar.memory_usage
 
 
-def test_subagent_indicator_off_when_feature_disabled() -> None:
-    window = _make_window(settings=Settings(enable_subagents=False))
-
-    status, detail = window._status_bar.subagent_state
-    assert status == "Off"
-    assert "subagents" in detail.lower()
-
-
 def test_subagent_indicator_updates_from_telemetry_events() -> None:
-    window = _make_window(settings=Settings(enable_subagents=True))
+    window = _make_window()
 
     # Initial state should be idle with a helpful tooltip message
     status, detail = window._status_bar.subagent_state

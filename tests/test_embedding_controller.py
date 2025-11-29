@@ -21,7 +21,6 @@ def _build_controller(tmp_path: Path) -> EmbeddingController:
         outline_worker_resolver=lambda: None,
         async_loop_resolver=lambda: asyncio.get_event_loop(),
         background_task_runner=lambda task_factory: None,
-        phase3_outline_enabled=True,
     )
 
 

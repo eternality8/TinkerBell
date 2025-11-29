@@ -113,36 +113,6 @@ def test_float_env_override_sets_temperature(monkeypatch: pytest.MonkeyPatch, tm
     assert overridden.temperature == pytest.approx(0.95)
 
 
-def test_env_override_enables_safe_ai_edits(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    path = tmp_path / "settings.json"
-    SettingsStore(path).save(Settings())
-    monkeypatch.setenv("TINKERBELL_SAFE_AI_EDITS", "true")
-
-    overridden = SettingsStore(path).load()
-
-    assert overridden.safe_ai_edits is True
-
-
-def test_int_env_override_sets_duplicate_threshold(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    path = tmp_path / "settings.json"
-    SettingsStore(path).save(Settings())
-    monkeypatch.setenv("TINKERBELL_DUPLICATE_THRESHOLD", "6")
-
-    overridden = SettingsStore(path).load()
-
-    assert overridden.safe_ai_duplicate_threshold == 6
-
-
-def test_float_env_override_sets_safe_ai_token_drift(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    path = tmp_path / "settings.json"
-    SettingsStore(path).save(Settings())
-    monkeypatch.setenv("TINKERBELL_TOKEN_DRIFT", "0.25")
-
-    overridden = SettingsStore(path).load()
-
-    assert overridden.safe_ai_token_drift == pytest.approx(0.25)
-
-
 def test_debug_settings_roundtrip(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     store = SettingsStore(path)

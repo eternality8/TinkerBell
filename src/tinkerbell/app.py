@@ -140,24 +140,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(f"Invalid --set override: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
-    if args.phase3_outline_tools is not None:
-        cli_overrides["phase3_outline_tools"] = args.phase3_outline_tools
-    if args.enable_outline_generation is not None:
-        cli_overrides["enable_outline_generation"] = args.enable_outline_generation
-    if args.enable_subagents is not None:
-        cli_overrides["enable_subagents"] = args.enable_subagents
-    if args.enable_plot_scaffolding is not None:
-        cli_overrides["enable_plot_scaffolding"] = args.enable_plot_scaffolding
     if args.embedding_backend is not None:
         cli_overrides["embedding_backend"] = args.embedding_backend
     if args.embedding_model is not None:
         cli_overrides["embedding_model_name"] = args.embedding_model
-    if args.safe_ai_edits is not None:
-        cli_overrides["safe_ai_edits"] = args.safe_ai_edits
-    if args.safe_ai_duplicate_threshold is not None:
-        cli_overrides["safe_ai_duplicate_threshold"] = args.safe_ai_duplicate_threshold
-    if args.safe_ai_token_drift is not None:
-        cli_overrides["safe_ai_token_drift"] = args.safe_ai_token_drift
     metadata_override: Dict[str, Any] | None = None
     if "metadata" in cli_overrides and isinstance(cli_overrides.get("metadata"), Mapping):
         metadata_override = dict(cli_overrides["metadata"])
@@ -467,93 +453,6 @@ def _parse_cli_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, lis
         action="append",
         default=[],
         help="Override persisted settings before launch (repeatable).",
-    )
-    parser.add_argument(
-        "--enable-phase3-outline-tools",
-        dest="phase3_outline_tools",
-        action="store_const",
-        const=True,
-        default=None,
-        help="Enable Phase 3 outline + retrieval tooling without editing settings.json.",
-    )
-    parser.add_argument(
-        "--disable-phase3-outline-tools",
-        dest="phase3_outline_tools",
-        action="store_const",
-        const=False,
-        help="Disable Phase 3 outline + retrieval tooling for this session.",
-    )
-    parser.add_argument(
-        "--enable-outline-generation",
-        dest="enable_outline_generation",
-        action="store_const",
-        const=True,
-        default=None,
-        help="Start the background outline worker without enabling Phase 3 tools.",
-    )
-    parser.add_argument(
-        "--disable-outline-generation",
-        dest="enable_outline_generation",
-        action="store_const",
-        const=False,
-        help="Stop the background outline worker for this session.",
-    )
-    parser.add_argument(
-        "--enable-subagents",
-        dest="enable_subagents",
-        action="store_const",
-        const=True,
-        default=None,
-        help="Enable the Phase 4 subagent sandbox for this session.",
-    )
-    parser.add_argument(
-        "--disable-subagents",
-        dest="enable_subagents",
-        action="store_const",
-        const=False,
-        help="Disable the Phase 4 subagent sandbox for this session.",
-    )
-    parser.add_argument(
-        "--enable-plot-scaffolding",
-        dest="enable_plot_scaffolding",
-        action="store_const",
-        const=True,
-        default=None,
-        help="Enable experimental plot/entity scaffolding without editing settings.json.",
-    )
-    parser.add_argument(
-        "--disable-plot-scaffolding",
-        dest="enable_plot_scaffolding",
-        action="store_const",
-        const=False,
-        help="Disable plot/entity scaffolding for this session.",
-    )
-    parser.add_argument(
-        "--enable-safe-ai-edits",
-        dest="safe_ai_edits",
-        action="store_const",
-        const=True,
-        default=None,
-        help="Enable post-edit inspections and auto-revert guardrails for this session.",
-    )
-    parser.add_argument(
-        "--disable-safe-ai-edits",
-        dest="safe_ai_edits",
-        action="store_const",
-        const=False,
-        help="Disable post-edit inspections for this session.",
-    )
-    parser.add_argument(
-        "--safe-ai-duplicate-threshold",
-        dest="safe_ai_duplicate_threshold",
-        type=int,
-        help="Override the duplicate paragraph threshold before rejecting an edit.",
-    )
-    parser.add_argument(
-        "--safe-ai-token-drift",
-        dest="safe_ai_token_drift",
-        type=float,
-        help="Override the token drift tolerance (0-1) before rejecting an edit.",
     )
     parser.add_argument(
         "--embedding-mode",

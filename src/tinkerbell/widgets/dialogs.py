@@ -777,62 +777,6 @@ class SettingsDialog(QDialog):
         self._tool_panel_checkbox.setChecked(
             bool(getattr(self._original, "show_tool_activity_panel", False))
         )
-        self._phase3_outline_checkbox = QCheckBox("Enable Phase 3 outline + retrieval tools")
-        self._phase3_outline_checkbox.setObjectName("phase3_outline_tools_checkbox")
-        self._phase3_outline_checkbox.setChecked(bool(getattr(self._original, "phase3_outline_tools", False)))
-        self._phase3_outline_hint = QLabel("Experimental outlines/retrieval with status bar indicators and telemetry.")
-        self._phase3_outline_hint.setObjectName("phase3_outline_hint")
-        self._prepare_hint_label(self._phase3_outline_hint)
-        self._outline_generation_checkbox = QCheckBox("Enable background outline generation")
-        self._outline_generation_checkbox.setObjectName("outline_generation_checkbox")
-        self._outline_generation_checkbox.setChecked(
-            bool(getattr(self._original, "enable_outline_generation", False))
-        )
-        self._outline_generation_hint = QLabel(
-            "Runs the Outline Builder worker so analysis + Document Status stay up to date even without Phase 3."
-        )
-        self._outline_generation_hint.setObjectName("outline_generation_hint")
-        self._prepare_hint_label(self._outline_generation_hint)
-        self._subagent_checkbox = QCheckBox("Enable Phase 4 subagent sandbox (selection scouts)")
-        self._subagent_checkbox.setObjectName("subagent_enable_checkbox")
-        self._subagent_checkbox.setChecked(bool(getattr(self._original, "enable_subagents", False)))
-        self._subagent_hint = QLabel(
-            "Injects helper summaries from chunk-level scouts when selections exceed the threshold."
-        )
-        self._subagent_hint.setObjectName("subagent_hint")
-        self._prepare_hint_label(self._subagent_hint)
-        self._plot_scaffolding_checkbox = QCheckBox("Enable experimental plot/entity scaffolding")
-        self._plot_scaffolding_checkbox.setObjectName("plot_scaffolding_checkbox")
-        self._plot_scaffolding_checkbox.setChecked(bool(getattr(self._original, "enable_plot_scaffolding", False)))
-        self._plot_scaffolding_hint = QLabel(
-            "Caches lightweight character + arc summaries from subagent runs for read-only inspection."
-        )
-        self._plot_scaffolding_hint.setObjectName("plot_scaffolding_hint")
-        self._prepare_hint_label(self._plot_scaffolding_hint)
-        safe_ai_enabled = bool(getattr(self._original, "safe_ai_edits", False))
-        self._safe_ai_checkbox = QCheckBox("Enable safe AI edits (auto-revert guardrail)")
-        self._safe_ai_checkbox.setObjectName("safe_ai_edits_checkbox")
-        self._safe_ai_checkbox.setChecked(safe_ai_enabled)
-        self._safe_ai_hint = QLabel(
-            "Automatically reverts AI edits when duplicates or token drift exceed thresholds."
-        )
-        self._safe_ai_hint.setObjectName("safe_ai_edits_hint")
-        self._prepare_hint_label(self._safe_ai_hint)
-        duplicate_default = int(getattr(self._original, "safe_ai_duplicate_threshold", 2) or 2)
-        self._safe_ai_duplicate_threshold_input = QSpinBox()
-        self._safe_ai_duplicate_threshold_input.setObjectName("safe_ai_duplicate_threshold_input")
-        self._safe_ai_duplicate_threshold_input.setRange(2, 20)
-        self._safe_ai_duplicate_threshold_input.setValue(max(2, duplicate_default))
-        self._safe_ai_duplicate_threshold_input.setSuffix(" paragraphs")
-        drift_default = float(getattr(self._original, "safe_ai_token_drift", 0.05) or 0.0)
-        self._safe_ai_token_drift_input = QDoubleSpinBox()
-        self._safe_ai_token_drift_input.setObjectName("safe_ai_token_drift_input")
-        self._safe_ai_token_drift_input.setRange(0.0, 1.0)
-        self._safe_ai_token_drift_input.setSingleStep(0.01)
-        self._safe_ai_token_drift_input.setDecimals(3)
-        self._safe_ai_token_drift_input.setValue(max(0.0, min(drift_default, 1.0)))
-        self._safe_ai_token_drift_input.setSuffix(" drift")
-        self._safe_ai_checkbox.toggled.connect(self._update_safe_ai_controls)
         self._max_tool_iterations_input = QSpinBox()
         self._max_tool_iterations_input.setObjectName("max_tool_iterations_input")
         self._max_tool_iterations_input.setRange(1, 200)
@@ -969,46 +913,6 @@ class SettingsDialog(QDialog):
         embedding_mode_stack_layout.setSpacing(4)
         embedding_mode_stack_layout.addWidget(self._embedding_mode_stack)
 
-        phase3_container = QWidget()
-        phase3_layout = QVBoxLayout(phase3_container)
-        phase3_layout.setContentsMargins(0, 0, 0, 0)
-        phase3_layout.setSpacing(2)
-        phase3_layout.addWidget(self._phase3_outline_checkbox)
-        phase3_layout.addWidget(self._phase3_outline_hint)
-
-        outline_container = QWidget()
-        outline_layout = QVBoxLayout(outline_container)
-        outline_layout.setContentsMargins(0, 0, 0, 0)
-        outline_layout.setSpacing(2)
-        outline_layout.addWidget(self._outline_generation_checkbox)
-        outline_layout.addWidget(self._outline_generation_hint)
-
-        subagent_container = QWidget()
-        subagent_layout = QVBoxLayout(subagent_container)
-        subagent_layout.setContentsMargins(0, 0, 0, 0)
-        subagent_layout.setSpacing(2)
-        subagent_layout.addWidget(self._subagent_checkbox)
-        subagent_layout.addWidget(self._subagent_hint)
-
-        plot_container = QWidget()
-        plot_layout = QVBoxLayout(plot_container)
-        plot_layout.setContentsMargins(0, 0, 0, 0)
-        plot_layout.setSpacing(2)
-        plot_layout.addWidget(self._plot_scaffolding_checkbox)
-        plot_layout.addWidget(self._plot_scaffolding_hint)
-        safe_ai_container = QWidget()
-        safe_ai_layout = QVBoxLayout(safe_ai_container)
-        safe_ai_layout.setContentsMargins(0, 0, 0, 0)
-        safe_ai_layout.setSpacing(2)
-        safe_ai_layout.addWidget(self._safe_ai_checkbox)
-        safe_ai_layout.addWidget(self._safe_ai_hint)
-        safe_ai_threshold_container = QWidget()
-        safe_ai_threshold_form = QFormLayout(safe_ai_threshold_container)
-        safe_ai_threshold_form.setContentsMargins(0, 0, 0, 0)
-        safe_ai_threshold_form.setSpacing(6)
-        safe_ai_threshold_form.addRow("Duplicate threshold", self._safe_ai_duplicate_threshold_input)
-        safe_ai_threshold_form.addRow("Token drift", self._safe_ai_token_drift_input)
-
         reserve_container = QWidget()
         reserve_layout = QVBoxLayout(reserve_container)
         reserve_layout.setContentsMargins(0, 0, 0, 0)
@@ -1072,12 +976,6 @@ class SettingsDialog(QDialog):
                 ("Debug", self._debug_checkbox),
                 ("Event Logs", self._event_log_checkbox),
                 ("Tool Traces", self._tool_panel_checkbox),
-                ("Phase 3 Tools", phase3_container),
-                ("Outline Generation", outline_container),
-                ("Phase 4 Subagents", subagent_container),
-                ("Plot Scaffolding", plot_container),
-                ("Safe AI Edits", safe_ai_container),
-                ("Inspector Thresholds", safe_ai_threshold_container),
             ]
         )
 
@@ -1143,7 +1041,6 @@ class SettingsDialog(QDialog):
         self._update_reserve_hint()
         self._update_timeout_hint()
         self._update_temperature_hint()
-        self._update_safe_ai_controls()
         self._update_context_policy_hint()
         self._handle_embedding_mode_changed()
         self._validate_embedding_fields()
@@ -1215,13 +1112,6 @@ class SettingsDialog(QDialog):
         debug_logging = self._debug_checkbox.isChecked()
         debug_event_logging = self._event_log_checkbox.isChecked()
         show_tool_activity_panel = self._tool_panel_checkbox.isChecked()
-        phase3_outline_tools = self._phase3_outline_checkbox.isChecked()
-        enable_outline_generation = self._outline_generation_checkbox.isChecked()
-        enable_subagents = self._subagent_checkbox.isChecked()
-        enable_plot_scaffolding = self._plot_scaffolding_checkbox.isChecked()
-        safe_ai_edits = self._safe_ai_checkbox.isChecked()
-        safe_ai_duplicate_threshold = int(self._safe_ai_duplicate_threshold_input.value())
-        safe_ai_token_drift = float(self._safe_ai_token_drift_input.value())
         max_tool_iterations = int(self._max_tool_iterations_input.value())
         max_context_tokens = int(self._max_context_tokens_input.value())
         response_token_reserve = int(self._response_token_reserve_input.value())
@@ -1241,13 +1131,6 @@ class SettingsDialog(QDialog):
             debug_logging=debug_logging,
             debug_event_logging=debug_event_logging,
             show_tool_activity_panel=show_tool_activity_panel,
-            phase3_outline_tools=phase3_outline_tools,
-            enable_outline_generation=enable_outline_generation,
-            enable_subagents=enable_subagents,
-            enable_plot_scaffolding=enable_plot_scaffolding,
-            safe_ai_edits=safe_ai_edits,
-            safe_ai_duplicate_threshold=safe_ai_duplicate_threshold,
-            safe_ai_token_drift=safe_ai_token_drift,
             max_tool_iterations=max_tool_iterations,
             max_context_tokens=max_context_tokens,
             response_token_reserve=response_token_reserve,
@@ -1658,11 +1541,6 @@ class SettingsDialog(QDialog):
             level = "info"
             message = "Near-zero temps keep responses predictable."
         self._set_hint(self._temperature_hint, message, level)
-
-    def _update_safe_ai_controls(self) -> None:
-        enabled = self._safe_ai_checkbox.isChecked()
-        self._safe_ai_duplicate_threshold_input.setEnabled(enabled)
-        self._safe_ai_token_drift_input.setEnabled(enabled)
 
     def _update_context_policy_hint(self) -> None:
         enabled = self._context_policy_enabled.isChecked()

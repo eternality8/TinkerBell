@@ -63,9 +63,6 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     prompt_input = dialog.findChild(QSpinBox, "context_policy_prompt_override_input")
     reserve_toggle = dialog.findChild(QCheckBox, "context_policy_reserve_override_toggle")
     reserve_override_input = dialog.findChild(QSpinBox, "context_policy_reserve_override_input")
-    safe_ai_checkbox = dialog.findChild(QCheckBox, "safe_ai_edits_checkbox")
-    duplicate_input = dialog.findChild(QSpinBox, "safe_ai_duplicate_threshold_input")
-    drift_input = dialog.findChild(QDoubleSpinBox, "safe_ai_token_drift_input")
 
     assert base_input is not None
     assert api_input is not None
@@ -83,9 +80,6 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert prompt_input is not None
     assert reserve_toggle is not None
     assert reserve_override_input is not None
-    assert safe_ai_checkbox is not None
-    assert duplicate_input is not None
-    assert drift_input is not None
 
     base_input.setText("https://example.com/v2")
     api_input.setText("new-key")
@@ -98,9 +92,6 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     timeout_input.setValue(42.5)
     context_input.setValue(256_000)
     reserve_input.setValue(20_000)
-    safe_ai_checkbox.setChecked(True)
-    duplicate_input.setValue(5)
-    drift_input.setValue(0.12)
     policy_enable.setChecked(True)
     policy_dry_run.setChecked(False)
     prompt_toggle.setChecked(True)
@@ -120,9 +111,6 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert updated.request_timeout == pytest.approx(42.5)
     assert updated.max_context_tokens == 256_000
     assert updated.response_token_reserve == 20_000
-    assert updated.safe_ai_edits is True
-    assert updated.safe_ai_duplicate_threshold == 5
-    assert updated.safe_ai_token_drift == pytest.approx(0.12)
     assert updated.context_policy.enabled is True
     assert updated.context_policy.dry_run is False
     assert updated.context_policy.prompt_budget_override == 100_000

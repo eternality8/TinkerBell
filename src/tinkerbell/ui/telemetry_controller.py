@@ -22,13 +22,11 @@ class TelemetryController:
         *,
         status_bar: StatusBar | None,
         context: WindowContext,
-        initial_subagent_enabled: bool = False,
         chat_panel: ChatPanel | None = None,
     ) -> None:
         self._status_bar = status_bar
         self._context = context
         self._last_compaction_stats: Mapping[str, int] | None = None
-        self._subagent_enabled = initial_subagent_enabled
         self._subagent_active_jobs: set[str] = set()
         self._subagent_pending_jobs: set[str] = set()
         self._subagent_job_totals: dict[str, int] = {"completed": 0, "failed": 0, "skipped": 0}
@@ -194,33 +192,9 @@ class TelemetryController:
         status_text, badge_text, detail_text = self._format_analysis_indicator(advice, document_label)
         return {"status": status_text, "badge": badge_text, "detail": detail_text}
 
-    def set_subagent_enabled(self, enabled: bool) -> None:
-        normalized = bool(enabled)
-        if self._subagent_enabled == normalized:
-            if not normalized:
-                self._subagent_active_jobs.clear()
-                self._subagent_pending_jobs.clear()
-                self._subagent_last_queue_detail = ""
-            self.update_subagent_indicator()
-            return
-        self._subagent_enabled = normalized
-        if not normalized:
-            self._subagent_active_jobs.clear()
-            self._subagent_pending_jobs.clear()
-            self._subagent_last_queue_detail = ""
-        self.update_subagent_indicator()
-
     def update_subagent_indicator(self) -> None:
         status_bar = self._status_bar
         if status_bar is None:
-            return
-        enabled = bool(self._subagent_enabled)
-        if not enabled:
-            detail = "Enable Phase 4 subagents in Settings to capture chunk-level scouts."
-            try:
-                status_bar.set_subagent_status("Off", detail=detail)
-            except Exception:
-                LOGGER.debug("Failed to update subagent status", exc_info=True)
             return
 
         active_jobs = len(self._subagent_active_jobs)

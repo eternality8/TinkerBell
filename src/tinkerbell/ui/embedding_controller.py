@@ -169,14 +169,12 @@ class EmbeddingController:
         outline_worker_resolver: Callable[[], Any | None],
         async_loop_resolver: Callable[[], asyncio.AbstractEventLoop | None],
         background_task_runner: Callable[[Callable[[], Coroutine[Any, Any, Any]]], None],
-        phase3_outline_enabled: bool,
     ) -> None:
         self._status_bar = status_bar
         self._cache_root_resolver = cache_root_resolver
         self._outline_worker_resolver = outline_worker_resolver
         self._resolve_async_loop = async_loop_resolver
         self._run_background_task = background_task_runner
-        self._phase3_outline_enabled = phase3_outline_enabled
         self._embedding_index: DocumentEmbeddingIndex | None = None
         self._embedding_state = EmbeddingRuntimeState()
         self._embedding_signature: tuple[Any, ...] | None = None
@@ -187,18 +185,11 @@ class EmbeddingController:
     # ------------------------------------------------------------------
     # Life-cycle hooks
     # ------------------------------------------------------------------
-    def set_phase3_outline_enabled(self, enabled: bool) -> None:
-        if self._phase3_outline_enabled == enabled:
-            return
-        self._phase3_outline_enabled = enabled
-        if not enabled:
-            self._teardown_embedding_runtime(reason="Phase 3 tools disabled", hide_status=True)
-
     def refresh_runtime(self, settings: Settings | None) -> None:
-        if settings is None or not self._phase3_outline_enabled:
+        if settings is None:
             self._teardown_embedding_runtime(
-                reason="Phase 3 tools disabled",
-                hide_status=not self._phase3_outline_enabled,
+                reason="No settings available",
+                hide_status=False,
             )
             return
 
@@ -814,11 +805,11 @@ class EmbeddingController:
         self._handle_embedding_activity(False, None)
         if keep_status:
             return
-        fallback_backend = "disabled" if self._phase3_outline_enabled else "unavailable"
+        fallback_backend = "disabled"
         state = EmbeddingRuntimeState(
             backend=fallback_backend,
             model=None,
-            status=fallback_backend if fallback_backend != "unavailable" else "unavailable",
+            status=fallback_backend,
             detail=reason,
         )
         self._set_embedding_state(state, hide_status=hide_status)

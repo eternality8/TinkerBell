@@ -52,7 +52,6 @@ def test_chunk_flow_events_update_indicators() -> None:
     controller = TelemetryController(
         status_bar=status_bar,
         context=WindowContext(unsaved_cache=UnsavedCache()),
-        initial_subagent_enabled=False,
         chat_panel=chat_probe,
     )
 
@@ -88,7 +87,6 @@ def test_subagent_queue_events_drive_indicator() -> None:
     controller = TelemetryController(
         status_bar=status_bar,
         context=WindowContext(unsaved_cache=UnsavedCache()),
-        initial_subagent_enabled=True,
     )
 
     controller.register_subagent_listeners()
