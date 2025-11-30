@@ -18,10 +18,7 @@ from tinkerbell.ai.ai_types import (
 from tinkerbell.ai.memory.cache_bus import DocumentCacheBus, DocumentChangedEvent
 from tinkerbell.ai.memory.result_cache import SubagentResultCache
 from tinkerbell.ai.client import AIClient
-
-
-class _DummyClient:
-    settings = type("S", (), {"model": "test-model"})()
+from tests.helpers import DummyAIClient
 
 
 def _make_job(*, chunk_hash: str = "chunk-1", summary: str = "cached") -> SubagentJob:
@@ -78,7 +75,7 @@ async def test_subagent_manager_reuses_cached_results(monkeypatch: pytest.Monkey
     bus = DocumentCacheBus()
     cache = SubagentResultCache(max_entries=4, ttl_seconds=None, bus=bus)
     manager = SubagentManager(
-        cast(AIClient, _DummyClient()),
+        cast(AIClient, DummyAIClient()),
         tool_resolver=lambda: {},
         config=SubagentRuntimeConfig(enabled=True, max_jobs_per_turn=2),
         result_cache=cache,

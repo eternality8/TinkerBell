@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import RLock
-from typing import Any, Callable, Iterable, List, MutableMapping, Type
+from typing import Any, Callable, Iterable, MutableMapping, Type
 import logging
 import weakref
 
@@ -96,7 +96,7 @@ class DocumentCacheBus:
     """Synchronous pub/sub bus for cache invalidation events."""
 
     def __init__(self) -> None:
-        self._subscribers: MutableMapping[Type[DocumentCacheEvent], List[_Subscriber]] = {}
+        self._subscribers: MutableMapping[Type[DocumentCacheEvent], list[_Subscriber]] = {}
         self._lock = RLock()
 
     def subscribe(

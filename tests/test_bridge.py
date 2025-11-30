@@ -14,7 +14,7 @@ from tinkerbell.ai.memory.cache_bus import (
     DocumentChangedEvent,
     DocumentClosedEvent,
 )
-from tinkerbell.chat.message_model import EditDirective
+from tinkerbell.ui.presentation.chat.message_model import EditDirective
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.editor.patches import PatchResult
 from tinkerbell.editor.post_edit_inspector import InspectionResult

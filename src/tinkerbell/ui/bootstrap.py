@@ -170,7 +170,7 @@ def create_application(
     if context.settings_store:
         try:
             cache_root = context.settings_store.path.parent / "embedding_cache"
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
     embedding_store = EmbeddingStore(

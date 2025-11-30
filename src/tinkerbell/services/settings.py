@@ -10,7 +10,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, Dict, Mapping, MutableMapping, Literal
+from typing import Any, Mapping, MutableMapping, Literal
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -303,7 +303,7 @@ class SettingsStore:
         )
         return self._path
 
-    def _serialize(self, settings: Settings) -> Dict[str, Any]:
+    def _serialize(self, settings: Settings) -> dict[str, Any]:
         data = asdict(settings)
         api_key = data.pop("api_key", "") or ""
         ciphertext = self._encrypt_api_key(api_key)
@@ -314,7 +314,7 @@ class SettingsStore:
         data["secret_backend"] = self._vault.strategy
         return data
 
-    def _read_payload(self) -> Dict[str, Any]:
+    def _read_payload(self) -> dict[str, Any]:
         if not self._path.exists():
             return {}
         try:
@@ -334,7 +334,7 @@ class SettingsStore:
         source: str = "runtime",
     ) -> Settings:
         allowed = {field.name for field in fields(Settings)}
-        filtered: Dict[str, Any] = {}
+        filtered: dict[str, Any] = {}
         for key, value in overrides.items():
             if key not in allowed or value is None:
                 continue
@@ -352,7 +352,7 @@ class SettingsStore:
         return settings
 
     def _apply_env_overrides(self, settings: Settings) -> Settings:
-        overrides: Dict[str, Any] = {}
+        overrides: dict[str, Any] = {}
         for env_name, field_name in _ENV_OVERRIDES.items():
             value = os.environ.get(env_name)
             if value is not None:
@@ -410,7 +410,7 @@ class SettingsStore:
         mutated = backend_changed or metadata != original_metadata
         if not mutated:
             return settings, False
-        updates: Dict[str, Any] = {}
+        updates: dict[str, Any] = {}
         if metadata != original_metadata:
             updates["metadata"] = metadata
         if backend_changed:
@@ -610,9 +610,9 @@ class SecretVault:
         return (prefix or None), payload
 
 
-def _filter_fields(payload: Mapping[str, Any]) -> Dict[str, Any]:
+def _filter_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
     allowed = {field.name for field in fields(Settings)} - {"api_key"}
-    result: Dict[str, Any] = {}
+    result: dict[str, Any] = {}
     for key, value in payload.items():
         if key not in allowed:
             continue

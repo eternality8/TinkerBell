@@ -38,7 +38,7 @@ from tinkerbell.ai.orchestration.tool_dispatcher import (
     DispatchResult,
     create_tool_dispatcher,
 )
-from tinkerbell.ai.prompts_v2 import (
+from tinkerbell.ai.prompts import (
     system_prompt_v2,
     format_document_context,
     format_error_context,

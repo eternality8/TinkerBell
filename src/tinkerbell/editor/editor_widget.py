@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Mapping, Optional, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
-from ..chat.message_model import EditDirective
-from ..documents.ranges import TextRange
+from tinkerbell.ui.presentation.chat.message_model import EditDirective
+from ..core.ranges import TextRange
 from .document_model import DocumentState, SelectionRange
 from .patches import PatchResult
 from .syntax.markdown import MarkdownPreview, render_preview
@@ -114,7 +114,7 @@ class EditorWidget(QWidgetBase):
 
     MAX_HISTORY = 50
 
-    def __init__(self, parent: Optional[Any] = None) -> None:
+    def __init__(self, parent: Any | None = None) -> None:
         super().__init__(parent)
         self._state = DocumentState()
         self._selection = SelectionRange()
@@ -124,7 +124,7 @@ class EditorWidget(QWidgetBase):
         self._stack: Any = None
         self._preview_widget: Any = None
         self._preview_enabled = False
-        self._preview_cache: Optional[MarkdownPreview] = None
+        self._preview_cache: MarkdownPreview | None = None
         self._snapshot_listeners: list[SnapshotListener] = []
         self._text_listeners: list[TextChangeListener] = []
         self._selection_listeners: list[SelectionListener] = []
@@ -271,7 +271,7 @@ class EditorWidget(QWidgetBase):
         self._emit_text_changed()
         self._mark_change_source("programmatic")
 
-    def insert_text(self, text: str, position: Optional[int] = None) -> None:
+    def insert_text(self, text: str, position: int | None = None) -> None:
         """Insert ``text`` at ``position`` or current selection start."""
 
         start = position if position is not None else self._selection.start
@@ -654,12 +654,12 @@ class EditorWidget(QWidgetBase):
                 if color is not None:
                     try:
                         format_obj.setBackground(color)
-                    except Exception:
+                    except Exception:  # pragma: no cover - Qt defensive guard
                         pass
                 if text_color is not None:
                     try:
                         format_obj.setForeground(text_color)
-                    except Exception:
+                    except Exception:  # pragma: no cover - Qt defensive guard
                         pass
                 selections.append(selection)
         try:

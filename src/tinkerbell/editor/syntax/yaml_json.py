@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from json import JSONDecodeError
-from typing import Any, Iterable, List, Sequence
+from typing import Any, Iterable, Sequence
 
 try:  # pragma: no cover - dependency provided via pyproject extras
     import jsonschema
@@ -30,7 +30,7 @@ class ValidationError:
     line: int | None = None
 
 
-def validate_yaml(text: str) -> List[ValidationError]:
+def validate_yaml(text: str) -> list[ValidationError]:
     """Validate YAML content and return any issues."""
 
     raw = (text or "").strip()
@@ -51,7 +51,7 @@ def validate_yaml(text: str) -> List[ValidationError]:
         return [ValidationError(message=str(exc) or "Invalid YAML content")]
 
 
-def validate_json(text: str, *, schema: dict[str, Any] | None = None) -> List[ValidationError]:
+def validate_json(text: str, *, schema: dict[str, Any] | None = None) -> list[ValidationError]:
     """Validate JSON content and return any issues."""
 
     raw = (text or "").strip()
@@ -71,7 +71,7 @@ def validate_json(text: str, *, schema: dict[str, Any] | None = None) -> List[Va
     if jsonschema is None:  # pragma: no cover - dependency always installed in CI
         return [ValidationError(message="JSON schema validation requires the 'jsonschema' dependency.")]
 
-    errors: List[ValidationError] = []
+    errors: list[ValidationError] = []
     validator_cls = _resolve_json_validator()
     if validator_cls is None:  # pragma: no cover - defensive guard
         return [ValidationError(message="No compatible JSON Schema validator available.")]

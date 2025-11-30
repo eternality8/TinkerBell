@@ -8,7 +8,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, Iterable, List, Mapping, MutableMapping, Sequence, cast
+from typing import Any, AsyncIterator, Iterable, Mapping, MutableMapping, Sequence, cast
 
 import httpx
 from openai import AsyncOpenAI, APIConnectionError, APIError, APIStatusError, RateLimitError
@@ -93,7 +93,7 @@ class TokenCounterRegistry:
 
     def __init__(self, *, fallback: TokenCounterProtocol | None = None) -> None:
         self._fallback = fallback or ApproxByteCounter()
-        self._counters: Dict[str, TokenCounterProtocol] = {}
+        self._counters: dict[str, TokenCounterProtocol] = {}
 
     @classmethod
     def global_instance(cls) -> "TokenCounterRegistry":
@@ -245,7 +245,7 @@ class AIClient:
                             yield normalized
                 break
 
-    async def list_models(self, *, force_refresh: bool = False) -> List[str]:
+    async def list_models(self, *, force_refresh: bool = False) -> list[str]:
         """Return a list of supported model identifiers."""
 
         if self._models_cache is not None and not force_refresh:
@@ -335,8 +335,8 @@ class AIClient:
 
     def _coerce_messages(
         self, messages: Iterable[Mapping[str, Any] | ChatCompletionMessageParam]
-    ) -> List[ChatCompletionMessageParam]:
-        normalized: List[ChatCompletionMessageParam] = []
+    ) -> list[ChatCompletionMessageParam]:
+        normalized: list[ChatCompletionMessageParam] = []
         for message in messages:
             if isinstance(message, MutableMapping):
                 normalized.append(cast(ChatCompletionMessageParam, dict(message)))
@@ -361,8 +361,8 @@ class AIClient:
         max_tokens: int | None,
         metadata: Mapping[str, str] | None,
         extra_params: Mapping[str, Any],
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "model": self._settings.model,
             "messages": list(messages),
         }
@@ -387,8 +387,8 @@ class AIClient:
 
         return payload
 
-    def _merge_metadata(self, runtime_metadata: Mapping[str, Any] | None) -> Dict[str, str] | None:
-        combined: Dict[str, str] = {}
+    def _merge_metadata(self, runtime_metadata: Mapping[str, Any] | None) -> dict[str, str] | None:
+        combined: dict[str, str] = {}
         sources = [self._settings.metadata, runtime_metadata]
         for source in sources:
             if not source:

@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, cast
+from typing import Any, Iterable, Mapping, cast
 
 from .models import ColorTuple, Theme
 
-_DEFAULT_DARK_PALETTE: Dict[str, ColorTuple] = {
+_DEFAULT_DARK_PALETTE: dict[str, ColorTuple] = {
     "background": (26, 26, 27),
     "surface": (32, 32, 33),
     "surface_alt": (45, 45, 48),
@@ -41,7 +41,7 @@ _DEFAULT_DARK_PALETTE: Dict[str, ColorTuple] = {
     "link": (108, 199, 255),
 }
 
-_DEFAULT_LIGHT_PALETTE: Dict[str, ColorTuple] = {
+_DEFAULT_LIGHT_PALETTE: dict[str, ColorTuple] = {
     "background": (248, 248, 248),
     "surface": (255, 255, 255),
     "surface_alt": (240, 240, 240),
@@ -98,7 +98,7 @@ class ThemeManager:
     """Registry that resolves and serializes themes across the application."""
 
     def __init__(self, themes: Iterable[Theme] | None = None, *, default_name: str = "default") -> None:
-        self._themes: Dict[str, Theme] = {}
+        self._themes: dict[str, Theme] = {}
         self._default_name = default_name.lower()
         if themes:
             for theme in themes:
@@ -114,10 +114,10 @@ class ThemeManager:
             raise ValueError(f"Theme '{theme.name}' already registered")
         self._themes[key] = theme
 
-    def available(self) -> List[Theme]:
+    def available(self) -> list[Theme]:
         return [self._themes[name] for name in sorted(self._themes.keys())]
 
-    def available_names(self) -> List[str]:
+    def available_names(self) -> list[str]:
         return [theme.name for theme in self.available()]
 
     def resolve(self, theme: Theme | str | None = None) -> Theme:
@@ -218,7 +218,7 @@ def load_theme(theme: Theme | str | None = None) -> Theme:
     return theme_manager.resolve(theme)
 
 
-def available_themes() -> List[str]:
+def available_themes() -> list[str]:
     return theme_manager.available_names()
 
 

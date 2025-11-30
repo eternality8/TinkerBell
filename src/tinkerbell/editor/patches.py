@@ -6,7 +6,7 @@ import re
 import logging
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import List, Optional, Sequence, Tuple
+from typing import Sequence
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ class PatchResult:
     """Result of applying a unified diff to a document."""
 
     text: str
-    spans: Tuple[Tuple[int, int], ...]
+    spans: tuple[tuple[int, int], ...]
     summary: str
 
 
@@ -60,8 +60,8 @@ class RangePatch:
     end: int
     replacement: str
     match_text: str
-    chunk_id: Optional[str] = None
-    chunk_hash: Optional[str] = None
+    chunk_id: str | None = None
+    chunk_hash: str | None = None
 
 
 @dataclass(slots=True)
@@ -75,7 +75,7 @@ class _Hunk:
     header: str
     old_start: int
     new_start: int
-    lines: Tuple[_HunkLine, ...]
+    lines: tuple[_HunkLine, ...]
 
 
 def apply_unified_diff(original_text: str, diff: str) -> PatchResult:
@@ -87,7 +87,7 @@ def apply_unified_diff(original_text: str, diff: str) -> PatchResult:
 
     lines, original_trailing_newline, newline = _split_lines(original_text)
     newline = newline_hint or newline
-    result_lines: List[str] = []
+    result_lines: list[str] = []
     original_index = 0
 
     for hunk in hunks:
@@ -233,7 +233,7 @@ def _detect_newline(text: str) -> str:
     return "\n"
 
 
-def _compute_spans(before: str, after: str) -> Tuple[Tuple[int, int], ...]:
+def _compute_spans(before: str, after: str) -> tuple[tuple[int, int], ...]:
     matcher = SequenceMatcher(a=before, b=after, autojunk=False)
     spans: list[tuple[int, int]] = []
     for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
@@ -307,7 +307,7 @@ def _locate_hunk(lines: Sequence[str], hunk: _Hunk, start_index: int) -> int:
     return match_index
 
 
-def _hunk_old_lines(hunk: _Hunk) -> Tuple[str, ...]:
+def _hunk_old_lines(hunk: _Hunk) -> tuple[str, ...]:
     lines: list[str] = []
     for entry in hunk.lines:
         if entry.op in {"-", " "}:

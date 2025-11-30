@@ -23,6 +23,15 @@ def _load_pytest():  # pragma: no cover - helper for dynamic import
 pytest = _load_pytest()
 
 
+# Import shared helpers for re-export via fixtures
+from tests.helpers import DummyAIClient
+
+
+# =============================================================================
+# Fixtures
+# =============================================================================
+
+
 @pytest.fixture
 def sample_snapshot() -> dict:
     return {
@@ -30,3 +39,9 @@ def sample_snapshot() -> dict:
         "text_range": {"start": 0, "end": 5},
         "window": {"start": 0, "end": 5},
     }
+
+
+@pytest.fixture
+def dummy_client() -> DummyAIClient:
+    """Create a minimal AI client stub."""
+    return DummyAIClient()

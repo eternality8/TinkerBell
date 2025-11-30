@@ -141,7 +141,7 @@ class SettingsAdapter:
             settings: The settings containing the theme configuration.
         """
         try:
-            from ...theme import load_theme, theme_manager
+            from tinkerbell.ui.theme import load_theme, theme_manager
         except ImportError:  # pragma: no cover - dependency guard
             _LOGGER.debug("Theme module not available")
             return

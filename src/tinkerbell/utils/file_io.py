@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
     "DocumentFormat",
@@ -163,7 +163,7 @@ def write_autosave(
     document: SupportsAutosave,
     *,
     autosave_dir: Path | str | None = None,
-    timestamp: Optional[datetime] = None,
+    timestamp: datetime | None = None,
 ) -> Path:
     """Persist the provided document to the autosave directory."""
 
@@ -264,7 +264,7 @@ def _looks_like_markdown(text: str) -> bool:
     return bool(re.search(r"`{1,3}", text))
 
 
-def _document_path(document: SupportsAutosave | None) -> Optional[Path]:
+def _document_path(document: SupportsAutosave | None) -> Path | None:
     if document is None:
         return None
     metadata = getattr(document, "metadata", None)
@@ -272,7 +272,7 @@ def _document_path(document: SupportsAutosave | None) -> Optional[Path]:
     return Path(path) if path else None
 
 
-def _autosave_slug(path: Optional[Path]) -> str:
+def _autosave_slug(path: Path | None) -> str:
     if path is None:
         return "untitled"
     slug = re.sub(r"[^A-Za-z0-9._-]", "_", path.name).strip("._")

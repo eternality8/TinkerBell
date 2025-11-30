@@ -4,8 +4,8 @@ from typing import cast
 
 import pytest
 
-from tinkerbell.chat.message_model import EditDirective
-from tinkerbell.documents.ranges import TextRange
+from tinkerbell.ui.presentation.chat.message_model import EditDirective
+from tinkerbell.core.ranges import TextRange
 from tinkerbell.editor.document_model import DocumentState, SelectionRange
 from tinkerbell.editor.editor_widget import EditorWidget
 from tinkerbell.editor.patches import PatchResult

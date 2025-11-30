@@ -3,7 +3,7 @@
 This module provides dialog provider classes that implement the
 DialogProvider and ImportDialogProvider protocols from the application layer.
 
-These classes wrap the Qt-based dialogs from tinkerbell.widgets.dialogs
+These classes wrap the Qt-based dialogs from tinkerbell.ui.presentation.widgets.dialogs
 and provide a clean interface for the use cases.
 """
 
@@ -81,7 +81,7 @@ class FileDialogProvider:
             Selected path or None if canceled.
         """
         try:
-            from tinkerbell.widgets.dialogs import open_file_dialog
+            from tinkerbell.ui.presentation.widgets.dialogs import open_file_dialog
         except ImportError as exc:  # pragma: no cover
             LOGGER.warning("File dialogs require PySide6: %s", exc)
             return None
@@ -118,7 +118,7 @@ class FileDialogProvider:
             Selected path or None if canceled.
         """
         try:
-            from tinkerbell.widgets.dialogs import save_file_dialog
+            from tinkerbell.ui.presentation.widgets.dialogs import save_file_dialog
         except ImportError as exc:  # pragma: no cover
             LOGGER.warning("File dialogs require PySide6: %s", exc)
             return None
@@ -194,7 +194,7 @@ class ImportDialogProvider:
             Selected path or None if canceled.
         """
         try:
-            from tinkerbell.widgets.dialogs import open_file_dialog
+            from tinkerbell.ui.presentation.widgets.dialogs import open_file_dialog
         except ImportError as exc:  # pragma: no cover
             LOGGER.warning("File dialogs require PySide6: %s", exc)
             return None

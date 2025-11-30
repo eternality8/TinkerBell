@@ -1,350 +1,141 @@
 # TinkerBell
 
-> A Windows-first, agent-aware desktop text editor that lets you co-write Markdown, YAML, JSON, and plain text with an AI assistant that can *see* and *edit* your document through guarded, structured actions.
-
-TinkerBell pairs a PySide6 editor with a full LangChain/LangGraph tool stack so you can ask for summaries, rewrites, annotations, or scoped refactors and review every change before it lands. The app ships with a qasync event loop bridge, encrypted settings storage, autosave-aware document bridge, and an extensible toolbox for future agents.
-
-## Contents
-
-- [Highlights](#highlights)
-- [Architecture at a glance](#architecture-at-a-glance)
-- [Getting started](#getting-started)
-- [Configuring AI access](#configuring-ai-access)
-- [Everyday workflow](#everyday-workflow)
-- [Built-in agent tools](#built-in-agent-tools)
-- [Safety, privacy, and reliability](#safety-privacy-and-reliability)
-- [Testing & developer experience](#testing--developer-experience)
-- [Roadmap & contributing](#roadmap--contributing)
+AI‑assisted text editor built with PySide6 and modern LLM APIs.
 
 ## Highlights
 
-- **Dual-pane UX** – A splitter-based main window (`tinkerbell.ui.main_window.MainWindow`) keeps the editor and chat panes in sync with status indicators, toolbars, and autosave messaging.
-- **AI-native editing** – The chat panel streams OpenAI-compatible responses, shows tool traces, and forwards structured commands (`EditDirective`) to the editor bridge.
-- **Diff-based edits by default** – Agents fetch snapshots, build unified diffs, and submit `action="patch"` directives so every change is reproducible and undo-friendly.
-- **Structured safety rails** – All AI edits flow through `DocumentBridge` where schema validation, document-version checks, and diff summaries prevent stale or destructive operations.
-- **Deterministic token budgets** – A shared `TokenCounterRegistry` normalizes counts per model, falls back to a byte-length estimator when `tiktoken` is unavailable, and ships with `scripts/inspect_tokens.py` for quick sanity checks.
-- **Context budget policy + trace compactor** – Budget checks now run (and enforce) by default, compacting oversized tool payloads into pointer summaries while keeping the original trace available for auditing. Settings still expose dry-run/override switches when you need to experiment.
-- **Phase 3 outline + retrieval** – Guardrail-aware `DocumentOutlineTool` and `DocumentFindTextTool` stream structured digests, surface pending/unsupported/huge-document hints, and fall back to offline heuristics while the controller injects "Guardrail hint" messages the agent must obey.
-- **Subagent sandbox toggle + telemetry** – Phase 4 selection scouts remain opt-in via the settings dialog, CLI flags, or `TINKERBELL_ENABLE_SUBAGENTS`, and the status bar now surfaces a "Subagents" indicator with live job counts and the latest telemetry event.
-- **Plot scaffolding memory (experimental)** – Optional character/entity + plot arc scaffolding ingests subagent summaries into a guarded store and exposes it through `DocumentPlotStateTool` so the controller can nudge agents toward continuity-aware edits when the flag is enabled.
-- **Turn-level telemetry** – The status bar and debug settings can stream per-turn prompt/tool budgets via `ContextUsageEvent` objects so regressions are visible before shipping.
-- **Versioned document bus** – Every snapshot now includes `{document_id, version_id, content_hash}` and `DocumentCacheBus` broadcasts `DocumentChanged`/`DocumentClosed` events so downstream caches can stay coherent.
-- **Markdown-first editor** – `EditorWidget` wraps `QPlainTextEdit`/`QsciScintilla` with headless fallbacks, Markdown preview, undo/redo, selection tracking, and theme hooks.
-- **One-click imports** – `File → Import…` converts PDFs (and future formats via pluggable handlers) into fresh, editable tabs so you can work with research papers or specs that aren’t plain text.
-- **Async everywhere** – LangGraph-powered agents run on asyncio while `qasync` ensures Qt stays responsive during streaming conversations.
-- **Windows-friendly secrets** – API keys are encrypted with DPAPI when available (fallback to Fernet) so dropping your laptop does not leak credentials.
-- **Tested components** – `pytest` + `pytest-qt` suites cover agents, bridge logic, widgets, syntax helpers, dialogs, and service layers.
+- **Multi-document tabbed UI** – open, edit, and compare several files at once
+- **Persistent chat** – conversation history survives across sessions
+- **Review mode** – inspect AI‑proposed changes before accepting or rejecting
+- **Streaming AI responses** – see results as they arrive
+- **Context-aware tools** – AI can read, search, and modify your documents
 
-## Architecture at a glance
+## Architecture
 
 ```
-┌───────────────────────────────────────────────┐
-│ MainWindow                                   │
-│  ├─ EditorWidget (Markdown/YAML/JSON)        │
-│  ├─ ChatPanel (history, composer, traces)    │
-│  └─ StatusBar + menu/toolbar actions         │
-│                                               │
-│  Documents ↔ DocumentBridge ↔ Agent Tools    │
-│                                               │
-│  AI stack                                    │
-│  ├─ AIClient (OpenAI-compatible streaming)   │
-│  ├─ LangGraph Agent (planning + retries)     │
-│  └─ Tools: snapshot, edit, search/replace,   │
-│      validation, memory buffers              │
-└───────────────────────────────────────────────┘
+src/tinkerbell/
+├── app/              # Application entry, main window, tabs
+├── ai/               # AI client, turn management, context budgeting
+├── chat/             # Chat panel, commands, formatting
+├── document/         # Document model, storage, importers
+├── editor/           # Text editor widget, syntax highlighting
+├── orchestration/    # Multi-step AI pipelines (analyze → prepare → execute → finish)
+├── review/           # Diff display, accept/reject workflows
+├── services/         # Container, caching, telemetry
+├── settings/         # User preferences and model configuration
+├── tools/            # AI-callable tools (navigation, editing, search)
+└── utils/            # Shared helpers
 ```
 
-Reference docs:
-
-- `plan.md` – end-to-end product scope and sequencing.
-- `module_plan.md` – per-module responsibilities and APIs.
-- `src/tinkerbell/**` – concrete implementations referenced above.
-
-## Getting started
+## Getting Started
 
 ### Prerequisites
 
-- Windows 10/11 (works on macOS/Linux with PySide6, but the packaged secrets vault currently targets Windows).
-- Python **3.11** or newer on your PATH.
-- [uv](https://docs.astral.sh/uv/) for fast dependency management (falls back to pip if you prefer, but uv is what we test).
-- Optional: VS Code + Python extension for richer dev tooling.
+| Requirement | Version |
+|-------------|---------|
+| Python      | 3.9+    |
+| uv          | latest  |
 
-### 1. Clone & install
+### Clone & Install
 
-```powershell
+```bash
 git clone https://github.com/eternality8/TinkerBell.git
 cd TinkerBell
 uv sync
 ```
 
-`uv sync` creates `.venv/` and installs runtime + dev dependencies (PySide6, LangChain, LangGraph, OpenAI SDK, pytest, etc.). If you cannot install `uv`, run `pip install uv` first or translate the dependencies from `pyproject.toml` into your environment manager of choice.
+### Launch
 
-### 2. Launch the desktop app
-
-```powershell
+```bash
 uv run tinkerbell
 ```
 
-The console script calls `tinkerbell.app:main`, which boots the qasync-enabled Qt application, warms FAISS for vector searches, and opens the main window. The first launch will create `~/.tinkerbell/settings.json` for preferences and encrypted credentials.
+### Optional Extras
 
-### 3. Explore sample docs (optional)
+For development tools:
 
-`test_data/phase3/` now ships the Phase 3 sample pack (stacked outline demo, guardrail scenario cookbook, and a binary placeholder). Read `test_data/phase3/README.md` for reproduction steps. The legacy `assets/sample_docs/` snippets and large fixtures under `test_data/` remain available for broader smoke tests.
-
-### Optional extras (tokenizers)
-
-Install the optional tokenizer extra (`tiktoken>=0.12,<0.13`) whenever you need model-authentic counts or want to run token benchmarks:
-
-```powershell
-uv sync --extra ai_tokenizers
+```bash
+uv sync --all-extras
 ```
 
-> `tiktoken` currently requires a Rust toolchain for Python 3.13 on Windows. Install [rustup](https://rustup.rs/) or run the command under Python 3.12 until official wheels are published. Without the extra, the editor automatically falls back to the deterministic byte-length estimator.
+## Configuring AI Access
 
-### Optional extras (local embeddings)
+Open **Settings → AI** and enter credentials for your preferred provider:
 
-Local SentenceTransformers mode depends on PyTorch and friends, so install the new embeddings extra before turning the flag on:
+| Provider  | Required Settings       |
+|-----------|-------------------------|
+| OpenAI    | API key                 |
+| Anthropic | API key                 |
+| Google    | API key                 |
+| OpenRouter| API key                 |
+| Local     | Base URL (e.g., Ollama) |
 
-```powershell
-uv sync --extra embeddings
+The editor supports any OpenAI-compatible endpoint.
+
+## AI Tools
+
+The AI assistant can use these tools during a conversation:
+
+### Navigation & Reading
+
+| Tool | Description |
+|------|-------------|
+| `get_tab_info` | Get active tab metadata |
+| `list_tabs` | List all open documents |
+| `read_document_lines` | Read specific line ranges |
+| `read_selection` | Get currently selected text |
+| `search_document` | Regex search within a document |
+
+### Editing
+
+| Tool | Description |
+|------|-------------|
+| `edit_document` | Replace text ranges with new content |
+| `apply_edits` | Batch multiple edits atomically |
+
+### Memory & Context
+
+| Tool | Description |
+|------|-------------|
+| `write_to_memory` | Store information for later |
+| `read_from_memory` | Retrieve stored information |
+| `list_memory_buffers` | List available memory buffers |
+
+## Safety & Privacy
+
+- **Local-first** – all data stays on your machine
+- **Review before apply** – AI edits require explicit approval
+- **No telemetry** – usage data is never sent externally
+- **Bring your own keys** – API credentials are stored locally
+
+## Testing
+
+Run the full test suite:
+
+```bash
+uv run pytest
 ```
 
-This pulls `sentence-transformers>=3.0`, `torch>=2.2`, and `numpy>=1.26`. Windows users may need the VC++ Build Tools (and the right CUDA runtime if you target a GPU). Once installed you can download Hugging Face models or point at an on-disk clone without polluting the default runtime environment.
+Run a specific test file:
 
-### Embedding backends & configuration
-
-Phase 3 outline/retrieval tooling relies on an embedding index that can speak either native OpenAI embeddings or any LangChain-compatible provider. The runtime picks the backend from **Settings → AI → Embeddings** and mirrors the choice into telemetry/status widgets.
-
-1. **Enable outline generation** – Toggle **Settings → Experimental → Outline generation** (or pass `--enable-outline-generation`) to start the background Outline Builder worker without forcing the full Phase 3 toolchain. This keeps Document Status + preflight analysis fed with fresh outlines even when you leave the Phase 3 tools off. Automation can also export `TINKERBELL_ENABLE_OUTLINE_GENERATION=1` for one-off sessions.
-2. **Enable the tools** – Toggle **Settings → Experimental → Phase 3 outline tools** (or launch with `--enable-phase3-outline-tools`) when you want the manual `/outline` & `/find` commands plus the guardrail-aware tool loop. The worker flag above is automatically implied if you enable the tools.
-3. **Pick a mode + backend** – The settings dialog exposes a mode selector (`Same API`, `Custom API`, `Local`) plus a backend dropdown. The remote modes map to the OpenAI/LangChain stack (`auto`, `openai`, `langchain`, or `disabled`), while `Local` forces `sentence-transformers`. CLI/env overrides remain available for the backend:
-	 - CLI: `uv run tinkerbell --embedding-backend langchain --embedding-model deepseek-embedding`
-	 - Env vars: `TINKERBELL_EMBEDDING_BACKEND=langchain`, `TINKERBELL_EMBEDDING_MODEL=deepseek-embedding`
-4. **Provide credentials or a model path** – Remote backends reuse the global API key/base URL/org (or `metadata.embedding_api.*` when the custom mode is enabled). Local mode expects a SentenceTransformers repo or folder plus optional device/dtype/cache overrides.
-	- The app auto-detects common LangChain families (OpenAI, DeepSeek, GLM/Zhipu, Moonshot/Kimi). It inspects `embedding_model_name` (or `settings.metadata["langchain_provider_family"]` / `TINKERBELL_LANGCHAIN_PROVIDER_FAMILY`) and wires the correct base URL, tokenizer hint, and embedding dimensionality. Provider-specific API keys can live in `settings.metadata["<family>_api_key"]` or env vars such as `DEEPSEEK_API_KEY`, `GLM_API_KEY`, and `MOONSHOT_API_KEY`. Override URLs per family with `settings.metadata["<family>_base_url"]` when needed. Unknown models fall back to the stock OpenAI configuration until you supply manual overrides.
-5. **Test the backend** – Click **Test Embeddings** in the dialog to run a short encode roundtrip. Remote errors usually signal invalid credentials or missing LangChain providers; local errors usually mean the embeddings extra is not installed (`uv sync --extra embeddings`) or the model path/device is unavailable.
-6. **Advanced overrides** – When you need a non-OpenAI LangChain class, drop this into `settings.metadata` (or export `TINKERBELL_LANGCHAIN_EMBEDDINGS_CLASS/KWARGS`):
-
-	 ```jsonc
-	 {
-		 "langchain_embeddings_class": "langchain_community.embeddings.DeepSeekEmbeddings",
-		 "langchain_embeddings_kwargs": {
-			 "model": "deepseek-embedding",
-			 "api_key": "${DEEPSEEK_API_KEY}",
-			 "base_url": "https://api.deepseek.com/v1"
-		 }
-	 }
-	 ```
-
-	 The kwargs blob can be stored as a dict in `settings.metadata` or as a JSON string in `TINKERBELL_LANGCHAIN_EMBEDDINGS_KWARGS`. All fields merge with the automatically supplied `model` argument.
-7. **Observe the runtime** – The status bar shows `Embeddings: OpenAI/LangChain/SentenceTransformers/Error` labels, and every `ContextUsageEvent` now includes `embedding_backend`, `embedding_model`, and `embedding_status` so exports/audits can segment remote vs. local runs.
-
-#### Bring-your-own SentenceTransformers models (local mode)
-
-1. Run `uv sync --extra embeddings` (or `pip install -e '.[embeddings]'`) to pull in PyTorch + SentenceTransformers.
-2. Download or clone your preferred model (`sentence-transformers/all-MiniLM-L6-v2`, `BAAI/bge-large-en-v1.5`, etc.) and note the directory path. Hugging Face repo IDs can also be entered directly and will be cached locally.
-3. Open **Settings → AI → Embeddings**, set **Mode** to `Local`, and paste the model path/repo ID. Optional fields cover device targeting (`cpu`, `cuda:0`, `mps`), Torch dtype overrides, cache directory, and batch size.
-4. Press **Test Embeddings** to confirm the model loads before closing the dialog. The validator performs a tiny encode call and reports timing/errors inline.
-5. Save, reopen your document, and watch the status bar flip to `Embeddings: SentenceTransformers` once the worker hydrates the local encoder.
-
-> Licensing reminder: local models (and remote BYO providers) ship under their own licenses. Review the upstream terms for every model you install and make sure you have permission to run it with your data; TinkerBell only wires the runtime and cannot grant redistribution or attribution rights on your behalf.
-
-If embeddings are disabled or initialization fails, the outline worker keeps running but retrieval calls degrade gracefully and telemetry marks the backend as `unavailable`.
-
-#### Phase 3 outline + retrieval field guide
-
-- The controller injects `Guardrail hint (…)` system messages whenever outline/retrieval responses include `guardrails`, `status != "ok"`, or `offline_mode=true`. Restate the warning to the user and follow the suggested remediation before editing.
-- Use the curated fixtures under `test_data/phase3/` to validate each guardrail quickly. For example, `stacked_outline_demo.md` is perfect for pointer hydration loops, `guardrail_scenarios.md` documents huge/pending/offline playbooks, and `firmware_dump.bin` triggers the unsupported-format path instantly.
-- Full troubleshooting steps (including a matrix that maps tool statuses to actions) live in `docs/ai_v2.md` under “Phase 3 – Outline & Retrieval Quickstart.”
-
-### Phase 4 – Plot scaffolding quickstart
-
-- **Flip the flag** – Toggle **Settings → Experimental → Plot scaffolding** to instantiate the in-memory `DocumentPlotStateStore`. One-off sessions can pass `--enable-plot-scaffolding` (or `--disable-plot-scaffolding`) to the launcher, and automation can export `TINKERBELL_ENABLE_PLOT_SCAFFOLDING=1` to force the feature on without mutating `settings.json`.
-- **Ingestion path** – Each time a Phase 4 subagent job succeeds, its 200-ish token summary flows into the plot store where lightweight heuristics capture recurring character names plus a primary arc beat list (24 entities/24 beats per arc max). The store is ephemeral: closing a document or receiving a cache-bus invalidation clears the corresponding entry immediately.
-- **Tooling** – When enabled, `DocumentPlotStateTool` appears in the registry (non-summarizable) so LangGraph agents can request `{status:"ok", entities:[…], arcs:[…]}` payloads for the active or explicit `document_id`. The controller also emits a short system hint (“Plot scaffolding refreshed…”) after fresh ingests so prompts know when a call will succeed.
-- **Graceful fallbacks** – If subagents are disabled, no summaries have landed, or the target document has been cleared, the tool returns diagnostic statuses (`plot_state_disabled`, `plot_state_unavailable`, or `no_plot_state`) and the system hints stop until new data exists. Treat the responses as advisory context only; authors still approve every edit.
-- **Telemetry & release notes** – Phase 4.4 tracks helper cache hits and TraceCompactor entries, adds the new `subagent.turn_summary` telemetry event, and ships repeatable latency data (`benchmarks/subagent_latency.md`). See `docs/ai_v2_release_notes.md` for the full change log plus rollout guidance; the flags remain opt-in by default until those metrics stay green in production.
-
-See `docs/operations/subagents.md` for operator-focused instructions that cover runtime expectations, telemetry, and troubleshooting tips for both toggles.
-
-## Configuring AI access
-
-You can supply OpenAI-compatible credentials in three interchangeable ways:
-
-1. **Settings dialog** – Press `Ctrl+,` or use **Settings → Preferences…** to enter a base URL, API key, model name, and retry/backoff settings. Keys are stored with DPAPI (Windows) or Fernet (cross-platform) via `SettingsStore`. The dialog also exposes **Max Context Tokens**, **Response Token Reserve**, and the **Context Budget Policy** toggles (enforce vs. dry-run plus optional prompt/reserve overrides) so you can dial in budgets even though enforcement is now on by default.
-2. **Environment variables** – Set any subset of the following before launching the app:
-	 - `TINKERBELL_API_KEY`
-	 - `TINKERBELL_BASE_URL` (e.g., `https://api.openai.com/v1` or your proxy)
-	 - `TINKERBELL_MODEL` (defaults to `gpt-4o-mini`)
-	 - `TINKERBELL_THEME` / `TINKERBELL_ORGANIZATION`
-	 - `TINKERBELL_DEBUG_LOGGING` (set to `1`/`true` to force verbose logging and prompt dumps)
-	 - `TINKERBELL_REQUEST_TIMEOUT` (seconds before an AI request fails; defaults to `90`)
-	 - `TINKERBELL_ENABLE_SUBAGENTS` (set to `1`/`true` to opt into the Phase 4 subagent sandbox for the current session)
-	 - `TINKERBELL_ENABLE_PLOT_SCAFFOLDING` (set to `1`/`true` to expose the experimental character/plot memory tool for the current session)
-	 - `TINKERBELL_ENABLE_OUTLINE_GENERATION` (set to `1`/`true` when you want the Outline Builder worker running even if the Phase 3 tools stay off)
-3. **Programmatic injection** – Instantiate `Settings` or `ClientSettings` yourself if you embed TinkerBell in a larger Python workflow.
-4. **CLI overrides** – Pass `--set key=value` flags to the launcher to override persisted settings for a single session:
-
-```powershell
-uv run tinkerbell --set base_url=https://proxy.example.com --set max_tool_iterations=5
+```bash
+uv run pytest tests/test_orchestrator.py -v
 ```
 
-Add `--settings-path` when you want to point at a custom `settings.json` file.
+Run with coverage:
 
-Use `--enable-outline-generation` / `--disable-outline-generation`, `--enable-subagents` / `--disable-subagents`, and `--enable-plot-scaffolding` / `--disable-plot-scaffolding` (or their respective env vars) to toggle the experimental workers without editing the persisted settings; the status bar immediately reflects each active state.
-
-Precedence is deterministic: **environment variables override CLI flags, which in turn override the values saved via the UI**. This matches the debugging workflow where you might hardcode safe defaults, tweak them per-session with CLI overrides, and fall back to environment variables for quick emergency switches (e.g., rotating API keys).
-
-Need to confirm what the app sees? Use the built-in inspector to dump the fully merged configuration with secrets redacted:
-
-```powershell
-uv run tinkerbell --dump-settings --set base_url=https://proxy.example.com
+```bash
+uv run pytest --cov=src/tinkerbell --cov-report=html
 ```
 
-The output includes the resolved settings path, the active secret backend (DPAPI or Fernet; override with `TINKERBELL_SECRET_BACKEND`), and whichever environment variables were applied.
+## Contributing
 
-Test credentials via the **Refresh Snapshot** or a simple “Say hello” chat message. Failures are surfaced in the chat panel and status bar, and logs are written to your platform-specific temp directory.
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Run `uv run pytest` to ensure tests pass
+5. Submit a pull request
 
-## Context budgets & trace compaction
+## License
 
-- **Enforced budget policy (opt-out available)** – Context budgets ship enabled with `dry_run=False`, so every new session automatically enforces prompt/reserve math. Toggle **Settings → Context budget policy → Dry run only** if you want to inspect decisions without blocking, or disable the policy entirely for legacy debugging.
-- **Automatic tool pointerization** – When the policy reports `needs_summary`, oversized tool payloads (snapshots, diffs, search results) are compacted into `[pointer:…]` summaries before they’re handed back to the model. Each pointer carries human-readable text plus rehydrate instructions so LangGraph nodes (and future tools) can call the originating tool again with a narrower scope whenever the raw payload is required. Validators and other critical outputs opt out via the `summarizable=False` flag on their registrations.
-- **UI + telemetry hooks** – Chat tool traces now show “Compacted” badges, the status bar publishes `tokens_saved` / `total_compactions`, and telemetry gains a `trace_compaction` event alongside `context_budget_decision`. Exported benchmarks (`benchmarks/measure_diff_latency.py`) demonstrate savings like “War and Peace diff: 88K tokens → 247 pointer tokens” to keep regression budgets honest.
-
-## Everyday workflow
-
-1. **Open, create, or import a document** – Markdown, YAML, JSON, or plain text files are supported out of the box, and PDFs can be converted to text via **File → Import…**. Syntax detection drives highlighting and validation helpers.
-2. **Compose a prompt** – Select the text you want help with, describe the task (“Rewrite the introduction in an encouraging tone”), and hit **Send**. The controller automatically captures a span-scoped snapshot plus chunk-manifest metadata (calling `selection_range` only when those hints are missing) before the agent begins planning.
-3. **Watch the agent work** – Streaming responses land in the chat history. Enable the Tool Activity panel from **Settings → Show tool activity panel** whenever you need to inspect each LangChain tool invocation (snapshot, diff builder, edits, etc.).
-4. **Apply or rollback edits** – Structured payloads go through the bridge, which enforces document-version checks and emits diff summaries (e.g., `+128 chars`). Undo/redo is still available because edits use the regular editor APIs.
-5. **Iterate rapidly** – Refresh snapshots, toggle Markdown preview, or enable autosave intervals from settings. Each AI turn records metadata so future prompts understand the document state.
-
-## Built-in agent tools
-
-### New Tools (WS1-6)
-
-| Tool | Module | Purpose |
-| --- | --- | --- |
-| `read_document` | `tinkerbell.ai.tools.read_document` | Read document content with automatic pagination, version tokens, and line metadata. |
-| `search_document` | `tinkerbell.ai.tools.search_document` | Search with exact match, regex, or semantic search. Returns line numbers with context. |
-| `get_outline` | `tinkerbell.ai.tools.get_outline` | Extract document structure (headings, sections) for Markdown, JSON, YAML, or plain text. |
-| `insert_lines` | `tinkerbell.ai.tools.insert_lines` | Insert new content after a specific line without touching existing text. |
-| `replace_lines` | `tinkerbell.ai.tools.replace_lines` | Replace a range of lines with new content. Supports drift recovery. |
-| `delete_lines` | `tinkerbell.ai.tools.delete_lines` | Delete a range of lines and return deleted content for reference. |
-| `write_document` | `tinkerbell.ai.tools.write_document` | Replace entire document content (requires version token). |
-| `find_and_replace` | `tinkerbell.ai.tools.find_and_replace` | Batch find/replace with regex support, previews, and max replacement caps. |
-| `create_document` | `tinkerbell.ai.tools.create_document` | Create a new document tab with optional initial content. |
-| `analyze_document` | `tinkerbell.ai.tools.analyze_document` | Subagent tool for document analysis (characters, plot, style, summary). |
-| `transform_document` | `tinkerbell.ai.tools.transform_document` | Subagent tool for document transformation (rename, setting change, style rewrite). |
-| `list_tabs` | `tinkerbell.ai.tools.list_tabs` | List open tabs with version info, file type, and size. |
-
-### Legacy Tools (Deprecated)
-
-The following tools are deprecated but retained for backward compatibility:
-
-| Tool | Module | Purpose |
-| --- | --- | --- |
-| `DocumentSnapshotTool` | `tinkerbell.ai.tools.document_snapshot` | Returns the latest document text, metadata, span window (`snapshot_span`/`text_range`), chunk manifest, preview flag, and diff token so the agent can reason safely.
-| `DocumentEditTool` | `tinkerbell.ai.tools.document_edit` | Applies validated insert/replace/annotate directives and patch diffs through the bridge with undo support and diff summaries.
-| `DiffBuilderTool` | `tinkerbell.ai.tools.diff_builder` | Generates unified diffs from before/after snippets so agents never have to handcraft patch formatting.
-| `SearchReplaceTool` | `tinkerbell.ai.tools.search_replace` | Provides regex/literal transforms with capped replacements, explicit target-range support, diff previews, and optional dry-run summaries before edits are enqueued.
-| `ValidationTool` | `tinkerbell.ai.tools.validation` | Checks YAML/JSON snippets via `ruamel.yaml`/`jsonschema`, lint-stubs Markdown for heading/fence issues, and exposes hooks for custom validators.
-| `Memory Buffers` | `tinkerbell.ai.memory.buffers` | Maintains conversation + document summaries so prompts stay concise without losing context.
-
-You can register custom tools at runtime via `AIController.register_tool`, and the LangGraph plan automatically picks them up.
-
-### New Tool Parameters (WS1-6)
-
-- **`read_document`** — accepts `tab_id` (optional, defaults to active tab), `start_line` and `end_line` (0-indexed, inclusive), `max_tokens` (default ~6000). Returns `content`, `lines.start/end/total`, `version_token`, `has_more`, and `continuation_hint` for pagination.
-- **`search_document`** — accepts `query` (required), `tab_id`, `search_type` (`exact`, `regex`, `semantic`), `case_sensitive`, `whole_word`, `max_results`. Returns `matches[]` with `line`, `score`, `preview`, and `context` fields.
-- **`get_outline`** — accepts `tab_id`. Returns hierarchical `outline[]` with `title`, `level`, `line_start`, `line_end`, `children[]`, plus `detection_confidence` and `detection_method`.
-- **`insert_lines`** — accepts `tab_id`, `version_token` (required), `after_line` (-1 for start), `content`, `dry_run`, `match_text` (optional drift anchor). Returns `inserted_at.after_line/lines_added/new_lines`, new `version_token`.
-- **`replace_lines`** — accepts `tab_id`, `version_token` (required), `start_line`, `end_line`, `content`, `dry_run`, `match_text`. Returns `lines_affected.removed/added/net_change`, new `version_token`.
-- **`delete_lines`** — accepts `tab_id`, `version_token` (required), `start_line`, `end_line`, `dry_run`. Returns `lines_deleted`, `deleted_content`, new `version_token`.
-- **`write_document`** — accepts `tab_id`, `version_token` (required), `content`. Returns `lines_affected.previous/current`, `size_affected.previous/current`, new `version_token`.
-- **`find_and_replace`** — accepts `tab_id`, `version_token` (required for apply), `pattern`, `replacement`, `is_regex`, `case_sensitive`, `whole_word`, `scope.start_line/end_line`, `max_replacements`, `preview` (bool). Returns `matches_found`, `replacements_made`, `preview[]` with before/after.
-- **`create_document`** — accepts `title` (required), `content` (optional), `file_type` (optional). Returns `tab_id`, `version_token`, `file_type`.
-- **`analyze_document`** — accepts `tab_id`, `analysis_type` (`characters`, `plot`, `style`, `summary`, `custom`), `custom_prompt`, `output_format` (`markdown`, `json`, `plain`). Returns `analysis` with structured findings.
-- **`transform_document`** — accepts `tab_id`, `version_token`, `transformation_type` (`character_rename`, `setting_change`, `style_rewrite`, `tense_change`, `pov_change`, `custom`), type-specific parameters, `output_mode` (`new_tab`, `in_place`). Returns transformed content or new tab info.
-- **`list_tabs`** — no required parameters; returns `{tabs: [...], active_tab_id, total}` with `version`, `size_chars`, `line_count`, `file_type` per tab.
-
-### Legacy Tool Parameters (Deprecated)
-
-- **`document_snapshot`** — accepts `delta_only` (bool) to request only changed fields, `tab_id` to target a non-active document, `source_tab_ids` to batch additional read-only snapshots, and `include_open_documents` to embed lightweight metadata for every tab. Each response still carries the latest diff summary and digest so agents can detect drift.
-- **`document_edit`** — consumes either a native `EditDirective` or a JSON/mapping payload matching the schema exposed during registration. Prefer `action="patch"` plus a unified diff and `document_version`; legacy `insert`/`replace` actions remain available for small, cursor-relative tweaks. Provide `tab_id` whenever the edit should be applied to a background tab.
-- **`diff_builder`** — accepts `original`, `updated`, optional `filename`, and optional `context` (default 3) to produce a ready-to-send unified diff string compatible with `document_edit` patch directives.
-- **`search_replace`** — parameters include `pattern`, `replacement`, `is_regex`, optional `target_range` (`{start, end}` offsets), `dry_run`, `max_replacements` (defaults to a guarded cap), `match_case`, and `whole_word`. Each call reports replacement counts, whether the cap was hit, and a unified diff preview; with `dry_run=True`, no edit occurs and only previews/diff metadata are returned.
-- **`validate_snippet`** — requires `text` and `fmt` (`yaml`, `yml`, `json`, `markdown`, or `md`) and responds with a `ValidationOutcome` describing the first issue plus a count of remaining problems. JSON calls optionally accept a schema, Markdown checks flag heading jumps/unclosed fences, and you can register additional formats at runtime via `tinkerbell.ai.tools.validation.register_snippet_validator`.
-
-## Phase 0 instrumentation & observability
-
-### Deterministic token counters
-
-- `TokenCounterRegistry` keeps a per-model tokenizer (`TiktokenCounter` when the optional extra is installed, otherwise `ApproxByteCounter`).
-- The registry is shared by the AI client, controller, memory buffers, and telemetry emitters so every component speaks the same budget language.
-- Run `scripts/inspect_tokens.py` to inspect counts from stdin or a file:
-	```powershell
-	uv run python -m tinkerbell.scripts.inspect_tokens --file "test_data/Romeo and Juliet.txt"
-	```
-- Install `tiktoken` via `uv sync --extra ai_tokenizers` for exact parity. On Python 3.13 you currently need a Rust toolchain; without it, the CLI still prints the byte-length approximation and logs a single warning per session.
-
-### Context usage telemetry
-
-- `ContextUsageEvent` objects capture per-turn prompt tokens, tool tokens, response reserves, tool names, timestamps, and the active embedding backend/model/status so audits can distinguish LangChain vs. OpenAI runs.
-- Toggle **Settings → Debug → Token logging enabled** (or set `settings.debug.token_logging_enabled` programmatically) to surface live totals in the status bar and capture up to *N* events (default 200).
-- Retrieve the rolling buffer via `AIController.get_recent_context_events()` for assertions, diagnostics, or custom sinks.
-- Export recent events anytime with the CLI below (JSON or CSV) which reads the persisted buffer from `~/.tinkerbell/telemetry/context_usage.json`:
-	```powershell
-	uv run python -m tinkerbell.scripts.export_context_usage --format csv --limit 50 --output usage.csv
-	```
-	Use `--format json` (default) for structured blobs, `--source` to point at a custom buffer, and omit `--output` to stream directly to stdout for piping.
-
-### Document version IDs
-
-- `DocumentState` snapshots now embed `{document_id, version_id, content_hash}` along with a combined `version` token.
-- `DocumentApplyPatchTool` refuses to run without a matching `document_version` and `DocumentBridge` raises `DocumentVersionMismatchError` when callers use stale snapshots.
-- Snapshot span fingerprints (chunk manifests + `snapshot_span`) and diff summaries keep optimistic concurrency obvious without leaking implementation details to end users.
-
-### Cache registry & invalidation bus
-
-- `tinkerbell.ai.memory.cache_bus` provides `DocumentCacheBus` plus `DocumentChangedEvent` / `DocumentClosedEvent` types and helper subscribers (`ChunkCacheSubscriber`, `OutlineCacheSubscriber`, `EmbeddingCacheSubscriber`).
-- `DocumentBridge` publishes change events automatically after every edit/patch and `DocumentWorkspace.close_tab()` now emits a closed event, keeping downstream caches honest.
-- Future chunk/outline/embedding caches only need to subscribe; no additional wiring is required inside the editor.
-
-> Need more detail? See [`docs/ai_v2.md`](docs/ai_v2.md) for implementation notes that map directly to the Phase 0 checklist.
-
-## Safety, privacy, and reliability
-
-- **Document versioning & patch guards** – Every snapshot includes a SHA-1 digest plus span metadata (`snapshot_span`, chunk manifest ranges) so stale edits are rejected before they touch the editor; patch directives must cite the version they were built against.
-- **Guarded parsing** – `chat.commands` normalizes and JSON-validates any agent payload (even if it arrives as a markdown code fence) before it becomes an `EditDirective`.
-- **Encrypted secrets** – API keys reside in `%USERPROFILE%\.tinkerbell\settings.json`, encrypted with Windows DPAPI when possible; other platforms fall back to Fernet with a locally stored key (`settings.key`).
-- **Error transparency** – All warnings bubble up via the status bar, chat notices, and structured logs, making it easy to debug misconfigurations or flaky endpoints.
-
-## Testing & developer experience
-
-- **Run the full suite**:
-
-	```powershell
-	uv run pytest
-	```
-
-	GUI-sensitive tests rely on `pytest-qt`, so running them on Windows with a display server is recommended. Headless CI uses the stub widgets built into the editor and chat modules.
-
-- **Static analysis**: `ruff`, `black`, and `mypy` configs live in `pyproject.toml`. Run `uv run ruff check .` or `uv run mypy src` as needed.
-- **Logging**: Set `TINKERBELL_DEBUG=1` before launching to enable verbose logs (including Qt message handler output).
-- **Debug prompt logging**: Toggle **Enable debug logging** inside the Settings dialog (or set `TINKERBELL_DEBUG_LOGGING=1`) to emit full AI prompt payloads to the log file for troubleshooting. Diff-based edits are always enabled now—if a patch conflicts, capture a fresh snapshot and retry rather than switching modes.
-- **Tool traces**: Toggle **Show tool activity panel** in the Settings dialog (or set `TINKERBELL_TOOL_ACTIVITY_PANEL=1`) when you need the debug-only LangChain trace list; it's hidden by default to maximize editing space.
-- **Scripts**: `src/tinkerbell/scripts/seed_examples.py` seeds demonstration docs; extend it when adding new showcase flows.
-- **Token inspector**: `scripts/inspect_tokens.py` compares precise (tiktoken) vs. approximate counts so you can size prompts or reproduce the data in `benchmarks/phase0_token_counts.md`.
-- **Selection ownership guardrail**: Only `src/tinkerbell/editor/**` and `ai/tools/selection_range.py` may import `SelectionRange`. Everything else must request spans through `editor.selection_gateway.SelectionGateway` (or stub its `SelectionSnapshotProvider`) and treat selection data as read-only. `tests/test_selection_guard.py` enforces this rule—if you see its failure, remove the import and rely on tuples/TextRange inputs instead.
-
-## Roadmap & contributing
-
-Planned improvements (see `plan.md` for details):
-
-- Multi-document tabs and workspace-aware retrieval.
-- Markdown preview polish (themes, live sync scrolling).
-- Additional tools (Git diffing, grammar checks, local vector stores).
-- Packaging experiments (PyInstaller, MSIX) for one-click Windows installs.
-
-Contributions are welcome! Please open an issue describing the change, keep PRs focused, and accompany code changes with tests/docs. The project is licensed under the MIT License (see `LICENSE`).
+MIT – see [LICENSE](LICENSE) for details.

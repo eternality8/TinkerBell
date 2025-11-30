@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, cast
+from typing import Any, Mapping, cast
 
 from openai.types.chat import ChatCompletionToolParam
 
@@ -80,7 +80,7 @@ class ToolCallRequest:
 class ModelTurnResult:
     """Aggregate of a single model turn (stream) including tool metadata."""
 
-    assistant_message: Dict[str, Any]
+    assistant_message: dict[str, Any]
     response_text: str
     tool_calls: list[ToolCallRequest]
 

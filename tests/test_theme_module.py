@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tinkerbell.theme import Theme, ThemeManager, build_default_dark_theme
+from tinkerbell.ui.theme import Theme, ThemeManager, build_default_dark_theme
 
 
 def test_theme_serialization_round_trip() -> None:

@@ -2,24 +2,18 @@
 
 from __future__ import annotations
 
-import math
 import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from ...chat.message_model import ToolPointerMessage
+from ..utils.tokens import estimate_tokens as _estimate_tokens
+from tinkerbell.ui.presentation.chat.message_model import ToolPointerMessage
 
 _SUMMARY_TOKEN_BUDGET = 512
 _DIFF_SAMPLE_LINES = 40
 _PLAIN_SAMPLE_CHARS = 4 * _SUMMARY_TOKEN_BUDGET
 _DIFF_HUNK_PATTERN = re.compile(r"^@@.+@@", re.MULTILINE)
-
-
-def _estimate_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return max(1, math.ceil(len(text.encode("utf-8", errors="ignore")) / 4))
 
 
 def _looks_like_diff(text: str) -> bool:

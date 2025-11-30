@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional, Protocol, TypeVar
+from typing import Any, Callable, Mapping, Protocol, TypeVar
 
-from ..documents.ranges import TextRange
+from ..core.ranges import TextRange
 
 
 TResult = TypeVar("TResult")
@@ -44,7 +44,7 @@ class EditorAdapter(Protocol):
 if False:  # TYPE_CHECKING equivalent that doesn't require typing import
     from ..editor.document_model import DocumentState
     from ..editor.patches import PatchResult
-    from ..chat.message_model import EditDirective
+    from tinkerbell.ui.presentation.chat.message_model import EditDirective
 
 
 @dataclass(slots=True)
@@ -71,7 +71,7 @@ class EditContext:
     target_range: TextRange
     replaced_text: str
     content: str
-    diff: Optional[str] = None
+    diff: str | None = None
     spans: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
@@ -129,9 +129,9 @@ class QueuedEdit:
     """Internal representation of a validated directive awaiting execution."""
 
     directive: Any  # EditDirective - using Any to avoid circular import
-    context_version: Optional[str] = None
-    content_hash: Optional[str] = None
-    payload: Optional[Mapping[str, Any]] = None
-    diff: Optional[str] = None
+    context_version: str | None = None
+    content_hash: str | None = None
+    payload: Mapping[str, Any] | None = None
+    diff: str | None = None
     ranges: tuple[PatchRangePayload, ...] = ()
     scope_summary: Mapping[str, Any] | None = None

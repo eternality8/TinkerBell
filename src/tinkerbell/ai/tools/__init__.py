@@ -188,14 +188,7 @@ from .tool_registry import (
     ALL_TOOL_SCHEMAS,
 )
 
-# WS7: Deprecation & Migration
-from .deprecation import (
-    LEGACY_TOOL_REPLACEMENTS,
-    DeprecatedToolWarning,
-    deprecated_tool,
-    emit_deprecation_warning,
-    get_replacement_tool,
-)
+# WS7: Registry Adapter
 from .registry_adapter import (
     NewToolRegistryContext,
     register_new_tools as adapter_register_new_tools,
@@ -360,16 +353,11 @@ __all__ = [
     "DIFF_BUILDER_SCHEMA",
     "VALIDATE_SNIPPET_SCHEMA",
     "ALL_TOOL_SCHEMAS",
-    # WS7: Deprecation & Migration (WS7.1)
-    "LEGACY_TOOL_REPLACEMENTS",
-    "DeprecatedToolWarning",
-    "deprecated_tool",
-    "emit_deprecation_warning",
-    "get_replacement_tool",
+    # WS7: Registry Adapter
     "NewToolRegistryContext",
     "adapter_register_new_tools",
     "get_new_tool_schemas",
-    # WS7: Tool Wiring (WS7.1)
+    # WS7: Tool Wiring
     "DocumentBridge",
     "WorkspaceProvider",
     "SelectionProvider",

@@ -11,7 +11,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, TextIO, cast, get_args, get_origin, get_type_hints
+from typing import Any, Mapping, Sequence, TextIO, cast, get_args, get_origin, get_type_hints
 
 from .ai.ai_types import SubagentRuntimeConfig
 from .ai.orchestration import AIOrchestrator, OrchestratorConfig
@@ -26,7 +26,7 @@ from .services.settings import (
     redact_secret,
 )
 from .services.unsaved_cache import UnsavedCache, UnsavedCacheStore
-from .theme import theme_manager
+from .ui.theme import theme_manager
 from .utils import logging as logging_utils
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
@@ -68,7 +68,7 @@ def configure_logging(debug: bool = False, *, force: bool = False) -> None:
 
 
 def load_settings(
-    path: Optional[Path] = None,
+    path: Path | None = None,
     *,
     store: SettingsStore | None = None,
     overrides: Mapping[str, Any] | None = None,
@@ -145,7 +145,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         cli_overrides["embedding_backend"] = args.embedding_backend
     if args.embedding_model is not None:
         cli_overrides["embedding_model_name"] = args.embedding_model
-    metadata_override: Dict[str, Any] | None = None
+    metadata_override: dict[str, Any] | None = None
     if "metadata" in cli_overrides and isinstance(cli_overrides.get("metadata"), Mapping):
         metadata_override = dict(cli_overrides["metadata"])
     if args.embedding_mode is not None:
@@ -154,7 +154,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if metadata_override is not None:
         cli_overrides["metadata"] = metadata_override
 
-    overrides_mapping: Dict[str, Any] | None = cli_overrides or None
+    overrides_mapping: dict[str, Any] | None = cli_overrides or None
     settings = load_settings(resolved_path, store=settings_store, overrides=overrides_mapping)
     try:
         unsaved_cache = unsaved_cache_store.load()
@@ -491,8 +491,8 @@ def _rewrite_sys_argv(passthrough: Sequence[str]) -> None:
     sys.argv = [program, *passthrough]
 
 
-def _coerce_cli_overrides(items: Sequence[str]) -> Dict[str, Any]:
-    overrides: Dict[str, Any] = {}
+def _coerce_cli_overrides(items: Sequence[str]) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
     if not items:
         return overrides
 

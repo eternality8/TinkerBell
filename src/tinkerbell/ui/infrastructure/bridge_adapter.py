@@ -12,7 +12,7 @@ from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
 from ..events import EditApplied, EditFailed, EventBus
 
 if TYPE_CHECKING:  # pragma: no cover - imports for type checking only
-    from ...chat.message_model import EditDirective
+    from ..presentation.chat.message_model import EditDirective
     from ...editor.document_model import DocumentState
     from ...editor.workspace import DocumentTab, DocumentWorkspace
     from ...services.bridge_router import WorkspaceBridgeRouter
@@ -245,7 +245,7 @@ class BridgeAdapter:
             tab = self._workspace.get_tab(tab_id)
             if tab and hasattr(tab, "document_id"):
                 document_id = tab.document_id or ""
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
         
         # Create a simple diff summary

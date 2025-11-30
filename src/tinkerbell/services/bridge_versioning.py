@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping
 
 from ..editor.document_model import DocumentState, DocumentVersion
 
@@ -42,7 +42,7 @@ def hash_text(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
-def extract_context_version(payload: Mapping[str, Any]) -> Optional[str]:
+def extract_context_version(payload: Mapping[str, Any]) -> str | None:
     """Extract the document version token from a payload."""
     for key in ("document_version", "snapshot_version", "version", "document_digest"):
         token = payload.get(key)
@@ -54,7 +54,7 @@ def extract_context_version(payload: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
-def extract_content_hash(payload: Mapping[str, Any]) -> Optional[str]:
+def extract_content_hash(payload: Mapping[str, Any]) -> str | None:
     """Extract the content hash from a payload."""
     token = payload.get("content_hash")
     if token is None:

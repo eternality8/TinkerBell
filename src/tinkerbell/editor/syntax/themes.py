@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ...theme import Theme, load_theme as _load_theme, theme_manager
+from tinkerbell.ui.theme import Theme, load_theme as _load_theme, theme_manager
 
 
 DEFAULT_THEME = _load_theme()

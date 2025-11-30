@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Literal
 
-from ..documents.ranges import TextRange
+from tinkerbell.core.ranges import TextRange
 
 
 def _utcnow() -> datetime:
@@ -25,7 +25,7 @@ class ToolPointerMessage:
     kind: str
     display_text: str
     rehydrate_instructions: str
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def as_chat_content(self) -> str:
         """Render the pointer as plain-text content for chat history."""
@@ -38,10 +38,10 @@ class ToolPointerMessage:
             blocks.append(f"Rehydrate instructions: {footer}")
         return "\n".join(blocks)
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         """Serialize the pointer for telemetry/UI traces."""
 
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "pointer_id": self.pointer_id,
             "kind": self.kind,
             "display_text": self.display_text,
@@ -60,8 +60,8 @@ class ToolTrace:
     input_summary: str
     output_summary: str
     duration_ms: int = 0
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    step_index: Optional[int] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    step_index: int | None = None
 
 
 @dataclass(slots=True)
@@ -71,10 +71,10 @@ class ChatMessage:
     role: ChatRole
     content: str
     created_at: datetime = field(default_factory=_utcnow)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
     tool_traces: list[ToolTrace] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize the message for persistence."""
 
         return {
@@ -93,11 +93,11 @@ class EditDirective:
     action: str
     target_range: TextRange
     content: str
-    rationale: Optional[str] = None
-    diff: Optional[str] = None
-    match_text: Optional[str] = None
-    expected_text: Optional[str] = None
-    replace_all: Optional[bool] = None
+    rationale: str | None = None
+    diff: str | None = None
+    match_text: str | None = None
+    expected_text: str | None = None
+    replace_all: bool | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "target_range", TextRange.from_value(self.target_range))

@@ -12,12 +12,12 @@ from dataclasses import dataclass
 from enum import Enum
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 from jsonschema import Draft7Validator, ValidationError
 
-from ..documents.ranges import TextRange
-from ..services.telemetry import emit as telemetry_emit
+from tinkerbell.core.ranges import TextRange
+from tinkerbell.services.telemetry import emit as telemetry_emit
 
 
 class ActionType(str, Enum):
@@ -434,7 +434,7 @@ def _looks_numeric(token: str) -> bool:
     except (TypeError, ValueError):
         return False
 
-_TEXT_RANGE_OBJECT_SCHEMA: Dict[str, Any] = {
+_TEXT_RANGE_OBJECT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "start": {"type": "integer", "minimum": 0},
@@ -444,7 +444,7 @@ _TEXT_RANGE_OBJECT_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
 }
 
-_TEXT_RANGE_SEQUENCE_SCHEMA: Dict[str, Any] = {
+_TEXT_RANGE_SEQUENCE_SCHEMA: dict[str, Any] = {
     "type": "array",
     "items": {"type": "integer"},
     "minItems": 2,
@@ -452,7 +452,7 @@ _TEXT_RANGE_SEQUENCE_SCHEMA: Dict[str, Any] = {
 }
 
 
-DIRECTIVE_SCHEMA: Dict[str, Any] = {
+DIRECTIVE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["action"],
     "properties": {
@@ -525,7 +525,7 @@ DIRECTIVE_SCHEMA: Dict[str, Any] = {
 _DIRECTIVE_VALIDATOR = Draft7Validator(DIRECTIVE_SCHEMA)
 
 
-def parse_agent_payload(payload: Mapping[str, Any] | str | bytes) -> Dict[str, Any]:
+def parse_agent_payload(payload: Mapping[str, Any] | str | bytes) -> dict[str, Any]:
     """Normalize agent payload dictionaries or JSON-encoded command strings."""
 
     mapping = _coerce_payload(payload)
@@ -586,7 +586,7 @@ def validate_directive(payload: Mapping[str, Any]) -> ValidationResult:
     return ValidationResult(ok=True)
 
 
-def create_patch_directive(diff: str, version: str, rationale: str | None = None) -> Dict[str, Any]:
+def create_patch_directive(diff: str, version: str, rationale: str | None = None) -> dict[str, Any]:
     """Helper used by agents/tests to construct a valid patch directive payload."""
 
     if not diff or not diff.strip():
@@ -594,7 +594,7 @@ def create_patch_directive(diff: str, version: str, rationale: str | None = None
     version_token = str(version).strip()
     if not version_token:
         raise ValueError("version must be a non-empty string")
-    directive: Dict[str, Any] = {
+    directive: dict[str, Any] = {
         "action": ActionType.PATCH.value,
         "diff": diff,
         "document_version": version_token,
@@ -604,7 +604,7 @@ def create_patch_directive(diff: str, version: str, rationale: str | None = None
     return directive
 
 
-def _coerce_payload(payload: Mapping[str, Any] | str | bytes) -> Dict[str, Any]:
+def _coerce_payload(payload: Mapping[str, Any] | str | bytes) -> dict[str, Any]:
     if isinstance(payload, Mapping):
         return dict(payload)
     if isinstance(payload, bytes):
@@ -621,7 +621,7 @@ def _coerce_payload(payload: Mapping[str, Any] | str | bytes) -> Dict[str, Any]:
     raise TypeError("Directive payload must be a mapping or JSON string")
 
 
-def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(payload)
 
     action = normalized.get("action")

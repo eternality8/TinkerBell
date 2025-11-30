@@ -17,10 +17,7 @@ from tinkerbell.ai.ai_types import (
 )
 from tinkerbell.ai.client import AIClient
 from tinkerbell.ai.services.context_policy import BudgetDecision
-
-
-class _DummyClient:
-    settings = type("S", (), {"model": "test-model"})()
+from tests.helpers import DummyAIClient
 
 
 def _build_job(job_id: str, chunk_hash: str) -> SubagentJob:
@@ -61,7 +58,7 @@ def test_subagent_job_exposes_chunk_metadata() -> None:
 @pytest.mark.asyncio
 async def test_subagent_manager_runs_jobs_sequentially(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = SubagentManager(
-        cast(AIClient, _DummyClient()),
+        cast(AIClient, DummyAIClient()),
         tool_resolver=lambda: {},
         config=SubagentRuntimeConfig(enabled=True, max_jobs_per_turn=4),
     )
@@ -122,7 +119,7 @@ class _RejectingPolicy:
 async def test_subagent_manager_respects_budget_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     policy = _RejectingPolicy()
     manager = SubagentManager(
-        cast(AIClient, _DummyClient()),
+        cast(AIClient, DummyAIClient()),
         tool_resolver=lambda: {},
         config=SubagentRuntimeConfig(enabled=True, max_jobs_per_turn=2),
         budget_policy=policy,
@@ -142,7 +139,7 @@ async def test_subagent_manager_respects_budget_policy(monkeypatch: pytest.Monke
 def test_subagent_runtime_manager_exposes_character_map_store() -> None:
     runtime = SubagentRuntimeManager(tool_resolver=lambda: {})
     runtime.configure(
-        client=cast(AIClient, _DummyClient()),
+        client=cast(AIClient, DummyAIClient()),
         config=SubagentRuntimeConfig(enabled=True, plot_scaffolding_enabled=True),
         budget_policy=None,
     )

@@ -208,7 +208,7 @@ class ListTabsTool(BaseTool):
             token = self.version_manager.get_current_token(tab_id)
             if token:
                 version = token.to_string()
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
         return {

@@ -35,13 +35,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...services.settings import (
+from tinkerbell.services.settings import (
     ContextPolicySettings,
     DEFAULT_EMBEDDING_MODE,
     EMBEDDING_MODE_CHOICES,
     Settings,
 )
-from ...theme import theme_manager
+from tinkerbell.ui.theme import theme_manager
 
 if TYPE_CHECKING:
     from ...ui.embedding_controller import EmbeddingValidationResult
@@ -1356,13 +1356,13 @@ def test_embedding_settings(settings: Settings) -> ValidationResult:
                     task.cancel()
                     try:
                         loop.run_until_complete(task)
-                    except Exception:
+                    except Exception:  # pragma: no cover - Qt defensive guard
                         pass
                 loop.close()
                 if restore_loop is not None:
                     try:
                         asyncio.set_event_loop(restore_loop)
-                    except Exception:
+                    except Exception:  # pragma: no cover - Qt defensive guard
                         pass
 
         def _run_validation_in_thread() -> "EmbeddingValidationResult":
@@ -1398,5 +1398,5 @@ def test_embedding_settings(settings: Settings) -> ValidationResult:
         try:
             if controller is not None:
                 controller._dispose_embedding_resource()
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass

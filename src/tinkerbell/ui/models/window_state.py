@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - imports for type checking only
     from ...ai.orchestration import AIOrchestrator
@@ -15,11 +15,11 @@ if TYPE_CHECKING:  # pragma: no cover - imports for type checking only
 class WindowContext:
     """Shared context passed to the main window when constructing the UI."""
 
-    settings: Optional[Settings] = None
-    ai_orchestrator: Optional[AIOrchestrator] = None
-    settings_store: Optional[SettingsStore] = None
-    unsaved_cache: Optional[UnsavedCache] = None
-    unsaved_cache_store: Optional[UnsavedCacheStore] = None
+    settings: Settings | None = None
+    ai_orchestrator: AIOrchestrator | None = None
+    settings_store: SettingsStore | None = None
+    unsaved_cache: UnsavedCache | None = None
+    unsaved_cache_store: UnsavedCacheStore | None = None
 
 
 @dataclass(slots=True)

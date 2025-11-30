@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Protocol
+from typing import Any, Callable, Iterable, Iterator, Protocol
 
 from .document_model import DocumentMetadata, DocumentState
 
@@ -21,7 +21,7 @@ __all__ = ["DocumentTab", "DocumentWorkspace", "ActiveTabListener"]
 class ActiveTabListener(Protocol):
     """Callback signature fired whenever the active tab changes."""
 
-    def __call__(self, tab: Optional["DocumentTab"]) -> None:  # pragma: no cover - protocol
+    def __call__(self, tab: "DocumentTab | None") -> None:  # pragma: no cover - protocol
         ...
 
 
@@ -104,11 +104,11 @@ class DocumentWorkspace:
     ) -> None:
         self._editor_factory = editor_factory or EditorWidget
         self._bridge_factory = bridge_factory or (lambda editor: DocumentBridge(editor=editor))
-        self._tabs: Dict[str, DocumentTab] = {}
-        self._order: List[str] = []
+        self._tabs: dict[str, DocumentTab] = {}
+        self._order: list[str] = []
         self._active_tab_id: str | None = None
-        self._listeners: List[ActiveTabListener] = []
-        self._tab_created_listeners: List[TabCreatedListener] = []
+        self._listeners: list[ActiveTabListener] = []
+        self._tab_created_listeners: list[TabCreatedListener] = []
         self._untitled_counter = 1
 
     # ------------------------------------------------------------------

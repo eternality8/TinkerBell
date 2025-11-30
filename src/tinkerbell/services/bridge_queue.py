@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from ..chat.commands import ActionType, parse_agent_payload, validate_directive
-from ..chat.message_model import EditDirective
-from ..documents.ranges import TextRange
+from tinkerbell.ui.presentation.chat.commands import ActionType, parse_agent_payload, validate_directive
+from tinkerbell.ui.presentation.chat.message_model import EditDirective
+from ..core.ranges import TextRange
 from .bridge_types import PatchRangePayload, QueuedEdit
 
 

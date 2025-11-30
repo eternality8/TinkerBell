@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tinkerbell.chat.commands import (
+from tinkerbell.ui.presentation.chat.commands import (
     ActionType,
     ManualCommandType,
     parse_agent_payload,

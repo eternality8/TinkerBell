@@ -22,7 +22,7 @@ import json
 import re
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, List, Mapping, Optional, Protocol, Sequence, cast
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence, cast
 
 from .message_model import ChatMessage, ToolTrace
 
@@ -154,15 +154,15 @@ class ChatPanel(QWidgetBase):
 
     def __init__(
         self,
-        parent: Optional[Any] = None,
+        parent: Any | None = None,
         *,
-        history_limit: Optional[int] = None,
+        history_limit: int | None = None,
         show_tool_activity_panel: bool = False,
     ) -> None:
         super().__init__(parent)
         self._history_limit = max(1, history_limit or self.MAX_HISTORY)
-        self._messages: List[ChatMessage] = []
-        self._active_stream: Optional[ChatMessage] = None
+        self._messages: list[ChatMessage] = []
+        self._active_stream: ChatMessage | None = None
         self._tool_traces: list[ToolTrace] = []
         self._visible_tool_traces: list[ToolTrace] = []
         self._suggestions: list[str] = []
@@ -191,10 +191,10 @@ class ChatPanel(QWidgetBase):
         self._guardrail_label: Any = None
         self._analysis_label: Any = None
         self._suggestion_panel_open = False
-        self._last_copied_text: Optional[str] = None
-        self._stop_ai_callback: Optional[Callable[[], None]] = None
+        self._last_copied_text: str | None = None
+        self._stop_ai_callback: Callable[[], None] | None = None
         self._ai_running = False
-        self._pending_turn_snapshot: Optional[ChatTurnSnapshot] = None
+        self._pending_turn_snapshot: ChatTurnSnapshot | None = None
         self._send_button_idle_text = "Send"
         self._send_button_idle_tooltip = "Send message"
         self._action_button_busy_text = "■"
@@ -205,7 +205,7 @@ class ChatPanel(QWidgetBase):
     # ------------------------------------------------------------------
     # Public API – history + composer
     # ------------------------------------------------------------------
-    def history(self) -> List[ChatMessage]:
+    def history(self) -> list[ChatMessage]:
         """Return a copy of the recorded chat history."""
 
         return list(self._messages)
@@ -218,10 +218,10 @@ class ChatPanel(QWidgetBase):
 
     def set_guardrail_state(
         self,
-        status: Optional[str],
+        status: str | None,
         *,
-        detail: Optional[str] = None,
-        category: Optional[str] = None,
+        detail: str | None = None,
+        category: str | None = None,
     ) -> None:
         """Update the guardrail badge for a specific category (chunk flow, safe edit)."""
 
@@ -237,7 +237,7 @@ class ChatPanel(QWidgetBase):
             self._guardrail_entries[category_key] = (normalized, detail_text)
         self._apply_guardrail_state()
 
-    def set_analysis_badge(self, text: Optional[str], *, detail: Optional[str] = None) -> None:
+    def set_analysis_badge(self, text: str | None, *, detail: str | None = None) -> None:
         """Update the preflight analysis badge."""
 
         normalized = (text or "").strip()
@@ -287,7 +287,7 @@ class ChatPanel(QWidgetBase):
         self._refresh_suggestion_widget()
         self._apply_guardrail_state()
 
-    def consume_turn_snapshot(self) -> Optional[ChatTurnSnapshot]:
+    def consume_turn_snapshot(self) -> ChatTurnSnapshot | None:
         """Return the pending turn snapshot once, clearing it afterwards."""
 
         snapshot = self._pending_turn_snapshot
@@ -301,7 +301,7 @@ class ChatPanel(QWidgetBase):
         return self._tool_activity_visible
 
     @property
-    def last_copied_text(self) -> Optional[str]:
+    def last_copied_text(self) -> str | None:
         """Expose the last message text copied to the clipboard."""
 
         return self._last_copied_text
@@ -335,7 +335,7 @@ class ChatPanel(QWidgetBase):
                 pass
         return self._composer_text
 
-    def set_composer_text(self, text: str, *, context: Optional[ComposerContext] = None) -> None:
+    def set_composer_text(self, text: str, *, context: ComposerContext | None = None) -> None:
         """Set the composer text and optional metadata context."""
 
         self._composer_text = text
@@ -368,7 +368,7 @@ class ChatPanel(QWidgetBase):
     def append_user_message(
         self,
         content: str,
-        metadata: Optional[Mapping[str, Any]] = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> ChatMessage:
         """Add a user-authored message to the panel."""
 
@@ -517,9 +517,9 @@ class ChatPanel(QWidgetBase):
 
     def copy_tool_trace_details(
         self,
-        trace: Optional[ToolTrace] = None,
+        trace: ToolTrace | None = None,
         *,
-        index: Optional[int] = None,
+        index: int | None = None,
     ) -> bool:
         """Copy a formatted summary of a recorded tool trace."""
 
@@ -571,7 +571,7 @@ class ChatPanel(QWidgetBase):
         except ValueError:  # pragma: no cover - defensive guard
             pass
 
-    def set_stop_ai_callback(self, callback: Optional[Callable[[], None]]) -> None:
+    def set_stop_ai_callback(self, callback: Callable[[], None] | None) -> None:
         """Configure a callable invoked when the user requests to stop the AI run."""
 
         self._stop_ai_callback = callback
@@ -597,10 +597,10 @@ class ChatPanel(QWidgetBase):
 
     def send_prompt(
         self,
-        prompt: Optional[str] = None,
+        prompt: str | None = None,
         *,
         record_history: bool = True,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         """Submit a prompt to registered listeners and optionally log it."""
 
@@ -1063,7 +1063,7 @@ class ChatPanel(QWidgetBase):
             return "…"
         return ""
 
-    def _tool_trace_color(self, status: str) -> Optional[str]:
+    def _tool_trace_color(self, status: str) -> str | None:
         if status == "success":
             return "#2ea043"
         if status == "failure":
@@ -1160,7 +1160,7 @@ class ChatPanel(QWidgetBase):
 
         return False
 
-    def _extract_structured_status(self, metadata: Mapping[str, Any]) -> Optional[str]:
+    def _extract_structured_status(self, metadata: Mapping[str, Any]) -> str | None:
         status_value = metadata.get("status")
         if status_value:
             return str(status_value)
@@ -1183,7 +1183,7 @@ class ChatPanel(QWidgetBase):
                     return status_value
         return None
 
-    def _lookup_status_field(self, payload: Any) -> Optional[str]:
+    def _lookup_status_field(self, payload: Any) -> str | None:
         if isinstance(payload, Mapping):
             for key in ("status", "state", "outcome", "result"):
                 value = payload.get(key)
@@ -1338,7 +1338,7 @@ class ChatPanel(QWidgetBase):
                 return entry
         return ("", "")
 
-    def _normalize_guardrail_category(self, category: Optional[str]) -> str:
+    def _normalize_guardrail_category(self, category: str | None) -> str:
         normalized = (category or "default").strip().lower()
         return normalized or "default"
 
@@ -1396,11 +1396,11 @@ class ChatPanel(QWidgetBase):
             pass
 
     def _format_tool_trace_details(self, trace: ToolTrace) -> str:
-        def _normalize(value: Optional[str]) -> str:
+        def _normalize(value: str | None) -> str:
             text = (value or "").strip()
             return text if text else "(empty)"
 
-        def _normalize_block(value: Optional[str]) -> str:
+        def _normalize_block(value: str | None) -> str:
             if value is None:
                 return "(empty)"
             text = str(value)
@@ -1463,7 +1463,7 @@ class ChatPanel(QWidgetBase):
 
         return "\n".join(lines)
 
-    def _resolve_tool_trace(self, index: Optional[int]) -> Optional[ToolTrace]:
+    def _resolve_tool_trace(self, index: int | None) -> ToolTrace | None:
         if not self._tool_traces:
             return None
         if index is None:
@@ -1652,7 +1652,7 @@ class ChatPanel(QWidgetBase):
                 return False
         return False
 
-    def _handle_composer_key_event(self, key: Optional[int], modifiers: Optional[int]) -> bool:
+    def _handle_composer_key_event(self, key: int | None, modifiers: int | None) -> bool:
         if self._ai_running:
             return False
         if key is None or modifiers is None:
@@ -1678,7 +1678,7 @@ class ChatPanel(QWidgetBase):
         self._handle_send_clicked()
         return True
 
-    def _extract_event_type(self, event: Any) -> Optional[int]:
+    def _extract_event_type(self, event: Any) -> int | None:
         if event is None:
             return None
         getter = getattr(event, "type", None)
@@ -1690,7 +1690,7 @@ class ChatPanel(QWidgetBase):
             return None
         return self._coerce_int(value)
 
-    def _extract_event_code(self, event: Any, attr: str) -> Optional[int]:
+    def _extract_event_code(self, event: Any, attr: str) -> int | None:
         if event is None:
             return None
         getter = getattr(event, attr, None)
@@ -1703,12 +1703,12 @@ class ChatPanel(QWidgetBase):
         return self._coerce_int(value)
 
     @staticmethod
-    def _coerce_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    def _coerce_int(value: Any, default: int | None = None) -> int | None:
         if value is None:
             return default
         try:
             return int(value)
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
         candidate = getattr(value, "value", None)
         if candidate is not None:

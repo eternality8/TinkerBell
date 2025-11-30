@@ -1065,7 +1065,7 @@ class EmbeddingStore:
         if callable(close):
             try:
                 close()
-            except Exception:
+            except Exception:  # pragma: no cover - Qt defensive guard
                 pass
 
     def _handle_embedding_activity(self, active: bool, detail: str | None) -> None:

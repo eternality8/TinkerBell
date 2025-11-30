@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable
 
 
 @dataclass(slots=True)
@@ -12,9 +12,9 @@ class WindowAction:
 
     name: str
     text: str
-    shortcut: Optional[str] = None
-    status_tip: Optional[str] = None
-    callback: Optional[Callable[[], Any]] = None
+    shortcut: str | None = None
+    status_tip: str | None = None
+    callback: Callable[[], Any] | None = None
 
     def trigger(self) -> None:
         """Invoke the registered callback, if available."""
@@ -29,7 +29,7 @@ class MenuSpec:
 
     name: str
     title: str
-    actions: Tuple[str, ...]
+    actions: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -37,7 +37,7 @@ class ToolbarSpec:
     """Declarative toolbar definition mirroring the cleanup plan contract."""
 
     name: str
-    actions: Tuple[str, ...]
+    actions: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -47,7 +47,7 @@ class SplitterState:
     editor: Any
     chat_panel: Any
     orientation: str = "horizontal"
-    stretch_factors: Tuple[int, int] = (3, 2)
+    stretch_factors: tuple[int, int] = (3, 2)
 
 
 __all__ = [

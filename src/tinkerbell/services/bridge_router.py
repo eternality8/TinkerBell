@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any, Callable, Iterable, List, Mapping, Sequence, Set
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from ..chat.message_model import EditDirective
+from tinkerbell.ui.presentation.chat.message_model import EditDirective
 from ..editor.workspace import DocumentTab, DocumentWorkspace
 from .bridge import DocumentBridge, EditAppliedListener
 
@@ -19,9 +19,9 @@ class WorkspaceBridgeRouter:
 
     def __init__(self, workspace: DocumentWorkspace) -> None:
         self._workspace = workspace
-        self._wired_bridge_ids: Set[int] = set()
-        self._edit_listeners: List[EditAppliedListener] = []
-        self._failure_listeners: List[Callable[[EditDirective, str], None]] = []
+        self._wired_bridge_ids: set[int] = set()
+        self._edit_listeners: list[EditAppliedListener] = []
+        self._failure_listeners: list[Callable[[EditDirective, str], None]] = []
         self._failure_listener_capabilities: dict[Callable[..., Any], bool] = {}
         self._bridge_failure_handlers: dict[int, Callable[..., Any]] = {}
         self._bridge_tab_index: dict[int, str | None] = {}

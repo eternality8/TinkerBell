@@ -31,15 +31,25 @@ from tinkerbell.ai.tools.errors import (
 class MockDocumentProvider:
     """Mock document provider for testing."""
 
-    def __init__(self, text: str = "Hello World", active_tab: str = "tab-1") -> None:
+    def __init__(self, text: str = "Hello World", active_tab: str | None = "tab-1") -> None:
         self._text = text
         self._active_tab = active_tab
+        self._documents: dict[str, str] = {}
 
     def get_document_text(self, tab_id: str | None = None) -> str:
         return self._text
 
     def get_active_tab_id(self) -> str | None:
         return self._active_tab
+
+    def get_document_content(self, tab_id: str) -> str | None:
+        return self._documents.get(tab_id, self._text)
+
+    def set_document_content(self, tab_id: str, content: str) -> None:
+        self._documents[tab_id] = content
+
+    def get_document_metadata(self, tab_id: str) -> dict[str, Any] | None:
+        return {"tab_id": tab_id, "path": f"/{tab_id}.txt", "language": "plain_text"}
 
 
 class MockTelemetry:
@@ -179,7 +189,7 @@ class TestToolContext:
         version_manager: VersionManager,
     ) -> None:
         """Test None returned when no tab_id and no active tab."""
-        provider = MockDocumentProvider(active_tab=None)  # type: ignore
+        provider = MockDocumentProvider(active_tab=None)
         context = ToolContext(
             document_provider=provider,
             version_manager=version_manager,
@@ -194,7 +204,7 @@ class TestToolContext:
         version_manager: VersionManager,
     ) -> None:
         """Test error when no tab_id and no active tab using require_tab_id."""
-        provider = MockDocumentProvider(active_tab=None)  # type: ignore
+        provider = MockDocumentProvider(active_tab=None)
         context = ToolContext(
             document_provider=provider,
             version_manager=version_manager,

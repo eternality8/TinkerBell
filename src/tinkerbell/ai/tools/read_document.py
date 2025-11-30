@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from ..utils.tokens import CHARS_PER_TOKEN, estimate_tokens
 from .base import ReadOnlyTool, ToolContext
 from .errors import (
     InvalidLineRangeError,
@@ -22,33 +23,12 @@ from .list_tabs import detect_file_type, is_supported_file_type
 from .version import VersionManager, compute_content_hash, get_version_manager
 
 
-# Token estimation constants
-# Average characters per token for English prose (GPT-style tokenization)
-CHARS_PER_TOKEN = 4.0
-
 # Default token window for automatic pagination (~6000 tokens = ~24000 chars)
 DEFAULT_TOKEN_WINDOW = 6000
 DEFAULT_CHAR_WINDOW = int(DEFAULT_TOKEN_WINDOW * CHARS_PER_TOKEN)
 
 # Maximum lines to return in a single response
 MAX_LINES_PER_RESPONSE = 2000
-
-
-def estimate_tokens(text: str) -> int:
-    """Estimate the number of tokens in a text string.
-
-    Uses a simple character-based heuristic. For more accurate estimates,
-    consider integrating a proper tokenizer.
-
-    Args:
-        text: The text to estimate tokens for.
-
-    Returns:
-        Estimated token count.
-    """
-    if not text:
-        return 0
-    return max(1, int(len(text) / CHARS_PER_TOKEN))
 
 
 def split_lines(text: str) -> list[str]:

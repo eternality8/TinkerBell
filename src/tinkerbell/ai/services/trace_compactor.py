@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Mapping, MutableMapping
 
-from ...chat.message_model import ToolPointerMessage
+from tinkerbell.ui.presentation.chat.message_model import ToolPointerMessage
 
 
 EstimateMessageTokens = Callable[[Mapping[str, Any]], int]

@@ -263,15 +263,8 @@ class ProgressTracker:
 # Document Chunking
 # =============================================================================
 
-
-def estimate_tokens(text: str) -> int:
-    """Estimate token count for text.
-
-    Uses a simple heuristic of ~4 characters per token.
-    """
-    if not text:
-        return 0
-    return max(1, len(text.encode("utf-8")) // 4)
+# Re-export for backwards compatibility
+from ..utils.tokens import estimate_tokens
 
 
 def find_chunk_boundaries(

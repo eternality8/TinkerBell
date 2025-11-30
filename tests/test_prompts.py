@@ -5,14 +5,21 @@ from __future__ import annotations
 from tinkerbell.ai import prompts
 
 
-def test_base_system_prompt_includes_budget_and_fallback():
+def test_base_system_prompt_includes_core_elements():
+    """Test that system prompt includes key guidance sections."""
     content = prompts.base_system_prompt(model_name=None)
-    assert "Tool workflow" in content
-    assert "Edit Recipe" in content
-    assert "Voice & tone" in content
-    assert "collaborative peer" in content
-    assert "TokenCounterRegistry" in content
-    assert "approximate" in content.lower()
+    # Check personality/voice section
+    assert "TinkerBell" in content
+    assert "fairy" in content.lower()
+    # Check tool sections
+    assert "Available Tools" in content
+    assert "read_document" in content
+    assert "replace_lines" in content
+    # Check workflow section
+    assert "Core Workflow" in content
+    assert "version_token" in content
+    # Check guidelines
+    assert "Guidelines" in content
 
 
 def test_format_user_prompt_includes_window_metadata():
@@ -30,11 +37,8 @@ def test_format_user_prompt_includes_window_metadata():
     assert "abc123" in content
 
 
-def test_token_budget_hint_changes_when_model_registered():
-    # Register a fake counter to flip the hint branch.
-    registry = prompts.TokenCounterRegistry.global_instance()
-    registry.register("fake-model", prompts.TokenCounterRegistry.global_instance().get(None))
-    content = prompts.base_system_prompt(model_name="fake-model")
-    assert "exact" in content.lower()
-    # Clean up to avoid leaking into other tests.
-    registry.unregister("fake-model")
+def test_system_prompt_v2_alias():
+    """Test that base_system_prompt is an alias for system_prompt_v2."""
+    base_content = prompts.base_system_prompt(model_name=None)
+    v2_content = prompts.system_prompt_v2(model_name=None)
+    assert base_content == v2_content

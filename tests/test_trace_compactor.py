@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import Mapping
 
 from tinkerbell.ai.services.trace_compactor import TraceCompactor
-from tinkerbell.chat.message_model import ToolPointerMessage
+from tinkerbell.ui.presentation.chat.message_model import ToolPointerMessage
 
 
 def _token_counter(message: Mapping[str, object]) -> int:

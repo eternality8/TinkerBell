@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from .themes import DEFAULT_THEME, Theme
 
@@ -31,10 +31,10 @@ class MarkdownPreview:
     """Container holding rendered HTML preview content and metadata."""
 
     html: str
-    metadata: Dict[str, Any]
+    metadata: dict[str, Any]
 
 
-def detect_frontmatter(text: str) -> Dict[str, Any]:
+def detect_frontmatter(text: str) -> dict[str, Any]:
     """Return parsed YAML frontmatter from ``text`` if present."""
 
     block, _ = _split_frontmatter(text or "")
@@ -45,7 +45,7 @@ def render_preview(
     text: str,
     *,
     theme: Theme | None = None,
-    max_chars: Optional[int] = MAX_PREVIEW_CHARS,
+    max_chars: int | None = MAX_PREVIEW_CHARS,
 ) -> MarkdownPreview:
     """Render Markdown ``text`` into HTML using ``markdown-it-py`` when available."""
 
@@ -69,7 +69,7 @@ def render_preview(
 # ---------------------------------------------------------------------------
 # Frontmatter helpers
 # ---------------------------------------------------------------------------
-def _split_frontmatter(text: str) -> tuple[Optional[str], str]:
+def _split_frontmatter(text: str) -> tuple[str | None, str]:
     """Return (frontmatter_block, body) from ``text`` if fenced frontmatter exists."""
 
     if not text:
@@ -102,7 +102,7 @@ def _split_frontmatter(text: str) -> tuple[Optional[str], str]:
     return frontmatter_block, remainder
 
 
-def _parse_frontmatter_block(block: Optional[str]) -> Dict[str, Any]:
+def _parse_frontmatter_block(block: str | None) -> dict[str, Any]:
     if not block:
         return {}
     if YAML is None:  # pragma: no cover - dependency always installed in CI
@@ -122,7 +122,7 @@ def _parse_frontmatter_block(block: Optional[str]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Rendering + metadata extraction helpers
 # ---------------------------------------------------------------------------
-def _maybe_truncate(text: str, max_chars: Optional[int]) -> Tuple[str, bool]:
+def _maybe_truncate(text: str, max_chars: int | None) -> tuple[str, bool]:
     if max_chars is None or len(text) <= max_chars:
         return text, False
     truncated = text[:max_chars]
@@ -133,10 +133,10 @@ def _maybe_truncate(text: str, max_chars: Optional[int]) -> Tuple[str, bool]:
     return truncated, True
 
 
-_MARKDOWN_RENDERER: Optional[MarkdownIt] = None  # type: ignore[valid-type]
+_MARKDOWN_RENDERER: MarkdownIt | None = None  # type: ignore[valid-type]
 
 
-def _build_renderer() -> Optional[MarkdownIt]:  # type: ignore[valid-type]
+def _build_renderer() -> MarkdownIt | None:  # type: ignore[valid-type]
     global _MARKDOWN_RENDERER
     if _MARKDOWN_RENDERER is None and MarkdownIt is not None:
         renderer = MarkdownIt(
@@ -156,8 +156,8 @@ def _render_markdown(text: str) -> str:
     return renderer.render(text)
 
 
-def _extract_headings(text: str) -> list[Dict[str, Any]]:
-    headings: list[Dict[str, Any]] = []
+def _extract_headings(text: str) -> list[dict[str, Any]]:
+    headings: list[dict[str, Any]] = []
     for match in _HEADING_PATTERN.finditer(text):
         title = match.group("title").strip()
         if not title:
@@ -172,7 +172,7 @@ def _slugify(value: str) -> str:
     return slug or "section"
 
 
-def _calculate_stats(text: str) -> Dict[str, Any]:
+def _calculate_stats(text: str) -> dict[str, Any]:
     words = _WORD_PATTERN.findall(text)
     word_count = len(words)
     char_count = len(text)
@@ -231,12 +231,12 @@ def _wrap_with_theme(html_body: str, theme: Theme) -> str:
     return f"{style}<div class=\"tb-markdown-preview\">{html_body}</div>"
 
 
-def _palette_to_css(rgb: Tuple[int, int, int]) -> str:
+def _palette_to_css(rgb: tuple[int, int, int]) -> str:
     r, g, b = [max(0, min(255, channel)) for channel in rgb]
     return f"rgb({r}, {g}, {b})"
 
 
-def _adjust_color(rgb: Tuple[int, int, int], factor: float) -> Tuple[int, int, int]:
+def _adjust_color(rgb: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
     r, g, b = rgb
     return (
         min(255, int(r * factor)),

@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...services.telemetry import count_text_tokens
+from tinkerbell.services.telemetry import count_text_tokens
 from .common import (
     DEFAULT_FILE_FILTER,
     PREVIEW_CHAR_LIMIT,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Sequence
+from typing import Any, Callable, Sequence
 
 from .document_model import DocumentState, SelectionRange
 from .editor_widget import EditorWidget, SnapshotListener, TextChangeListener, QWidgetBase
@@ -51,7 +51,7 @@ class TabbedEditorWidget(QWidgetBase):
         self._tab_widget: Any | None = None
         self._block_qt_signal = False
         self._initializing = True
-        self._editor_lookup: Dict[int, str] = {}
+        self._editor_lookup: dict[int, str] = {}
         self._main_thread_executor: Executor | None = None
         self._tab_created_listeners: list[TabCreatedListener] = []
         self._selection_listeners: list[SelectionChangeListener] = []
@@ -277,7 +277,7 @@ class TabbedEditorWidget(QWidgetBase):
         try:  # pragma: no cover - Qt-specific wiring
             self._tab_widget.currentChanged.connect(self._handle_qt_tab_changed)
             self._tab_widget.tabCloseRequested.connect(self._handle_qt_tab_close_requested)
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)

@@ -825,15 +825,13 @@ class TransformDocumentTool(SubagentTool):
             priority=TaskPriority.NORMAL,
         )
 
-        # If we have an orchestrator, queue the task
-        # Note: The orchestrator handles async execution; this tool returns
-        # a task reference that can be checked later for results
+        # Fallback path: orchestrator exists but executor not available
+        # This should rarely happen as async execution is the primary path
         if self.orchestrator:
-            # TODO: When async execution is implemented, this should queue the task
-            # For now, we return an error indicating the limitation
+            # Sync execution through orchestrator is not supported
             LOGGER.warning(
-                "transform_document: orchestrator is configured but sync execution is not yet supported. "
-                "Task %s for chunk %s with type '%s' cannot be executed.",
+                "transform_document: orchestrator exists but no executor for sync execution. "
+                "Task %s for chunk %s with type '%s' cannot be executed via sync path.",
                 subagent_task.task_id,
                 chunk.chunk_id,
                 transform_type.value,
@@ -842,8 +840,8 @@ class TransformDocumentTool(SubagentTool):
                 "task_id": subagent_task.task_id,
                 "success": False,
                 "chunk_id": chunk.chunk_id,
-                "error": f"Transformation type '{transform_type.value}' is queued but sync execution is not yet implemented. "
-                         "Only 'character_rename' transformations are currently fully supported.",
+                "error": f"Transformation type '{transform_type.value}' requires async execution path. "
+                         "Ensure orchestrator has an executor configured.",
                 "output": {},
                 "tokens_used": 0,
             }

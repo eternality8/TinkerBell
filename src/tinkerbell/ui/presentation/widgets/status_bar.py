@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 try:  # pragma: no cover - Qt imports are optional during tests
     from PySide6.QtWidgets import QApplication, QLabel, QStatusBar
@@ -56,12 +56,12 @@ class ContextUsageWidget:
         if self._summary_label is not None:
             try:
                 self._summary_label.setText(self.summary_text)
-            except Exception:
+            except Exception:  # pragma: no cover - Qt defensive guard
                 pass
         if self._details_label is not None:
             try:
                 self._details_label.setText(self._details_text())
-            except Exception:
+            except Exception:  # pragma: no cover - Qt defensive guard
                 pass
 
     def _details_text(self) -> str:
@@ -127,7 +127,7 @@ class DiffReviewControls:
             try:
                 accept_button.clicked.connect(self.trigger_accept)  # type: ignore[attr-defined]
                 reject_button.clicked.connect(self.trigger_reject)  # type: ignore[attr-defined]
-            except Exception:
+            except Exception:  # pragma: no cover - Qt defensive guard
                 pass
             # Do NOT apply Ignored policy - we want the controls to be visible
             # The container should take its natural size from the buttons
@@ -171,14 +171,14 @@ class DiffReviewControls:
         if self.accept_callback is not None:
             try:
                 self.accept_callback()
-            except Exception:
+            except Exception:  # pragma: no cover - Qt defensive guard
                 pass
 
     def trigger_reject(self) -> None:
         if self.reject_callback is not None:
             try:
                 self.reject_callback()
-            except Exception:
+            except Exception:  # pragma: no cover - Qt defensive guard
                 pass
 
     def _update_summary_label(self) -> None:
@@ -186,7 +186,7 @@ class DiffReviewControls:
             return
         try:
             self._summary_label.setText(self.summary_text)
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
     def _set_visible(self, visible: bool) -> None:
@@ -269,9 +269,9 @@ class DocumentStatusIndicator:
                     try:
                         style.unpolish(self._button)
                         style.polish(self._button)
-                    except Exception:
+                    except Exception:  # pragma: no cover - Qt defensive guard
                         pass
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
     def _handle_clicked(self) -> None:
@@ -279,7 +279,7 @@ class DocumentStatusIndicator:
             return
         try:
             self._callback()
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
 
@@ -349,7 +349,7 @@ class EditorLockIndicator:
             self._label.setText(symbol)
             tooltip = self._message or ("Editor locked" if self._is_locked else "Editor unlocked")
             self._label.setToolTip(tooltip)
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
 class StatusBar:
@@ -357,7 +357,7 @@ class StatusBar:
 
     def __init__(self, parent: Any | None = None) -> None:
         self._message: str = ""
-        self._message_timeout: Optional[int] = None
+        self._message_timeout: int | None = None
         self._cursor: tuple[int, int] = (1, 1)
         self._document_format: str = "plain"
         self._ai_state: str = "Idle"
@@ -405,7 +405,7 @@ class StatusBar:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def set_message(self, message: str, *, timeout_ms: Optional[int] = None) -> None:
+    def set_message(self, message: str, *, timeout_ms: int | None = None) -> None:
         """Show a primary status message, honoring optional timeouts."""
 
         self._message = message
@@ -414,7 +414,7 @@ class StatusBar:
             timeout = timeout_ms or 0
             try:
                 self._qt_bar.showMessage(message, timeout)
-            except Exception:
+            except Exception:  # pragma: no cover - Qt defensive guard
                 pass
 
     def clear_message(self) -> None:
@@ -425,7 +425,7 @@ class StatusBar:
         if self._qt_bar is not None:
             try:
                 self._qt_bar.clearMessage()
-            except Exception:
+            except Exception:  # pragma: no cover - Qt defensive guard
                 pass
 
     def update_cursor(self, line: int, column: int) -> None:
@@ -469,7 +469,7 @@ class StatusBar:
             self._update_label(self._outline_label, self._format_outline_text())
             try:
                 self._outline_label.setToolTip(self._outline_detail)
-            except Exception:
+            except Exception:  # pragma: no cover - Qt defensive guard
                 pass
 
     def set_embedding_status(self, status: str | None, *, detail: str | None = None) -> None:
@@ -498,7 +498,7 @@ class StatusBar:
             self._update_label(self._subagent_label, self._format_subagent_text())
             try:
                 self._subagent_label.setToolTip(self._subagent_detail)
-            except Exception:
+            except Exception:  # pragma: no cover - Qt defensive guard
                 pass
 
     def set_chunk_flow_state(self, status: str | None, *, detail: str | None = None) -> None:
@@ -514,7 +514,7 @@ class StatusBar:
         try:
             label.setToolTip(self._chunk_flow_detail or self._chunk_flow_status)
             label.setVisible(visible)
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
     def set_guardrail_notice(self, status: str | None, *, detail: str | None = None) -> None:
@@ -530,7 +530,7 @@ class StatusBar:
         try:
             label.setToolTip(self._guardrail_detail or self._guardrail_status)
             label.setVisible(visible)
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
     def set_analysis_state(self, status: str | None, *, detail: str | None = None) -> None:
@@ -546,7 +546,7 @@ class StatusBar:
         try:
             label.setToolTip(self._analysis_detail or self._analysis_status)
             label.setVisible(visible)
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
     def set_lock_state(self, locked: bool, *, reason: str = "") -> None:
@@ -754,7 +754,7 @@ class StatusBar:
         self._ai_label.setContentsMargins(8, 0, 8, 0)
         try:
             self._qt_bar.addWidget(self._ai_label)
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
         # Add remaining labels as permanent widgets (right side)
@@ -784,7 +784,7 @@ class StatusBar:
             return
         try:
             label.setText(text)
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
     def _refresh_embedding_label(self) -> None:
@@ -795,7 +795,7 @@ class StatusBar:
         try:
             tooltip = self._format_embedding_tooltip()
             label.setToolTip(tooltip)
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
     def _format_cursor_text(self) -> str:
@@ -879,7 +879,7 @@ class StatusBar:
         try:
             bar.setObjectName("tb-status-bar")
             bar.messageChanged.connect(self._handle_qt_message_changed)
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
         return bar
 

@@ -5,9 +5,9 @@ import types
 
 import pytest
 
-import tinkerbell.chat.chat_panel as chat_panel
-from tinkerbell.chat.chat_panel import ChatPanel, ComposerContext, ChatTurnSnapshot
-from tinkerbell.chat.message_model import ChatMessage, ToolTrace
+import tinkerbell.ui.presentation.chat.chat_panel as chat_panel
+from tinkerbell.ui.presentation.chat.chat_panel import ChatPanel, ComposerContext, ChatTurnSnapshot
+from tinkerbell.ui.presentation.chat.message_model import ChatMessage, ToolTrace
 
 
 def _ensure_qapp() -> None:

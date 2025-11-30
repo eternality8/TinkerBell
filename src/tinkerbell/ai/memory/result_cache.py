@@ -6,7 +6,7 @@ import hashlib
 import time
 from dataclasses import dataclass, replace
 from threading import RLock
-from typing import Dict, MutableMapping, Sequence
+from typing import MutableMapping, Sequence
 
 from ..ai_types import SubagentJob, SubagentJobResult
 from ..services import telemetry as telemetry_service
@@ -41,7 +41,7 @@ class SubagentResultCache:
     ) -> None:
         self._max_entries = max(1, int(max_entries))
         self._ttl_seconds = None if ttl_seconds is None else max(0.0, float(ttl_seconds))
-        self._entries: Dict[str, _CacheEntry] = {}
+        self._entries: dict[str, _CacheEntry] = {}
         self._doc_index: MutableMapping[str, set[str]] = {}
         self._lock = RLock()
         self._bus = bus or get_document_cache_bus()

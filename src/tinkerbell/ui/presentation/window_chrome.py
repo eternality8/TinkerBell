@@ -14,12 +14,12 @@ the window "chrome" (menus, toolbars, layout) without business logic.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Mapping
 
 try:
-    from ...chat.chat_panel import ChatPanel
+    from .chat.chat_panel import ChatPanel
     from ...editor.tabbed_editor import TabbedEditorWidget
-    from ...widgets.status_bar import StatusBar
+    from .widgets.status_bar import StatusBar
 except ImportError:  # pragma: no cover - handle isolated imports
     ChatPanel = Any  # type: ignore[misc,assignment]
     TabbedEditorWidget = Any  # type: ignore[misc,assignment]
@@ -41,10 +41,10 @@ class WindowChromeState:
     """
 
     splitter: Any
-    actions: Dict[str, WindowAction]
-    menus: Dict[str, MenuSpec]
-    toolbars: Dict[str, ToolbarSpec]
-    qt_actions: Dict[str, Any]
+    actions: dict[str, WindowAction]
+    menus: dict[str, MenuSpec]
+    toolbars: dict[str, ToolbarSpec]
+    qt_actions: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,12 +53,12 @@ class _ActionDefinition:
 
     name: str
     text: str
-    shortcut: Optional[str]
-    status_tip: Optional[str]
+    shortcut: str | None
+    status_tip: str | None
 
 
 # Action definitions for menus and toolbars
-_ACTION_DEFINITIONS: Tuple[_ActionDefinition, ...] = (
+_ACTION_DEFINITIONS: tuple[_ActionDefinition, ...] = (
     _ActionDefinition(
         name="file_new_tab",
         text="New Tab",
@@ -141,7 +141,7 @@ _ACTION_DEFINITIONS: Tuple[_ActionDefinition, ...] = (
 
 
 # Default menu structure
-_DEFAULT_MENUS: Tuple[MenuSpec, ...] = (
+_DEFAULT_MENUS: tuple[MenuSpec, ...] = (
     MenuSpec(
         name="file",
         title="&File",
@@ -174,7 +174,7 @@ _DEFAULT_MENUS: Tuple[MenuSpec, ...] = (
 
 
 # Default toolbar structure
-_DEFAULT_TOOLBARS: Tuple[ToolbarSpec, ...] = (
+_DEFAULT_TOOLBARS: tuple[ToolbarSpec, ...] = (
     ToolbarSpec(
         name="file",
         actions=("file_new_tab", "file_open", "file_save", "file_close_tab"),
@@ -268,7 +268,7 @@ class WindowChrome:
         qt_status_bar = getattr(self._status_bar, "widget", lambda: None)()
         try:
             self._window.setStatusBar(qt_status_bar or self._status_bar)  # type: ignore[arg-type]
-        except Exception:
+        except Exception:  # pragma: no cover - Qt defensive guard
             pass
 
     def _build_splitter(self) -> Any:
@@ -295,7 +295,7 @@ class WindowChrome:
             if orientation is not None:
                 try:
                     splitter.setOrientation(orientation)  # type: ignore[arg-type]
-                except Exception:
+                except Exception:  # pragma: no cover - Qt defensive guard
                     pass
             splitter.addWidget(self._editor)  # type: ignore[arg-type]
             splitter.addWidget(self._chat_panel)  # type: ignore[arg-type]
@@ -305,7 +305,7 @@ class WindowChrome:
         except Exception:
             return SplitterState(editor=self._editor, chat_panel=self._chat_panel)
 
-    def _create_actions(self) -> Dict[str, WindowAction]:
+    def _create_actions(self) -> dict[str, WindowAction]:
         """Create WindowAction instances from definitions.
 
         Returns:
@@ -314,7 +314,7 @@ class WindowChrome:
         Raises:
             KeyError: If a required callback is missing.
         """
-        actions: Dict[str, WindowAction] = {}
+        actions: dict[str, WindowAction] = {}
         for definition in _ACTION_DEFINITIONS:
             callback = self._callbacks.get(definition.name)
             if callback is None:
@@ -330,9 +330,9 @@ class WindowChrome:
 
     def _install_qt_menus(
         self,
-        actions: Dict[str, WindowAction],
-        menus: Dict[str, MenuSpec],
-    ) -> Dict[str, Any]:
+        actions: dict[str, WindowAction],
+        menus: dict[str, MenuSpec],
+    ) -> dict[str, Any]:
         """Install Qt menus and actions on the window.
 
         Args:
@@ -358,19 +358,19 @@ class WindowChrome:
             except Exception:
                 menubar = QMenuBar(self._window)
 
-        qt_actions: Dict[str, Any] = {}
+        qt_actions: dict[str, Any] = {}
         for action in actions.values():
             qt_action = QAction(action.text, self._window)
             if action.shortcut:
                 try:
                     qt_action.setShortcut(action.shortcut)  # type: ignore[arg-type]
-                except Exception:
+                except Exception:  # pragma: no cover - Qt defensive guard
                     pass
             if action.status_tip:
                 qt_action.setStatusTip(action.status_tip)
             try:
                 qt_action.triggered.connect(action.trigger)  # type: ignore[attr-defined]
-            except Exception:
+            except Exception:  # pragma: no cover - Qt defensive guard
                 pass
             qt_actions[action.name] = qt_action
 

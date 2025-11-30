@@ -459,7 +459,7 @@ class ChatPanelUpdater:
         if self._message_factory is not None:
             return self._message_factory(role=role, content=content)
 
-        from ...chat.chat_panel import ChatMessage
+        from .chat.chat_panel import ChatMessage
 
         return ChatMessage(role=role, content=content)
 

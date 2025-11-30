@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 from ..events import EventBus
 
 if TYPE_CHECKING:  # pragma: no cover
-    from ...documents.ranges import TextRange
+    from ...core.ranges import TextRange
 
 LOGGER = logging.getLogger(__name__)
 

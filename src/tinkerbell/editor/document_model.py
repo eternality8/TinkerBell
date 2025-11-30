@@ -7,9 +7,9 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
-from ..documents.ranges import TextRange
+from ..core.ranges import TextRange
 
 
 def _utcnow() -> datetime:
@@ -36,7 +36,7 @@ class DocumentVersion:
 class DocumentMetadata:
     """Metadata describing the currently loaded document."""
 
-    path: Optional[Path] = None
+    path: Path | None = None
     language: str = "markdown"
     created_at: datetime = field(default_factory=_utcnow)
     updated_at: datetime = field(default_factory=_utcnow)
@@ -104,10 +104,10 @@ class DocumentState:
         self.version_id += 1
         self.content_hash = _hash_text(new_text)
 
-    def snapshot(self, *, delta_only: bool = False) -> Dict[str, Any]:
+    def snapshot(self, *, delta_only: bool = False) -> dict[str, Any]:
         """Return a serializable snapshot consumed by agent tools."""
 
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "text": self.text if not delta_only else "",
             "language": self.metadata.language,
             "dirty": self.dirty,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, List, MutableMapping
+from typing import Any, Callable, MutableMapping
 
 from tinkerbell.editor.syntax import yaml_json
 
@@ -88,20 +88,20 @@ def parse_snapshot_token(
     return (tab_id_clean or None, version_id_clean or None)
 
 
-SnippetValidator = Callable[[str], List[yaml_json.ValidationError]]
+SnippetValidator = Callable[[str], list[yaml_json.ValidationError]]
 
 
 _HEADING_PATTERN = re.compile(r"^(?P<hashes>#{1,6})\s+\S")
 _FENCE_PATTERN = re.compile(r"^(```+|~~~+)(.*)$")
 
 
-def _validate_markdown(text: str) -> List[yaml_json.ValidationError]:
+def _validate_markdown(text: str) -> list[yaml_json.ValidationError]:
     raw = text or ""
     if not raw.strip():
         return []
 
-    errors: List[yaml_json.ValidationError] = []
-    fence_stack: List[tuple[str, int]] = []
+    errors: list[yaml_json.ValidationError] = []
+    fence_stack: list[tuple[str, int]] = []
     previous_heading_level: int | None = None
 
     for line_number, line in enumerate(raw.splitlines(), start=1):
@@ -184,7 +184,7 @@ def validate_snippet(text: str, fmt: str, *, schema: dict[str, Any] | None = Non
     return _outcome_from_errors(errors)
 
 
-def _outcome_from_errors(errors: List[yaml_json.ValidationError]) -> ValidationOutcome:
+def _outcome_from_errors(errors: list[yaml_json.ValidationError]) -> ValidationOutcome:
     if not errors:
         return ValidationOutcome(ok=True, message="Snippet is valid.")
 

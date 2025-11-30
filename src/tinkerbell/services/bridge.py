@@ -7,7 +7,7 @@ import logging
 import time
 from copy import deepcopy
 from collections import OrderedDict, deque
-from typing import Any, Callable, Deque, Mapping, Optional, Sequence
+from typing import Any, Callable, Deque, Mapping, Sequence
 
 from ..ai.memory.cache_bus import (
     DocumentCacheBus,
@@ -16,10 +16,10 @@ from ..ai.memory.cache_bus import (
     get_document_cache_bus,
 )
 from ..ai.tools.version import get_version_manager
-from ..chat.commands import ActionType, parse_agent_payload, validate_directive
-from ..chat.message_model import EditDirective
-from ..documents.ranges import TextRange
-from ..documents.range_normalizer import normalize_text_range
+from tinkerbell.ui.presentation.chat.commands import ActionType, parse_agent_payload, validate_directive
+from tinkerbell.ui.presentation.chat.message_model import EditDirective
+from ..core.ranges import TextRange
+from ..core.range_normalizer import normalize_text_range
 from ..editor.document_model import DocumentState, DocumentVersion
 from ..editor.patches import PatchApplyError, PatchResult, RangePatch, apply_streamed_ranges, apply_unified_diff
 from ..editor.post_edit_inspector import InspectionResult, PostEditInspector
@@ -98,16 +98,16 @@ class DocumentBridge:
         self,
         *,
         editor: EditorAdapter,
-        main_thread_executor: Optional[Executor] = None,
+        main_thread_executor: Executor | None = None,
         cache_bus: DocumentCacheBus | None = None,
     ) -> None:
         self.editor = editor
         self._pending_edits: Deque[_QueuedEdit] = deque()
         self._draining = False
-        self._last_diff: Optional[str] = None
-        self._last_snapshot_token: Optional[str] = None
-        self._last_document_version: Optional[DocumentVersion] = None
-        self._last_edit_context: Optional[EditContext] = None
+        self._last_diff: str | None = None
+        self._last_snapshot_token: str | None = None
+        self._last_document_version: DocumentVersion | None = None
+        self._last_edit_context: EditContext | None = None
         self._main_thread_executor = main_thread_executor
         self._edit_listeners: list[EditAppliedListener] = []
         self._failure_listeners: list[Callable[[EditDirective, str], None]] = []
@@ -115,8 +115,8 @@ class DocumentBridge:
         self._patch_metrics = PatchMetrics()
         self._cache_bus = cache_bus or get_document_cache_bus()
         self._chunk_manifest_cache: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
-        self._tab_id: Optional[str] = None
-        self._last_failure_metadata: Optional[dict[str, Any]] = None
+        self._tab_id: str | None = None
+        self._last_failure_metadata: dict[str, Any] | None = None
         self._safe_edit_settings = SafeEditSettings()
         self._post_edit_inspector = PostEditInspector(
             duplicate_threshold=self._safe_edit_settings.duplicate_threshold,
@@ -177,25 +177,25 @@ class DocumentBridge:
         return snapshot
 
     @property
-    def last_diff_summary(self) -> Optional[str]:
+    def last_diff_summary(self) -> str | None:
         """Return a lightweight description of the most recent edit diff."""
 
         return self._last_diff
 
     @property
-    def last_snapshot_version(self) -> Optional[str]:
+    def last_snapshot_version(self) -> str | None:
         """Expose the digest associated with the latest document snapshot."""
 
         return self._last_snapshot_token
 
     @property
-    def last_document_version(self) -> Optional[DocumentVersion]:
+    def last_document_version(self) -> DocumentVersion | None:
         """Expose the most recent :class:`DocumentVersion`."""
 
         return self._last_document_version
 
     @property
-    def last_edit_context(self) -> Optional[EditContext]:
+    def last_edit_context(self) -> EditContext | None:
         """Expose metadata about the most recently applied edit."""
 
         return self._last_edit_context
@@ -207,7 +207,7 @@ class DocumentBridge:
         return self._patch_metrics
 
     @property
-    def last_failure_metadata(self) -> Optional[Mapping[str, Any]]:
+    def last_failure_metadata(self) -> Mapping[str, Any] | None:
         """Expose structured details about the most recent failure if any."""
 
         if self._last_failure_metadata is None:
@@ -242,7 +242,7 @@ class DocumentBridge:
         except ValueError:  # pragma: no cover - defensive guard
             pass
 
-    def set_main_thread_executor(self, executor: Optional[Executor]) -> None:
+    def set_main_thread_executor(self, executor: Executor | None) -> None:
         """Configure a callable used to marshal edits onto the UI thread."""
 
         self._main_thread_executor = executor

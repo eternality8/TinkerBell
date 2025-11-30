@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from typing import Any, Mapping, Sequence
 
-ColorTuple = Tuple[int, int, int]
+ColorTuple = tuple[int, int, int]
 PaletteLike = Mapping[str, Any] | Sequence[tuple[str, Any]]
 
 
@@ -48,8 +48,8 @@ def normalize_color(value: Any) -> ColorTuple:
     raise TypeError(f"Cannot convert {type(value)!r} to an RGB color")
 
 
-def _normalize_palette(palette: PaletteLike | None) -> Dict[str, ColorTuple]:
-    normalized: Dict[str, ColorTuple] = {}
+def _normalize_palette(palette: PaletteLike | None) -> dict[str, ColorTuple]:
+    normalized: dict[str, ColorTuple] = {}
     if palette is None:
         return normalized
     items: Sequence[tuple[str, Any]]
@@ -74,10 +74,10 @@ class Theme:
 
     name: str
     title: str
-    palette: Dict[str, ColorTuple] = field(default_factory=dict)
+    palette: dict[str, ColorTuple] = field(default_factory=dict)
     description: str | None = None
     version: str = "1.0.0"
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.name = (self.name or "default").strip().lower() or "default"
@@ -106,7 +106,7 @@ class Theme:
             return fallback
         return _tuple_to_hex(value)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "title": self.title,

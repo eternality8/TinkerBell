@@ -66,6 +66,25 @@ class MockTabListingProvider:
     def get_tab_content(self, tab_id: str) -> str | None:
         return self.contents.get(tab_id)
 
+    def get_document_text(self, tab_id: str | None = None) -> str:
+        tid = tab_id or self.active_tab
+        return self.contents.get(tid or "", "")
+
+    def get_active_tab_id(self) -> str | None:
+        return self.active_tab
+
+    def get_document_content(self, tab_id: str) -> str | None:
+        return self.contents.get(tab_id)
+
+    def set_document_content(self, tab_id: str, content: str) -> None:
+        self.contents[tab_id] = content
+
+    def get_document_metadata(self, tab_id: str) -> dict[str, Any] | None:
+        for tab in self.tabs:
+            if tab.get("tab_id") == tab_id:
+                return tab
+        return None
+
 
 @dataclass
 class MockDocumentProvider:
@@ -84,6 +103,9 @@ class MockDocumentProvider:
     
     def get_document_content(self, tab_id: str) -> str | None:
         return self.documents.get(tab_id)
+
+    def set_document_content(self, tab_id: str, content: str) -> None:
+        self.documents[tab_id] = content
     
     def get_document_metadata(self, tab_id: str) -> dict[str, Any] | None:
         return self.metadata.get(tab_id)
@@ -181,7 +203,7 @@ class TestListTabsTool:
         )
         
         tool = ListTabsTool(provider=provider, version_manager=version_manager)
-        context = ToolContext(document_provider=provider, version_manager=version_manager)  # type: ignore
+        context = ToolContext(document_provider=provider, version_manager=version_manager)
         
         result = tool.execute(context, {})
         
@@ -198,7 +220,7 @@ class TestListTabsTool:
         )
         
         tool = ListTabsTool(provider=provider, version_manager=version_manager)
-        context = ToolContext(document_provider=provider, version_manager=version_manager)  # type: ignore
+        context = ToolContext(document_provider=provider, version_manager=version_manager)
         
         result = tool.execute(context, {})
         tab = result["tabs"][0]
@@ -334,7 +356,8 @@ class TestTokenEstimation:
         text = "Hello world"
         tokens = estimate_tokens(text)
         assert tokens > 0
-        assert tokens == max(1, int(len(text) / CHARS_PER_TOKEN))
+        # Uses ceil(bytes / 4), "Hello world" is 11 bytes -> ceil(11/4) = 3
+        assert tokens == 3
     
     def test_split_lines_empty(self) -> None:
         assert split_lines("") == []

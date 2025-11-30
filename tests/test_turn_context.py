@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 from datetime import datetime, timezone
 
@@ -117,7 +119,7 @@ class TestExtractTabIdFromVersion:
 
     def test_handles_non_string(self) -> None:
         """Returns None for non-string input."""
-        assert _extract_tab_id_from_version(123) is None  # type: ignore
+        assert _extract_tab_id_from_version(cast(Any, 123)) is None
 
     def test_handles_no_colon(self) -> None:
         """Returns the whole string if no colon."""

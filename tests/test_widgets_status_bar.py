@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tinkerbell.widgets.status_bar import ContextUsageWidget, StatusBar
+from tinkerbell.ui.presentation.widgets.status_bar import ContextUsageWidget, StatusBar
 
 
 def test_context_usage_widget_tracks_state_without_qt() -> None:

@@ -185,9 +185,9 @@ class ThinMainWindow(QMainWindow):
     def _create_widgets(self) -> None:
         """Create the core UI widgets."""
         try:
-            from ...chat.chat_panel import ChatPanel
+            from .chat.chat_panel import ChatPanel
             from ...editor.tabbed_editor import TabbedEditorWidget
-            from ...widgets.status_bar import StatusBar
+            from .widgets.status_bar import StatusBar
 
             self._editor = TabbedEditorWidget(
                 workspace=self._workspace,
@@ -407,7 +407,7 @@ class ThinMainWindow(QMainWindow):
         if self._chat_panel is None:
             return
 
-        from ...chat.message_model import ToolTrace
+        from .chat.message_model import ToolTrace
 
         # Get event details
         tool_name = getattr(event, "tool_name", "") or "tool"
@@ -540,7 +540,7 @@ class ThinMainWindow(QMainWindow):
     def _handle_settings(self) -> None:
         """Handle settings action."""
         try:
-            from tinkerbell.widgets.dialogs import SettingsDialog, ValidationResult
+            from tinkerbell.ui.presentation.widgets.dialogs import SettingsDialog, ValidationResult
             from tinkerbell.services.settings import Settings
         except ImportError:
             LOGGER.warning("Settings dialog requires PySide6")
@@ -574,7 +574,7 @@ class ThinMainWindow(QMainWindow):
 
     def _create_settings_validator(self) -> Any:
         """Create a function to validate settings/API key."""
-        from tinkerbell.widgets.dialogs import ValidationResult
+        from tinkerbell.ui.presentation.widgets.dialogs import ValidationResult
 
         def validate_settings(settings: Any) -> ValidationResult:
             """Validate API key and settings format."""
@@ -614,7 +614,7 @@ class ThinMainWindow(QMainWindow):
 
     def _create_api_tester(self) -> Any:
         """Create a function to test API connection."""
-        from tinkerbell.widgets.dialogs import ValidationResult
+        from tinkerbell.ui.presentation.widgets.dialogs import ValidationResult
 
         def test_api(settings: Any) -> ValidationResult:
             """Test API connection by listing models."""
@@ -676,7 +676,7 @@ class ThinMainWindow(QMainWindow):
 
     def _create_embedding_tester(self) -> Any:
         """Create a function to test embedding service."""
-        from tinkerbell.widgets.dialogs import ValidationResult
+        from tinkerbell.ui.presentation.widgets.dialogs import ValidationResult
 
         def test_embeddings(settings: Any) -> ValidationResult:
             """Test embedding service by actually generating embeddings."""

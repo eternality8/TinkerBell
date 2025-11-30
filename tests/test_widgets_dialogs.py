@@ -21,8 +21,8 @@ from PySide6.QtWidgets import (
 )
 
 from tinkerbell.services.settings import DEFAULT_EMBEDDING_MODE, Settings
-from tinkerbell.widgets import dialogs
-from tinkerbell.widgets.dialogs import (
+from tinkerbell.ui.presentation.widgets import dialogs
+from tinkerbell.ui.presentation.widgets.dialogs import (
     DocumentExportDialog,
     DocumentLoadDialog,
     SampleDocument,
