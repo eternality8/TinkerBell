@@ -7,6 +7,7 @@ execution flow with support for the tool loop.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -333,6 +334,12 @@ class TurnRunner:
 
         # Tool loop: iterate until no tool calls or max iterations
         while iteration < max_iterations:
+            # Check for cancellation at the start of each iteration
+            # This ensures we stop promptly when cancel() is called
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelled():
+                raise asyncio.CancelledError()
+            
             iteration += 1
 
             if self._config.log_pipeline_stages:
@@ -368,6 +375,10 @@ class TurnRunner:
                 response=response,
                 tool_callback=tool_callback,
             )
+
+            # Check for cancellation after tool execution
+            if current_task is not None and current_task.cancelled():
+                raise asyncio.CancelledError()
 
             # Convert to records and accumulate
             iteration_records = tool_results.to_records(response.tool_calls)

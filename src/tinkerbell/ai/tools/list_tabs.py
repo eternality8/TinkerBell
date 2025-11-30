@@ -78,8 +78,8 @@ def detect_file_type(path: str | None, language: str | None = None) -> str:
         return language.lower()
 
     if path is None:
-        # Untitled documents default to markdown (common for creative writing)
-        return "markdown"
+        # Untitled documents default to plain_text (no assumed structure)
+        return "plain_text"
 
     ext = os.path.splitext(path)[1].lower()
 

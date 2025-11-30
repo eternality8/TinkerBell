@@ -65,6 +65,7 @@ class DocumentStore:
         path: Path | str | None = None,
         *,
         make_active: bool = True,
+        untitled_index: int | None = None,
     ) -> DocumentTab:
         """Create a new document tab.
 
@@ -73,6 +74,7 @@ class DocumentStore:
             title: Optional tab title.
             path: Optional file path for the document.
             make_active: Whether to make this the active tab.
+            untitled_index: Optional index for untitled documents (for restoration).
 
         Returns:
             The newly created DocumentTab.
@@ -86,6 +88,7 @@ class DocumentStore:
             title=title,
             path=path,
             make_active=make_active,
+            untitled_index=untitled_index,
         )
 
         doc = tab.document()

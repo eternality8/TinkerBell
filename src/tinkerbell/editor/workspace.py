@@ -79,10 +79,18 @@ class DocumentTab:
         if path is not None:
             candidate = path.name or str(path)
         else:
-            suffix = f" {self.untitled_index}" if self.untitled_index else ""
-            candidate = f"{fallback}{suffix}".strip()
+            # For untitled documents, only add suffix if fallback doesn't already contain it
+            # This handles restoration where title="Untitled 4" and untitled_index=4
+            if self.untitled_index and not fallback.endswith(f" {self.untitled_index}"):
+                suffix = f" {self.untitled_index}"
+                candidate = f"{fallback}{suffix}".strip()
+            else:
+                candidate = fallback
         prefix = "*" if document.dirty else ""
         self.title = f"{prefix}{candidate}" if prefix else candidate
+
+
+TabCreatedListener = Callable[["DocumentTab"], None]
 
 
 class DocumentWorkspace:
@@ -100,6 +108,7 @@ class DocumentWorkspace:
         self._order: List[str] = []
         self._active_tab_id: str | None = None
         self._listeners: List[ActiveTabListener] = []
+        self._tab_created_listeners: List[TabCreatedListener] = []
         self._untitled_counter = 1
 
     # ------------------------------------------------------------------
@@ -157,6 +166,7 @@ class DocumentWorkspace:
         self._order.append(resolved_tab_id)
         if make_active or self._active_tab_id is None:
             self.set_active_tab(resolved_tab_id)
+        self._notify_tab_created(tab)
         return tab
 
     def close_tab(self, tab_id: str) -> DocumentTab:
@@ -216,6 +226,21 @@ class DocumentWorkspace:
             self._listeners.remove(listener)
         except ValueError:  # pragma: no cover - defensive
             pass
+
+    def add_tab_created_listener(self, listener: TabCreatedListener) -> None:
+        """Register a callback to be invoked whenever a new tab is created."""
+        self._tab_created_listeners.append(listener)
+
+    def remove_tab_created_listener(self, listener: TabCreatedListener) -> None:
+        """Unregister a tab-created callback."""
+        try:
+            self._tab_created_listeners.remove(listener)
+        except ValueError:  # pragma: no cover - defensive
+            pass
+
+    def _notify_tab_created(self, tab: DocumentTab) -> None:
+        for listener in list(self._tab_created_listeners):
+            listener(tab)
 
     def _notify_active_listeners(self) -> None:
         tab = self.active_tab
@@ -301,9 +326,11 @@ class DocumentWorkspace:
         payload: list[dict[str, object]] = []
         for tab in self.iter_tabs():
             document = tab.document()
+            # Strip dirty marker from title for persistence
+            clean_title = tab.title.lstrip("*") if tab.title.startswith("*") else tab.title
             entry: dict[str, object] = {
                 "tab_id": tab.id,
-                "title": tab.title,
+                "title": clean_title,
                 "dirty": document.dirty,
                 "language": document.metadata.language,
                 "created_at": tab.created_at.isoformat(),

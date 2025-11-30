@@ -681,6 +681,21 @@ class SubagentOrchestrator:
                 latency_ms=(time.perf_counter() - start_time) * 1000.0,
                 chunk_id=task.chunk.chunk_id,
             )
+        except asyncio.CancelledError:
+            # Task was cancelled (either by parent or directly)
+            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            LOGGER.warning(
+                "Subagent task %s cancelled after %.1fms in orchestrator",
+                task.task_id,
+                elapsed_ms,
+            )
+            result = SubagentResult(
+                task_id=task.task_id,
+                success=False,
+                error=f"Task cancelled after {elapsed_ms:.0f}ms",
+                latency_ms=elapsed_ms,
+                chunk_id=task.chunk.chunk_id,
+            )
         except Exception as exc:
             result = SubagentResult(
                 task_id=task.task_id,
@@ -726,6 +741,7 @@ class AnalysisAggregator(ResultAggregator):
         all_plot_points: list[dict[str, Any]] = []
         all_summaries: list[str] = []
         all_custom: list[dict[str, Any]] = []
+        all_styles: list[dict[str, Any]] = []
 
         for result in successful:
             output = result.output
@@ -739,6 +755,8 @@ class AnalysisAggregator(ResultAggregator):
                 all_summaries.append(output["summary"])
             if "custom" in output:
                 all_custom.append(output["custom"])
+            if "style" in output:
+                all_styles.append(output["style"])
 
         # Deduplicate characters by name
         unique_characters = {}
@@ -765,7 +783,8 @@ class AnalysisAggregator(ResultAggregator):
             "themes": unique_themes,
             "plot_points": all_plot_points,
             "summary": " ".join(all_summaries) if all_summaries else None,
-            "custom": all_custom if all_custom else None,
+            "style": all_styles[0] if len(all_styles) == 1 else (all_styles if all_styles else None),
+            "custom": all_custom[0] if len(all_custom) == 1 else (all_custom if all_custom else None),
             "errors": [{"chunk_id": r.chunk_id, "error": r.error} for r in failed] if failed else None,
         }
 
@@ -776,8 +795,21 @@ class TransformAggregator(ResultAggregator):
     Collects transformation outputs and statistics.
     """
 
-    def aggregate(self, results: list[SubagentResult]) -> dict[str, Any]:
-        """Aggregate transformation results."""
+    def aggregate(
+        self,
+        results: list[SubagentResult],
+        chunk_order: list[tuple[str, int]] | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate transformation results.
+        
+        Args:
+            results: List of subagent results.
+            chunk_order: Optional list of (chunk_id, start_char) tuples for ordering.
+                         If provided, enables reassembly of transformed content.
+        
+        Returns:
+            Aggregated result dict with status, counts, and optionally transformed_content.
+        """
         successful = [r for r in results if r.success]
         failed = [r for r in results if not r.success]
 
@@ -789,7 +821,7 @@ class TransformAggregator(ResultAggregator):
             total_replacements += output.get("replacements", 0)
             total_tokens_used += result.tokens_used
 
-        return {
+        aggregated: dict[str, Any] = {
             "status": "complete" if not failed else "partial",
             "chunks_processed": len(successful),
             "chunks_failed": len(failed),
@@ -797,6 +829,49 @@ class TransformAggregator(ResultAggregator):
             "tokens_used": total_tokens_used,
             "errors": [{"chunk_id": r.chunk_id, "error": r.error} for r in failed] if failed else None,
         }
+        
+        # If chunk_order provided and all chunks succeeded, reassemble content
+        if chunk_order and not failed:
+            transformed_content = self._reassemble_content(successful, chunk_order)
+            if transformed_content is not None:
+                aggregated["transformed_content"] = transformed_content
+        
+        return aggregated
+    
+    def _reassemble_content(
+        self,
+        results: list[SubagentResult],
+        chunk_order: list[tuple[str, int]],
+    ) -> str | None:
+        """Reassemble transformed content from chunk results in original order.
+        
+        Args:
+            results: Successful subagent results.
+            chunk_order: List of (chunk_id, start_char) tuples sorted by start_char.
+        
+        Returns:
+            Reassembled content string, or None if reassembly fails.
+        """
+        # Build a map from chunk_id to transformed content
+        content_map: dict[str, str] = {}
+        for result in results:
+            transformed = result.output.get("transformed_content")
+            if transformed is not None:
+                content_map[result.chunk_id] = transformed
+        
+        # Sort chunk_order by start_char to ensure correct order
+        sorted_chunks = sorted(chunk_order, key=lambda x: x[1])
+        
+        # Reassemble in order
+        pieces = []
+        for chunk_id, _ in sorted_chunks:
+            content = content_map.get(chunk_id)
+            if content is None:
+                # Missing chunk content, cannot reassemble
+                return None
+            pieces.append(content)
+        
+        return "".join(pieces)
 
 
 # =============================================================================

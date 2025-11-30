@@ -219,6 +219,9 @@ class BridgeAdapter:
     def set_document_content(self, tab_id: str, content: str) -> None:
         """Set document content for a tab.
 
+        This method emits an EditApplied event after setting the content,
+        ensuring that edit tracking works for full document replacements.
+
         Args:
             tab_id: The tab identifier.
             content: The new document content.
@@ -226,7 +229,44 @@ class BridgeAdapter:
         Raises:
             KeyError: If the tab is not found.
         """
+        # Get old content for diff calculation
+        old_content = self._router.get_document_content(tab_id) or ""
+        
+        # Apply the content change
         self._router.set_document_content(tab_id, content)
+        
+        # Generate edit ID and emit EditApplied event
+        self._edit_counter += 1
+        edit_id = f"edit-{self._edit_counter}"
+        
+        # Get document_id from workspace
+        document_id = ""
+        try:
+            tab = self._workspace.get_tab(tab_id)
+            if tab and hasattr(tab, "document_id"):
+                document_id = tab.document_id or ""
+        except Exception:
+            pass
+        
+        # Create a simple diff summary
+        old_len = len(old_content)
+        new_len = len(content)
+        diff = f"Full document replacement: {old_len} -> {new_len} chars"
+        
+        # Emit EditApplied event
+        event = EditApplied(
+            tab_id=tab_id,
+            document_id=document_id,
+            edit_id=edit_id,
+            action="write_document",
+            range=(0, old_len),
+            diff=diff,
+        )
+        self._event_bus.publish(event)
+        _LOGGER.debug(
+            "BridgeAdapter.set_document_content: emitted EditApplied, edit_id=%s",
+            edit_id,
+        )
 
     def get_version_token(self, tab_id: str) -> str | None:
         """Get current version token for a tab.

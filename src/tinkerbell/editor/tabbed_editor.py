@@ -62,6 +62,7 @@ class TabbedEditorWidget(QWidgetBase):
             workspace = DocumentWorkspace(editor_factory=editor_factory)
         self._workspace = workspace
         self._workspace.add_active_listener(self._handle_active_tab_changed)
+        self._workspace.add_tab_created_listener(self._on_workspace_tab_created)
 
         self._build_ui()
         existing_tabs = list(self._workspace.iter_tabs())
@@ -115,6 +116,14 @@ class TabbedEditorWidget(QWidgetBase):
 
     def toggle_preview(self) -> None:
         self._workspace.active_editor().toggle_preview()
+
+    def set_all_readonly(self, readonly: bool) -> None:
+        """Set all tabs to read-only or editable state.
+        
+        Used during AI turns to prevent user edits while AI is working.
+        """
+        for tab in self._workspace.iter_tabs():
+            tab.editor.set_readonly(readonly)
 
     def apply_theme(self, theme: Theme | str | None) -> Theme:
         resolved = load_theme(theme)
@@ -186,7 +195,7 @@ class TabbedEditorWidget(QWidgetBase):
             tab_id=tab_id,
             untitled_index=untitled_index,
         )
-        self._register_tab(tab)
+        # Tab registration is handled by _on_workspace_tab_created listener
         return tab
 
     def close_tab(self, tab_id: str) -> DocumentTab | None:
@@ -301,6 +310,16 @@ class TabbedEditorWidget(QWidgetBase):
     def _sync_active_tab(self) -> None:
         tab = self._workspace.active_tab
         self._handle_active_tab_changed(tab)
+
+    def _on_workspace_tab_created(self, tab: DocumentTab) -> None:
+        """Handle a new tab created directly on the workspace."""
+        # Avoid double-registration during __init__ which iterates existing tabs
+        if self._initializing:
+            return
+        # Already registered?
+        if id(tab.editor) in self._editor_lookup:
+            return
+        self._register_tab(tab)
 
     def _register_tab(self, tab: DocumentTab) -> None:
         self._editor_lookup[id(tab.editor)] = tab.id

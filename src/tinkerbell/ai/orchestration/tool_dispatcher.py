@@ -585,32 +585,54 @@ class ToolDispatcher:
         """
         if not token or ":" not in token:
             return InvalidVersionTokenError(
-                message="Invalid version_token format. Expected 'tab_id:version_id:hash'.",
+                message="Invalid version_token format. Expected 'tab_id:hash:version'.",
                 token=token,
             )
 
         parts = token.split(":")
-        if len(parts) < 2:
+        if len(parts) < 3:
             return InvalidVersionTokenError(
-                message="Invalid version_token format. Expected 'tab_id:version_id:hash'.",
+                message="Invalid version_token format. Expected 'tab_id:hash:version'.",
                 token=token,
             )
 
         tab_id = parts[0]
 
-        # Check if token is current
+        # Check if token is current using VersionToken.from_string and validate_token
         try:
-            parsed = self._version_manager.parse_token(token)
-            if not self._version_manager.is_current(parsed):
-                current = self._version_manager.get_current_token(tab_id)
-                return VersionMismatchToolError(
-                    message="Version token is stale. Document has been modified.",
-                    current_version={"token": current.to_string()} if current else None,
-                    your_version={"token": token},
-                )
-        except Exception:
-            # Token parsing failed - might be legacy format
-            LOGGER.debug("Version token validation failed for: %s", token)
+            from ...ai.tools.version import VersionToken, VersionMismatchError
+            
+            parsed = VersionToken.from_string(token)
+            self._version_manager.validate_token(parsed)
+        except VersionMismatchError as exc:
+            # Token is stale - document was modified
+            current = self._version_manager.get_current_token(tab_id)
+            return VersionMismatchToolError(
+                message=str(exc),
+                current_version={"token": current.to_string()} if current else None,
+                your_version={"token": token},
+            )
+        except KeyError:
+            # Tab not registered - likely closed or invalid tab_id
+            LOGGER.debug("Version token validation: tab not registered: %s", tab_id)
+            return InvalidVersionTokenError(
+                message=f"Tab '{tab_id}' is not registered or has been closed.",
+                token=token,
+            )
+        except ValueError as exc:
+            # Token parsing failed - malformed token
+            LOGGER.debug("Version token validation: parse error for %s: %s", token, exc)
+            # Provide more helpful guidance when token is clearly invalid
+            hint = ""
+            if token.startswith(":") or not parts[0]:
+                hint = " If no document is open, use 'create_document' first to create a new tab."
+            return InvalidVersionTokenError(
+                message=f"Invalid version token format: {exc}{hint}",
+                token=token,
+            )
+        except Exception as exc:
+            # Unexpected error - log but allow through for backwards compatibility
+            LOGGER.debug("Version token validation failed for %s: %s", token, exc)
 
         return None
 

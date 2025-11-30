@@ -17,6 +17,8 @@ from ..events import (
     AITurnFailed,
     AITurnStarted,
     AITurnStreamChunk,
+    AITurnToolExecuted,
+    EditorLockChanged,
     EventBus,
 )
 from ..models.ai_models import AITurnState, AITurnStatus
@@ -132,6 +134,9 @@ class AITurnManager:
             len(prompt),
         )
 
+        # Lock editor during AI turn
+        self._bus.publish(EditorLockChanged(locked=True, reason="AI_TURN"))
+
         # Emit started event
         self._bus.publish(AITurnStarted(turn_id=turn_id, prompt=prompt))
 
@@ -158,6 +163,9 @@ class AITurnManager:
                 self._current_turn.edit_count,
             )
 
+            # Unlock editor
+            self._bus.publish(EditorLockChanged(locked=False, reason=""))
+
             self._bus.publish(AITurnCompleted(
                 turn_id=turn_id,
                 success=True,
@@ -172,6 +180,8 @@ class AITurnManager:
             if self._current_turn:
                 self._current_turn.mark_canceled()
             LOGGER.debug("AITurnManager: turn canceled, turn_id=%s", turn_id)
+            # Unlock editor
+            self._bus.publish(EditorLockChanged(locked=False, reason=""))
             self._bus.publish(AITurnCanceled(turn_id=turn_id))
             raise
 
@@ -187,6 +197,8 @@ class AITurnManager:
                 error_msg,
             )
 
+            # Unlock editor
+            self._bus.publish(EditorLockChanged(locked=False, reason=""))
             self._bus.publish(AITurnFailed(turn_id=turn_id, error=error_msg))
             raise
 
@@ -230,6 +242,46 @@ class AITurnManager:
         if self._current_turn is not None:
             self._current_turn.edit_count += 1
 
+    async def suggest_followups(
+        self,
+        history: Sequence[Mapping[str, str]],
+        *,
+        max_suggestions: int = 4,
+    ) -> list[str]:
+        """Generate follow-up suggestions based on chat history.
+
+        Args:
+            history: Conversation history as role/content mappings.
+            max_suggestions: Maximum number of suggestions to generate.
+
+        Returns:
+            List of suggested follow-up prompts, or empty list if
+            orchestrator is unavailable or history is empty.
+        """
+        if not history:
+            return []
+
+        orchestrator = self._get_orchestrator()
+        if orchestrator is None:
+            LOGGER.debug("AITurnManager.suggest_followups: no orchestrator")
+            return []
+
+        suggest_method = getattr(orchestrator, "suggest_followups", None)
+        if not callable(suggest_method):
+            LOGGER.debug("AITurnManager.suggest_followups: orchestrator has no suggest_followups")
+            return []
+
+        try:
+            suggestions = await suggest_method(history, max_suggestions=max_suggestions)
+            LOGGER.debug(
+                "AITurnManager.suggest_followups: generated %d suggestions",
+                len(suggestions),
+            )
+            return suggestions
+        except Exception:
+            LOGGER.debug("AITurnManager.suggest_followups: error", exc_info=True)
+            return []
+
     # ------------------------------------------------------------------
     # Internal Helpers
     # ------------------------------------------------------------------
@@ -242,6 +294,7 @@ class AITurnManager:
         """Process a streaming event from the orchestrator.
 
         Extracts content chunks and emits AITurnStreamChunk events.
+        Also handles tool execution events.
         Also forwards to external handler if provided.
         """
         # Forward to external handler first
@@ -261,6 +314,62 @@ class AITurnManager:
                     turn_id=self._current_turn.turn_id,
                     content=str(content),
                 ))
+
+        # Handle tool call arguments done (tool is about to execute)
+        elif event_type == "tool_calls.function.arguments.done":
+            if self._current_turn:
+                tool_name = getattr(event, "tool_name", "") or ""
+                tool_call_id = getattr(event, "tool_call_id", "") or ""
+                arguments = getattr(event, "tool_arguments", "") or ""
+                self._bus.publish(AITurnToolExecuted(
+                    turn_id=self._current_turn.turn_id,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    arguments=arguments,
+                    result="(running…)",
+                    success=True,
+                    duration_ms=0.0,
+                ))
+
+        # Handle tool result (tool execution completed)
+        elif event_type == "tool_calls.result":
+            if self._current_turn:
+                tool_name = getattr(event, "tool_name", None) or ""
+                tool_call_id = getattr(event, "tool_call_id", "") or ""
+                content = getattr(event, "content", "") or ""
+                duration_ms = getattr(event, "duration_ms", 0.0) or 0.0
+                # Try to detect success from parsed result
+                parsed = getattr(event, "parsed", None)
+                success = True
+                if parsed is not None:
+                    success = self._detect_tool_success(parsed, content)
+                self._bus.publish(AITurnToolExecuted(
+                    turn_id=self._current_turn.turn_id,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    arguments="",
+                    result=content[:500] if content else "",  # Truncate for display
+                    success=success,
+                    duration_ms=duration_ms,
+                ))
+
+    def _detect_tool_success(self, parsed: Any, content: str) -> bool:
+        """Detect if a tool execution was successful from result."""
+        # Check parsed result for status field
+        if isinstance(parsed, dict):
+            status = parsed.get("status", "")
+            if isinstance(status, str):
+                status_lower = status.lower()
+                if status_lower in {"error", "failed", "failure"}:
+                    return False
+            # Check for error field
+            if parsed.get("error") or parsed.get("exception"):
+                return False
+        # Check content for error indicators
+        content_lower = (content or "").lower()
+        if content_lower.startswith("error:"):
+            return False
+        return True
 
     def _extract_response_text(self, result: Any) -> str:
         """Extract response text from orchestrator result.

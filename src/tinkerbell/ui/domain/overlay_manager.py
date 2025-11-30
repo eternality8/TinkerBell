@@ -49,6 +49,24 @@ class OverlayManager:
         self._bus = event_bus
         self._tabs_with_overlay: set[str] = set()
 
+    def set_callbacks(
+        self,
+        show_overlay: Callable[[str, tuple[tuple[int, int], ...], str | None, str | None, str | None], None],
+        clear_overlay: Callable[[str | None], None],
+    ) -> None:
+        """Update the overlay callbacks after construction.
+
+        This is useful when the editor widget is not available at
+        construction time but needs to be wired later.
+
+        Args:
+            show_overlay: Callback to show an overlay on a tab.
+            clear_overlay: Callback to clear an overlay from a tab.
+        """
+        self._show_overlay = show_overlay
+        self._clear_overlay = clear_overlay
+        LOGGER.debug("OverlayManager.set_callbacks: callbacks updated")
+
     # ------------------------------------------------------------------
     # Overlay Lifecycle
     # ------------------------------------------------------------------

@@ -411,6 +411,19 @@ def test_tool_trace_entry_marks_success_for_completed_output():
         assert status == expected_status, f"Expected '{expected_status}' for output '{output_summary}', got '{status}'"
 
 
+def test_tool_trace_entry_no_false_positive_on_errors_field():
+    """'errors': None in dict repr shouldn't trigger failure due to 'error' substring."""
+    panel = _make_panel()
+    
+    # This is the exact output format from transform_document when successful
+    dict_repr = "{'status': 'complete', 'chunks_processed': 1, 'chunks_failed': 0, 'total_replacements': 7, 'tokens_used': 0, 'errors': None}"
+    trace = ToolTrace(name="transform_document", input_summary="", output_summary=dict_repr)
+    
+    _, status = panel._format_tool_trace_entry(trace, 1)
+    # Should be success, not failure (the 'errors' field shouldn't match 'error' keyword)
+    assert status == "success", f"Expected 'success' for transform_document output with 'errors': None, got '{status}'"
+
+
 def test_chat_panel_suggestions_update_composer():
     panel = _make_panel()
     panel.set_suggestions(["Option A", "Option B"])

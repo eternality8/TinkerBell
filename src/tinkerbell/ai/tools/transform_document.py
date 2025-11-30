@@ -463,25 +463,37 @@ class TransformDocumentTool(SubagentTool):
         transform_type_str = params.get("transformation_type", "custom")
         transform_type = TransformationType(transform_type_str)
 
+        # Build chunk ordering for content reassembly
+        chunk_order = self._build_chunk_order(tasks)
+        
+        # Get output mode
+        output_mode_str = params.get("output_mode", "new_tab")
+        output_mode = OutputMode(output_mode_str)
+
         # Character rename can be done locally without LLM
         if transform_type == TransformationType.CHARACTER_RENAME:
-            return self._execute_sync(context, tasks)
+            aggregated = self._execute_sync(context, tasks, chunk_order)
+            return self._apply_output_mode(context, params, aggregated, output_mode)
 
         # For LLM-based transformations, use async execution if orchestrator available
         if self.orchestrator and self.orchestrator._executor is not None:
-            return self._execute_async(context, params, tasks)
+            return self._execute_async(context, params, tasks, chunk_order)
 
         # Fall back to sync execution (which will return errors without executor)
-        return self._execute_sync(context, tasks)
+        aggregated = self._execute_sync(context, tasks, chunk_order)
+        return self._apply_output_mode(context, params, aggregated, output_mode)
 
     async def _execute_async(
         self,
         context: ToolContext,
         params: dict[str, Any],
         tasks: list[dict[str, Any]],
+        chunk_order: list[tuple[str, int]],
     ) -> dict[str, Any]:
         """Execute transformation asynchronously using the orchestrator."""
         transform_type_str = params.get("transformation_type", "custom")
+        output_mode_str = params.get("output_mode", "new_tab")
+        output_mode = OutputMode(output_mode_str)
 
         # Convert task dicts to SubagentTask objects
         subagent_tasks = []
@@ -506,15 +518,17 @@ class TransformDocumentTool(SubagentTool):
         # Run all tasks through orchestrator
         results = await self.orchestrator.run_tasks(subagent_tasks, parallel=True)
 
-        # Aggregate results
-        aggregated = self._aggregate_results(results, transform_type_str)
+        # Aggregate results with chunk ordering for content reassembly
+        aggregated = self._aggregate_results(results, transform_type_str, chunk_order)
 
-        return aggregated
+        # Apply output mode
+        return self._apply_output_mode(context, params, aggregated, output_mode)
 
     def _execute_sync(
         self,
         context: ToolContext,
         tasks: list[dict[str, Any]],
+        chunk_order: list[tuple[str, int]],
     ) -> dict[str, Any]:
         """Execute transformation synchronously (for local transformations)."""
         results = []
@@ -527,8 +541,8 @@ class TransformDocumentTool(SubagentTool):
                 LOGGER.warning("Subagent task failed: %s", exc)
                 errors.append({"task": task, "error": str(exc)})
 
-        # Aggregate results
-        aggregated = self.aggregate(results)
+        # Aggregate results with chunk ordering
+        aggregated = self._aggregate_sync_results(results, chunk_order)
 
         # Include error info if any
         if errors:
@@ -538,14 +552,55 @@ class TransformDocumentTool(SubagentTool):
 
         return aggregated
 
+    def _build_chunk_order(self, tasks: list[dict[str, Any]]) -> list[tuple[str, int]]:
+        """Build chunk ordering from tasks for content reassembly.
+        
+        Args:
+            tasks: List of task dicts, each containing a 'chunk' ChunkSpec.
+        
+        Returns:
+            List of (chunk_id, start_char) tuples.
+        """
+        order = []
+        for task in tasks:
+            chunk: ChunkSpec = task["chunk"]
+            order.append((chunk.chunk_id, chunk.start_char))
+        return order
+
+    def _aggregate_sync_results(
+        self,
+        results: list[dict[str, Any]],
+        chunk_order: list[tuple[str, int]],
+    ) -> dict[str, Any]:
+        """Aggregate sync execution results with content reassembly."""
+        # Convert dict results to SubagentResult objects
+        subagent_results = []
+        for r in results:
+            if isinstance(r, SubagentResult):
+                subagent_results.append(r)
+            else:
+                subagent_results.append(SubagentResult(
+                    task_id=r.get("task_id", "unknown"),
+                    success=r.get("success", False),
+                    output=r.get("output", {}),
+                    error=r.get("error"),
+                    chunk_id=r.get("chunk_id", ""),
+                    tokens_used=r.get("tokens_used", 0),
+                ))
+
+        # Use the transform aggregator with chunk ordering
+        aggregator = TransformAggregator()
+        return aggregator.aggregate(subagent_results, chunk_order)
+
     def _aggregate_results(
         self,
         results: list[SubagentResult],
         transformation_type: str,
+        chunk_order: list[tuple[str, int]],
     ) -> dict[str, Any]:
         """Aggregate SubagentResult objects into final output."""
         aggregator = TransformAggregator()
-        aggregated = aggregator.aggregate(results)
+        aggregated = aggregator.aggregate(results, chunk_order)
 
         # Add transformation-specific summary
         successful = [r for r in results if r.success]
@@ -562,6 +617,120 @@ class TransformDocumentTool(SubagentTool):
                 for r in failed
             ]
 
+        return aggregated
+
+    def _apply_output_mode(
+        self,
+        context: ToolContext,
+        params: dict[str, Any],
+        aggregated: dict[str, Any],
+        output_mode: OutputMode,
+    ) -> dict[str, Any]:
+        """Apply output mode to the aggregated transformation results.
+        
+        Args:
+            context: Tool execution context.
+            params: Original tool parameters.
+            aggregated: Aggregated transformation results including transformed_content.
+            output_mode: How to output the results.
+        
+        Returns:
+            Updated aggregated result with output mode applied.
+        """
+        transformed_content = aggregated.get("transformed_content")
+        
+        # If transformation failed or no content, return as-is
+        if aggregated.get("status") != "complete" or transformed_content is None:
+            LOGGER.debug(
+                "Cannot apply output_mode=%s: status=%s, has_content=%s",
+                output_mode.value,
+                aggregated.get("status"),
+                transformed_content is not None,
+            )
+            return aggregated
+        
+        if output_mode == OutputMode.PREVIEW:
+            # Preview mode: just return the content without applying
+            aggregated["preview"] = transformed_content
+            # Remove transformed_content from output to keep it clean
+            # (preview is the explicit field for this mode)
+            return aggregated
+        
+        if output_mode == OutputMode.NEW_TAB:
+            return self._apply_new_tab_mode(context, params, aggregated, transformed_content)
+        
+        if output_mode == OutputMode.IN_PLACE:
+            return self._apply_in_place_mode(context, params, aggregated, transformed_content)
+        
+        # Unknown mode, just return
+        LOGGER.warning("Unknown output_mode: %s", output_mode)
+        return aggregated
+
+    def _apply_new_tab_mode(
+        self,
+        context: ToolContext,
+        params: dict[str, Any],
+        aggregated: dict[str, Any],
+        transformed_content: str,
+    ) -> dict[str, Any]:
+        """Create a new tab with the transformed content."""
+        if self.document_editor is None:
+            LOGGER.warning("Cannot create new tab: document_editor not configured")
+            aggregated["output_mode_error"] = "document_editor not configured"
+            return aggregated
+        
+        # Generate a title for the new tab
+        transform_type = params.get("transformation_type", "transformed")
+        source_tab_id = params.get("tab_id", "unknown")
+        title = f"{source_tab_id} ({transform_type})"
+        
+        try:
+            new_tab_id = self.document_editor.create_document(title, transformed_content)
+            if new_tab_id:
+                aggregated["output_tab_id"] = new_tab_id
+                LOGGER.info(
+                    "Created new tab %s with transformed content (%d chars)",
+                    new_tab_id,
+                    len(transformed_content),
+                )
+            else:
+                aggregated["output_mode_error"] = "Failed to create new tab"
+                LOGGER.warning("create_document returned None")
+        except Exception as exc:
+            LOGGER.exception("Failed to create new tab: %s", exc)
+            aggregated["output_mode_error"] = f"Failed to create new tab: {exc}"
+        
+        return aggregated
+
+    def _apply_in_place_mode(
+        self,
+        context: ToolContext,
+        params: dict[str, Any],
+        aggregated: dict[str, Any],
+        transformed_content: str,
+    ) -> dict[str, Any]:
+        """Apply transformation in-place to the source document."""
+        if self.document_editor is None:
+            LOGGER.warning("Cannot apply in-place: document_editor not configured")
+            aggregated["output_mode_error"] = "document_editor not configured"
+            return aggregated
+        
+        tab_id = context.require_tab_id(params.get("tab_id"))
+        
+        try:
+            self.document_editor.set_document_text(tab_id, transformed_content)
+            # Note: A new version token should be obtained after the edit
+            # For now, we just mark it as applied
+            aggregated["applied_in_place"] = True
+            LOGGER.info(
+                "Applied transformation in-place to tab %s (%d chars)",
+                tab_id,
+                len(transformed_content),
+            )
+        except Exception as exc:
+            LOGGER.exception("Failed to apply in-place: %s", exc)
+            aggregated["output_mode_error"] = f"Failed to apply in-place: {exc}"
+        
         return aggregated
 
     def plan(
@@ -623,25 +792,15 @@ class TransformDocumentTool(SubagentTool):
         return tasks
 
     def aggregate(self, results: list[dict[str, Any]]) -> dict[str, Any]:
-        """Aggregate transformation results from all chunks."""
-        # Convert dict results to SubagentResult objects
-        subagent_results = []
-        for r in results:
-            if isinstance(r, SubagentResult):
-                subagent_results.append(r)
-            else:
-                subagent_results.append(SubagentResult(
-                    task_id=r.get("task_id", "unknown"),
-                    success=r.get("success", False),
-                    output=r.get("output", {}),
-                    error=r.get("error"),
-                    chunk_id=r.get("chunk_id", ""),
-                    tokens_used=r.get("tokens_used", 0),
-                ))
-
-        # Use the transform aggregator
-        aggregator = TransformAggregator()
-        return aggregator.aggregate(subagent_results)
+        """Aggregate transformation results from all chunks.
+        
+        This is the abstract method implementation required by SubagentTool.
+        It delegates to _aggregate_sync_results without chunk ordering,
+        which means transformed_content won't be reassembled.
+        For full content reassembly, use _aggregate_sync_results directly.
+        """
+        # Without chunk ordering, we can't reassemble content
+        return self._aggregate_sync_results(results, chunk_order=[])
 
     def execute_subagent(
         self,

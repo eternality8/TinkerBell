@@ -510,8 +510,8 @@ TAB_ID_PARAM = ParameterSchema(
     name="tab_id",
     type="string",
     description=(
-        "The tab_id from list_tabs (e.g., '38b454b7b3274ffa90660bb5bc1b6017'). "
-        "Tab IDs are opaque strings, NOT document titles. "
+        "The tab_id from list_tabs (e.g., 't1', 't2'). "
+        "Tab IDs are short opaque strings, NOT document titles. "
         "Call list_tabs first to get valid tab_ids. "
         "If omitted, uses the currently active tab."
     ),
@@ -546,7 +546,7 @@ MAX_LINES_PARAM = ParameterSchema(
 LIST_TABS_SCHEMA = ToolSchema(
     name="list_tabs",
     description=(
-        "List all open document tabs. Returns tab_id (opaque identifier like '38b454b7b3274ffa90660bb5bc1b6017'), "
+        "List all open document tabs. Returns tab_id (short identifier like 't1', 't2'), "
         "title (human-readable name), and status for each tab. "
         "CALL THIS FIRST to get valid tab_ids for use with read_document and other tools. "
         "Do NOT use document titles as tab_ids."

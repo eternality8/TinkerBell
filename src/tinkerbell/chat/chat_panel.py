@@ -19,6 +19,7 @@ the headless tests simple while remaining Qt-friendly for the full app.
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, List, Mapping, Optional, Protocol, Sequence, cast
@@ -1215,8 +1216,13 @@ class ChatPanel(QWidgetBase):
     def _looks_like_failure(self, summary_lower: str) -> bool:
         if not summary_lower:
             return False
+        # Use word boundary check to avoid false positives (e.g., "errors" matching "error")
         keywords = ("error", "failed", "failure", "denied", "blocked", "timeout", "exception", "rejected", "aborted")
-        return any(token in summary_lower for token in keywords)
+        for token in keywords:
+            # Match token as a standalone word or at common boundaries (colon, quotes)
+            if re.search(rf'(?:^|[:\s"\'])({token})(?:$|[:\s"\',])', summary_lower):
+                return True
+        return False
 
     def _looks_like_success(self, summary_lower: str) -> bool:
         if not summary_lower:

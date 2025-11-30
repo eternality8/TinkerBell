@@ -51,7 +51,7 @@ def system_prompt_v2(*, model_name: str | None = None) -> str:
 
 ## IMPORTANT: Tab IDs
 
-Tab IDs are opaque identifiers (like "38b454b7b3274ffa90660bb5bc1b6017"), NOT document titles.
+Tab IDs are short identifiers (like "t1", "t2"), NOT document titles.
 - To work with the active document: omit tab_id (read_document will use the active tab)
 - To work with a specific document: call list_tabs first to get valid tab_ids
 - NEVER use document titles or names as tab_ids
@@ -94,7 +94,7 @@ def _workflow_section() -> str:
    **To read a specific document:**
    ```
    list_tabs() → tabs with tab_id for each
-   read_document(tab_id="38b454b7b3274ffa90660bb5bc1b6017") → version_token, content
+   read_document(tab_id="t1") → version_token, content
    ```
 
 2. **Choose Edit Tool**

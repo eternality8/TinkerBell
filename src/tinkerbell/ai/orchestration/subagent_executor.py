@@ -268,6 +268,11 @@ def normalize_analysis_result(
         result.setdefault("motifs", [])
         result.setdefault("subtext", None)
     
+    elif analysis_type == "custom":
+        # For custom analysis, if there's no "custom" key, wrap the entire response
+        if "custom" not in result:
+            result = {"custom": result}
+    
     return result
 
 
@@ -381,11 +386,19 @@ class SubagentExecutor(SubagentExecutorProtocol):
             return result
             
         except asyncio.CancelledError:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            LOGGER.warning(
+                "Subagent task %s was cancelled after %.1fms (chunk=%s, type=%s)",
+                task.task_id,
+                elapsed_ms,
+                task.chunk.chunk_id,
+                task.subagent_type.value,
+            )
             return SubagentResult(
                 task_id=task.task_id,
                 success=False,
-                error="Task cancelled",
-                latency_ms=(time.perf_counter() - start_time) * 1000.0,
+                error=f"Task cancelled after {elapsed_ms:.0f}ms",
+                latency_ms=elapsed_ms,
                 chunk_id=task.chunk.chunk_id,
             )
         except Exception as exc:
@@ -606,6 +619,7 @@ class SubagentExecutor(SubagentExecutorProtocol):
             Response text
         """
         full_response: list[str] = []
+        final_content: str | None = None
         
         async for event in self._client.stream_chat(
             messages=messages,
@@ -615,10 +629,11 @@ class SubagentExecutor(SubagentExecutorProtocol):
             if event.type == "content.delta" and event.content:
                 full_response.append(event.content)
             elif event.type == "content.done" and event.content:
-                # Use final content if available
-                return event.content
+                # Capture final content but let the generator complete naturally
+                final_content = event.content
         
-        return "".join(full_response)
+        # Prefer final content if available, otherwise join deltas
+        return final_content if final_content is not None else "".join(full_response)
     
     def _estimate_tokens_used(
         self,

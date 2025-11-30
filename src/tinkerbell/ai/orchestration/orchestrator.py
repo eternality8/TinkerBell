@@ -207,6 +207,7 @@ class _DispatcherToolExecutor:
                     content=result_str,
                     tool_index=self._tool_index,
                     parsed=result.result if result.success else None,
+                    duration_ms=result.execution_time_ms,
                 )
                 self._event_callback(result_event)
             except Exception:
@@ -714,8 +715,10 @@ class AIOrchestrator:
         """Cancel the active chat turn."""
         task = self._active_task
         if task and not task.done():
-            LOGGER.debug("Cancelling active chat task")
+            LOGGER.info("Cancelling active chat task (caller requested cancellation)")
             task.cancel()
+        else:
+            LOGGER.debug("cancel() called but no active task to cancel")
 
     async def aclose(self) -> None:
         """Close the orchestrator and clean up resources."""
@@ -977,3 +980,4 @@ class _ToolResultEvent:
     tool_index: int = 0
     type: str = "tool_calls.result"
     parsed: Any = None  # Parsed result object for status detection
+    duration_ms: float = 0.0  # Execution time in milliseconds

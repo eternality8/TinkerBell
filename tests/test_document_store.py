@@ -67,6 +67,7 @@ class MockWorkspace:
         title: str | None = None,
         path: Any = None,
         make_active: bool = True,
+        untitled_index: int | None = None,
     ) -> MockDocumentTab:
         tab_id = f"t{self._tab_counter}"
         self._tab_counter += 1

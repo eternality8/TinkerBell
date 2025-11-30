@@ -63,6 +63,45 @@ def split_lines(text: str) -> list[str]:
 
 
 # -----------------------------------------------------------------------------
+# Content-based Format Detection
+# -----------------------------------------------------------------------------
+
+
+def _looks_like_markdown(text: str) -> bool:
+    """Check if content appears to be markdown format.
+    
+    Used for untitled documents where file extension is not available.
+    Checks for common markdown indicators like ATX headings, lists, blockquotes.
+    
+    Args:
+        text: Document content to check.
+        
+    Returns:
+        True if content appears to be markdown.
+    """
+    if not text:
+        return False
+    # Check first non-empty line for markdown heading
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            # ATX heading at start
+            if stripped.startswith("#"):
+                return True
+            break
+    # Check for markdown patterns anywhere in first 500 chars
+    sample = text[:500]
+    # List items, blockquotes, code fences
+    if re.search(r"^[\*\-\+]\s+", sample, re.MULTILINE):
+        return True
+    if re.search(r"^>\s+", sample, re.MULTILINE):
+        return True
+    if "```" in sample:
+        return True
+    return False
+
+
+# -----------------------------------------------------------------------------
 # Markdown Outline Detection
 # -----------------------------------------------------------------------------
 
@@ -364,22 +403,31 @@ def _detect_caps_headings(lines: list[str]) -> list[OutlineNode]:
     return nodes
 
 
-def _detect_paragraph_sections(lines: list[str], min_gap: int = 2) -> list[OutlineNode]:
+def _detect_paragraph_sections(lines: list[str], min_gap: int = 1) -> list[OutlineNode]:
     """Detect sections based on paragraph breaks.
 
-    This is a fallback for unstructured text.
+    This is a fallback for unstructured text. It looks for blank lines
+    separating paragraphs and creates outline entries for substantial
+    paragraphs.
+    
+    Args:
+        lines: Document lines.
+        min_gap: Minimum number of blank lines to consider a section break.
+                 Default is 1 (single blank line between paragraphs).
     """
     nodes: list[OutlineNode] = []
     blank_count = 0
-    section_start = 0
     section_num = 1
+    in_section = False
 
     for i, line in enumerate(lines):
         if not line.strip():
             blank_count += 1
+            in_section = False
         else:
-            if blank_count >= min_gap and i > 0:
-                # Found a section break
+            # Start of content after blank line(s)
+            if blank_count >= min_gap or i == 0:
+                # Found a section break (or start of document)
                 # Get first line of new section as title
                 title = line.strip()[:50]
                 if len(line.strip()) > 50:
@@ -391,10 +439,12 @@ def _detect_paragraph_sections(lines: list[str], min_gap: int = 2) -> list[Outli
                     line_start=i,
                 ))
                 section_num += 1
+                in_section = True
             blank_count = 0
 
-    # Only return if we found meaningful sections
-    if len(nodes) >= 2:
+    # Only return if we found meaningful sections (at least 3 paragraphs)
+    # This avoids creating outline for very short documents
+    if len(nodes) >= 3:
         return nodes
     return []
 
@@ -533,8 +583,19 @@ class GetOutlineTool(ReadOnlyTool):
             nodes, detection_method = detect_yaml_outline(content)
             confidence = "high" if nodes else "medium"
         else:
-            # Plain text heuristics
-            nodes, detection_method, confidence = detect_plaintext_outline(content)
+            # For plain_text, check if content looks like markdown first
+            # This handles untitled documents that contain markdown formatting
+            if _looks_like_markdown(content):
+                nodes, detection_method = detect_markdown_outline(content)
+                if nodes:
+                    file_type = "markdown"  # Update file_type for response
+                    confidence = "high"
+                else:
+                    # Has markdown indicators but no headings found
+                    nodes, detection_method, confidence = detect_plaintext_outline(content)
+            else:
+                # Plain text heuristics
+                nodes, detection_method, confidence = detect_plaintext_outline(content)
 
         # Register version
         content_hash = compute_content_hash(content)

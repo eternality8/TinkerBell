@@ -444,7 +444,7 @@ class StatusBar:
         """Reflect the current AI controller state (Idle, Thinking, Streaming)."""
 
         self._ai_state = self._coerce_state(state)
-        self._update_label(self._ai_label, self._ai_state)
+        self._update_label(self._ai_label, self._format_ai_text())
 
     def set_memory_usage(self, usage: str, *, totals: str | None = None, last_tool: str | None = None) -> None:
         """Display the latest memory usage summary (e.g., autosave + tokens)."""
@@ -549,12 +549,24 @@ class StatusBar:
         except Exception:
             pass
 
+    def set_lock_state(self, locked: bool, *, reason: str = "") -> None:
+        """Update the editor lock indicator (padlock symbol).
+        
+        Args:
+            locked: Whether the editor is currently locked.
+            reason: Optional reason explaining why (shown as tooltip).
+        """
+        self._lock_indicator.set_locked(locked, reason)
+
     def set_editor_lock_state(self, locked: bool, message: str = "") -> None:
         """Update the editor lock indicator (padlock symbol).
         
         Args:
             locked: Whether the editor is currently locked.
             message: Optional tooltip/message explaining why.
+        
+        Note:
+            This is an alias for set_lock_state for backwards compatibility.
         """
         self._lock_indicator.set_locked(locked, message)
 
@@ -696,7 +708,7 @@ class StatusBar:
         self._cursor_label.setObjectName("tb-status-cursor")
         self._format_label = QLabel(self._document_format.upper())
         self._format_label.setObjectName("tb-status-format")
-        self._ai_label = QLabel(self._ai_state)
+        self._ai_label = QLabel(self._format_ai_text())
         self._ai_label.setObjectName("tb-status-ai")
         self._outline_label = QLabel(self._format_outline_text())
         self._outline_label.setObjectName("tb-status-outline")
@@ -738,10 +750,17 @@ class StatusBar:
         # of the permanent widget area (before all the status labels)
         self._review_controls.install(self._qt_bar)
 
+        # Add AI label to the LEFT side of the status bar (non-permanent widget)
+        self._ai_label.setContentsMargins(8, 0, 8, 0)
+        try:
+            self._qt_bar.addWidget(self._ai_label)
+        except Exception:
+            pass
+
+        # Add remaining labels as permanent widgets (right side)
         for label in (
             self._cursor_label,
             self._format_label,
-            self._ai_label,
             self._outline_label,
             self._embedding_label,
             self._autosave_label,
@@ -793,13 +812,11 @@ class StatusBar:
 
     def _format_embedding_text(self) -> str:
         parts: list[str] = []
-        base = ""
         if self._embedding_status:
             base = f"Embeddings: {self._embedding_status}"
-        elif self._embedding_processing:
-            base = "Embeddings"
-        if base:
-            parts.append(base)
+        else:
+            base = "Embeddings: Idle"
+        parts.append(base)
         if self._embedding_processing:
             parts.append("Processing...")
         return " · ".join(parts)
@@ -812,8 +829,12 @@ class StatusBar:
             parts.append(self._embedding_processing_detail or "Embeddings are processing.")
         return " ".join(part for part in parts if part).strip()
 
+    def _format_ai_text(self) -> str:
+        return f"AI: {self._ai_state}"
+
     def _format_subagent_text(self) -> str:
-        return f"Subagents: {self._subagent_status}" if self._subagent_status else ""
+        status = self._subagent_status or "Idle"
+        return f"Subagents: {status}"
 
     def _format_chunk_flow_text(self) -> str:
         return f"Chunk Flow: {self._chunk_flow_status}" if self._chunk_flow_status else ""

@@ -333,6 +333,21 @@ class AppCoordinator:
             LOGGER.debug("AppCoordinator.save_document_as: %s", exc)
             return None
 
+    def save_workspace_state(self) -> bool:
+        """Save the current workspace state to settings.
+
+        Returns:
+            True if workspace state was saved successfully.
+        """
+        workspace = self._document_store.workspace
+        workspace_state = workspace.serialize_state()
+        settings = self._settings_provider() if self._settings_provider else None
+        return self._session_store.sync_workspace_state(
+            workspace_state,
+            settings,
+            persist=True,
+        )
+
     def close_document(self, tab_id: str | None = None) -> bool:
         """Close a document tab.
 
@@ -406,6 +421,28 @@ class AppCoordinator:
         """
         uc = self._get_cancel_ai_turn_uc()
         return uc.execute()
+
+    async def suggest_followups(
+        self,
+        history: Sequence[Mapping[str, str]],
+        *,
+        max_suggestions: int = 4,
+    ) -> list[str]:
+        """Generate follow-up suggestions based on chat history.
+
+        Args:
+            history: Conversation history as role/content mappings.
+            max_suggestions: Maximum number of suggestions to generate.
+
+        Returns:
+            List of suggested follow-up prompts.
+        """
+        if self._ai_turn_manager is None:
+            return []
+        return await self._ai_turn_manager.suggest_followups(
+            history,
+            max_suggestions=max_suggestions,
+        )
 
     # ------------------------------------------------------------------
     # Review Operations
@@ -500,6 +537,93 @@ class AppCoordinator:
         tab = self._document_store.active_tab
         return tab.id if tab else None
 
+    @property
+    def active_tab(self) -> Any:
+        """Get the active tab, if any."""
+        return self._document_store.active_tab
+
+    # ------------------------------------------------------------------
+    # Document Status
+    # ------------------------------------------------------------------
+
+    def get_document_descriptors(self) -> list["DocumentDescriptor"]:
+        """Get descriptors for all open documents.
+
+        Returns:
+            List of DocumentDescriptor for each open tab.
+        """
+        from ..document_status import DocumentDescriptor
+
+        descriptors = []
+        for tab in self._document_store.iter_tabs():
+            doc = tab.document
+            label = tab.title or doc.path.name if doc.path else f"Untitled {tab.id}"
+            descriptors.append(DocumentDescriptor(
+                document_id=doc.document_id,
+                label=label,
+                tab_id=tab.id,
+            ))
+        return descriptors
+
+    def get_document_status(self, document_id: str | None = None) -> dict[str, Any]:
+        """Get the status payload for a document.
+
+        Args:
+            document_id: The document ID to get status for.
+                        If None, uses the active document.
+
+        Returns:
+            Status payload dictionary with document metadata.
+        """
+        # Find the document
+        doc = None
+        tab = None
+
+        if document_id is not None:
+            doc = self._document_store.find_document_by_id(document_id)
+            # Find the tab for this document
+            for t in self._document_store.iter_tabs():
+                if t.document.document_id == document_id:
+                    tab = t
+                    break
+        else:
+            tab = self._document_store.active_tab
+            if tab is not None:
+                doc = tab.document
+
+        if doc is None:
+            return {"document": {"document_id": document_id or "unknown"}, "error": "Document not found"}
+
+        # Build basic document info
+        doc_payload: dict[str, Any] = {
+            "document_id": doc.document_id,
+            "path": str(doc.path) if doc.path else None,
+            "label": tab.title if tab else doc.path.name if doc.path else "Untitled",
+            "dirty": doc.dirty,
+            "line_count": len(doc.content.splitlines()) if doc.content else 0,
+            "char_count": len(doc.content) if doc.content else 0,
+        }
+
+        # Try to get snapshot data for richer status
+        snapshot_data: dict[str, Any] = {}
+        if self._snapshot_provider is not None:
+            tab_id = tab.id if tab else None
+            try:
+                snapshot_data = self._snapshot_provider.generate_snapshot(tab_id=tab_id) or {}
+            except Exception:
+                LOGGER.debug("Failed to generate snapshot for status", exc_info=True)
+
+        return {
+            "document": doc_payload,
+            "chunks": snapshot_data.get("chunks", {}),
+            "outline": snapshot_data.get("outline", {}),
+            "plot": snapshot_data.get("plot", {}),
+            "telemetry": snapshot_data.get("telemetry", {}),
+            "concordance": snapshot_data.get("concordance", {}),
+            "planner": snapshot_data.get("planner", {}),
+            "summary": f"Document: {doc_payload['label']}",
+        }
+
     # ------------------------------------------------------------------
     # Use Case Factory Methods (Lazy Initialization)
     # ------------------------------------------------------------------
@@ -577,7 +701,6 @@ class AppCoordinator:
                 review_manager=self._review_manager,
                 overlay_manager=self._overlay_manager,
                 event_bus=self._event_bus,
-                cache_provider=self._cache_provider,
             )
         return self._restore_workspace_uc
 

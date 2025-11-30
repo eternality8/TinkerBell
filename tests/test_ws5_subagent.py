@@ -569,6 +569,75 @@ class TestTransformAggregator:
         assert aggregated["total_replacements"] == 8
         assert aggregated["tokens_used"] == 180
 
+    def test_aggregate_with_chunk_order_reassembles_content(self):
+        """Content is reassembled when chunk_order is provided."""
+        agg = TransformAggregator()
+        results = [
+            SubagentResult(
+                task_id="t1",
+                success=True,
+                output={"replacements": 1, "transformed_content": "First part. "},
+                chunk_id="c1",
+                tokens_used=50,
+            ),
+            SubagentResult(
+                task_id="t2",
+                success=True,
+                output={"replacements": 1, "transformed_content": "Second part."},
+                chunk_id="c2",
+                tokens_used=50,
+            ),
+        ]
+        # Provide chunk ordering (c1 at position 0, c2 at position 100)
+        chunk_order = [("c1", 0), ("c2", 100)]
+
+        aggregated = agg.aggregate(results, chunk_order)
+
+        assert aggregated["status"] == "complete"
+        assert aggregated["transformed_content"] == "First part. Second part."
+
+    def test_aggregate_without_chunk_order_no_content(self):
+        """Content is NOT reassembled when chunk_order is empty."""
+        agg = TransformAggregator()
+        results = [
+            SubagentResult(
+                task_id="t1",
+                success=True,
+                output={"replacements": 1, "transformed_content": "Transformed"},
+                chunk_id="c1",
+            ),
+        ]
+
+        aggregated = agg.aggregate(results, chunk_order=[])
+
+        assert "transformed_content" not in aggregated
+
+    def test_aggregate_reassembles_in_correct_order(self):
+        """Chunks are reassembled in start_char order, not task order."""
+        agg = TransformAggregator()
+        # Results may come back in any order
+        results = [
+            SubagentResult(
+                task_id="t2",
+                success=True,
+                output={"replacements": 0, "transformed_content": "SECOND"},
+                chunk_id="c2",
+            ),
+            SubagentResult(
+                task_id="t1",
+                success=True,
+                output={"replacements": 0, "transformed_content": "FIRST"},
+                chunk_id="c1",
+            ),
+        ]
+        # Chunk order specifies c1 is first (start_char=0), c2 is second (start_char=10)
+        chunk_order = [("c2", 10), ("c1", 0)]
+
+        aggregated = agg.aggregate(results, chunk_order)
+
+        # Should be FIRSTSECOND, not SECONDFIRST
+        assert aggregated["transformed_content"] == "FIRSTSECOND"
+
 
 # =============================================================================
 # WS5.2: analyze_document Tool Tests
@@ -944,6 +1013,87 @@ class TestTransformDocumentTool:
         assert result["success"]
         assert "Carol" in result["output"]["transformed_content"]
         assert result["output"]["replacements"] == 1
+
+    def test_build_chunk_order(self, tool_context: ToolContext):
+        """_build_chunk_order extracts chunk ordering from tasks."""
+        tool = TransformDocumentTool()
+        tasks = [
+            {"chunk": ChunkSpec("c1", "d1", "First chunk", start_char=0)},
+            {"chunk": ChunkSpec("c2", "d1", "Second chunk", start_char=100)},
+            {"chunk": ChunkSpec("c3", "d1", "Third chunk", start_char=50)},
+        ]
+        
+        order = tool._build_chunk_order(tasks)
+        
+        assert len(order) == 3
+        assert order[0] == ("c1", 0)
+        assert order[1] == ("c2", 100)
+        assert order[2] == ("c3", 50)
+
+    def test_apply_output_mode_preview(self, tool_context: ToolContext):
+        """Preview mode adds preview field without applying changes."""
+        from tinkerbell.ai.tools.transform_document import OutputMode
+        
+        tool = TransformDocumentTool()
+        aggregated = {
+            "status": "complete",
+            "transformed_content": "Transformed text here",
+            "chunks_processed": 1,
+        }
+        
+        result = tool._apply_output_mode(
+            tool_context,
+            {"transformation_type": "character_rename"},
+            aggregated,
+            OutputMode.PREVIEW,
+        )
+        
+        assert result["preview"] == "Transformed text here"
+
+    def test_apply_output_mode_new_tab_without_editor(self, tool_context: ToolContext):
+        """new_tab mode without editor reports error."""
+        from tinkerbell.ai.tools.transform_document import OutputMode
+        
+        tool = TransformDocumentTool()
+        # No document_editor configured
+        aggregated = {
+            "status": "complete",
+            "transformed_content": "Transformed text here",
+            "chunks_processed": 1,
+        }
+        
+        result = tool._apply_output_mode(
+            tool_context,
+            {"transformation_type": "character_rename"},
+            aggregated,
+            OutputMode.NEW_TAB,
+        )
+        
+        assert "output_mode_error" in result
+        assert "document_editor not configured" in result["output_mode_error"]
+
+    def test_apply_output_mode_skipped_on_failure(self, tool_context: ToolContext):
+        """Output mode is skipped when transformation failed."""
+        from tinkerbell.ai.tools.transform_document import OutputMode
+        
+        tool = TransformDocumentTool()
+        aggregated = {
+            "status": "partial",  # Not complete
+            "transformed_content": "Some content",
+            "chunks_processed": 1,
+            "chunks_failed": 1,
+        }
+        
+        result = tool._apply_output_mode(
+            tool_context,
+            {"transformation_type": "character_rename"},
+            aggregated,
+            OutputMode.NEW_TAB,
+        )
+        
+        # Should return unchanged - no output_tab_id or error
+        assert "output_tab_id" not in result
+        assert "output_mode_error" not in result
 
 
 class TestCheckTransformationConsistency:

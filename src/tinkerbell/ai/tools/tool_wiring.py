@@ -403,6 +403,10 @@ def register_new_tools(ctx: ToolWiringContext) -> ToolRegistrationResult:
         if orchestrator is not None:
             transform_tool.orchestrator = orchestrator
             LOGGER.debug("Configured transform_document with LLM orchestrator")
+        # Wire document_editor for output_mode support (new_tab, in_place)
+        if ctx.document_creator is not None:
+            transform_tool.document_editor = ctx.document_creator
+            LOGGER.debug("Configured transform_document with document_editor")
         _safe_register("transform_document", transform_tool, TRANSFORM_DOCUMENT_SCHEMA)
     except Exception as exc:
         LOGGER.warning("Failed to create transform_document tool: %s", exc)

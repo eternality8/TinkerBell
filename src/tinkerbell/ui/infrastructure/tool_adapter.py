@@ -44,12 +44,16 @@ class _DocumentCreatorAdapter:
 
     This adapter can work with either a TabbedEditorWidget (preferred, for full
     Qt UI integration) or a DocumentWorkspace (for tests without Qt).
+    
+    When an event_bus is provided, the adapter publishes DocumentCreated events
+    to enable edit tracking for the accept/reject workflow.
     """
 
-    __slots__ = ("_editor_or_workspace",)
+    __slots__ = ("_editor_or_workspace", "_event_bus")
 
-    def __init__(self, editor_or_workspace: Any) -> None:
+    def __init__(self, editor_or_workspace: Any, event_bus: EventBus | None = None) -> None:
         self._editor_or_workspace = editor_or_workspace
+        self._event_bus = event_bus
 
     def create_document(
         self,
@@ -73,6 +77,20 @@ class _DocumentCreatorAdapter:
         # Create the tab using create_tab() - works for both
         # TabbedEditorWidget and DocumentWorkspace
         tab = self._editor_or_workspace.create_tab(document=doc, title=title, make_active=True)
+        
+        # Publish DocumentCreated event for edit tracking
+        # This ensures the edit count is incremented when AI creates documents
+        if self._event_bus is not None:
+            from ..events import DocumentCreated
+            self._event_bus.publish(DocumentCreated(
+                tab_id=tab.id,
+                document_id=tab.document().document_id,
+            ))
+            _LOGGER.debug(
+                "_DocumentCreatorAdapter: published DocumentCreated for tab_id=%s",
+                tab.id,
+            )
+        
         return tab.id
 
     def document_exists(self, title: str) -> tuple[bool, str | None]:
@@ -83,6 +101,25 @@ class _DocumentCreatorAdapter:
             if tab.title == title:
                 return (True, tab.id)
         return (False, None)
+
+    def set_document_text(self, tab_id: str, new_text: str) -> None:
+        """Set the complete text content of a document.
+        
+        This implements TransformDocumentEditor.set_document_text for in-place
+        transformations.
+        """
+        # Get workspace for tab lookup
+        workspace = getattr(self._editor_or_workspace, "workspace", self._editor_or_workspace)
+        tab = workspace.get_tab(tab_id)
+        if tab is None:
+            _LOGGER.warning("Cannot set text: tab %s not found", tab_id)
+            return
+        doc = tab.document()
+        if doc is None:
+            _LOGGER.warning("Cannot set text: tab %s has no document", tab_id)
+            return
+        doc.set_text(new_text)
+        _LOGGER.debug("Set document text for tab %s (%d chars)", tab_id, len(new_text))
 
 
 @dataclass(slots=True)
@@ -134,7 +171,7 @@ class ToolAdapter:
             bridge=self.bridge,
             workspace=self.workspace,
             selection_gateway=self.selection_gateway,
-            document_creator=_DocumentCreatorAdapter(doc_creator_target),
+            document_creator=_DocumentCreatorAdapter(doc_creator_target, self.event_bus),
             ai_client_provider=_AIClientProviderAdapter(self.controller_resolver),
         )
 

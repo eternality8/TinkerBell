@@ -49,6 +49,10 @@ class Event:
     pass
 
 
+# High-frequency event types that should not log each publish
+_QUIET_EVENT_TYPES: set[type] = set()
+
+
 # =============================================================================
 # Document Events (WS1.2)
 # =============================================================================
@@ -175,6 +179,33 @@ class AITurnStreamChunk(Event):
 
     turn_id: str
     content: str
+
+
+# Register high-frequency event types (done after class definition)
+_QUIET_EVENT_TYPES.add(AITurnStreamChunk)
+
+
+@dataclass(slots=True)
+class AITurnToolExecuted(Event):
+    """Emitted when a tool is executed during an AI turn.
+
+    Attributes:
+        turn_id: The unique identifier of the AI turn.
+        tool_name: The name of the tool that was executed.
+        tool_call_id: The unique identifier for this tool call.
+        arguments: JSON string of the tool arguments.
+        result: The result content from the tool (if completed).
+        success: Whether the tool execution succeeded.
+        duration_ms: Execution time in milliseconds.
+    """
+
+    turn_id: str
+    tool_name: str
+    tool_call_id: str
+    arguments: str = ""
+    result: str = ""
+    success: bool = True
+    duration_ms: float = 0.0
 
 
 @dataclass(slots=True)
@@ -559,15 +590,21 @@ class EventBus(Generic[E]):
         """
         event_type = type(event)
         handlers = self._handlers.get(event_type)
+        is_quiet = event_type in _QUIET_EVENT_TYPES
+
         if handlers is None:
-            logger.debug("No handlers for event type %s", event_type.__name__)
+            # Only log for non-quiet events
+            if not is_quiet:
+                logger.debug("No handlers for event type %s", event_type.__name__)
             return
 
-        logger.debug(
-            "Publishing %s to %d handler(s)",
-            event_type.__name__,
-            len(handlers),
-        )
+        # Only log for non-quiet events (skip high-frequency streaming events)
+        if not is_quiet:
+            logger.debug(
+                "Publishing %s to %d handler(s)",
+                event_type.__name__,
+                len(handlers),
+            )
 
         # Collect dead references for cleanup
         dead_indices: list[int] = []
@@ -716,6 +753,7 @@ __all__ = [
     # AI turn events (WS1.3)
     "AITurnStarted",
     "AITurnStreamChunk",
+    "AITurnToolExecuted",
     "AITurnCompleted",
     "AITurnFailed",
     "AITurnCanceled",

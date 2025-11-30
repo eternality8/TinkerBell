@@ -794,11 +794,13 @@ class RestoreWorkspaceUseCase:
 
         # Create tab (with specific tab_id if provided)
         tab_id_hint = entry.get("tab_id")
+        untitled_index = entry.get("untitled_index")
         tab = self._document_store.create_tab(
             document=document,
             path=path,
             title=title,
             make_active=False,  # We'll set active later
+            untitled_index=untitled_index,
         )
 
         # Apply unsaved snapshot if available

@@ -133,10 +133,34 @@ def create_application(
     review_manager = ReviewManager(event_bus=event_bus)
     _LOGGER.debug("Created review manager")
 
-    # OverlayManager for diff overlays (needs editor reference later)
+    # EditTracker to wire EditApplied events to managers
+    from .presentation.status_updaters import EditTracker
+
+    edit_tracker = EditTracker(
+        ai_turn_manager=ai_turn_manager,
+        review_manager=review_manager,
+        event_bus=event_bus,
+    )
+    _LOGGER.debug("Created edit tracker")
+
+    # OverlayManager for diff overlays
+    # We create stub callbacks initially - they'll be wired to the actual
+    # editor after the main window is created
+    def _stub_show_overlay(
+        label: str,
+        spans: tuple[tuple[int, int], ...],
+        summary: str | None,
+        source: str | None,
+        tab_id: str | None,
+    ) -> None:
+        _LOGGER.debug("OverlayManager: show_overlay stub called (editor not wired)")
+
+    def _stub_clear_overlay(tab_id: str | None) -> None:
+        _LOGGER.debug("OverlayManager: clear_overlay stub called (editor not wired)")
+
     overlay_manager = OverlayManager(
-        editor=editor,
-        workspace=workspace,
+        show_overlay=_stub_show_overlay,
+        clear_overlay=_stub_clear_overlay,
         event_bus=event_bus,
     )
     _LOGGER.debug("Created overlay manager")
@@ -161,6 +185,7 @@ def create_application(
         document_provider=None,
         storage_root=None,
         loop_resolver=None,
+        event_bus=event_bus,
     )
     _LOGGER.debug("Created outline store")
 
@@ -216,13 +241,6 @@ def create_application(
     )
     _LOGGER.debug("Created application coordinator")
 
-    # Store adapters on coordinator for later access
-    coordinator._bridge_adapter = bridge_adapter  # type: ignore[attr-defined]
-    coordinator._settings_adapter = settings_adapter  # type: ignore[attr-defined]
-    coordinator._telemetry_adapter = telemetry_adapter  # type: ignore[attr-defined]
-    coordinator._embedding_store = embedding_store  # type: ignore[attr-defined]
-    coordinator._outline_store = outline_store  # type: ignore[attr-defined]
-
     # =========================================================================
     # 6. Create Main Window
     # =========================================================================
@@ -231,6 +249,7 @@ def create_application(
     main_window = ThinMainWindow(
         event_bus=event_bus,
         coordinator=coordinator,
+        workspace=workspace,
         skip_widgets=skip_widgets,
     )
     _LOGGER.debug("Created main window")
@@ -238,14 +257,104 @@ def create_application(
     # =========================================================================
     # 7. Wire Up Remaining Dependencies
     # =========================================================================
-    # Set editor reference on overlay manager if window created widgets
+    # Wire editor callbacks to overlay manager if window created widgets
     if main_window.editor is not None:
-        overlay_manager.set_editor(main_window.editor)
-        settings_adapter.set_editor(main_window.editor)
+        editor = main_window.editor
+
+        def _show_overlay(
+            label: str,
+            spans: tuple[tuple[int, int], ...],
+            summary: str | None,
+            source: str | None,
+            tab_id: str | None,
+        ) -> None:
+            editor.show_diff_overlay(
+                label,
+                spans=spans,
+                summary=summary,
+                source=source,
+                tab_id=tab_id,
+            )
+
+        def _clear_overlay(tab_id: str | None) -> None:
+            editor.clear_diff_overlay(tab_id=tab_id)
+
+        overlay_manager.set_callbacks(_show_overlay, _clear_overlay)
+        settings_adapter.set_editor(editor)
         _LOGGER.debug("Wired editor to overlay manager and settings adapter")
+
+    # Wire dialog providers to coordinator
+    if not skip_widgets:
+        from .presentation.dialogs import FileDialogProvider, ImportDialogProvider
+
+        # Create dialog providers with window as parent
+        file_dialog_provider = FileDialogProvider(
+            parent_provider=lambda: main_window,
+            start_dir_resolver=lambda: session_store.current_path,
+            token_budget_resolver=lambda: getattr(context.settings, "max_context_tokens", 128_000),
+        )
+        coordinator.set_dialog_provider(file_dialog_provider)
+
+        import_dialog_provider = ImportDialogProvider(
+            parent_provider=lambda: main_window,
+            start_dir_resolver=lambda: session_store.current_path,
+        )
+        coordinator.set_import_dialog_provider(import_dialog_provider)
+        _LOGGER.debug("Wired dialog providers to coordinator")
 
     # Set snapshot provider on coordinator
     coordinator.set_snapshot_provider(bridge_adapter)
+
+    # =========================================================================
+    # 8. Configure AI Tools
+    # =========================================================================
+    orchestrator = context.ai_orchestrator
+    if orchestrator is not None:
+        try:
+            from ..editor.selection_gateway import SelectionGateway
+            from .infrastructure.tool_adapter import ToolAdapter
+
+            # Create selection gateway for tool wiring
+            selection_gateway = SelectionGateway(workspace=workspace)
+
+            # Create tool adapter
+            tool_adapter = ToolAdapter(
+                controller_resolver=lambda: orchestrator,
+                bridge=bridge_adapter,
+                workspace=workspace,
+                selection_gateway=selection_gateway,
+                editor=main_window.editor,
+                event_bus=event_bus,
+            )
+
+            # Configure the tool dispatcher on the orchestrator
+            orchestrator.configure_tool_dispatcher(
+                context_provider=bridge_adapter,
+            )
+
+            # Register all tools
+            result = tool_adapter.register_tools()
+            _LOGGER.info(
+                "Tool registration: %d registered, %d failed, %d skipped",
+                len(result.registered),
+                len(result.failed),
+                len(result.skipped),
+            )
+
+        except ImportError as exc:
+            _LOGGER.warning("Tool registration unavailable: %s", exc)
+        except Exception as exc:
+            _LOGGER.warning("Tool registration failed: %s", exc)
+
+    # Restore workspace from saved session (or create default tab)
+    if not skip_widgets:
+        restored = coordinator.restore_workspace(context.settings, context.unsaved_cache)
+        if not restored:
+            # No workspace to restore - create a default empty tab
+            coordinator.new_document()
+            _LOGGER.debug("Created default empty document")
+        else:
+            _LOGGER.debug("Restored workspace from saved session")
 
     _LOGGER.info("Application bootstrap complete")
     return event_bus, coordinator, main_window

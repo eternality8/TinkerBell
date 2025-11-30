@@ -124,10 +124,11 @@ def test_workspace_serializes_tab_metadata(tmp_path: Path) -> None:
     tab.update_title()
 
     payload = workspace.serialize_tabs()
+    # Serialized title should not include dirty marker (*)
     assert payload == [
         {
             "tab_id": tab.id,
-            "title": tab.title,
+            "title": "doc.md",  # Clean title without * prefix
             "dirty": True,
             "language": "markdown",
             "path": str(path),

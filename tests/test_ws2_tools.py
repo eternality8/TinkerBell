@@ -153,7 +153,7 @@ class TestFileTypeDetection:
         assert detect_file_type("/path/to/file.txt", "markdown") == "markdown"
     
     def test_untitled_default(self) -> None:
-        assert detect_file_type(None) == "markdown"
+        assert detect_file_type(None) == "plain_text"
     
     def test_is_supported(self) -> None:
         assert is_supported_file_type("markdown") is True
