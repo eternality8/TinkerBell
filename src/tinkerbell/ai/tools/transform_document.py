@@ -438,10 +438,10 @@ class TransformDocumentTool(SubagentTool):
                 expected=f"one of {valid_modes}",
             )
 
-        if output_mode == "in_place" and not params.get("version"):
+        if output_mode == "in_place" and not params.get("version_token"):
             raise ContentRequiredError(
                 message="version token is required for in_place output_mode",
-                field_name="version",
+                field_name="version_token",
             )
 
     def execute(
@@ -497,6 +497,7 @@ class TransformDocumentTool(SubagentTool):
 
         # Convert task dicts to SubagentTask objects
         subagent_tasks = []
+        task_timeout = self.orchestrator.task_timeout_seconds
         for task in tasks:
             chunk: ChunkSpec = task["chunk"]
             subagent_task = SubagentTask(
@@ -505,11 +506,12 @@ class TransformDocumentTool(SubagentTool):
                 chunk=chunk,
                 instructions=task["instructions"],
                 priority=TaskPriority.NORMAL,
+                timeout_seconds=task_timeout,
                 metadata={
                     "transformation_type": transform_type_str,
                     "params": {
                         k: v for k, v in params.items()
-                        if k not in ("tab_id", "version")  # Exclude non-serializable
+                        if k not in ("tab_id", "version_token")  # Exclude non-serializable
                     },
                 },
             )
@@ -817,12 +819,14 @@ class TransformDocumentTool(SubagentTool):
             return self._transform_character_rename(chunk, params)
 
         # For other types, create subagent task
+        task_timeout = self.orchestrator.task_timeout_seconds if self.orchestrator else 120.0
         subagent_task = SubagentTask(
             task_id=f"transform-{uuid.uuid4().hex[:8]}",
             subagent_type=SubagentType.TRANSFORMER,
             chunk=chunk,
             instructions=task["instructions"],
             priority=TaskPriority.NORMAL,
+            timeout_seconds=task_timeout,
         )
 
         # Fallback path: orchestrator exists but executor not available

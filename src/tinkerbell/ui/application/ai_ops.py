@@ -36,6 +36,7 @@ class SnapshotProvider(Protocol):
 
         Returns:
             Snapshot dictionary with document content and metadata.
+            If no tabs are open, returns an empty snapshot with no_document=True.
         """
         ...
 
@@ -176,6 +177,7 @@ class RunAITurnUseCase:
                 metadata=dict(metadata) if metadata else {},
                 history=history,
                 on_stream_event=self._stream_handler,
+                turn_id=turn_id,
             )
 
             # Finalize review based on turn success

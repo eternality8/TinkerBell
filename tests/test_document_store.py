@@ -68,15 +68,16 @@ class MockWorkspace:
         path: Any = None,
         make_active: bool = True,
         untitled_index: int | None = None,
+        tab_id: str | None = None,
     ) -> MockDocumentTab:
-        tab_id = f"t{self._tab_counter}"
+        resolved_tab_id = tab_id or f"t{self._tab_counter}"
         self._tab_counter += 1
-        doc_id = f"doc-{tab_id}"
-        tab = MockDocumentTab(tab_id=tab_id, document_id=doc_id, path=path)
-        self._tabs[tab_id] = tab
-        self._order.append(tab_id)
+        doc_id = f"doc-{resolved_tab_id}"
+        tab = MockDocumentTab(tab_id=resolved_tab_id, document_id=doc_id, path=path)
+        self._tabs[resolved_tab_id] = tab
+        self._order.append(resolved_tab_id)
         if make_active:
-            self._active_tab_id = tab_id
+            self._active_tab_id = resolved_tab_id
             self._notify_listeners()
         return tab
 

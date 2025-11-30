@@ -378,13 +378,13 @@ class WriteTool(BaseTool):
         2. If dry_run=True, returns preview without applying changes
         3. Otherwise, applies changes and increments version
         """
-        # Extract and validate version token (accept both 'version' and 'version_token')
-        version_str = params.get("version") or params.get("version_token")
+        # Extract and validate version token
+        version_str = params.get("version_token")
         if not version_str:
             from .errors import ContentRequiredError
             raise ContentRequiredError(
-                message="Write operations require a 'version' or 'version_token' from a previous read",
-                field_name="version",
+                message="Write operations require a 'version_token' from a previous read",
+                field_name="version_token",
             )
 
         try:

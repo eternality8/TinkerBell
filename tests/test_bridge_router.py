@@ -193,5 +193,87 @@ class TestRouterToolContextProviderProtocol:
         assert callable(router.list_tabs)
         assert hasattr(router, "active_tab_id")
         assert callable(router.active_tab_id)
+
+
+class TestNoDocumentSnapshot:
+    """Tests for snapshot generation when no documents are open."""
+
+    def test_generate_snapshot_with_no_tabs_returns_empty_snapshot(self) -> None:
+        """When no tabs are open, generate_snapshot returns a no_document snapshot."""
+        workspace = _StubWorkspace([])  # Empty workspace
+        router = WorkspaceBridgeRouter(workspace)
+
+        snapshot = router.generate_snapshot()
+
+        assert snapshot["no_document"] is True
+        assert snapshot["tab_id"] is None
+        assert snapshot["text"] == ""
+        assert snapshot["version"] is None
+        assert snapshot["length"] == 0
+        assert snapshot["document_id"] == ""
+
+    def test_generate_snapshot_with_no_tabs_includes_open_documents(self) -> None:
+        """When include_open_documents=True, empty snapshot includes empty tabs list."""
+        workspace = _StubWorkspace([])
+        router = WorkspaceBridgeRouter(workspace)
+
+        snapshot = router.generate_snapshot(include_open_documents=True)
+
+        assert snapshot["no_document"] is True
+        assert snapshot["open_tabs"] == []
+        assert snapshot["active_tab_id"] is None
+
+    def test_generate_snapshot_with_specific_tab_id_still_works(self) -> None:
+        """Specifying a tab_id should still work even with no active tab."""
+        editor = RecordingEditor()
+        from tinkerbell.editor.document_model import DocumentState
+        editor.load_document(DocumentState(text="Some content"))
+        bridge = DocumentBridge(editor=editor)
+        bridge.set_tab_context(tab_id="tab-1")
+        tab = _StubTab(id="tab-1", bridge=bridge, title="Test Doc")
+        workspace = _StubWorkspace([tab])
+        workspace.active_tab_id = None  # No active tab, but tab exists
+        router = WorkspaceBridgeRouter(workspace)
+
+        snapshot = router.generate_snapshot(tab_id="tab-1")
+
+        assert "no_document" not in snapshot or snapshot.get("no_document") is not True
+        assert snapshot["text"] == "Some content"
+
+    def test_list_tabs_with_no_tabs_returns_empty_list(self) -> None:
+        """list_tabs should work even with no tabs open."""
+        workspace = _StubWorkspace([])
+        router = WorkspaceBridgeRouter(workspace)
+
+        tabs = router.list_tabs()
+
+        assert tabs == []
+
+    def test_active_tab_id_with_no_tabs_returns_none(self) -> None:
+        """active_tab_id should return None when no tabs are open."""
+        workspace = _StubWorkspace([])
+        router = WorkspaceBridgeRouter(workspace)
+
+        assert router.active_tab_id() is None
+        assert router.get_active_tab_id() is None
+
+    def test_getattr_raises_attribute_error_with_no_tabs(self) -> None:
+        """Accessing undefined attributes should raise AttributeError when no tabs."""
+        workspace = _StubWorkspace([])
+        router = WorkspaceBridgeRouter(workspace)
+
+        # Should raise AttributeError, not RuntimeError
+        with pytest.raises(AttributeError, match="no active tab"):
+            _ = router.some_undefined_attribute
+
+    def test_hasattr_returns_false_for_undefined_attributes_no_tabs(self) -> None:
+        """hasattr should return False for undefined attributes when no tabs."""
+        workspace = _StubWorkspace([])
+        router = WorkspaceBridgeRouter(workspace)
+
+        # hasattr should return False, not raise an exception
+        assert hasattr(router, "list_tabs") is True  # Explicitly defined
+        assert hasattr(router, "active_tab_id") is True  # Explicitly defined
+        assert hasattr(router, "get_document_text") is False  # Not defined, no tab fallback
         assert hasattr(router, "get_tab_content")
         assert callable(router.get_tab_content)

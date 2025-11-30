@@ -277,7 +277,7 @@ class TestInsertLinesTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "after_line": -1,
             "content": "New first line",
         })
@@ -303,7 +303,7 @@ class TestInsertLinesTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "after_line": 2,
             "content": "Inserted line",
         })
@@ -330,7 +330,7 @@ class TestInsertLinesTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "after_line": 0,
             "content": "New A\nNew B\nNew C",
         })
@@ -356,7 +356,7 @@ class TestInsertLinesTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "after_line": 0,
             "content": "Should not appear",
             "dry_run": True,
@@ -380,7 +380,7 @@ class TestInsertLinesTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "after_line": 0,
         })
 
@@ -411,7 +411,7 @@ class TestReplaceLinesTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "start_line": 1,
             "end_line": 1,
             "content": "Replaced line 1",
@@ -439,7 +439,7 @@ class TestReplaceLinesTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "start_line": 1,
             "end_line": 3,
             "content": "Single replacement",
@@ -467,7 +467,7 @@ class TestReplaceLinesTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "start_line": 1,
             "end_line": 1,
             "content": "",
@@ -490,7 +490,7 @@ class TestReplaceLinesTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "start_line": 3,
             "end_line": 1,  # end < start
             "content": "test",
@@ -523,7 +523,7 @@ class TestDeleteLinesTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "start_line": 2,
             "end_line": 2,
         })
@@ -549,7 +549,7 @@ class TestDeleteLinesTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "start_line": 1,
             "end_line": 3,
         })
@@ -570,7 +570,7 @@ class TestDeleteLinesTool:
         token = version_manager.get_current_token("tab-2")
         result = tool.run(context, {
             "tab_id": "tab-2",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "start_line": 0,
             "end_line": 0,
         })
@@ -603,7 +603,7 @@ class TestWriteDocumentTool:
         new_content = "Completely new content\nWith two lines"
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "content": new_content,
         })
 
@@ -629,7 +629,7 @@ class TestWriteDocumentTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "content": "",
         })
 
@@ -649,7 +649,7 @@ class TestWriteDocumentTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
         })
 
         assert not result.success
@@ -679,7 +679,7 @@ class TestFindAndReplaceTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "find": "Line",
             "replace": "Row",
         })
@@ -706,7 +706,7 @@ class TestFindAndReplaceTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "find": r"Line (\d)",
             "replace": r"Row \1",
             "mode": "regex",
@@ -734,7 +734,7 @@ class TestFindAndReplaceTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "find": "Line",
             "replace": "Row",
             "preview": True,
@@ -766,7 +766,7 @@ class TestFindAndReplaceTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "find": "line",
             "replace": "ROW",
             "case_sensitive": False,
@@ -788,7 +788,7 @@ class TestFindAndReplaceTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "find": "NOTFOUND",
             "replace": "whatever",
         })
@@ -807,7 +807,7 @@ class TestFindAndReplaceTool:
         token = version_manager.get_current_token("tab-1")
         result = tool.run(context, {
             "tab_id": "tab-1",
-            "version": token.to_string(),
+            "version_token": token.to_string(),
             "find": "[invalid",
             "replace": "test",
             "mode": "regex",

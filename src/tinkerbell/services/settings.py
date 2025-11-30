@@ -46,6 +46,7 @@ _BOOL_ENV_OVERRIDES: Mapping[str, str] = {
 }
 _FLOAT_ENV_OVERRIDES: Mapping[str, str] = {
     "TINKERBELL_REQUEST_TIMEOUT": "request_timeout",
+    "TINKERBELL_TOOL_TIMEOUT": "tool_timeout",
     "TINKERBELL_TEMPERATURE": "temperature",
 }
 _INT_ENV_OVERRIDES: Mapping[str, str] = {}
@@ -88,6 +89,7 @@ class Settings:
     theme: str = "default"
     organization: str | None = None
     request_timeout: float = 90.0
+    tool_timeout: float = 120.0
     max_retries: int = 3
     retry_min_seconds: float = 0.5
     retry_max_seconds: float = 6.0
@@ -110,6 +112,7 @@ class Settings:
     font_family: str = "JetBrains Mono"
     font_size: int = 13
     window_geometry: str | None = None
+    splitter_sizes: list[int] | None = None
     debug_logging: bool = False
     debug_event_logging: bool = False
     show_tool_activity_panel: bool = False

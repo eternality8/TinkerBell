@@ -113,6 +113,16 @@ def test_float_env_override_sets_temperature(monkeypatch: pytest.MonkeyPatch, tm
     assert overridden.temperature == pytest.approx(0.95)
 
 
+def test_float_env_override_sets_tool_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    SettingsStore(path).save(Settings())
+    monkeypatch.setenv("TINKERBELL_TOOL_TIMEOUT", "180.0")
+
+    overridden = SettingsStore(path).load()
+
+    assert overridden.tool_timeout == pytest.approx(180.0)
+
+
 def test_debug_settings_roundtrip(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     store = SettingsStore(path)

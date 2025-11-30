@@ -147,6 +147,9 @@ class ThinMainWindow(QMainWindow):
 
         self._update_window_title()
 
+        # Restore window geometry and splitter sizes from settings
+        self._restore_window_state()
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -1128,9 +1131,80 @@ class ThinMainWindow(QMainWindow):
         except Exception:
             LOGGER.debug("ThinMainWindow: failed to save workspace state", exc_info=True)
 
+    def _save_window_state(self) -> None:
+        """Save window geometry and splitter sizes to settings."""
+        settings_provider = getattr(self._coordinator, "_settings_provider", None)
+        settings = settings_provider() if settings_provider else None
+        if settings is None:
+            LOGGER.debug("ThinMainWindow: no settings to save window state")
+            return
+
+        try:
+            # Save window geometry
+            if _QT_AVAILABLE and hasattr(self, "saveGeometry"):
+                geometry_bytes = self.saveGeometry()
+                if geometry_bytes:
+                    import base64
+                    settings.window_geometry = base64.b64encode(geometry_bytes.data()).decode("ascii")
+
+            # Save splitter sizes
+            if self._chrome_state is not None and self._chrome_state.splitter is not None:
+                splitter = self._chrome_state.splitter
+                if hasattr(splitter, "sizes"):
+                    settings.splitter_sizes = list(splitter.sizes())
+
+            # Persist settings
+            session_store = getattr(self._coordinator, "_session_store", None)
+            if session_store:
+                session_store.persist_settings(settings)
+                LOGGER.debug("ThinMainWindow: saved window state (geometry + splitter)")
+        except Exception:
+            LOGGER.debug("ThinMainWindow: failed to save window state", exc_info=True)
+
+    def _restore_window_state(self) -> None:
+        """Restore window geometry and splitter sizes from settings."""
+        settings_provider = getattr(self._coordinator, "_settings_provider", None)
+        settings = settings_provider() if settings_provider else None
+        if settings is None:
+            return
+
+        try:
+            # Restore window geometry
+            if _QT_AVAILABLE and settings.window_geometry and hasattr(self, "restoreGeometry"):
+                import base64
+                from PySide6.QtCore import QByteArray
+                geometry_bytes = QByteArray(base64.b64decode(settings.window_geometry))
+                self.restoreGeometry(geometry_bytes)
+                LOGGER.debug("ThinMainWindow: restored window geometry")
+
+            # Restore splitter sizes (with validation)
+            if (
+                self._chrome_state is not None
+                and self._chrome_state.splitter is not None
+                and settings.splitter_sizes
+            ):
+                splitter = self._chrome_state.splitter
+                if hasattr(splitter, "setSizes") and hasattr(splitter, "count"):
+                    sizes = settings.splitter_sizes
+                    # Validate: correct number of sizes, all positive
+                    if (
+                        len(sizes) == splitter.count()
+                        and all(isinstance(s, int) and s >= 0 for s in sizes)
+                        and sum(sizes) > 0
+                    ):
+                        splitter.setSizes(sizes)
+                        LOGGER.debug("ThinMainWindow: restored splitter sizes: %s", sizes)
+                    else:
+                        LOGGER.debug("ThinMainWindow: skipped invalid splitter sizes: %s", sizes)
+        except Exception:
+            LOGGER.debug("ThinMainWindow: failed to restore window state", exc_info=True)
+
     def closeEvent(self, event: Any) -> None:
         """Handle window close event."""
         LOGGER.debug("ThinMainWindow: close event")
+
+        # Save window geometry and splitter sizes
+        self._save_window_state()
 
         # Save workspace state before closing
         self._save_workspace_state()

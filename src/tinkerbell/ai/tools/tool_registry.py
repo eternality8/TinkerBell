@@ -562,19 +562,34 @@ READ_DOCUMENT_SCHEMA = ToolSchema(
     description=(
         "Read document content and get a version_token. "
         "CALL THIS FIRST before any edit. Returns version_token (required for edits) "
-        "and content. Use offset/max_lines for large documents. "
+        "and content. Use start_line/end_line for large documents. "
         "Omit tab_id to read the active document, or call list_tabs first to get a valid tab_id."
     ),
     parameters=[
         TAB_ID_PARAM,
-        OFFSET_PARAM,
-        MAX_LINES_PARAM,
         ParameterSchema(
-            name="include_metadata",
-            type="boolean",
-            description="Include document metadata (file type, line count, etc.).",
+            name="start_line",
+            type="integer",
+            description="First line to read (0-indexed). Defaults to 0.",
             required=False,
-            default=True,
+            default=0,
+            minimum=0,
+        ),
+        ParameterSchema(
+            name="end_line",
+            type="integer",
+            description="Last line to read (0-indexed, inclusive). Defaults to auto-paginate based on max_tokens.",
+            required=False,
+            minimum=0,
+        ),
+        ParameterSchema(
+            name="max_tokens",
+            type="integer",
+            description="Maximum tokens to return (for auto-pagination). Defaults to 6000.",
+            required=False,
+            default=6000,
+            minimum=100,
+            maximum=20000,
         ),
     ],
     category=ToolCategory.NAVIGATION,
@@ -610,6 +625,13 @@ SEARCH_DOCUMENT_SCHEMA = ToolSchema(
             type="boolean",
             description="Whether to match case (for exact/regex modes).",
             required=False,
+            default=True,
+        ),
+        ParameterSchema(
+            name="whole_word",
+            type="boolean",
+            description="Match whole words only (exact mode only).",
+            required=False,
             default=False,
         ),
         ParameterSchema(
@@ -617,9 +639,18 @@ SEARCH_DOCUMENT_SCHEMA = ToolSchema(
             type="integer",
             description="Maximum number of matches to return.",
             required=False,
-            default=20,
+            default=50,
             minimum=1,
             maximum=100,
+        ),
+        ParameterSchema(
+            name="context_lines",
+            type="integer",
+            description="Lines of context around each match.",
+            required=False,
+            default=2,
+            minimum=0,
+            maximum=10,
         ),
     ],
     category=ToolCategory.NAVIGATION,
@@ -812,11 +843,12 @@ FIND_AND_REPLACE_SCHEMA = ToolSchema(
             required=True,
         ),
         ParameterSchema(
-            name="is_regex",
-            type="boolean",
-            description="Interpret 'find' as a regular expression.",
+            name="mode",
+            type="string",
+            description="Search mode: 'literal' or 'regex'.",
             required=False,
-            default=False,
+            default="literal",
+            enum=["literal", "regex"],
         ),
         ParameterSchema(
             name="case_sensitive",
@@ -826,14 +858,22 @@ FIND_AND_REPLACE_SCHEMA = ToolSchema(
             default=True,
         ),
         ParameterSchema(
+            name="whole_word",
+            type="boolean",
+            description="Match whole words only (literal mode only).",
+            required=False,
+            default=False,
+        ),
+        ParameterSchema(
             name="max_replacements",
             type="integer",
-            description="Maximum number of replacements. Omit for all.",
+            description="Maximum number of replacements. Defaults to 1000.",
             required=False,
+            default=1000,
             minimum=1,
         ),
         ParameterSchema(
-            name="dry_run",
+            name="preview",
             type="boolean",
             description="Preview replacements without applying them.",
             required=False,
@@ -851,7 +891,7 @@ FIND_AND_REPLACE_SCHEMA = ToolSchema(
 ANALYZE_DOCUMENT_SCHEMA = ToolSchema(
     name="analyze_document",
     description=(
-        "Analyze document content for characters, plot, style, or custom analysis. "
+        "Analyze document content for characters, plot, style, themes, or custom analysis. "
         "Auto-chunks large documents for parallel processing."
     ),
     parameters=[
@@ -861,7 +901,7 @@ ANALYZE_DOCUMENT_SCHEMA = ToolSchema(
             type="string",
             description="Type of analysis to perform.",
             required=True,
-            enum=["characters", "plot", "style", "summary", "custom"],
+            enum=["characters", "plot", "style", "summary", "themes", "custom"],
         ),
         ParameterSchema(
             name="custom_prompt",

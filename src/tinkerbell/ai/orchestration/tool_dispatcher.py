@@ -299,6 +299,11 @@ class ToolDispatcher:
                 registration, arguments, context, start_time
             )
 
+        # If create_document succeeded and we have no pinned tab, pin the new tab
+        # This enables the "first created tab becomes active" behavior for turns
+        # that started with no open documents.
+        self._maybe_pin_created_tab(tool_name, result)
+
         # Notify listener
         if self._listener:
             try:
@@ -635,6 +640,43 @@ class ToolDispatcher:
             LOGGER.debug("Version token validation failed for %s: %s", token, exc)
 
         return None
+
+    def _maybe_pin_created_tab(self, tool_name: str, result: DispatchResult) -> None:
+        """Pin the newly created tab if create_document succeeded with no pinned tab.
+        
+        This enables the "first created tab becomes active" behavior for AI turns
+        that started with no open documents. When a turn starts without any tabs
+        open, the turn context has pinned_tab_id=None. After create_document
+        successfully creates a tab, we pin that tab so subsequent tools in the
+        same turn will use it as the default.
+        
+        Args:
+            tool_name: Name of the tool that was executed.
+            result: The dispatch result from the tool execution.
+        """
+        # Only interested in successful create_document calls
+        if tool_name != "create_document" or not result.success:
+            return
+        
+        # Only pin if we have a turn context with no pinned tab
+        if not self._turn_context or self._turn_context.pinned_tab_id is not None:
+            return
+        
+        # Extract tab_id from result
+        tab_id = None
+        if isinstance(result.result, dict):
+            tab_id = result.result.get("tab_id")
+        
+        if not tab_id:
+            return
+        
+        # Pin the new tab
+        if self._turn_context.pin_tab_if_empty(tab_id):
+            LOGGER.info(
+                "Pinned first created tab %s to turn context (turn_id=%s)",
+                tab_id,
+                self._turn_context.turn_id,
+            )
 
     # ------------------------------------------------------------------
     # Result Building

@@ -99,6 +99,24 @@ class TurnContext:
             metadata=dict(self.metadata),
         )
     
+    def pin_tab_if_empty(self, tab_id: str) -> bool:
+        """Pin a tab ID if none is currently pinned.
+        
+        This is used when a turn starts without any open documents, and
+        the first document created during the turn should become the
+        pinned tab for subsequent operations.
+        
+        Args:
+            tab_id: The tab ID to pin.
+            
+        Returns:
+            True if the tab was pinned, False if already pinned.
+        """
+        if self.pinned_tab_id is None:
+            self.pinned_tab_id = tab_id
+            return True
+        return False
+    
     def to_dict(self) -> dict[str, Any]:
         """Serialize the turn context for logging/debugging."""
         return {

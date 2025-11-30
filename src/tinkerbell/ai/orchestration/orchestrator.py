@@ -36,6 +36,7 @@ from .tool_dispatcher import (
     ToolContextProvider,
     DispatchResult,
 )
+from .turn_context import TurnContext
 from .runner import TurnRunner, RunnerConfig
 from .types import (
     TurnInput,
@@ -79,6 +80,7 @@ class OrchestratorConfig:
         response_token_reserve: Tokens reserved for response.
         temperature: Sampling temperature.
         streaming_enabled: Whether to stream responses.
+        tool_timeout: Timeout for tool execution in seconds.
     """
 
     max_iterations: int = 8
@@ -86,6 +88,7 @@ class OrchestratorConfig:
     response_token_reserve: int = 16_000
     temperature: float = 0.2
     streaming_enabled: bool = True
+    tool_timeout: float = 120.0
 
 
 @dataclass(slots=True)
@@ -638,6 +641,15 @@ class AIOrchestrator:
         """
         run_id = str(uuid.uuid4())
 
+        # Create turn context from snapshot - this pins the tab_id for the duration
+        # of the turn. If no tab is open (pinned_tab_id will be None), the first
+        # document created during the turn will become the pinned tab.
+        turn_context = TurnContext.from_snapshot(snapshot, turn_id=run_id)
+        
+        # Set turn context on dispatcher before running
+        if self._tool_dispatcher:
+            self._tool_dispatcher.set_turn_context(turn_context)
+
         # Build document snapshot
         doc_snapshot = self._build_document_snapshot(snapshot)
 
@@ -651,6 +663,7 @@ class AIOrchestrator:
             response_reserve=self._config.response_token_reserve,
             temperature=self._config.temperature,
             streaming_enabled=self._config.streaming_enabled,
+            tool_timeout_seconds=self._config.tool_timeout,
         )
 
         # Build turn input
@@ -700,6 +713,9 @@ class AIOrchestrator:
                 error=str(e),
             )
         finally:
+            # Clear turn context when turn completes
+            if self._tool_dispatcher:
+                self._tool_dispatcher.clear_turn_context()
             if self._active_task is task:
                 self._active_task = None
 
@@ -800,6 +816,7 @@ class AIOrchestrator:
         runner_config = RunnerConfig(
             max_iterations=self._config.max_iterations,
             streaming_enabled=self._config.streaming_enabled,
+            tool_timeout=self._config.tool_timeout,
         )
 
         return TurnRunner(

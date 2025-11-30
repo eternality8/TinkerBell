@@ -299,8 +299,10 @@ class WindowChrome:
                     pass
             splitter.addWidget(self._editor)  # type: ignore[arg-type]
             splitter.addWidget(self._chat_panel)  # type: ignore[arg-type]
-            splitter.setStretchFactor(0, 3)
-            splitter.setStretchFactor(1, 2)
+            splitter.setStretchFactor(0, 7)
+            splitter.setStretchFactor(1, 3)
+            # Set initial sizes: 70% editor, 30% chat panel
+            splitter.setSizes([700, 300])
             return splitter
         except Exception:
             return SplitterState(editor=self._editor, chat_panel=self._chat_panel)

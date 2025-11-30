@@ -138,6 +138,9 @@ class ToolWiringContext:
     embedding_index_resolver: Callable[[], Any] | None = None
     active_document_provider: Callable[[], Any] | None = None
 
+    # Tool timeout configuration
+    tool_timeout: float | None = None
+
 
 # =============================================================================
 # Tool Registration Result
@@ -376,9 +379,19 @@ def register_new_tools(ctx: ToolWiringContext) -> ToolRegistrationResult:
         try:
             ai_client = ctx.ai_client_provider.get_ai_client()
             if ai_client is not None:
-                from ..orchestration.subagent_executor import create_subagent_orchestrator
-                orchestrator = create_subagent_orchestrator(ai_client)
-                LOGGER.debug("Created subagent orchestrator with LLM integration")
+                from ..orchestration.subagent_executor import (
+                    create_subagent_orchestrator,
+                    SubagentExecutorConfig,
+                )
+                # Use tool_timeout from context if provided
+                config = None
+                if ctx.tool_timeout is not None:
+                    config = SubagentExecutorConfig(timeout_seconds=ctx.tool_timeout)
+                orchestrator = create_subagent_orchestrator(ai_client, config)
+                LOGGER.debug(
+                    "Created subagent orchestrator with LLM integration (timeout=%.1fs)",
+                    ctx.tool_timeout or 120.0,
+                )
         except Exception as exc:
             LOGGER.warning("Failed to create subagent orchestrator: %s", exc)
 

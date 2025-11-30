@@ -299,6 +299,19 @@ class SettingsDialog(QDialog):
         self._prepare_hint_label(self._timeout_hint)
         self._request_timeout_input.valueChanged.connect(self._update_timeout_hint)
 
+        self._tool_timeout_input = QDoubleSpinBox()
+        self._tool_timeout_input.setObjectName("tool_timeout_input")
+        self._tool_timeout_input.setRange(30.0, 600.0)
+        self._tool_timeout_input.setSingleStep(10.0)
+        self._tool_timeout_input.setSuffix(" s")
+        self._tool_timeout_input.setDecimals(1)
+        tool_timeout_value = float(getattr(self._original, "tool_timeout", 120.0) or 120.0)
+        self._tool_timeout_input.setValue(max(30.0, min(tool_timeout_value, 600.0)))
+        self._tool_timeout_hint = QLabel("Timeout for tool calls including analysis/transform (30–600s).")
+        self._tool_timeout_hint.setObjectName("tool_timeout_hint")
+        self._prepare_hint_label(self._tool_timeout_hint)
+        self._tool_timeout_input.valueChanged.connect(self._update_tool_timeout_hint)
+
     def _init_policy_widgets(self) -> None:
         """Initialize context policy widgets."""
         policy_original = getattr(self._original, "context_policy", ContextPolicySettings())
@@ -405,6 +418,13 @@ class SettingsDialog(QDialog):
         timeout_layout.addWidget(self._request_timeout_input)
         timeout_layout.addWidget(self._timeout_hint)
 
+        tool_timeout_container = QWidget()
+        tool_timeout_layout = QVBoxLayout(tool_timeout_container)
+        tool_timeout_layout.setContentsMargins(0, 0, 0, 0)
+        tool_timeout_layout.setSpacing(2)
+        tool_timeout_layout.addWidget(self._tool_timeout_input)
+        tool_timeout_layout.addWidget(self._tool_timeout_hint)
+
         policy_container = QWidget()
         policy_layout = QVBoxLayout(policy_container)
         policy_layout.setContentsMargins(0, 0, 0, 0)
@@ -456,6 +476,7 @@ class SettingsDialog(QDialog):
             ("Max Context Tokens", self._max_context_tokens_input),
             ("Response Token Reserve", reserve_container),
             ("AI Timeout", timeout_container),
+            ("Tool Call Timeout", tool_timeout_container),
         ])
 
         policy_tab = _build_form_tab([("Context Budget Policy", policy_container)])
@@ -761,6 +782,7 @@ class SettingsDialog(QDialog):
         max_context_tokens = int(self._max_context_tokens_input.value())
         response_token_reserve = int(self._response_token_reserve_input.value())
         request_timeout = float(self._request_timeout_input.value())
+        tool_timeout = float(self._tool_timeout_input.value())
         context_policy = self._gather_context_policy_settings()
         metadata = self._build_embedding_metadata()
         return replace(
@@ -780,6 +802,7 @@ class SettingsDialog(QDialog):
             max_context_tokens=max_context_tokens,
             response_token_reserve=response_token_reserve,
             request_timeout=request_timeout,
+            tool_timeout=tool_timeout,
             context_policy=context_policy,
             metadata=metadata,
         )
@@ -990,6 +1013,22 @@ class SettingsDialog(QDialog):
             message = "Large (>300s) timeouts can stall the UI if the API hangs."
         self._set_hint(self._timeout_hint, message, level)
         self._set_field_error("timeout", message if level == "error" else None)
+
+    def _update_tool_timeout_hint(self) -> None:
+        timeout = float(self._tool_timeout_input.value())
+        level = "info"
+        message = "Timeout for tool calls including analysis/transform (30–600s)."
+        if timeout < 30.0:
+            level = "error"
+            message = "Tool call timeout must be at least 30 seconds."
+        elif timeout > 300.0:
+            level = "warning"
+            message = "Large timeouts (>300s) may delay error detection for hung tasks."
+        elif timeout >= 120.0:
+            level = "success"
+            message = "Recommended for large documents that require multiple LLM calls."
+        self._set_hint(self._tool_timeout_hint, message, level)
+        self._set_field_error("tool_timeout", message if level == "error" else None)
 
     def _update_temperature_hint(self) -> None:
         temperature = float(self._temperature_input.value())

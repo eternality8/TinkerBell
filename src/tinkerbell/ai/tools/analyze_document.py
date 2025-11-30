@@ -266,6 +266,7 @@ class AnalyzeDocumentTool(SubagentTool):
 
         # Convert task dicts to SubagentTask objects
         subagent_tasks = []
+        task_timeout = self.orchestrator.task_timeout_seconds
         for task in tasks:
             chunk: ChunkSpec = task["chunk"]
             subagent_task = SubagentTask(
@@ -274,6 +275,7 @@ class AnalyzeDocumentTool(SubagentTool):
                 chunk=chunk,
                 instructions=task["instructions"],
                 priority=TaskPriority.NORMAL,
+                timeout_seconds=task_timeout,
                 metadata={
                     "analysis_type": analysis_type_str,
                     "custom_prompt": custom_prompt,
@@ -444,12 +446,14 @@ class AnalyzeDocumentTool(SubagentTool):
         instructions: str = task["instructions"]
 
         # Create a SubagentTask
+        task_timeout = self.orchestrator.task_timeout_seconds if self.orchestrator else 120.0
         subagent_task = SubagentTask(
             task_id=f"analyze-{uuid.uuid4().hex[:8]}",
             subagent_type=SubagentType.CHUNK_ANALYZER,
             chunk=chunk,
             instructions=instructions,
             priority=TaskPriority.NORMAL,
+            timeout_seconds=task_timeout,
         )
 
         # Fallback path: orchestrator exists but executor not available

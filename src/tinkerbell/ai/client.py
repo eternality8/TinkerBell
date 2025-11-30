@@ -162,7 +162,6 @@ class ClientSettings:
     retry_min_seconds: float = 0.5
     retry_max_seconds: float = 6.0
     default_headers: Mapping[str, str] | None = None
-    metadata: Mapping[str, Any] | None = None
     debug_logging: bool = False
 
 
@@ -211,7 +210,6 @@ class AIClient:
         temperature: float | None = 0.2,
         max_completion_tokens: int | None = None,
         max_tokens: int | None = None,
-        metadata: Mapping[str, str] | None = None,
         **extra_params: Any,
     ) -> AsyncIterator[AIStreamEvent]:
         """Stream chat completions for the provided messages."""
@@ -224,7 +222,6 @@ class AIClient:
             temperature=temperature,
             max_completion_tokens=max_completion_tokens,
             max_tokens=max_tokens,
-            metadata=metadata,
             extra_params=extra_params,
         )
         message_count = len(payload["messages"])
@@ -359,7 +356,6 @@ class AIClient:
         temperature: float | None,
         max_completion_tokens: int | None,
         max_tokens: int | None,
-        metadata: Mapping[str, str] | None,
         extra_params: Mapping[str, Any],
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -367,9 +363,6 @@ class AIClient:
             "messages": list(messages),
         }
 
-        merged_metadata = self._merge_metadata(metadata)
-        if merged_metadata:
-            payload["metadata"] = merged_metadata
         if tools:
             payload["tools"] = list(tools)
         if tool_choice:
@@ -387,24 +380,21 @@ class AIClient:
 
         return payload
 
-    def _merge_metadata(self, runtime_metadata: Mapping[str, Any] | None) -> dict[str, str] | None:
-        combined: dict[str, str] = {}
-        sources = [self._settings.metadata, runtime_metadata]
-        for source in sources:
-            if not source:
-                continue
-            for key, value in source.items():
-                if not isinstance(key, str) or not isinstance(value, str):
-                    continue
-                combined[key] = value
-        return combined or None
-
     def _normalize_stream_event(self, event: ChatCompletionStreamEvent[Any]) -> AIStreamEvent | None:
         event_type = getattr(event, "type", None)
         if event_type is None:
             return None
 
         if event_type == "chunk":
+            # Handle raw ChatCompletionChunk events from non-OpenAI providers
+            # Content is in choices[0].delta.content
+            choices = getattr(event, "choices", None)
+            if choices and len(choices) > 0:
+                delta = getattr(choices[0], "delta", None)
+                if delta:
+                    content = getattr(delta, "content", None)
+                    if content:
+                        return AIStreamEvent(type="content.delta", content=str(content))
             return None
         if event_type == "content.delta":
             delta_text = getattr(event, "delta", None)

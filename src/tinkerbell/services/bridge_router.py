@@ -65,6 +65,20 @@ class WorkspaceBridgeRouter:
         max_tokens: int | None = None,
         include_text: bool = True,
     ) -> dict:
+        # Handle case where no tabs are open
+        if tab_id is None and self._workspace.active_tab_id is None:
+            snapshot: dict[str, Any] = {
+                "tab_id": None,
+                "text": "",
+                "version": None,
+                "length": 0,
+                "document_id": "",
+                "no_document": True,
+            }
+            if include_open_documents:
+                snapshot["open_tabs"] = []
+                snapshot["active_tab_id"] = None
+            return snapshot
         tab = self._resolve_tab(tab_id)
         snapshot = tab.bridge.generate_snapshot(
             delta_only=delta_only,
@@ -231,6 +245,9 @@ class WorkspaceBridgeRouter:
             return None
 
     def __getattr__(self, name: str):  # pragma: no cover - fallback forwarding
+        # Handle case where no active tab exists
+        if self._workspace.active_tab_id is None:
+            raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}' (no active tab)")
         return getattr(self._bridge_for_tab(None), name)
 
     # ------------------------------------------------------------------

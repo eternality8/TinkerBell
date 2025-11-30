@@ -386,7 +386,6 @@ def _build_ai_orchestrator(settings: Settings, *, debug_logging: bool = False) -
             retry_min_seconds=settings.retry_min_seconds,
             retry_max_seconds=settings.retry_max_seconds,
             default_headers=settings.default_headers,
-            metadata=settings.metadata,
             debug_logging=debug_logging or settings.debug_logging,
         )
         client = AIClient(client_settings)
@@ -400,6 +399,7 @@ def _build_ai_orchestrator(settings: Settings, *, debug_logging: bool = False) -
     limit = _resolve_max_tool_iterations(settings)
     context_tokens = getattr(settings, "max_context_tokens", 128_000)
     response_reserve = getattr(settings, "response_token_reserve", 16_000)
+    tool_timeout = getattr(settings, "tool_timeout", 120.0)
     
     config = OrchestratorConfig(
         max_iterations=limit,
@@ -407,6 +407,7 @@ def _build_ai_orchestrator(settings: Settings, *, debug_logging: bool = False) -
         response_token_reserve=response_reserve,
         temperature=getattr(settings, "temperature", 0.2),
         streaming_enabled=True,
+        tool_timeout=tool_timeout,
     )
     
     return AIOrchestrator(

@@ -207,7 +207,6 @@ class SettingsAdapter:
             retry_min_seconds=settings.retry_min_seconds,
             retry_max_seconds=settings.retry_max_seconds,
             default_headers=settings.default_headers or None,
-            metadata=settings.metadata or None,
             debug_logging=bool(getattr(settings, "debug_logging", False)),
         )
 
@@ -246,6 +245,7 @@ class SettingsAdapter:
                 response_token_reserve=getattr(settings, "response_token_reserve", 16_000),
                 temperature=getattr(settings, "temperature", 0.2),
                 streaming_enabled=True,
+                tool_timeout=getattr(settings, "tool_timeout", 120.0),
             )
             return AIOrchestrator(
                 client=client,
@@ -379,6 +379,7 @@ class SettingsAdapter:
                     response_token_reserve=getattr(settings, "response_token_reserve", 16_000),
                     temperature=getattr(settings, "temperature", 0.2),
                     streaming_enabled=True,
+                    tool_timeout=getattr(settings, "tool_timeout", 120.0),
                 )
                 orchestrator.set_config(new_config)
             except Exception as exc:  # pragma: no cover - defensive guard

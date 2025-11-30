@@ -118,6 +118,23 @@ def test_settings_dialog_gather_settings_reflects_changes(qtbot, dialog_settings
     assert updated.metadata.get("embedding_mode") == DEFAULT_EMBEDDING_MODE
 
 
+def test_settings_dialog_tool_timeout_reflects_changes(qtbot, dialog_settings: Settings) -> None:
+    dialog = SettingsDialog(settings=dialog_settings, show_toasts=False)
+    qtbot.addWidget(dialog)
+
+    tool_timeout_input = dialog.findChild(QDoubleSpinBox, "tool_timeout_input")
+    assert tool_timeout_input is not None
+
+    # Default value should be 120.0
+    assert tool_timeout_input.value() == pytest.approx(120.0)
+
+    # Change the value
+    tool_timeout_input.setValue(180.0)
+
+    updated = dialog.gather_settings()
+    assert updated.tool_timeout == pytest.approx(180.0)
+
+
 def test_settings_dialog_validation_uses_validator(qtbot, dialog_settings: Settings) -> None:
     def validator(settings: Settings) -> ValidationResult:
         if settings.api_key:

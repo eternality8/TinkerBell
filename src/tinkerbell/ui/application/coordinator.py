@@ -336,17 +336,69 @@ class AppCoordinator:
     def save_workspace_state(self) -> bool:
         """Save the current workspace state to settings.
 
+        This method saves both workspace metadata (open tabs, active tab) and
+        the content of dirty/untitled documents to the unsaved cache. This
+        ensures that document content created by AI tools is preserved across
+        app restarts.
+
         Returns:
             True if workspace state was saved successfully.
         """
         workspace = self._document_store.workspace
         workspace_state = workspace.serialize_state()
         settings = self._settings_provider() if self._settings_provider else None
+
+        # Save dirty document content to the unsaved cache
+        cache = self._cache_provider() if self._cache_provider else None
+        if cache is not None:
+            self._save_dirty_documents_to_cache(cache)
+            self._session_store.persist_unsaved_cache(cache)
+
         return self._session_store.sync_workspace_state(
             workspace_state,
             settings,
             persist=True,
         )
+
+    def _save_dirty_documents_to_cache(self, cache: "UnsavedCache") -> None:
+        """Save content of dirty documents to the unsaved cache.
+
+        For documents with a file path, saves to unsaved_snapshots keyed by path.
+        For untitled documents (no path), saves to untitled_snapshots keyed by tab_id.
+
+        Args:
+            cache: The unsaved cache to update.
+        """
+        for tab in self._document_store.iter_tabs():
+            document = tab.document()
+            if not document.dirty:
+                continue
+
+            snapshot = {
+                "text": document.text,
+                "language": document.metadata.language,
+            }
+
+            path = document.metadata.path
+            if path is not None:
+                # Document has a file path - save to unsaved_snapshots
+                key = self._session_store.normalize_snapshot_key(path, tab.id)
+                if cache.unsaved_snapshots is None:
+                    cache.unsaved_snapshots = {}
+                cache.unsaved_snapshots[key] = snapshot
+                LOGGER.debug(
+                    "AppCoordinator: saved dirty document snapshot for path %s",
+                    path,
+                )
+            else:
+                # Untitled document - save to untitled_snapshots keyed by tab_id
+                if cache.untitled_snapshots is None:
+                    cache.untitled_snapshots = {}
+                cache.untitled_snapshots[tab.id] = snapshot
+                LOGGER.debug(
+                    "AppCoordinator: saved untitled document snapshot for tab %s",
+                    tab.id,
+                )
 
     def close_document(self, tab_id: str | None = None) -> bool:
         """Close a document tab.

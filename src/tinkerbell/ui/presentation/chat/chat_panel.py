@@ -51,7 +51,7 @@ FALLBACK_SHIFT_MODIFIER = 0x02000000  # Qt.ShiftModifier bit mask
 FALLBACK_KEY_PRESS_EVENT = 6  # QEvent.KeyPress
 
 try:  # pragma: no cover - PySide6 optional in CI
-    from PySide6.QtCore import Qt as _Qt, QEvent as _QtEvent, QSize as _QtSize
+    from PySide6.QtCore import Qt as _Qt, QEvent as _QtEvent, QSize as _QtSize, QTimer as _QtTimer
     from PySide6.QtGui import QColor as _QtColor
     from PySide6.QtWidgets import (
         QApplication as _QtApplication,
@@ -88,7 +88,9 @@ try:  # pragma: no cover - PySide6 optional in CI
     QColor = _QtColor
     QSizePolicy = _QtSizePolicy
     QSize = _QtSize
+    QTimer = _QtTimer
 except Exception:  # pragma: no cover - runtime fallback keeps dependencies optional
+    QTimer = None  # type: ignore[assignment,misc]
 
     class _StubQWidget:  # type: ignore[too-many-ancestors]
         """Runtime placeholder mirroring PySide6 QWidget signatures."""
@@ -200,7 +202,63 @@ class ChatPanel(QWidgetBase):
         self._action_button_busy_text = "■"
         self._action_button_busy_tooltip = "Stop the current AI response"
 
+        # Resize debounce timer
+        self._resize_timer: Any = None
+        self._last_viewport_width: int = 0
+
         self._build_ui()
+
+    # ------------------------------------------------------------------
+    # Resize handling
+    # ------------------------------------------------------------------
+
+    def resizeEvent(self, event: Any) -> None:
+        """Handle resize events to update chat bubble sizes."""
+        super().resizeEvent(event)
+        self._schedule_bubble_refresh()
+
+    def _schedule_bubble_refresh(self) -> None:
+        """Schedule a debounced refresh of chat bubbles after resize."""
+        if self._history_widget is None:
+            return
+
+        # Check if viewport width actually changed
+        try:
+            viewport = self._history_widget.viewport()
+            if viewport is not None:
+                current_width = viewport.width()
+                # Only refresh if width changed significantly (> 10px)
+                if abs(current_width - self._last_viewport_width) <= 10:
+                    return
+        except Exception:  # pragma: no cover
+            pass
+
+        # Create timer if needed
+        if self._resize_timer is None and QTimer is not None:
+            self._resize_timer = QTimer(self)
+            self._resize_timer.setSingleShot(True)
+            self._resize_timer.timeout.connect(self._on_resize_timer)
+
+        # Restart the debounce timer (150ms delay)
+        if self._resize_timer is not None:
+            self._resize_timer.stop()
+            self._resize_timer.start(150)
+
+    def _on_resize_timer(self) -> None:
+        """Handle debounced resize - refresh bubble sizes."""
+        if self._history_widget is None:
+            return
+
+        # Update last known width
+        try:
+            viewport = self._history_widget.viewport()
+            if viewport is not None:
+                self._last_viewport_width = viewport.width()
+        except Exception:  # pragma: no cover
+            pass
+
+        # Refresh the history widget to recalculate bubble sizes
+        self._refresh_history_widget()
 
     # ------------------------------------------------------------------
     # Public API – history + composer

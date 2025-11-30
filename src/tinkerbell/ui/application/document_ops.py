@@ -801,23 +801,29 @@ class RestoreWorkspaceUseCase:
             title=title,
             make_active=False,  # We'll set active later
             untitled_index=untitled_index,
+            tab_id=tab_id_hint,  # Preserve original tab_id for snapshot lookup
         )
 
         # Apply unsaved snapshot if available
+        # Use the original tab_id from the saved entry (tab_id_hint) for lookup,
+        # since untitled_snapshots are keyed by the tab_id from when they were saved.
+        # For untitled documents this is critical because tab.id is newly generated.
         if cache is not None:
+            lookup_tab_id = tab_id_hint if tab_id_hint else tab.id
             snapshot = self._session_store.get_unsaved_snapshot(
                 cache,
                 path,
-                tab.id,
+                lookup_tab_id,
             )
             if snapshot is not None:
                 text = snapshot.get("text", "")
-                doc = tab.document()
-                doc.text = text
-                doc.dirty = True
+                # Use editor.set_text() to properly update both the editor's
+                # internal text buffer and the DocumentState
+                tab.editor.set_text(text, mark_dirty=True)
                 LOGGER.debug(
-                    "RestoreWorkspaceUseCase: applied snapshot for tab %s",
+                    "RestoreWorkspaceUseCase: applied snapshot for tab %s (lookup key: %s)",
                     tab.id,
+                    lookup_tab_id,
                 )
 
         return tab

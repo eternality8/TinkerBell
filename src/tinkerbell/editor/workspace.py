@@ -57,6 +57,7 @@ class DocumentTab:
     title: str = "Untitled"
     untitled_index: int | None = None
     last_snapshot_digest: str | None = None
+    custom_title: str | None = None  # User/AI-assigned title for untitled docs
 
     def document(self) -> DocumentState:
         """Return the current :class:`DocumentState` for this tab."""
@@ -71,21 +72,34 @@ class DocumentTab:
     def dirty(self) -> bool:
         return self.document().dirty
 
-    def update_title(self, fallback: str = "Untitled") -> None:
-        """Refresh the human-friendly title used in the tab strip."""
+    def update_title(self, fallback: str | None = None) -> None:
+        """Refresh the human-friendly title used in the tab strip.
+        
+        Args:
+            fallback: Optional title to use for untitled documents. If provided
+                and different from "Untitled", it's stored as custom_title.
+        """
+        # Store custom title if provided (and not just "Untitled")
+        if fallback is not None and fallback != "Untitled":
+            self.custom_title = fallback
 
         document = self.document()
         path = document.metadata.path
         if path is not None:
             candidate = path.name or str(path)
         else:
-            # For untitled documents, only add suffix if fallback doesn't already contain it
-            # This handles restoration where title="Untitled 4" and untitled_index=4
-            if self.untitled_index and not fallback.endswith(f" {self.untitled_index}"):
-                suffix = f" {self.untitled_index}"
-                candidate = f"{fallback}{suffix}".strip()
+            # Use custom_title if available, otherwise fall back to "Untitled N"
+            base_title = self.custom_title or fallback or "Untitled"
+            # For untitled documents, only add suffix if base doesn't already contain it
+            # and we don't have a custom title
+            if self.untitled_index and not self.custom_title:
+                if not base_title.endswith(f" {self.untitled_index}"):
+                    suffix = f" {self.untitled_index}"
+                    candidate = f"{base_title}{suffix}".strip()
+                else:
+                    candidate = base_title
             else:
-                candidate = fallback
+                candidate = base_title
         prefix = "*" if document.dirty else ""
         self.title = f"{prefix}{candidate}" if prefix else candidate
 

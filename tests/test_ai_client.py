@@ -136,7 +136,6 @@ async def test_stream_chat_normalizes_delta_and_tool_events() -> None:
             api_key="test",
             model="gpt-4o-mini",
             max_retries=1,
-            metadata={"app": "tinkerbell"},
         ),
         client=cast(AsyncOpenAI, fake_client),
     )
@@ -144,7 +143,6 @@ async def test_stream_chat_normalizes_delta_and_tool_events() -> None:
     collected: list[AIStreamEvent] = []
     async for event in client.stream_chat(
         messages=[{"role": "user", "content": "Hi"}],
-        metadata={"doc": "sample.md"},
     ):
         collected.append(event)
 
@@ -154,9 +152,6 @@ async def test_stream_chat_normalizes_delta_and_tool_events() -> None:
         "tool_calls.function.arguments.done",
         "content.done",
     ]
-    # Metadata from settings and per-call should merge for the API request
-    metadata_payload = fake_client.chat.completions.calls[0]["metadata"]
-    assert metadata_payload == {"app": "tinkerbell", "doc": "sample.md"}
     assert fake_client.chat.completions.calls[0]["messages"][0]["role"] == "user"
 
 

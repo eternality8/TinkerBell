@@ -86,6 +86,7 @@ class AITurnManager:
         metadata: Mapping[str, Any],
         history: Sequence[Mapping[str, str]] | None,
         on_stream_event: Callable[[Any], None] | None = None,
+        turn_id: str | None = None,
     ) -> AITurnState:
         """Start a new AI turn.
 
@@ -95,6 +96,7 @@ class AITurnManager:
             metadata: Additional metadata for the turn.
             history: Chat history for context.
             on_stream_event: Optional callback for raw streaming events.
+            turn_id: Optional turn ID. If not provided, a unique ID is generated.
 
         Returns:
             The AITurnState for this turn.
@@ -116,8 +118,9 @@ class AITurnManager:
         if orchestrator is None:
             raise RuntimeError("AI orchestrator unavailable")
 
-        # Generate unique turn ID
-        turn_id = f"turn-{uuid.uuid4().hex[:8]}"
+        # Use provided turn ID or generate a unique one
+        if turn_id is None:
+            turn_id = f"turn-{uuid.uuid4().hex[:8]}"
 
         # Create turn state
         self._current_turn = AITurnState(

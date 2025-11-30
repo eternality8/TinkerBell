@@ -136,10 +136,17 @@ def create_application(
     # EditTracker to wire EditApplied events to managers
     from .presentation.status_updaters import EditTracker
 
+    # Create a document provider that returns DocumentState given a tab_id
+    def _document_provider(tab_id: str):
+        """Get DocumentState for a tab by ID."""
+        tab = document_store.get_tab(tab_id)
+        return tab.document()
+
     edit_tracker = EditTracker(
         ai_turn_manager=ai_turn_manager,
         review_manager=review_manager,
         event_bus=event_bus,
+        document_provider=_document_provider,
     )
     _LOGGER.debug("Created edit tracker")
 
@@ -317,6 +324,9 @@ def create_application(
             # Create selection gateway for tool wiring
             selection_gateway = SelectionGateway(workspace=workspace)
 
+            # Get tool timeout from settings
+            tool_timeout = getattr(context.settings, "tool_timeout", None)
+
             # Create tool adapter
             tool_adapter = ToolAdapter(
                 controller_resolver=lambda: orchestrator,
@@ -325,6 +335,7 @@ def create_application(
                 selection_gateway=selection_gateway,
                 editor=main_window.editor,
                 event_bus=event_bus,
+                tool_timeout=tool_timeout,
             )
 
             # Configure the tool dispatcher on the orchestrator

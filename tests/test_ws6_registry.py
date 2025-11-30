@@ -42,8 +42,6 @@ from tinkerbell.ai.prompts import (
     system_prompt_v2,
     format_document_context,
     format_error_context,
-    read_document_instructions,
-    simple_edit_workflow,
 )
 
 
@@ -700,23 +698,6 @@ class TestFormatErrorContext:
         result = format_error_context(error)
         assert "Recovery" in result
         assert "read_document" in result
-
-
-class TestToolInstructions:
-    """Tests for tool-specific instructions."""
-
-    def test_read_document_instructions(self) -> None:
-        """Test read_document instructions."""
-        instructions = read_document_instructions()
-        assert "read_document" in instructions
-        assert "version_token" in instructions
-        assert "offset" in instructions
-
-    def test_workflow_templates(self) -> None:
-        """Test workflow template content."""
-        workflow = simple_edit_workflow()
-        assert "read_document" in workflow
-        assert "version_token" in workflow
 
 
 # =============================================================================

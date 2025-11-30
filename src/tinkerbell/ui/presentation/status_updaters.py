@@ -666,7 +666,9 @@ class EditTracker:
         """Handle DocumentCreated events.
 
         When the AI creates a new document, it counts as an edit
-        for the accept/reject workflow.
+        for the accept/reject workflow. We also ensure a review session
+        is created for the new tab so that accept/reject workflows
+        properly track the affected tabs.
         """
         # Increment AI turn manager edit count
         if self._ai_turn_manager is not None:
@@ -676,15 +678,50 @@ class EditTracker:
                 event.tab_id,
             )
 
-        # Increment review manager count for accept/reject
+        # Record the document creation as an edit in review manager
         if self._review_manager is not None:
             pending = self._review_manager.pending_review
             if pending is not None:
-                pending.total_edit_count += 1
-                LOGGER.debug(
-                    "EditTracker: incremented review total_edit_count to %d for created document",
-                    pending.total_edit_count,
+                from ..models.review_models import PendingEdit
+
+                # Create a PendingEdit representing the document creation
+                pending_edit = PendingEdit(
+                    edit_id=f"create-{event.tab_id}",
+                    tab_id=event.tab_id,
+                    action="create_document",
+                    range=(0, 0),
+                    diff=f"Created new document (tab_id={event.tab_id})",
                 )
+
+                # Get document snapshot if provider available
+                document_snapshot = None
+                if self._document_provider is not None:
+                    try:
+                        document_snapshot = self._document_provider(event.tab_id)
+                    except Exception:
+                        LOGGER.debug(
+                            "EditTracker: failed to get document snapshot for created document",
+                            exc_info=True,
+                        )
+
+                # Record the edit - this ensures a session is created for the tab
+                if document_snapshot is not None:
+                    self._review_manager.record_edit(
+                        event.tab_id,
+                        document_snapshot,
+                        pending_edit,
+                    )
+                    LOGGER.debug(
+                        "EditTracker: recorded create_document edit for tab_id=%s",
+                        event.tab_id,
+                    )
+                else:
+                    # Fallback: increment count even without full session support
+                    pending.total_edit_count += 1
+                    LOGGER.debug(
+                        "EditTracker: incremented review total_edit_count to %d for created document (no snapshot)",
+                        pending.total_edit_count,
+                    )
 
 
 __all__ = [

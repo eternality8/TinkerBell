@@ -134,7 +134,7 @@ class SubagentTask:
     chunk: ChunkSpec
     instructions: str = ""
     priority: TaskPriority = TaskPriority.NORMAL
-    timeout_seconds: float = 60.0
+    timeout_seconds: float = 120.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -572,6 +572,16 @@ class SubagentOrchestrator:
     def set_executor(self, executor: SubagentExecutorProtocol) -> None:
         """Set the subagent executor."""
         self._executor = executor
+
+    @property
+    def task_timeout_seconds(self) -> float:
+        """Get the task timeout from executor config, or default."""
+        if self._executor is not None:
+            # Access config.timeout_seconds if executor has it
+            config = getattr(self._executor, "config", None)
+            if config is not None:
+                return getattr(config, "timeout_seconds", 120.0)
+        return 120.0
 
     async def run_tasks(
         self,

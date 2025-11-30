@@ -620,20 +620,40 @@ class SubagentExecutor(SubagentExecutorProtocol):
         """
         full_response: list[str] = []
         final_content: str | None = None
+        event_types_seen: list[str] = []
+        refusal_content: str | None = None
         
         async for event in self._client.stream_chat(
             messages=messages,
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
         ):
+            event_types_seen.append(event.type)
             if event.type == "content.delta" and event.content:
                 full_response.append(event.content)
             elif event.type == "content.done" and event.content:
                 # Capture final content but let the generator complete naturally
                 final_content = event.content
+            elif event.type in ("refusal.delta", "refusal.done") and event.content:
+                refusal_content = event.content
         
         # Prefer final content if available, otherwise join deltas
-        return final_content if final_content is not None else "".join(full_response)
+        result = final_content if final_content is not None else "".join(full_response)
+        
+        # Log diagnostic info if response is empty
+        if not result:
+            unique_event_types = sorted(set(event_types_seen))
+            LOGGER.warning(
+                "LLM returned empty response. Events received: %d total, types: %s. "
+                "Refusal content: %s. Final content was: %s. Delta count: %d.",
+                len(event_types_seen),
+                unique_event_types,
+                refusal_content[:200] if refusal_content else None,
+                repr(final_content),
+                len(full_response),
+            )
+        
+        return result
     
     def _estimate_tokens_used(
         self,

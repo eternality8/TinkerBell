@@ -69,9 +69,11 @@ class _DocumentCreatorAdapter:
             raise
 
         # Create document state with content
+        # Mark as dirty if there's content so it gets persisted across restarts
         doc = DocumentState(
             text=content,
             metadata=DocumentMetadata(path=None, language=file_type or "markdown"),
+            dirty=bool(content),  # Dirty if created with content
         )
 
         # Create the tab using create_tab() - works for both
@@ -114,11 +116,8 @@ class _DocumentCreatorAdapter:
         if tab is None:
             _LOGGER.warning("Cannot set text: tab %s not found", tab_id)
             return
-        doc = tab.document()
-        if doc is None:
-            _LOGGER.warning("Cannot set text: tab %s has no document", tab_id)
-            return
-        doc.set_text(new_text)
+        # Use the editor's set_text method which properly marks the document dirty
+        tab.editor.set_text(new_text)
         _LOGGER.debug("Set document text for tab %s (%d chars)", tab_id, len(new_text))
 
 
@@ -149,6 +148,7 @@ class ToolAdapter:
     selection_gateway: SelectionSnapshotProvider
     editor: Any = None
     event_bus: EventBus | None = None
+    tool_timeout: float | None = None
 
     def build_wiring_context(self) -> ToolWiringContext:
         """Build a tool wiring context reflecting the current runtime state.
@@ -173,6 +173,7 @@ class ToolAdapter:
             selection_gateway=self.selection_gateway,
             document_creator=_DocumentCreatorAdapter(doc_creator_target, self.event_bus),
             ai_client_provider=_AIClientProviderAdapter(self.controller_resolver),
+            tool_timeout=self.tool_timeout,
         )
 
     def register_tools(self) -> ToolRegistrationResult:

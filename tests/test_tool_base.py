@@ -446,7 +446,7 @@ class TestWriteTool:
 
         # Valid token
         current = context.version_manager.get_current_token("tab-1")
-        result = tool.run(context, {"version": current.to_string()})
+        result = tool.run(context, {"version_token": current.to_string()})
         assert result.success is True
 
     def test_stale_token_rejected(self, context: ToolContext) -> None:
@@ -464,7 +464,7 @@ class TestWriteTool:
         old_token = context.version_manager.get_current_token("tab-1")
         context.version_manager.increment_version("tab-1", "newhash")
 
-        result = tool.run(context, {"version": old_token.to_string()})
+        result = tool.run(context, {"version_token": old_token.to_string()})
 
         assert result.success is False
         assert result.error.error_code == "version_mismatch"
@@ -486,7 +486,7 @@ class TestWriteTool:
         tool = WriteTestTool()
         current = context.version_manager.get_current_token("tab-1")
 
-        result = tool.run(context, {"version": current.to_string(), "dry_run": True})
+        result = tool.run(context, {"version_token": current.to_string(), "dry_run": True})
 
         assert result.success is True
         assert result.data["dry_run"] is True
@@ -505,7 +505,7 @@ class TestWriteTool:
         tool = WriteTestTool()
         old_token = context.version_manager.get_current_token("tab-1")
 
-        result = tool.run(context, {"version": old_token.to_string()})
+        result = tool.run(context, {"version_token": old_token.to_string()})
 
         assert result.success is True
         new_version = result.data["version"]
