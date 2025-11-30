@@ -41,7 +41,6 @@ This reference captures the telemetry events emitted by the AI editing guardrail
 1. **Subscribe once** – Register a `TelemetrySink` (or reuse `scripts/export_context_usage.py`) so all events stream through a single dispatcher.
 2. **Normalize cause codes** – Downstream dashboards should treat `hash_mismatch` as the general “stale snapshot” bucket, `chunk_hash_mismatch` as manifest drift, and `inspector_failure` as duplicate/boundary catches.
 3. **Correlate with UI badges** – The chat panel/status bar consume the same payloads, so dashboards built from these events will mirror what operators already see live.
-4. **Benchmark tie-in** – When running `benchmarks/measure_diff_latency.py --mode pipeline`, watch for matching `patch.apply`/`edit_rejected` events to confirm safe-edit thresholds before rolling changes into production.
 
 ## 5. Guardrail & span signals
 
